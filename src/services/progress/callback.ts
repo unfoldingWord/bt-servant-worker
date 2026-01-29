@@ -68,7 +68,7 @@ export class ProgressCallbackSender {
     };
 
     try {
-      await fetch(this.config.url, {
+      const response = await fetch(this.config.url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -76,9 +76,21 @@ export class ProgressCallbackSender {
         },
         body: JSON.stringify(fullPayload),
       });
-    } catch {
-      // Fail silently - webhook failures shouldn't break the main flow
-      // Logging would be done by the caller if needed
+
+      if (!response.ok) {
+        console.error('[webhook_failure]', {
+          url: this.config.url,
+          status: response.status,
+          user_id: this.config.user_id,
+        });
+      }
+    } catch (error) {
+      // Non-blocking: webhook failures shouldn't break main flow
+      console.error('[webhook_failure]', {
+        url: this.config.url,
+        error: error instanceof Error ? error.message : 'Unknown error',
+        user_id: this.config.user_id,
+      });
     }
   }
 }

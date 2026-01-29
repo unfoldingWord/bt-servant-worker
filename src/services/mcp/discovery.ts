@@ -1,5 +1,24 @@
 /**
  * MCP Tool Discovery - fetches tool definitions from MCP servers
+ *
+ * SECURITY: MCP Server Trust Model
+ * ---------------------------------
+ * MCP servers are configured by administrators and are implicitly trusted.
+ * This module fetches tool definitions and executes tool calls on these servers.
+ *
+ * Security considerations:
+ * 1. Server URLs come from trusted storage (Durable Object), not user input
+ * 2. Auth tokens are stored as secrets and passed via Authorization header
+ * 3. Tool definitions are included in Claude prompts - malicious definitions
+ *    could potentially influence Claude's behavior
+ * 4. Tool execution results are returned to Claude - servers could return
+ *    malicious content that influences subsequent responses
+ *
+ * Recommendations for administrators:
+ * - Only register MCP servers you control or trust
+ * - Use allowedTools to restrict which tools are exposed
+ * - Monitor MCP server logs for suspicious activity
+ * - Consider network isolation (private endpoints) for sensitive servers
  */
 
 import { MCPError } from '../../utils/errors.js';

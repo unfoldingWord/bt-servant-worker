@@ -7,6 +7,10 @@ export interface Env {
   MAX_ORCHESTRATION_ITERATIONS: string;
   CODE_EXEC_TIMEOUT_MS: string;
 
+  // Claude configuration (optional - has defaults)
+  CLAUDE_MODEL?: string;
+  CLAUDE_MAX_TOKENS?: string;
+
   // Secrets (set via wrangler secret put)
   ANTHROPIC_API_KEY: string;
   ENGINE_API_KEY: string;

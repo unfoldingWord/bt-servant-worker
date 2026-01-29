@@ -11,15 +11,18 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { Env } from '../../config/types.js';
 import { ChatHistoryEntry, StreamCallbacks } from '../../types/engine.js';
-import { ClaudeAPIError } from '../../utils/errors.js';
+import { ClaudeAPIError, MCPError, ValidationError } from '../../utils/errors.js';
 import { RequestLogger } from '../../utils/logger.js';
 import { createMCPHostFunctions, executeCode } from '../code-execution/index.js';
 import { callMCPTool, getToolNames, ToolCatalog } from '../mcp/index.js';
 import { buildSystemPrompt, historyToMessages } from './system-prompt.js';
 import { buildAllTools, getToolDefinitions } from './tools.js';
 
-const MODEL = 'claude-sonnet-4-20250514';
-const MAX_TOKENS = 4096;
+/** Default Claude model - can be overridden via CLAUDE_MODEL env var */
+const DEFAULT_MODEL = 'claude-sonnet-4-20250514';
+
+/** Default max tokens - can be overridden via CLAUDE_MAX_TOKENS env var */
+const DEFAULT_MAX_TOKENS = 4096;
 
 interface OrchestratorOptions {
   env: Env;
@@ -37,8 +40,31 @@ interface ToolUseBlock {
   input: Record<string, unknown>;
 }
 
+/** Type guard for execute_code input */
+function isExecuteCodeInput(input: unknown): input is { code: string } {
+  return (
+    typeof input === 'object' &&
+    input !== null &&
+    'code' in input &&
+    typeof (input as { code: unknown }).code === 'string'
+  );
+}
+
+/** Type guard for get_tool_definitions input */
+function isGetToolDefinitionsInput(input: unknown): input is { tool_names: string[] } {
+  return (
+    typeof input === 'object' &&
+    input !== null &&
+    'tool_names' in input &&
+    Array.isArray((input as { tool_names: unknown }).tool_names) &&
+    (input as { tool_names: unknown[] }).tool_names.every((n) => typeof n === 'string')
+  );
+}
+
 interface OrchestrationContext {
   client: Anthropic;
+  model: string;
+  maxTokens: number;
   systemPrompt: string;
   tools: Anthropic.Tool[];
   messages: Anthropic.MessageParam[];
@@ -68,8 +94,8 @@ async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message>
     return streamClaudeResponse(ctx);
   }
   return ctx.client.messages.create({
-    model: MODEL,
-    max_tokens: MAX_TOKENS,
+    model: ctx.model,
+    max_tokens: ctx.maxTokens,
     system: ctx.systemPrompt,
     messages: ctx.messages,
     tools: ctx.tools,
@@ -78,8 +104,8 @@ async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message>
 
 async function streamClaudeResponse(ctx: OrchestrationContext): Promise<Anthropic.Message> {
   const stream = ctx.client.messages.stream({
-    model: MODEL,
-    max_tokens: MAX_TOKENS,
+    model: ctx.model,
+    max_tokens: ctx.maxTokens,
     system: ctx.systemPrompt,
     messages: ctx.messages,
     tools: ctx.tools,
@@ -126,18 +152,16 @@ async function processIteration(ctx: OrchestrationContext, iteration: number): P
   return false;
 }
 
-/**
- * Main orchestration function
- */
-export async function orchestrate(
+function createOrchestrationContext(
   userMessage: string,
   options: OrchestratorOptions
-): Promise<string[]> {
+): OrchestrationContext {
   const { env, catalog, history, preferences, logger, callbacks } = options;
-  const maxIterations = parseInt(env.MAX_ORCHESTRATION_ITERATIONS, 10) || 10;
 
-  const ctx: OrchestrationContext = {
+  return {
     client: new Anthropic({ apiKey: env.ANTHROPIC_API_KEY }),
+    model: env.CLAUDE_MODEL ?? DEFAULT_MODEL,
+    maxTokens: parseInt(env.CLAUDE_MAX_TOKENS ?? '', 10) || DEFAULT_MAX_TOKENS,
     systemPrompt: buildSystemPrompt(catalog, preferences, history),
     tools: buildAllTools(catalog),
     messages: [...historyToMessages(history), { role: 'user', content: userMessage }],
@@ -147,20 +171,42 @@ export async function orchestrate(
     logger,
     callbacks,
   };
+}
 
-  callbacks?.onStatus('Processing your request...');
+async function runOrchestrationLoop(
+  ctx: OrchestrationContext,
+  maxIterations: number
+): Promise<void> {
+  for (let i = 0; i < maxIterations; i++) {
+    const done = await processIteration(ctx, i);
+    if (done) break;
+  }
+}
+
+function handleOrchestrationError(error: unknown, logger: RequestLogger): never {
+  logger.error('claude_error', error);
+  if (error instanceof Anthropic.APIError) {
+    throw new ClaudeAPIError(error.message, error.status);
+  }
+  throw error;
+}
+
+/**
+ * Main orchestration function
+ */
+export async function orchestrate(
+  userMessage: string,
+  options: OrchestratorOptions
+): Promise<string[]> {
+  const maxIterations = parseInt(options.env.MAX_ORCHESTRATION_ITERATIONS, 10) || 10;
+  const ctx = createOrchestrationContext(userMessage, options);
+
+  ctx.callbacks?.onStatus('Processing your request...');
 
   try {
-    for (let i = 0; i < maxIterations; i++) {
-      const done = await processIteration(ctx, i);
-      if (done) break;
-    }
+    await runOrchestrationLoop(ctx, maxIterations);
   } catch (error) {
-    logger.error('claude_error', error);
-    if (error instanceof Anthropic.APIError) {
-      throw new ClaudeAPIError(error.message, error.status);
-    }
-    throw error;
+    handleOrchestrationError(error, ctx.logger);
   }
 
   return ctx.responses;
@@ -200,10 +246,20 @@ async function dispatchToolCall(
   ctx: OrchestrationContext
 ): Promise<unknown> {
   if (toolCall.name === 'execute_code') {
-    return handleExecuteCode(toolCall.input as { code: string }, ctx);
+    if (!isExecuteCodeInput(toolCall.input)) {
+      throw new ValidationError(
+        `Invalid input for execute_code: expected { code: string }, got ${JSON.stringify(toolCall.input)}`
+      );
+    }
+    return handleExecuteCode(toolCall.input, ctx);
   }
   if (toolCall.name === 'get_tool_definitions') {
-    return getToolDefinitions(ctx.catalog, (toolCall.input as { tool_names: string[] }).tool_names);
+    if (!isGetToolDefinitionsInput(toolCall.input)) {
+      throw new ValidationError(
+        `Invalid input for get_tool_definitions: expected { tool_names: string[] }, got ${JSON.stringify(toolCall.input)}`
+      );
+    }
+    return getToolDefinitions(ctx.catalog, toolCall.input.tool_names);
   }
   return handleMCPToolCall(toolCall.name, toolCall.input, ctx);
 }
@@ -268,10 +324,14 @@ async function handleMCPToolCall(
   ctx: OrchestrationContext
 ): Promise<unknown> {
   const tool = ctx.catalog.tools.find((t) => t.name === toolName);
-  if (!tool) throw new Error(`Unknown tool: ${toolName}`);
+  if (!tool) {
+    throw new ValidationError(`Unknown tool: ${toolName}`);
+  }
 
   const server = ctx.catalog.serverMap.get(tool.serverId);
-  if (!server) throw new Error(`Server not found for tool: ${toolName}`);
+  if (!server) {
+    throw new MCPError(`Server not found for tool: ${toolName}`, tool.serverId);
+  }
 
   return callMCPTool(server, toolName, input, ctx.logger);
 }

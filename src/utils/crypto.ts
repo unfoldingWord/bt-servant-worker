@@ -16,8 +16,9 @@ export function constantTimeCompare(a: string, b: string): boolean {
 
   let result = 0;
   for (let i = 0; i < aBytes.length; i++) {
+    // Length check above guarantees valid indices - use non-null assertion
     // eslint-disable-next-line security/detect-object-injection -- i is a controlled loop index
-    result |= (aBytes[i] ?? 0) ^ (bBytes[i] ?? 0);
+    result |= aBytes[i]! ^ bBytes[i]!;
   }
 
   return result === 0;

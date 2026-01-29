@@ -15,11 +15,31 @@ export interface ChatRequest {
 }
 
 export interface ChatResponse {
+  /**
+   * Array of response text segments from the assistant.
+   * Typically contains a single concatenated response, but may contain multiple
+   * segments if the orchestration produces multiple text blocks.
+   */
   responses: string[];
+
+  /** Language code for the response (e.g., 'en', 'es', 'fr') */
   response_language: string;
+
+  /** Base64-encoded audio response, or null if no audio was generated */
   voice_audio_base64: string | null;
-  // Backward compatibility fields (deprecated - will be removed when consumers updated)
+
+  /**
+   * @deprecated Since v0.2.0 - Agentic flow doesn't use explicit intents.
+   * Always returns 'agentic'. Will be removed in v0.3.0.
+   * Consumers should migrate to not depend on this field.
+   */
   intent_processed: string;
+
+  /**
+   * @deprecated Since v0.2.0 - Agentic flow doesn't queue intents.
+   * Always returns false. Will be removed in v0.3.0.
+   * Consumers should migrate to not depend on this field.
+   */
   has_queued_intents: boolean;
 }
 

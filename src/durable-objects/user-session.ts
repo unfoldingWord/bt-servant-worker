@@ -3,6 +3,22 @@
  *
  * Provides per-user request serialization (only one request per user at a time),
  * chat history storage, MCP server registry, and user preferences.
+ *
+ * DESIGN NOTE: Request Serialization
+ * ----------------------------------
+ * The orchestration loop intentionally blocks the Durable Object during processing.
+ * This is by design - we want to serialize requests per user to:
+ * 1. Prevent race conditions in conversation history
+ * 2. Ensure consistent state during multi-turn tool execution
+ * 3. Avoid duplicate/conflicting responses to the same user
+ *
+ * Each user gets their own DO instance, so this only affects concurrent requests
+ * from the same user. Different users are processed independently in parallel.
+ *
+ * Trade-offs:
+ * - Long-running orchestrations (10+ tool calls) may take 30+ seconds
+ * - Subsequent requests from the same user queue until completion
+ * - Streaming provides real-time progress despite blocking
  */
 
 import { Hono } from 'hono';

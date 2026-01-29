@@ -13,6 +13,9 @@ import { CodeExecutionError, TimeoutError } from '../../utils/errors.js';
 import { RequestLogger } from '../../utils/logger.js';
 import { CodeExecutionOptions, CodeExecutionResult, ConsoleLog, HostFunction } from './types.js';
 
+/** Number of VM cycles between timeout checks (performance vs responsiveness trade-off) */
+const INTERRUPT_CHECK_CYCLES = 10000;
+
 let quickjsModule: Awaited<ReturnType<typeof newQuickJSWASMModule>> | null = null;
 
 async function getQuickJSModule() {
@@ -68,7 +71,14 @@ function registerHostFunction(
 
     promise
       .then((result) => {
-        vm.evalCode(`__pendingResults__[${id}] = ${JSON.stringify(result)};`);
+        try {
+          const serialized = JSON.stringify(result);
+          vm.evalCode(`__pendingResults__[${id}] = ${serialized};`);
+        } catch (serializeError) {
+          const msg =
+            serializeError instanceof Error ? serializeError.message : 'Serialization failed';
+          vm.evalCode(`__pendingResults__[${id}] = { __error__: ${JSON.stringify(msg)} };`);
+        }
       })
       .catch((error) => {
         const msg = error instanceof Error ? error.message : String(error);
@@ -111,11 +121,10 @@ async function processPendingCalls(vm: QuickJSContext, pendingCalls: PendingCall
 function createInterruptHandler(startTime: number, timeoutMs: number) {
   let interrupted = false;
   let cycleCount = 0;
-  const interruptCycles = 10000;
 
   const handler = () => {
     cycleCount++;
-    if (cycleCount % interruptCycles === 0 && Date.now() - startTime > timeoutMs) {
+    if (cycleCount % INTERRUPT_CHECK_CYCLES === 0 && Date.now() - startTime > timeoutMs) {
       interrupted = true;
       return true;
     }
