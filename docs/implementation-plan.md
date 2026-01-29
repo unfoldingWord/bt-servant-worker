@@ -693,9 +693,19 @@ CLOUDFLARE ACCOUNT (yours)
 
 ## Observability & Logging
 
-Cloudflare provides built-in observability (no external tools needed):
+Cloudflare provides built-in observability (no external tools needed).
 
-### 1. Workers Logs (GA)
+### Logging Approach
+
+Use native `console.log` with structured JSON - no external library needed:
+
+- Workers Logs automatically parses and indexes JSON fields
+- Include correlation ID (`request_id`) in all logs for request tracing
+- JSON format enables powerful queries in the Cloudflare dashboard
+
+### Cloudflare Observability Features
+
+#### Workers Logs (GA)
 
 - **Enable**: `observability = { enabled = true }` in wrangler.toml
 - **Retention**: 7 days
@@ -703,52 +713,148 @@ Cloudflare provides built-in observability (no external tools needed):
 - **Dashboard**: Query logs across all Workers
 - **Free** on both Free and Paid plans
 
-### 2. Workers Tracing (Beta, free until Jan 2026)
+#### Workers Tracing (Beta)
 
 - **Enable**: `observability.traces.enabled = true` in wrangler.toml
 - **What**: OpenTelemetry-compliant spans showing timing for every operation
 - **View**: Trace waterfall in Cloudflare dashboard
 - **Export**: Compatible with Honeycomb, Grafana Cloud, Axiom
 
-### 3. Query Builder
+#### Query Builder
 
 - Write SQL-like queries against your logs
 - Filter by user_id, request path, errors, etc.
 - Create visualizations and save queries
 
-### How to trace a message through the pipeline:
+### Log Levels
+
+Use console methods for log levels:
 
 ```typescript
-// Add structured logging in your code
+console.log(); // INFO - normal operations
+console.info(); // INFO - same as log
+console.warn(); // WARN - recoverable issues
+console.error(); // ERROR - failures, exceptions
+console.debug(); // DEBUG - verbose (filtered in production)
+```
+
+### Events to Log
+
+| Event                     | Level | When                                | Fields                                                       |
+| ------------------------- | ----- | ----------------------------------- | ------------------------------------------------------------ |
+| `request_received`        | INFO  | Request enters Worker               | `request_id`, `user_id`, `client_id`, `path`                 |
+| `do_routed`               | INFO  | Request forwarded to Durable Object | `request_id`, `do_id`                                        |
+| `mcp_discovery_start`     | INFO  | Starting MCP tool discovery         | `request_id`, `server_count`                                 |
+| `mcp_discovery_complete`  | INFO  | Discovery finished                  | `request_id`, `tools_found`, `duration_ms`                   |
+| `mcp_discovery_error`     | ERROR | Discovery failed                    | `request_id`, `server_url`, `error`                          |
+| `claude_request`          | INFO  | Calling Claude API                  | `request_id`, `iteration`, `message_count`                   |
+| `claude_response`         | INFO  | Claude responded                    | `request_id`, `iteration`, `tool_calls_count`, `duration_ms` |
+| `claude_error`            | ERROR | Claude API error                    | `request_id`, `error`, `status_code`                         |
+| `tool_execution_start`    | INFO  | Starting tool execution             | `request_id`, `tool_name`, `iteration`                       |
+| `tool_execution_complete` | INFO  | Tool finished                       | `request_id`, `tool_name`, `duration_ms`, `success`          |
+| `tool_execution_error`    | ERROR | Tool failed                         | `request_id`, `tool_name`, `error`                           |
+| `code_execution_start`    | INFO  | QuickJS sandbox starting            | `request_id`, `code_length`                                  |
+| `code_execution_complete` | INFO  | QuickJS finished                    | `request_id`, `duration_ms`, `console_logs_count`            |
+| `code_execution_error`    | ERROR | QuickJS error                       | `request_id`, `error`, `line_number`                         |
+| `request_complete`        | INFO  | Request finished                    | `request_id`, `duration_ms`, `iterations`, `status`          |
+| `request_error`           | ERROR | Unhandled error                     | `request_id`, `error`, `stack`                               |
+
+### Structured Log Format
+
+```typescript
+interface LogEntry {
+  event: string; // Event name from table above
+  request_id: string; // Correlation ID (UUID)
+  timestamp: number; // Date.now()
+  user_id?: string; // When available
+  // ... event-specific fields
+}
+
+// Helper function
+function log(entry: LogEntry): void {
+  console.log(JSON.stringify(entry));
+}
+
+function logError(entry: LogEntry & { error: string; stack?: string }): void {
+  console.error(JSON.stringify(entry));
+}
+```
+
+### Example: Tracing a Request
+
+```typescript
+// Generate correlation ID at request entry
+const requestId = crypto.randomUUID();
+
+// Log request received
 console.log(
   JSON.stringify({
-    event: 'chat_request',
-    user_id: request.user_id,
-    request_id: crypto.randomUUID(), // Generate correlation ID
+    event: 'request_received',
+    request_id: requestId,
+    user_id: body.user_id,
+    client_id: body.client_id,
+    path: '/api/v1/chat',
     timestamp: Date.now(),
   })
 );
 
-// Log each step
+// Log MCP discovery
 console.log(
   JSON.stringify({
-    event: 'mcp_discovery',
-    request_id: correlationId,
+    event: 'mcp_discovery_complete',
+    request_id: requestId,
     tools_found: manifest.tools.length,
+    duration_ms: Date.now() - startTime,
+    timestamp: Date.now(),
   })
 );
 
+// Log Claude iteration
 console.log(
   JSON.stringify({
-    event: 'claude_call',
-    request_id: correlationId,
+    event: 'claude_response',
+    request_id: requestId,
     iteration: 1,
-    tool_calls: ['fetch_scripture'],
+    tool_calls_count: response.tool_calls?.length ?? 0,
+    duration_ms: Date.now() - claudeStartTime,
+    timestamp: Date.now(),
   })
 );
 ```
 
 Then in the Cloudflare dashboard, query by `request_id` to see the full trace.
+
+### Error Handling & Logging
+
+- Wrap all async operations in try/catch
+- Log errors with full context before re-throwing or returning error response
+- Include stack traces for unexpected errors
+- **Sanitize sensitive data**: Never log API keys, auth tokens, or full message content
+
+```typescript
+try {
+  const result = await claudeClient.messages.create(params);
+} catch (error) {
+  console.error(
+    JSON.stringify({
+      event: 'claude_error',
+      request_id: requestId,
+      error: error instanceof Error ? error.message : 'Unknown error',
+      status_code: error?.status,
+      timestamp: Date.now(),
+    })
+  );
+  throw error;
+}
+```
+
+### wrangler.toml Configuration
+
+```toml
+[observability]
+enabled = true
+head_sampling_rate = 1  # Log 100% of requests (adjust for high traffic)
+```
 
 **Sources:**
 
