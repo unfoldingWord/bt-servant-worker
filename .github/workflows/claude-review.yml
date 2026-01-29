@@ -27,7 +27,7 @@ jobs:
             Review this PR for: security issues, logic errors, TypeScript problems.
             Be concise. Only comment if you find real issues.
           claude_args: |
-            --model claude-haiku-4-20250118
-            --max-turns 3
+            --model claude-sonnet-4-5-20250929
+            --max-turns 5
           additional_permissions: |
             actions: read
