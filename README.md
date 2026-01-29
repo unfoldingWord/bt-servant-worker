@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/unfoldingWord/bt-servant-worker/actions/workflows/ci.yml/badge.svg)](https://github.com/unfoldingWord/bt-servant-worker/actions/workflows/ci.yml)
 
-> AI-powered assistance for Bible translators, at the edge.
+> AI-powered assistance for Bible translators at the edge.
 
 This project is designed to help translators work more efficiently with their Bible translation projects. It provides advanced features for processing natural language queries and executing code in a secure environment.
 
