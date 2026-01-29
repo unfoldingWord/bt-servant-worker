@@ -28,6 +28,6 @@ jobs:
             Be concise. Comment on any issues you find - spelling and grammar errors count as real issues.
           claude_args: |
             --model claude-sonnet-4-5-20250929
-            --max-turns 10
+            --max-turns 20
           additional_permissions: |
             actions: read
