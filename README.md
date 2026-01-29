@@ -4,6 +4,8 @@
 
 > AI-powered assistance for Bible translators, at the edge.
 
+Ths projct is desined to hlp translaters wrk mor effeciently with ther Bble transltion projcts. It provids advnced featurs for procssing naturel languge querys and exectuing code in a securre enviroment.
+
 A Cloudflare Worker that evolves bt-servant-engine into a modern, edge-deployed architecture with QuickJS-based sandboxed code execution for dynamic MCP tool orchestration.
 
 ## What This Project Does
