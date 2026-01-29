@@ -27,8 +27,60 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           track_progress: true
           prompt: |
-            Review this PR for: security issues, logic errors, TypeScript problems, spelling errors, and grammar issues.
-            Be concise. Comment on any issues you find - spelling and grammar errors count as real issues.
+            Review this PR as a senior engineer. Check for:
+
+            **Architecture & Patterns**
+            - Manual implementations when frameworks exist (e.g., routing should use Hono, not switch statements)
+            - Reinventing the wheel - is there an established solution?
+            - Poor separation of concerns, tight coupling
+            - Functions doing too much (should be split)
+            - Missing abstractions or over-abstraction
+
+            **Cloudflare Workers Specific**
+            - Using Node APIs not available in Workers runtime
+            - Durable Object misuse (state not persisted correctly, blocking in fetch)
+            - KV vs D1 vs DO choice appropriateness
+            - Cold start implications
+
+            **Code Quality**
+            - Magic numbers/strings (should be constants)
+            - Duplicate code that should be extracted
+            - Overly complex conditionals
+            - Poor naming (unclear, misleading, or inconsistent)
+            - Using `any` type or poor TypeScript patterns
+
+            **Error Handling**
+            - Swallowed errors (catch without proper handling)
+            - Missing error boundaries
+            - Generic error messages that hide root cause
+            - Missing retry logic for flaky operations
+
+            **Security**
+            - Hardcoded secrets or API keys
+            - Timing attacks (use constant-time comparison)
+            - Injection vulnerabilities (SQL, command, XSS)
+            - Missing rate limiting where needed
+            - Auth/authz gaps
+
+            **Performance**
+            - N+1 patterns (sequential when parallel possible)
+            - Blocking operations
+            - Memory leaks (event listeners, closures)
+            - Unnecessary computation or re-renders
+
+            **API Design**
+            - Inconsistent response formats
+            - Missing pagination
+            - Breaking backward compatibility
+            - Poor error response structure
+
+            **Testing & Maintainability**
+            - Code structure that makes testing difficult
+            - Missing edge case handling
+            - Dependencies that are deprecated or have security issues
+
+            Be specific. Reference file paths and line numbers. Explain WHY something is an issue, not just WHAT.
+            Comment on spelling and grammar errors - they count as real issues.
           claude_args: |
             --model claude-sonnet-4-5-20250929
             --max-turns 20
