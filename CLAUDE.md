@@ -14,6 +14,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 4. **No Suppression**: NEVER suppress warnings, disable linting rules, or skip checks without explicitly asking the user first
 5. **No --no-verify**: NEVER use `--no-verify` or any flag to skip pre-commit hooks
 
+## Things to Remember Before Writing Any Code
+
+1. State how you will verify this change works (ex. tests, bash commands, browser checks, etc)
+2. Write the test orchestration step first
+3. Then implement the code
+4. Run verification and iterate until it passes
+
 ## Project Overview
 
 bt-servant-worker is a Cloudflare Worker that integrates with bt-servant-engine.
@@ -25,11 +32,24 @@ bt-servant-worker is a Cloudflare Worker that integrates with bt-servant-engine.
 
 ## Development Commands
 
-_To be documented once project setup is complete. Expected commands:_
-
-- `wrangler dev` - Start local development server
+- `pnpm dev` - Start local development server
+- `pnpm build` - Build the worker
+- `pnpm test` - Run tests
+- `pnpm lint` - Run ESLint
+- `pnpm format` - Format code with Prettier
+- `pnpm check` - TypeScript type check
+- `pnpm architecture` - Check for circular dependencies
 - `wrangler deploy` - Deploy to Cloudflare
+
+## What to Do After a Push
+
+After every `git push`, you MUST invoke the ci-watcher subagent to verify CI passes:
+
+1. Invoke the ci-watcher agent using the Task tool with `subagent_type: "ci-watcher"`
+2. Wait for it to report CI status
+3. If CI fails, fix the issues and push again
+4. Repeat until CI passes
 
 ## Architecture
 
-_To be documented as the codebase develops._
+See [docs/implementation-plan.md](docs/implementation-plan.md) for full architecture details.
