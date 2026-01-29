@@ -210,6 +210,10 @@ Every commit runs:
 
 If any check fails, the commit is blocked.
 
+## CI Watcher (Claude Code)
+
+When using Claude Code, a `ci-watcher` subagent automatically monitors GitHub Actions after every push. It reports CI status and helps fix any failures before moving on.
+
 ## Implementation Phases
 
 ### Phase 0: Barebones Deployment ✅
