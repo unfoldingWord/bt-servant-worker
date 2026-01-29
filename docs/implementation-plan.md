@@ -324,12 +324,72 @@ interface ChatResponse {
 }
 ```
 
+### Streaming Endpoint (SSE)
+
+In addition to the standard `/api/v1/chat` endpoint, support a streaming endpoint for real-time response delivery.
+
+**Endpoint:** `POST /api/v1/chat/stream`
+
+**Response:** Server-Sent Events (SSE) with `Content-Type: text/event-stream`
+
+```typescript
+// SSE Headers
+{
+  'Content-Type': 'text/event-stream',
+  'Cache-Control': 'no-cache',
+  'Connection': 'keep-alive'
+}
+```
+
+**SSE Event Types:**
+
+| Event         | Purpose                                 | Payload                                                  |
+| ------------- | --------------------------------------- | -------------------------------------------------------- |
+| `status`      | Processing status messages              | `{ type: 'status', message: string }`                    |
+| `progress`    | Streaming text chunks as they arrive    | `{ type: 'progress', text: string }`                     |
+| `complete`    | Final response when finished            | `{ type: 'complete', response: ChatResponse }`           |
+| `error`       | Error messages                          | `{ type: 'error', error: string }`                       |
+| `tool_use`    | Tool invocation (debug mode only)       | `{ type: 'tool_use', tool: string, input: unknown }`     |
+| `tool_result` | Tool execution result (debug mode only) | `{ type: 'tool_result', tool: string, result: unknown }` |
+
+**SSE Event Format:**
+
+```typescript
+function formatSSEEvent(data: object): string {
+  return `data: ${JSON.stringify(data)}\n\n`;
+}
+```
+
+**Streaming Callback Interface:**
+
+```typescript
+interface StreamCallbacks {
+  onStatus: (message: string) => void;
+  onProgress: (text: string) => void;
+  onComplete: (response: ChatResponse) => void;
+  onError: (error: string) => void;
+  onToolUse?: (toolName: string, input: unknown) => void;
+  onToolResult?: (toolName: string, result: unknown) => void;
+}
+```
+
+**Implementation Notes:**
+
+- Uses Anthropic SDK's `messages.stream()` for token-by-token delivery
+- Each `content_block_delta` event with `text_delta` triggers `onProgress()`
+- Tool uses are collected and executed between agentic iterations
+- Stream continues across multiple Claude calls during tool execution
+- Debug events (`tool_use`, `tool_result`) controlled by `SSE_DEBUG_EVENTS` env var
+
+**Reference:** See `lasker-api/src/services/claude.service.ts` for streaming implementation pattern.
+
 ### Client Updates Required
 
 | Project                     | File                                         | Change                                                              |
 | --------------------------- | -------------------------------------------- | ------------------------------------------------------------------- |
 | bt-servant-web-client       | `src/types/engine.ts`                        | Remove `intent_processed`, `has_queued_intents` from `ChatResponse` |
 | bt-servant-web-client       | Any UI using these fields                    | Remove references                                                   |
+| bt-servant-web-client       | Chat component                               | Add SSE streaming support for `/api/v1/chat/stream` endpoint        |
 | bt-servant-whatsapp-gateway | `whatsapp_gateway/services/engine_client.py` | Update response type (remove intent fields)                         |
 
 ### bt-servant-whatsapp-gateway Compatibility
@@ -922,7 +982,15 @@ curl -X POST http://localhost:8787/api/v1/chat \
   -H "Content-Type: application/json" \
   -d '{"client_id":"test","user_id":"test@example.com","message":"Help me understand John 3:16","message_type":"text"}'
 
-# 4. Test with web client
+# 4. Test streaming endpoint
+curl -X POST http://localhost:8787/api/v1/chat/stream \
+  -H "Authorization: Bearer <key>" \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{"client_id":"test","user_id":"test@example.com","message":"Help me understand John 3:16","message_type":"text"}'
+# Should see SSE events: status, progress (multiple), complete
+
+# 5. Test with web client
 # Update bt-servant-web-client ENGINE_BASE_URL to worker URL
 # Send a translation help query
 ```
@@ -950,11 +1018,12 @@ Claude sees the user message + tool catalog and naturally determines which MCP t
 
 ## Phase 1 Scope Decisions
 
-| Feature            | Decision | Rationale                           |
-| ------------------ | -------- | ----------------------------------- |
-| Progress callbacks | Skip     | Return complete response, add later |
-| Audio/TTS          | Skip     | Return `voice_audio_base64: null`   |
-| Intent system      | None     | Fully agentic - Claude decides      |
+| Feature            | Decision    | Rationale                                             |
+| ------------------ | ----------- | ----------------------------------------------------- |
+| Streaming (SSE)    | **Include** | Real-time response delivery via `/api/v1/chat/stream` |
+| Progress callbacks | Skip        | Streaming replaces the need for webhooks              |
+| Audio/TTS          | Skip        | Return `voice_audio_base64: null`                     |
+| Intent system      | None        | Fully agentic - Claude decides                        |
 
 ---
 
