@@ -23,6 +23,7 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          track_progress: true
           prompt: |
             Review this PR for: security issues, logic errors, TypeScript problems, spelling errors, and grammar issues.
             Be concise. Comment on any issues you find - spelling and grammar errors count as real issues.
