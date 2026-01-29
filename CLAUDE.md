@@ -25,11 +25,11 @@ bt-servant-worker is a Cloudflare Worker that integrates with bt-servant-engine.
 
 ## Development Commands
 
-*To be documented once project setup is complete. Expected commands:*
+_To be documented once project setup is complete. Expected commands:_
 
 - `wrangler dev` - Start local development server
 - `wrangler deploy` - Deploy to Cloudflare
 
 ## Architecture
 
-*To be documented as the codebase develops.*
+_To be documented as the codebase develops._

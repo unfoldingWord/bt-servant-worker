@@ -1,0 +1,20 @@
+name = "bt-servant-worker"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[observability]
+enabled = true
+
+[vars]
+ENVIRONMENT = "development"
+MAX_ORCHESTRATION_ITERATIONS = "10"
+CODE_EXEC_TIMEOUT_MS = "5000"
+
+# Durable Objects - uncomment for Phase 1
+# [[durable_objects.bindings]]
+# name = "USER_SESSION"
+# class_name = "UserSession"
+
+# [[migrations]]
+# tag = "v1"
+# new_classes = ["UserSession"]

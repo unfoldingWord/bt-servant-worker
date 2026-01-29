@@ -1,0 +1,16 @@
+#!/usr/bin/env sh
+
+echo "Running lint-staged..."
+npx lint-staged
+
+echo "Running type checks..."
+pnpm run check
+
+echo "Running architecture check..."
+npx depcruise --config .dependency-cruiser.js src
+
+echo "Running tests..."
+pnpm run test
+
+echo "Running build..."
+pnpm run build
