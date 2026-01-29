@@ -10,6 +10,7 @@ jobs:
   review:
     if: |
       github.actor != 'claude[bot]' &&
+      github.actor != 'claude' &&
       (github.event_name == 'pull_request' ||
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')))
     runs-on: ubuntu-latest
