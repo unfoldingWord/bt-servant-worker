@@ -25,7 +25,7 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           prompt: |
             Review this PR for: security issues, logic errors, TypeScript problems, spelling errors, and grammar issues.
-            Be concise. Only comment if you find real issues.
+            Be concise. Comment on any issues you find - spelling and grammar errors count as real issues.
           claude_args: |
             --model claude-sonnet-4-5-20250929
             --max-turns 10
