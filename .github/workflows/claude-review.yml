@@ -22,3 +22,37 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are reviewing a Cloudflare Worker for bt-servant, a Bible translation assistant.
+
+            ## Code Quality Standards (Enforced by ESLint)
+            - Max 50 lines per function
+            - Max 25 statements per function
+            - Cyclomatic complexity ≤ 10
+            - Max nesting depth: 4
+            - Max 5 parameters per function
+
+            ## Architecture Rules (Enforced by dependency-cruiser)
+            - No circular dependencies
+            - types/ cannot import from routes, services, or durable-objects
+            - services/ cannot import from routes
+            - Onion architecture: routes → services → types
+
+            ## Security Focus
+            - QuickJS sandbox for code execution (no eval, no fetch in sandbox)
+            - Never log API keys, auth tokens, or sensitive user data
+            - Validate all external inputs with Zod
+
+            ## Review Priorities
+            1. Security vulnerabilities (injection, data exposure)
+            2. Architecture violations
+            3. Error handling and logging
+            4. TypeScript type safety (strict mode)
+            5. Code clarity and maintainability
+            6. Logic errors (off-by-one, race conditions, edge cases, any other general logic mistakes)
+
+            Reference docs/implementation-plan.md for architectural context.
+          claude_args: |
+            --max-turns 10
+          additional_permissions: |
+            actions: read
