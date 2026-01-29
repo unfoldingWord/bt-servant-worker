@@ -17,8 +17,20 @@ export interface ChatRequest {
 export interface ChatResponse {
   /**
    * Array of response text segments from the assistant.
-   * Typically contains a single concatenated response, but may contain multiple
-   * segments if the orchestration produces multiple text blocks.
+   *
+   * Why an array instead of a single string?
+   * - Claude may produce multiple text blocks interleaved with tool calls
+   * - Each text block from Claude becomes a separate array element
+   * - This preserves the structure of multi-turn tool-assisted responses
+   *
+   * Common patterns:
+   * - Simple responses: Single element with the complete response
+   * - Tool-assisted responses: Multiple elements (e.g., "Let me check that...", then result)
+   *
+   * For display, consumers should typically:
+   * - Join with '\n' for plain text: responses.join('\n')
+   * - Display sequentially for chat UI
+   * - Use the last element if only the final answer matters
    */
   responses: string[];
 

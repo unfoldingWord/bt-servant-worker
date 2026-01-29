@@ -50,6 +50,32 @@ After every `git push`, you MUST invoke the ci-watcher subagent to verify CI pas
 3. If CI fails, fix the issues and push again
 4. Repeat until CI passes
 
+## Responding to PR Review Comments
+
+When Claude PR Review (or any automated/human reviewer) comments on a PR:
+
+### Priority Levels and Required Actions
+
+| Priority            | Action Required                                            |
+| ------------------- | ---------------------------------------------------------- |
+| **Critical**        | MUST fix before merge. No exceptions.                      |
+| **High**            | MUST fix before merge.                                     |
+| **Medium**          | MUST fix before merge. These are real issues.              |
+| **Low**             | Either fix now OR add a TODO comment with issue reference. |
+| **Optional/Polish** | Address if time permits, otherwise note for future.        |
+
+### Process
+
+1. **Read the full review** - Don't skim. Understand each issue.
+2. **Assess each issue honestly** - Don't dismiss valid concerns. If unsure, err on the side of fixing.
+3. **Fix all Critical/High/Medium issues** - No shortcuts. These affect security, reliability, or maintainability.
+4. **For Low priority issues**, choose one:
+   - Fix them (preferred if quick)
+   - Add `// TODO(review): <description>` comment in the code
+   - Create a GitHub issue to track it
+5. **Push fixes and wait for re-review** - The reviewer may find new issues or confirm fixes.
+6. **Iterate until approved** - Don't merge with unresolved medium+ issues.
+
 ## Architecture
 
 See [docs/implementation-plan.md](docs/implementation-plan.md) for full architecture details.

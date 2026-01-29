@@ -24,6 +24,12 @@ const DEFAULT_MODEL = 'claude-sonnet-4-20250514';
 /** Default max tokens - can be overridden via CLAUDE_MAX_TOKENS env var */
 const DEFAULT_MAX_TOKENS = 4096;
 
+/** Maximum allowed code length to prevent DoS via huge payloads (100KB) */
+const MAX_CODE_LENGTH = 100_000;
+
+/** Maximum number of tool names that can be requested at once */
+const MAX_TOOL_NAMES = 100;
+
 interface OrchestratorOptions {
   env: Env;
   catalog: ToolCatalog;
@@ -40,24 +46,41 @@ interface ToolUseBlock {
   input: Record<string, unknown>;
 }
 
-/** Type guard for execute_code input */
+/**
+ * Type guard for execute_code input with semantic validation.
+ * Checks structure, non-empty code, and length limits.
+ */
 function isExecuteCodeInput(input: unknown): input is { code: string } {
-  return (
-    typeof input === 'object' &&
-    input !== null &&
-    'code' in input &&
-    typeof (input as { code: unknown }).code === 'string'
-  );
+  if (
+    typeof input !== 'object' ||
+    input === null ||
+    !('code' in input) ||
+    typeof (input as { code: unknown }).code !== 'string'
+  ) {
+    return false;
+  }
+  const code = (input as { code: string }).code;
+  return code.length > 0 && code.length <= MAX_CODE_LENGTH;
 }
 
-/** Type guard for get_tool_definitions input */
+/**
+ * Type guard for get_tool_definitions input with semantic validation.
+ * Checks structure, non-empty array, length limits, and non-empty tool names.
+ */
 function isGetToolDefinitionsInput(input: unknown): input is { tool_names: string[] } {
+  if (
+    typeof input !== 'object' ||
+    input === null ||
+    !('tool_names' in input) ||
+    !Array.isArray((input as { tool_names: unknown }).tool_names)
+  ) {
+    return false;
+  }
+  const names = (input as { tool_names: string[] }).tool_names;
   return (
-    typeof input === 'object' &&
-    input !== null &&
-    'tool_names' in input &&
-    Array.isArray((input as { tool_names: unknown }).tool_names) &&
-    (input as { tool_names: unknown[] }).tool_names.every((n) => typeof n === 'string')
+    names.length > 0 &&
+    names.length <= MAX_TOOL_NAMES &&
+    names.every((n) => typeof n === 'string' && n.length > 0)
   );
 }
 

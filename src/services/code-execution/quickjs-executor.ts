@@ -55,6 +55,22 @@ interface PendingCall {
   reject: (error: Error) => void;
 }
 
+/**
+ * Safely set a result value in the VM's __pendingResults__ object.
+ *
+ * Uses double JSON encoding to prevent code injection:
+ * 1. JSON.stringify converts the value to a JSON string
+ * 2. JSON.stringify again escapes that string for safe interpolation
+ * 3. JSON.parse in the VM reconstructs the original value
+ *
+ * This eliminates the risk of special characters breaking out of the value context.
+ */
+function setVMResult(vm: QuickJSContext, id: number, value: unknown): void {
+  const jsonValue = JSON.stringify(value);
+  const safeStringLiteral = JSON.stringify(jsonValue);
+  vm.evalCode(`__pendingResults__[${id}] = JSON.parse(${safeStringLiteral});`);
+}
+
 function registerHostFunction(
   vm: QuickJSContext,
   hostFn: HostFunction,
@@ -72,17 +88,16 @@ function registerHostFunction(
     promise
       .then((result) => {
         try {
-          const serialized = JSON.stringify(result);
-          vm.evalCode(`__pendingResults__[${id}] = ${serialized};`);
+          setVMResult(vm, id, result);
         } catch (serializeError) {
           const msg =
             serializeError instanceof Error ? serializeError.message : 'Serialization failed';
-          vm.evalCode(`__pendingResults__[${id}] = { __error__: ${JSON.stringify(msg)} };`);
+          setVMResult(vm, id, { __error__: msg });
         }
       })
       .catch((error) => {
         const msg = error instanceof Error ? error.message : String(error);
-        vm.evalCode(`__pendingResults__[${id}] = { __error__: ${JSON.stringify(msg)} };`);
+        setVMResult(vm, id, { __error__: msg });
       });
 
     return vm.newNumber(id);
