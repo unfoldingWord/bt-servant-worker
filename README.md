@@ -1,5 +1,7 @@
 # bt-servant-worker
 
+[![CI](https://github.com/unfoldingWord/bt-servant-worker/actions/workflows/ci.yml/badge.svg)](https://github.com/unfoldingWord/bt-servant-worker/actions/workflows/ci.yml)
+
 A Cloudflare Worker that evolves bt-servant-engine into a modern, edge-deployed architecture with QuickJS-based sandboxed code execution for dynamic MCP tool orchestration.
 
 ## What This Project Does
