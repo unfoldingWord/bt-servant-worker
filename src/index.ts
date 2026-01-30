@@ -59,6 +59,28 @@ app.get('/api/v1/users/:userId/history', async (c) => {
   return handleUserRequest(c.req.raw, c.env, userId, '/history');
 });
 
+// Admin endpoints for MCP server management (org-scoped)
+app.get('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
+  const org = c.req.param('org');
+  return handleOrgRequest(c.req.raw, c.env, org, '/mcp-servers');
+});
+
+app.put('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
+  const org = c.req.param('org');
+  return handleOrgRequest(c.req.raw, c.env, org, '/mcp-servers');
+});
+
+app.post('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
+  const org = c.req.param('org');
+  return handleOrgRequest(c.req.raw, c.env, org, '/mcp-servers');
+});
+
+app.delete('/api/v1/admin/orgs/:org/mcp-servers/:serverId', async (c) => {
+  const org = c.req.param('org');
+  const serverId = c.req.param('serverId');
+  return handleOrgRequest(c.req.raw, c.env, org, `/mcp-servers/${serverId}`);
+});
+
 export default app;
 
 async function handleChatRequest(request: Request, env: Env, doPath: string): Promise<Response> {
@@ -134,6 +156,44 @@ async function handleUserRequest(
     method: request.method,
     headers: request.headers,
     body: request.method !== 'GET' ? request.body : null,
+  });
+
+  return stub.fetch(doRequest);
+}
+
+/**
+ * Handle org-scoped admin requests (MCP server management)
+ *
+ * Routes to a DO instance using `org:${org}` as the ID.
+ * This ensures all users in the same org share the same MCP server config.
+ */
+async function handleOrgRequest(
+  request: Request,
+  env: Env,
+  org: string,
+  doPath: string
+): Promise<Response> {
+  const requestId = crypto.randomUUID();
+  const logger = createRequestLogger(requestId);
+
+  if (!org) {
+    return Response.json({ error: 'org is required in path' }, { status: 400 });
+  }
+
+  logger.log('admin_request_received', { org, path: doPath, method: request.method });
+
+  // Use org-prefixed ID so all users in an org share config
+  const doId = env.USER_SESSION.idFromName(`org:${org}`);
+  const stub = env.USER_SESSION.get(doId);
+
+  const doUrl = new URL(request.url);
+  doUrl.pathname = doPath;
+  doUrl.searchParams.set('org', org);
+
+  const doRequest = new Request(doUrl.toString(), {
+    method: request.method,
+    headers: request.headers,
+    body: request.method !== 'GET' && request.method !== 'DELETE' ? request.body : null,
   });
 
   return stub.fetch(doRequest);

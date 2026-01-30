@@ -24,7 +24,16 @@
 import { Hono } from 'hono';
 import { Env } from '../config/types.js';
 import { orchestrate } from '../services/claude/index.js';
-import { buildToolCatalog, discoverAllTools, getEnabledMCPServers } from '../services/mcp/index.js';
+import {
+  addMCPServer,
+  buildToolCatalog,
+  discoverAllTools,
+  getEnabledMCPServers,
+  getMCPServers,
+  removeMCPServer,
+  updateMCPServers,
+} from '../services/mcp/index.js';
+import { MCPServerConfig } from '../services/mcp/types.js';
 import {
   createWebhookCallbacks,
   ProgressCallbackConfig,
@@ -78,6 +87,15 @@ export class UserSession {
     this.app.get('/preferences', () => this.handleGetPreferences());
     this.app.put('/preferences', (c) => this.handleUpdatePreferences(c.req.raw));
     this.app.get('/history', (c) => this.handleGetHistory(new URL(c.req.url)));
+
+    // MCP server management (admin routes)
+    this.app.get('/mcp-servers', (c) => this.handleGetMCPServers(new URL(c.req.url)));
+    this.app.put('/mcp-servers', (c) => this.handleReplaceMCPServers(c.req.raw));
+    this.app.post('/mcp-servers', (c) => this.handleAddMCPServer(c.req.raw));
+    this.app.delete('/mcp-servers/:serverId', (c) => {
+      const serverId = c.req.param('serverId');
+      return this.handleDeleteMCPServer(new URL(c.req.url), serverId);
+    });
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -364,5 +382,55 @@ export class UserSession {
 
   private async updatePreferences(preferences: UserPreferencesInternal): Promise<void> {
     await this.state.storage.put(PREFERENCES_KEY, preferences);
+  }
+
+  // ==================== MCP Server Management ====================
+
+  private async handleGetMCPServers(url: URL): Promise<Response> {
+    const org = url.searchParams.get('org') ?? this.env.DEFAULT_ORG;
+    const servers = await getMCPServers(this.state.storage, org);
+    return Response.json({ org, servers });
+  }
+
+  private async handleReplaceMCPServers(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const org = url.searchParams.get('org') ?? this.env.DEFAULT_ORG;
+    const servers = (await request.json()) as MCPServerConfig[];
+
+    if (!Array.isArray(servers)) {
+      return Response.json(
+        { error: 'Request body must be an array of server configs' },
+        { status: 400 }
+      );
+    }
+
+    await updateMCPServers(this.state.storage, org, servers);
+    return Response.json({ org, servers, message: 'MCP servers updated' });
+  }
+
+  private async handleAddMCPServer(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const org = url.searchParams.get('org') ?? this.env.DEFAULT_ORG;
+    const server = (await request.json()) as MCPServerConfig;
+
+    if (!server.id || !server.url) {
+      return Response.json({ error: 'Server config must have id and url' }, { status: 400 });
+    }
+
+    await addMCPServer(this.state.storage, org, server);
+    const servers = await getMCPServers(this.state.storage, org);
+    return Response.json({ org, servers, message: 'MCP server added' });
+  }
+
+  private async handleDeleteMCPServer(url: URL, serverId: string): Promise<Response> {
+    const org = url.searchParams.get('org') ?? this.env.DEFAULT_ORG;
+
+    if (!serverId) {
+      return Response.json({ error: 'Server ID is required' }, { status: 400 });
+    }
+
+    await removeMCPServer(this.state.storage, org, serverId);
+    const servers = await getMCPServers(this.state.storage, org);
+    return Response.json({ org, servers, message: 'MCP server removed' });
   }
 }
