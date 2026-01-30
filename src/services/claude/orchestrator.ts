@@ -175,21 +175,39 @@ async function processIteration(ctx: OrchestrationContext, iteration: number): P
   return false;
 }
 
+function parseEnvConfig(env: Env, logger: RequestLogger) {
+  const model = env.CLAUDE_MODEL ?? DEFAULT_MODEL;
+  const maxTokens = parseInt(env.CLAUDE_MAX_TOKENS ?? '', 10) || DEFAULT_MAX_TOKENS;
+  const codeExecTimeout = parseInt(env.CODE_EXEC_TIMEOUT_MS, 10) || 5000;
+  const maxIterations = parseInt(env.MAX_ORCHESTRATION_ITERATIONS, 10) || 10;
+
+  // Log when using defaults (helps debug configuration issues)
+  if (!env.CLAUDE_MODEL) {
+    logger.log('config_default', { key: 'CLAUDE_MODEL', value: model });
+  }
+  if (!env.CLAUDE_MAX_TOKENS) {
+    logger.log('config_default', { key: 'CLAUDE_MAX_TOKENS', value: maxTokens });
+  }
+
+  return { model, maxTokens, codeExecTimeout, maxIterations };
+}
+
 function createOrchestrationContext(
   userMessage: string,
-  options: OrchestratorOptions
+  options: OrchestratorOptions,
+  config: ReturnType<typeof parseEnvConfig>
 ): OrchestrationContext {
   const { env, catalog, history, preferences, logger, callbacks } = options;
 
   return {
     client: new Anthropic({ apiKey: env.ANTHROPIC_API_KEY }),
-    model: env.CLAUDE_MODEL ?? DEFAULT_MODEL,
-    maxTokens: parseInt(env.CLAUDE_MAX_TOKENS ?? '', 10) || DEFAULT_MAX_TOKENS,
+    model: config.model,
+    maxTokens: config.maxTokens,
     systemPrompt: buildSystemPrompt(catalog, preferences, history),
     tools: buildAllTools(catalog),
     messages: [...historyToMessages(history), { role: 'user', content: userMessage }],
     responses: [],
-    codeExecTimeout: parseInt(env.CODE_EXEC_TIMEOUT_MS, 10) || 5000,
+    codeExecTimeout: config.codeExecTimeout,
     catalog,
     logger,
     callbacks,
@@ -221,13 +239,13 @@ export async function orchestrate(
   userMessage: string,
   options: OrchestratorOptions
 ): Promise<string[]> {
-  const maxIterations = parseInt(options.env.MAX_ORCHESTRATION_ITERATIONS, 10) || 10;
-  const ctx = createOrchestrationContext(userMessage, options);
+  const config = parseEnvConfig(options.env, options.logger);
+  const ctx = createOrchestrationContext(userMessage, options, config);
 
   ctx.callbacks?.onStatus('Processing your request...');
 
   try {
-    await runOrchestrationLoop(ctx, maxIterations);
+    await runOrchestrationLoop(ctx, config.maxIterations);
   } catch (error) {
     handleOrchestrationError(error, ctx.logger);
   }
