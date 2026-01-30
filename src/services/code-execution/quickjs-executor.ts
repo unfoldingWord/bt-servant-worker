@@ -169,13 +169,28 @@ function createInterruptHandler(startTime: number, timeoutMs: number) {
   return { handler, isInterrupted: () => interrupted };
 }
 
+function formatErrorValue(errorValue: unknown): string {
+  if (typeof errorValue === 'string') {
+    return errorValue;
+  }
+  if (errorValue && typeof errorValue === 'object') {
+    const err = errorValue as Record<string, unknown>;
+    // QuickJS errors typically have message and stack properties
+    if (err.message) {
+      return err.stack ? `${err.message}\n${err.stack}` : String(err.message);
+    }
+    return JSON.stringify(errorValue);
+  }
+  return String(errorValue);
+}
+
 function evaluateUserCode(vm: QuickJSContext, code: string): void {
   const result = vm.evalCode(code, 'user-code.js');
   // Must dispose the result handle to prevent GC assertion failure
   if (result.error) {
     const errorValue = vm.dump(result.error);
     result.error.dispose();
-    throw new CodeExecutionError(String(errorValue));
+    throw new CodeExecutionError(formatErrorValue(errorValue));
   }
   result.value.dispose();
 }
@@ -186,7 +201,7 @@ function extractResult(vm: QuickJSContext): unknown {
   if (finalResult.error) {
     const errorValue = vm.dump(finalResult.error);
     finalResult.error.dispose();
-    throw new CodeExecutionError(String(errorValue));
+    throw new CodeExecutionError(formatErrorValue(errorValue));
   }
 
   const value = vm.dump(finalResult.value);
