@@ -5,7 +5,7 @@
  * Key format: mcp_servers:${org}
  */
 
-import { DEFAULT_MCP_SERVERS, MCPServerConfig } from './types.js';
+import { MCPServerConfig } from './types.js';
 
 /**
  * Build the storage key for an organization's MCP servers
@@ -17,13 +17,17 @@ function buildStorageKey(org: string): string {
 /**
  * Get MCP servers from Durable Object storage for a specific organization
  */
+/**
+ * Get MCP servers from Durable Object storage for a specific organization.
+ * Returns empty array if org has no servers configured.
+ */
 export async function getMCPServers(
   storage: DurableObjectStorage,
   org: string
 ): Promise<MCPServerConfig[]> {
   const key = buildStorageKey(org);
   const servers = await storage.get<MCPServerConfig[]>(key);
-  return servers ?? DEFAULT_MCP_SERVERS;
+  return servers ?? [];
 }
 
 /**

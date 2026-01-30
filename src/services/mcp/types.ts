@@ -76,14 +76,6 @@ export interface MCPToolResult {
 }
 
 /**
- * Default MCP servers for Bible translation assistance
+ * No default MCP servers - each org must explicitly configure their servers.
+ * This ensures orgs intentionally set up their MCP infrastructure.
  */
-export const DEFAULT_MCP_SERVERS: MCPServerConfig[] = [
-  {
-    id: 'translation-helps',
-    name: 'Translation Helps MCP',
-    url: 'https://translation-helps-mcp.pages.dev/api/mcp',
-    enabled: true,
-    priority: 1,
-  },
-];

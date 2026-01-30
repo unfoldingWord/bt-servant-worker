@@ -3,7 +3,7 @@
  */
 
 import { ChatHistoryEntry } from '../../types/engine.js';
-import { generateToolDescriptions, ToolCatalog } from '../mcp/index.js';
+import { generateToolCatalog, ToolCatalog } from '../mcp/index.js';
 
 /**
  * Orchestration preferences (subset of full user preferences)
@@ -20,10 +20,21 @@ const BASE_SYSTEM_PROMPT = `You are BT Servant, a helpful assistant for Bible tr
 - Providing translation suggestions and alternatives
 - Explaining cultural and historical context
 
-You have access to various tools to help with these tasks. When a user asks a question:
-1. If you need specific scripture or translation data, use the available MCP tools
-2. For complex operations requiring multiple lookups or data transformation, use execute_code
-3. For simple lookups, call MCP tools directly
+## How to Use Tools
+
+You have access to MCP tools for Bible translation data. To use them:
+
+1. **Review the catalog below** to identify which tools you need
+2. **Call get_tool_definitions** with the tool names to get their full schemas
+3. **Use execute_code** to call the tools with the correct parameters
+
+Example workflow:
+\`\`\`
+// 1. First, call get_tool_definitions to learn the schema
+// 2. Then use execute_code:
+const scripture = await fetch_scripture({ book: "John", chapter: 3, verse: 16 });
+__result__ = scripture;
+\`\`\`
 
 Always be accurate and cite your sources when providing information about scripture.`;
 
@@ -37,9 +48,9 @@ export function buildSystemPrompt(
 ): string {
   const sections: string[] = [BASE_SYSTEM_PROMPT];
 
-  // Add tool descriptions
-  const toolDescriptions = generateToolDescriptions(catalog);
-  sections.push('\n\n## Available Tools\n\n' + toolDescriptions);
+  // Add tool catalog (compact format - name + one-liner only)
+  const toolCatalog = generateToolCatalog(catalog);
+  sections.push('\n\n' + toolCatalog);
 
   // Add user preferences
   if (preferences.response_language !== 'en') {

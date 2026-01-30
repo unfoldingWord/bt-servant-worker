@@ -86,6 +86,7 @@ export class UserSession {
 
   private async handleChat(request: Request): Promise<Response> {
     const requestId = crypto.randomUUID();
+    const startTime = Date.now();
     const body = (await request.json()) as ChatRequest;
     const logger = createRequestLogger(requestId, body.user_id);
 
@@ -106,10 +107,15 @@ export class UserSession {
       }
 
       const response = await this.processChat(body, logger, callbacks);
-      logger.log('do_chat_complete', { response_count: response.responses.length });
+      const totalDuration = Date.now() - startTime;
+      logger.log('do_chat_complete', {
+        response_count: response.responses.length,
+        total_duration_ms: totalDuration,
+      });
       return Response.json(response);
     } catch (error) {
-      logger.error('do_chat_error', error);
+      const totalDuration = Date.now() - startTime;
+      logger.error('do_chat_error', error, { total_duration_ms: totalDuration });
       if (error instanceof ValidationError) {
         return Response.json({ error: error.message }, { status: 400 });
       }
@@ -119,6 +125,7 @@ export class UserSession {
 
   private async handleStreamingChat(request: Request): Promise<Response> {
     const requestId = crypto.randomUUID();
+    const startTime = Date.now();
     const body = (await request.json()) as ChatRequest;
     const logger = createRequestLogger(requestId, body.user_id);
 
@@ -128,12 +135,21 @@ export class UserSession {
     const writer = writable.getWriter();
     const encoder = new TextEncoder();
 
+    // Track time to first token
+    let firstTokenTime: number | null = null;
+
     const sendEvent = async (event: SSEEvent): Promise<void> => {
+      // Log time to first token on first progress event
+      if (event.type === 'progress' && firstTokenTime === null) {
+        firstTokenTime = Date.now() - startTime;
+        logger.log('stream_first_token', { time_to_first_token_ms: firstTokenTime });
+      }
       await writer.write(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
     };
 
-    this.processStreamingChat(body, sendEvent, writer, logger).catch(async (error) => {
-      logger.error('do_stream_error', error);
+    this.processStreamingChat(body, sendEvent, writer, logger, startTime).catch(async (error) => {
+      const totalDuration = Date.now() - startTime;
+      logger.error('do_stream_error', error, { total_duration_ms: totalDuration });
       await sendEvent({
         type: 'error',
         error: error instanceof Error ? error.message : 'Unknown error',
@@ -224,7 +240,8 @@ export class UserSession {
     body: ChatRequest,
     sendEvent: (event: SSEEvent) => Promise<void>,
     writer: WritableStreamDefaultWriter<Uint8Array>,
-    logger: RequestLogger
+    logger: RequestLogger,
+    startTime: number
   ): Promise<void> {
     const callbacks: StreamCallbacks = {
       onStatus: async (message) => sendEvent({ type: 'status', message }),
@@ -237,10 +254,56 @@ export class UserSession {
 
     try {
       const response = await this.processChat(body, logger, callbacks);
+      const totalDuration = Date.now() - startTime;
+      logger.log('do_stream_complete', {
+        response_count: response.responses.length,
+        total_duration_ms: totalDuration,
+      });
       await sendEvent({ type: 'complete', response });
     } finally {
       await writer.close();
     }
+  }
+
+  private async loadUserContext(logger: RequestLogger) {
+    const startTime = Date.now();
+    const [preferences, history] = await Promise.all([this.getPreferences(), this.getHistory()]);
+    logger.log('phase_load_complete', {
+      history_count: history.length,
+      duration_ms: Date.now() - startTime,
+    });
+    return { preferences, history };
+  }
+
+  private async discoverMCPTools(org: string, logger: RequestLogger) {
+    const startTime = Date.now();
+    const servers = await getEnabledMCPServers(this.state.storage, org);
+    const manifests = await discoverAllTools(servers, logger);
+    const catalog = buildToolCatalog(manifests, servers);
+    logger.log('mcp_catalog_built', {
+      server_count: servers.length,
+      tool_count: catalog.tools.length,
+      discovery_duration_ms: Date.now() - startTime,
+    });
+    return catalog;
+  }
+
+  private async saveConversation(
+    message: string,
+    responses: string[],
+    preferences: UserPreferencesInternal,
+    logger: RequestLogger
+  ) {
+    const startTime = Date.now();
+    await this.addHistoryEntry({
+      user_message: message,
+      assistant_response: responses.join('\n'),
+      timestamp: Date.now(),
+    });
+    if (preferences.first_interaction) {
+      await this.updatePreferences({ ...preferences, first_interaction: false });
+    }
+    logger.log('phase_save_complete', { duration_ms: Date.now() - startTime });
   }
 
   private async processChat(
@@ -252,20 +315,11 @@ export class UserSession {
       throw new ValidationError('Message is required');
     }
 
-    // Use org from request or fall back to default
     const org = body.org ?? this.env.DEFAULT_ORG;
+    const { preferences, history } = await this.loadUserContext(logger);
+    const catalog = await this.discoverMCPTools(org, logger);
 
-    const [preferences, history] = await Promise.all([this.getPreferences(), this.getHistory()]);
-
-    const servers = await getEnabledMCPServers(this.state.storage, org);
-    const manifests = await discoverAllTools(servers, logger);
-    const catalog = buildToolCatalog(manifests, servers);
-
-    logger.log('mcp_catalog_built', {
-      server_count: servers.length,
-      tool_count: catalog.tools.length,
-    });
-
+    const startTime = Date.now();
     const responses = await orchestrate(body.message, {
       env: this.env,
       catalog,
@@ -277,16 +331,12 @@ export class UserSession {
       logger,
       callbacks,
     });
-
-    await this.addHistoryEntry({
-      user_message: body.message,
-      assistant_response: responses.join('\n'),
-      timestamp: Date.now(),
+    logger.log('phase_orchestration_complete', {
+      response_count: responses.length,
+      duration_ms: Date.now() - startTime,
     });
 
-    if (preferences.first_interaction) {
-      await this.updatePreferences({ ...preferences, first_interaction: false });
-    }
+    await this.saveConversation(body.message, responses, preferences, logger);
 
     return {
       responses,
