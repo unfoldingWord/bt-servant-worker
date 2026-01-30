@@ -5,8 +5,8 @@ import {
   buildAllTools,
   isBuiltInTool,
   getToolDefinitions,
-} from '../src/services/claude/tools.js';
-import { buildToolCatalog } from '../src/services/mcp/catalog.js';
+} from '../../src/services/claude/tools.js';
+import { buildToolCatalog } from '../../src/services/mcp/catalog.js';
 
 describe('buildExecuteCodeTool', () => {
   it('should return valid tool definition', () => {

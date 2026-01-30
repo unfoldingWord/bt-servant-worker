@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { constantTimeCompare } from '../src/utils/crypto.js';
+import { constantTimeCompare } from '../../src/utils/crypto.js';
 
 describe('constantTimeCompare', () => {
   it('should return true for equal strings', () => {

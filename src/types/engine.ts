@@ -39,20 +39,6 @@ export interface ChatResponse {
 
   /** Base64-encoded audio response, or null if no audio was generated */
   voice_audio_base64: string | null;
-
-  /**
-   * @deprecated Since v0.2.0 - Agentic flow doesn't use explicit intents.
-   * Always returns 'agentic'. Will be removed in v0.3.0.
-   * Consumers should migrate to not depend on this field.
-   */
-  intent_processed: string;
-
-  /**
-   * @deprecated Since v0.2.0 - Agentic flow doesn't queue intents.
-   * Always returns false. Will be removed in v0.3.0.
-   * Consumers should migrate to not depend on this field.
-   */
-  has_queued_intents: boolean;
 }
 
 /**
@@ -82,8 +68,6 @@ export interface ChatHistoryResponse {
 export interface UserPreferencesInternal {
   response_language: string;
   first_interaction: boolean;
-  agentic_strength: 'normal' | 'low' | 'very_low';
-  dev_agentic_mcp: boolean;
 }
 
 /**
@@ -91,8 +75,6 @@ export interface UserPreferencesInternal {
  */
 export interface UserPreferencesAPI {
   response_language?: string | null;
-  agentic_strength?: 'normal' | 'low' | 'very_low' | null;
-  dev_agentic_mcp?: boolean | null;
 }
 
 /**
@@ -100,8 +82,6 @@ export interface UserPreferencesAPI {
  */
 export interface UpdatePreferencesRequest {
   response_language?: string;
-  agentic_strength?: 'normal' | 'low' | 'very_low';
-  dev_agentic_mcp?: boolean;
 }
 
 /**

@@ -48,11 +48,19 @@ const MAX_HISTORY_ENTRIES = 50;
 const HISTORY_KEY = 'history';
 const PREFERENCES_KEY = 'preferences';
 
+/**
+ * Validates ISO 639-1 language code format (2 lowercase letters).
+ * Does not validate against the full ISO 639-1 standard, just the format.
+ */
+const ISO_639_1_PATTERN = /^[a-z]{2}$/;
+
+function isValidLanguageCode(code: string): boolean {
+  return ISO_639_1_PATTERN.test(code);
+}
+
 const DEFAULT_PREFERENCES: UserPreferencesInternal = {
   response_language: 'en',
   first_interaction: true,
-  agentic_strength: 'normal',
-  dev_agentic_mcp: false,
 };
 
 export class UserSession {
@@ -146,14 +154,30 @@ export class UserSession {
     const prefs = await this.getPreferences();
     const apiPrefs: UserPreferencesAPI = {
       response_language: prefs.response_language,
-      agentic_strength: prefs.agentic_strength,
-      dev_agentic_mcp: prefs.dev_agentic_mcp,
     };
     return Response.json(apiPrefs);
   }
 
   private async handleUpdatePreferences(request: Request): Promise<Response> {
     const updates = (await request.json()) as UpdatePreferencesRequest;
+
+    // Validate response_language format (ISO 639-1: 2 lowercase letters)
+    if (updates.response_language !== undefined) {
+      if (
+        typeof updates.response_language !== 'string' ||
+        !isValidLanguageCode(updates.response_language)
+      ) {
+        return Response.json(
+          {
+            error: 'Invalid response_language',
+            message:
+              'Must be a valid ISO 639-1 language code (2 lowercase letters, e.g., "en", "es", "fr")',
+          },
+          { status: 400 }
+        );
+      }
+    }
+
     const current = await this.getPreferences();
 
     const updated: UserPreferencesInternal = {
@@ -161,16 +185,12 @@ export class UserSession {
       ...(updates.response_language !== undefined && {
         response_language: updates.response_language,
       }),
-      ...(updates.agentic_strength !== undefined && { agentic_strength: updates.agentic_strength }),
-      ...(updates.dev_agentic_mcp !== undefined && { dev_agentic_mcp: updates.dev_agentic_mcp }),
     };
 
     await this.updatePreferences(updated);
 
     const apiPrefs: UserPreferencesAPI = {
       response_language: updated.response_language,
-      agentic_strength: updated.agentic_strength,
-      dev_agentic_mcp: updated.dev_agentic_mcp,
     };
     return Response.json(apiPrefs);
   }
@@ -269,9 +289,6 @@ export class UserSession {
       responses,
       response_language: preferences.response_language,
       voice_audio_base64: null,
-      // Backward compatibility - agentic flow doesn't have explicit intents
-      intent_processed: 'agentic',
-      has_queued_intents: false,
     };
   }
 

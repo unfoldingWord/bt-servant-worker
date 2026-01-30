@@ -4,8 +4,8 @@ import {
   findTool,
   getToolNames,
   generateToolDescriptions,
-} from '../src/services/mcp/catalog.js';
-import type { MCPServerConfig, MCPServerManifest } from '../src/services/mcp/types.js';
+} from '../../src/services/mcp/catalog.js';
+import type { MCPServerConfig, MCPServerManifest } from '../../src/services/mcp/types.js';
 
 describe('buildToolCatalog', () => {
   const mockServer: MCPServerConfig = {

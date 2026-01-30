@@ -175,19 +175,66 @@ async function processIteration(ctx: OrchestrationContext, iteration: number): P
   return false;
 }
 
+/** Default code execution timeout in milliseconds (30 seconds) */
+const DEFAULT_CODE_EXEC_TIMEOUT_MS = 30_000;
+
+/** Default maximum orchestration iterations */
+const DEFAULT_MAX_ITERATIONS = 10;
+
+/**
+ * Parse and validate an integer environment variable.
+ * Returns the parsed value if valid, or the default if missing/invalid.
+ * Logs a warning if the value is present but malformed.
+ */
+function parseIntEnvVar(
+  value: string | undefined,
+  key: string,
+  defaultValue: number,
+  logger: RequestLogger
+): number {
+  if (!value) {
+    logger.log('config_default', { key, value: defaultValue });
+    return defaultValue;
+  }
+
+  const parsed = parseInt(value, 10);
+  if (isNaN(parsed) || parsed <= 0) {
+    logger.warn('config_invalid', {
+      key,
+      provided: value,
+      reason: isNaN(parsed) ? 'not a number' : 'must be positive',
+      using_default: defaultValue,
+    });
+    return defaultValue;
+  }
+
+  return parsed;
+}
+
 function parseEnvConfig(env: Env, logger: RequestLogger) {
   const model = env.CLAUDE_MODEL ?? DEFAULT_MODEL;
-  const maxTokens = parseInt(env.CLAUDE_MAX_TOKENS ?? '', 10) || DEFAULT_MAX_TOKENS;
-  const codeExecTimeout = parseInt(env.CODE_EXEC_TIMEOUT_MS, 10) || 5000;
-  const maxIterations = parseInt(env.MAX_ORCHESTRATION_ITERATIONS, 10) || 10;
-
-  // Log when using defaults (helps debug configuration issues)
   if (!env.CLAUDE_MODEL) {
     logger.log('config_default', { key: 'CLAUDE_MODEL', value: model });
   }
-  if (!env.CLAUDE_MAX_TOKENS) {
-    logger.log('config_default', { key: 'CLAUDE_MAX_TOKENS', value: maxTokens });
-  }
+
+  const maxTokens = parseIntEnvVar(
+    env.CLAUDE_MAX_TOKENS,
+    'CLAUDE_MAX_TOKENS',
+    DEFAULT_MAX_TOKENS,
+    logger
+  );
+  const codeExecTimeout = parseIntEnvVar(
+    env.CODE_EXEC_TIMEOUT_MS,
+    'CODE_EXEC_TIMEOUT_MS',
+    DEFAULT_CODE_EXEC_TIMEOUT_MS,
+    logger
+  );
+  const maxIterations = parseIntEnvVar(
+    env.MAX_ORCHESTRATION_ITERATIONS,
+    'MAX_ORCHESTRATION_ITERATIONS',
+    DEFAULT_MAX_ITERATIONS,
+    logger
+  );
 
   return { model, maxTokens, codeExecTimeout, maxIterations };
 }
