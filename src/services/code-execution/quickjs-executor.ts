@@ -27,13 +27,10 @@ import { CodeExecutionOptions, CodeExecutionResult, ConsoleLog, HostFunction } f
  */
 const INTERRUPT_CHECK_CYCLES = 10000;
 
-let quickjsModule: Awaited<ReturnType<typeof getQuickJSWASMModule>> | null = null;
-
+// Note: Don't cache the module - it causes assertion failures on context disposal
+// in Cloudflare Workers. Creating a fresh module per execution is safer.
 async function getQuickJSModule() {
-  if (!quickjsModule) {
-    quickjsModule = await getQuickJSWASMModule();
-  }
-  return quickjsModule;
+  return await getQuickJSWASMModule();
 }
 
 function setupConsole(vm: QuickJSContext, logs: ConsoleLog[]): void {
