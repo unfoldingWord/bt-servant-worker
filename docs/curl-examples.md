@@ -169,6 +169,109 @@ data: {"type":"complete","response":{...}}
 
 ---
 
+## Admin: MCP Server Management
+
+Admin endpoints require either:
+
+- `ENGINE_API_KEY` (super admin - manages all orgs)
+- Org-specific admin key stored in KV namespace `ORG_ADMIN_KEYS`
+
+### List MCP Servers
+
+```bash
+curl "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+**Response:**
+
+```json
+{
+  "org": "unfoldingWord",
+  "servers": []
+}
+```
+
+### List MCP Servers with Discovery Status
+
+Add `?discover=true` to run discovery and see which servers are working:
+
+```bash
+curl "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers?discover=true" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+**Response (with discovery):**
+
+```json
+{
+  "org": "unfoldingWord",
+  "servers": [
+    {
+      "id": "translation-helps",
+      "name": "Translation Helps MCP",
+      "url": "https://translation-helps-mcp.pages.dev/api/mcp",
+      "enabled": true,
+      "priority": 1,
+      "discovery_status": "ok",
+      "discovery_error": null,
+      "tools_count": 5
+    },
+    {
+      "id": "broken-server",
+      "name": "Broken Server",
+      "url": "https://invalid.example.com/mcp",
+      "enabled": true,
+      "priority": 2,
+      "discovery_status": "error",
+      "discovery_error": "MCP server returned 404: Not Found",
+      "tools_count": 0
+    }
+  ]
+}
+```
+
+### Add MCP Server
+
+```bash
+curl -X POST "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "translation-helps",
+    "name": "Translation Helps MCP",
+    "url": "https://translation-helps-mcp.pages.dev/api/mcp",
+    "enabled": true,
+    "priority": 1
+  }'
+```
+
+### Replace All MCP Servers
+
+```bash
+curl -X PUT "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '[
+    {
+      "id": "translation-helps",
+      "name": "Translation Helps MCP",
+      "url": "https://translation-helps-mcp.pages.dev/api/mcp",
+      "enabled": true,
+      "priority": 1
+    }
+  ]'
+```
+
+### Delete MCP Server
+
+```bash
+curl -X DELETE "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers/translation-helps" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+---
+
 ## Testing All E2E Scenarios
 
 ```bash
