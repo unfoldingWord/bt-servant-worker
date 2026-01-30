@@ -8,6 +8,10 @@ export interface Env {
   CODE_EXEC_TIMEOUT_MS: string;
   DEFAULT_ORG: string;
 
+  // Rate limiting (optional - has defaults)
+  ADMIN_RATE_LIMIT_MAX?: string;
+  ADMIN_RATE_LIMIT_WINDOW_MS?: string;
+
   // Claude configuration (optional - has defaults)
   CLAUDE_MODEL?: string;
   CLAUDE_MAX_TOKENS?: string;

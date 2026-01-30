@@ -2,14 +2,20 @@
  * MCP Tool Catalog - builds unified tool catalog from multiple MCP servers
  */
 
+import { RequestLogger } from '../../utils/logger.js';
 import { CatalogTool, MCPServerConfig, MCPServerManifest, ToolCatalog } from './types.js';
 
 /**
  * Build a unified tool catalog from multiple MCP server manifests
+ *
+ * @param manifests - Server manifests from discovery
+ * @param servers - Server configurations
+ * @param logger - Optional logger for warnings (e.g., name collisions)
  */
 export function buildToolCatalog(
   manifests: MCPServerManifest[],
-  servers: MCPServerConfig[]
+  servers: MCPServerConfig[],
+  logger?: RequestLogger
 ): ToolCatalog {
   const serverMap = new Map<string, MCPServerConfig>();
   for (const server of servers) {
@@ -28,9 +34,13 @@ export function buildToolCatalog(
       let name = tool.name;
       if (toolNames.has(name)) {
         const prefixedName = `${manifest.serverId}_${tool.name}`;
-        console.warn(
-          `[mcp_catalog] Tool name collision: "${name}" already exists, renaming to "${prefixedName}"`
-        );
+        if (logger) {
+          logger.log('mcp_tool_name_collision', {
+            original_name: name,
+            renamed_to: prefixedName,
+            server_id: manifest.serverId,
+          });
+        }
         name = prefixedName;
       }
       toolNames.add(name);

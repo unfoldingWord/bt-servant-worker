@@ -57,9 +57,9 @@ const MAX_HISTORY_ENTRIES = 50;
 const HISTORY_KEY = 'history';
 const PREFERENCES_KEY = 'preferences';
 
-/** Rate limiting constants for admin endpoints */
-const ADMIN_RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute window
-const ADMIN_RATE_LIMIT_MAX_REQUESTS = 100; // max requests per window
+/** Default rate limiting for admin endpoints (can be overridden via env vars) */
+const DEFAULT_ADMIN_RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute window
+const DEFAULT_ADMIN_RATE_LIMIT_MAX_REQUESTS = 100; // max requests per window
 
 /**
  * Validates ISO 639-1 language code format (2 lowercase letters).
@@ -301,7 +301,7 @@ export class UserSession {
     const startTime = Date.now();
     const servers = await getEnabledMCPServers(this.state.storage, org);
     const manifests = await discoverAllTools(servers, logger);
-    const catalog = buildToolCatalog(manifests, servers);
+    const catalog = buildToolCatalog(manifests, servers, logger);
     logger.log('mcp_catalog_built', {
       server_count: servers.length,
       tool_count: catalog.tools.length,
@@ -390,6 +390,20 @@ export class UserSession {
 
   // ==================== Rate Limiting ====================
 
+  /** Get configured rate limit window (ms) */
+  private getRateLimitWindow(): number {
+    return this.env.ADMIN_RATE_LIMIT_WINDOW_MS
+      ? parseInt(this.env.ADMIN_RATE_LIMIT_WINDOW_MS, 10)
+      : DEFAULT_ADMIN_RATE_LIMIT_WINDOW_MS;
+  }
+
+  /** Get configured rate limit max requests */
+  private getRateLimitMax(): number {
+    return this.env.ADMIN_RATE_LIMIT_MAX
+      ? parseInt(this.env.ADMIN_RATE_LIMIT_MAX, 10)
+      : DEFAULT_ADMIN_RATE_LIMIT_MAX_REQUESTS;
+  }
+
   /**
    * Check rate limit for admin endpoints.
    * Returns null if within limit, or a 429 Response if rate limited.
@@ -397,17 +411,19 @@ export class UserSession {
   private async checkAdminRateLimit(org: string): Promise<Response | null> {
     const key = `rate_limit:admin:${org}`;
     const now = Date.now();
+    const windowMs = this.getRateLimitWindow();
+    const maxRequests = this.getRateLimitMax();
 
     const data = await this.state.storage.get<{ count: number; windowStart: number }>(key);
 
-    if (!data || now - data.windowStart > ADMIN_RATE_LIMIT_WINDOW_MS) {
+    if (!data || now - data.windowStart > windowMs) {
       // Start new window
       await this.state.storage.put(key, { count: 1, windowStart: now });
       return null;
     }
 
-    if (data.count >= ADMIN_RATE_LIMIT_MAX_REQUESTS) {
-      const retryAfter = Math.ceil((data.windowStart + ADMIN_RATE_LIMIT_WINDOW_MS - now) / 1000);
+    if (data.count >= maxRequests) {
+      const retryAfter = Math.ceil((data.windowStart + windowMs - now) / 1000);
       return new Response(
         JSON.stringify({
           error: 'Rate limit exceeded',

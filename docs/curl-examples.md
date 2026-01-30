@@ -176,6 +176,30 @@ Admin endpoints require either:
 - `ENGINE_API_KEY` (super admin - manages all orgs)
 - Org-specific admin key stored in KV namespace `ORG_ADMIN_KEYS`
 
+### Setting Up Org-Specific Admin Keys
+
+To allow delegated administration for specific organizations, store admin keys in the `ORG_ADMIN_KEYS` KV namespace:
+
+```bash
+# Create the KV namespace (one-time setup)
+npx wrangler kv:namespace create ORG_ADMIN_KEYS
+
+# Add the namespace ID to wrangler.toml (replace placeholder-id-for-dev)
+
+# Set an org-specific admin key
+npx wrangler kv:key put --binding=ORG_ADMIN_KEYS "unfoldingWord" "your-org-specific-api-key"
+
+# List all org keys
+npx wrangler kv:key list --binding=ORG_ADMIN_KEYS
+```
+
+Clients can then use the org-specific key instead of the super admin key:
+
+```bash
+curl "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers" \
+  -H "Authorization: Bearer your-org-specific-api-key"
+```
+
 ### List MCP Servers
 
 ```bash
