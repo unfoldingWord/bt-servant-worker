@@ -3,7 +3,7 @@ import {
   buildToolCatalog,
   findTool,
   getToolNames,
-  generateToolDescriptions,
+  generateToolCatalog,
 } from '../../src/services/mcp/catalog.js';
 import type { MCPServerConfig, MCPServerManifest } from '../../src/services/mcp/types.js';
 
@@ -101,7 +101,7 @@ describe('getToolNames', () => {
   });
 });
 
-describe('generateToolDescriptions', () => {
+describe('generateToolCatalog', () => {
   it('should generate compact catalog format (lasker-api pattern)', () => {
     // NOTE: The new format shows name + one-liner only (no parameter details).
     // Full schemas are retrieved via get_tool_definitions.
@@ -128,7 +128,7 @@ describe('generateToolDescriptions', () => {
       [{ id: 's1', name: 'S1', url: 'http://test', enabled: true, priority: 1 }]
     );
 
-    const desc = generateToolDescriptions(catalog);
+    const desc = generateToolCatalog(catalog);
     expect(desc).toContain('fetchData');
     expect(desc).toContain('Fetches data from source');
     // New format does NOT include parameter details - they're fetched on-demand
@@ -138,7 +138,7 @@ describe('generateToolDescriptions', () => {
 
   it('should return message when no tools available', () => {
     const catalog = buildToolCatalog([], []);
-    const desc = generateToolDescriptions(catalog);
+    const desc = generateToolCatalog(catalog);
     expect(desc).toBe('No MCP tools are currently available.');
   });
 });

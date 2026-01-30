@@ -264,8 +264,8 @@ describe('UserSession MCP Server Admin', () => {
       expect(response.status).toBe(400);
     });
 
-    it('rejects server with http URL (insecure)', async () => {
-      // Note: http URLs are allowed per current validation, but https is recommended
+    it('accepts http URLs for local development', async () => {
+      // HTTP URLs are allowed for local development scenarios
       const server = {
         id: 'test-server',
         name: 'Test Server',
@@ -280,7 +280,6 @@ describe('UserSession MCP Server Admin', () => {
         body: JSON.stringify(server),
       });
 
-      // HTTP URLs are currently allowed (for local dev)
       expect(response.status).toBe(200);
     });
   });

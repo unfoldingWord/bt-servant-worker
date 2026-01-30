@@ -27,7 +27,11 @@ export function buildToolCatalog(
       // Handle name collisions by prefixing with server ID
       let name = tool.name;
       if (toolNames.has(name)) {
-        name = `${manifest.serverId}_${tool.name}`;
+        const prefixedName = `${manifest.serverId}_${tool.name}`;
+        console.warn(
+          `[mcp_catalog] Tool name collision: "${name}" already exists, renaming to "${prefixedName}"`
+        );
+        name = prefixedName;
       }
       toolNames.add(name);
 
@@ -132,11 +136,4 @@ Example:
 const result = await fetch_scripture({ book: "John", chapter: 3, verse: 16 });
 __result__ = result;
 \`\`\``;
-}
-
-/**
- * @deprecated Use generateToolCatalog instead
- */
-export function generateToolDescriptions(catalog: ToolCatalog): string {
-  return generateToolCatalog(catalog);
 }

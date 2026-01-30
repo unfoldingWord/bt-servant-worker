@@ -67,7 +67,7 @@ export function buildSystemPrompt(
 
   // Add first interaction note
   if (preferences.first_interaction) {
-    sections.push("\n\nThis is the user's first interaction. Welcome them briefly.");
+    sections.push("\n\nThis is the user's first interaction. Briefly welcome them.");
   }
 
   return sections.join('');

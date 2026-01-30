@@ -512,12 +512,34 @@ export class UserSession {
 
   private async handleGetMCPServers(url: URL): Promise<Response> {
     const org = url.searchParams.get('org') ?? this.env.DEFAULT_ORG;
+    const discover = url.searchParams.get('discover') === 'true';
 
     const rateLimited = await this.checkAdminRateLimit(org);
     if (rateLimited) return rateLimited;
 
     const servers = await getMCPServers(this.state.storage, org);
-    this.logAdminAction('list_mcp_servers', org, { server_count: servers.length });
+    this.logAdminAction('list_mcp_servers', org, { server_count: servers.length, discover });
+
+    // If discover=true, run discovery and include status/errors in response
+    if (discover && servers.length > 0) {
+      const enabledServers = servers.filter((s) => s.enabled);
+      const logger = createRequestLogger(crypto.randomUUID());
+      const manifests = await discoverAllTools(enabledServers, logger);
+
+      // Build server status map including discovery results
+      const serverStatuses = servers.map((server) => {
+        const manifest = manifests.find((m) => m.serverId === server.id);
+        return {
+          ...server,
+          discovery_status: manifest ? (manifest.error ? 'error' : 'ok') : 'skipped',
+          discovery_error: manifest?.error ?? null,
+          tools_count: manifest?.tools.length ?? 0,
+        };
+      });
+
+      return Response.json({ org, servers: serverStatuses });
+    }
+
     return Response.json({ org, servers });
   }
 
