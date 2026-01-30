@@ -19,11 +19,13 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.71.2",
+    "@modelcontextprotocol/sdk": "^1.25.3",
     "hono": "^4.11.7",
     "quickjs-emscripten": "^0.31.0",
     "zod": "^3.24.0"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.12.8",
     "@cloudflare/workers-types": "^4.20241230.0",
     "@eslint/js": "^9.18.0",
     "@types/node": "^22.10.0",

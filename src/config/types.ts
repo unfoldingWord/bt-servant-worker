@@ -6,6 +6,11 @@ export interface Env {
   ENVIRONMENT: string;
   MAX_ORCHESTRATION_ITERATIONS: string;
   CODE_EXEC_TIMEOUT_MS: string;
+  DEFAULT_ORG: string;
+
+  // Rate limiting (optional - has defaults)
+  ADMIN_RATE_LIMIT_MAX?: string;
+  ADMIN_RATE_LIMIT_WINDOW_MS?: string;
 
   // Claude configuration (optional - has defaults)
   CLAUDE_MODEL?: string;
@@ -14,6 +19,9 @@ export interface Env {
   // Secrets (set via wrangler secret put)
   ANTHROPIC_API_KEY: string;
   ENGINE_API_KEY: string;
+
+  // KV Namespaces
+  ORG_ADMIN_KEYS: KVNamespace;
 
   // Durable Object bindings
   USER_SESSION: DurableObjectNamespace;

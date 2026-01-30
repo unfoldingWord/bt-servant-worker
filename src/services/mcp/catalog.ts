@@ -2,14 +2,20 @@
  * MCP Tool Catalog - builds unified tool catalog from multiple MCP servers
  */
 
+import { RequestLogger } from '../../utils/logger.js';
 import { CatalogTool, MCPServerConfig, MCPServerManifest, ToolCatalog } from './types.js';
 
 /**
  * Build a unified tool catalog from multiple MCP server manifests
+ *
+ * @param manifests - Server manifests from discovery
+ * @param servers - Server configurations
+ * @param logger - Optional logger for warnings (e.g., name collisions)
  */
 export function buildToolCatalog(
   manifests: MCPServerManifest[],
-  servers: MCPServerConfig[]
+  servers: MCPServerConfig[],
+  logger?: RequestLogger
 ): ToolCatalog {
   const serverMap = new Map<string, MCPServerConfig>();
   for (const server of servers) {
@@ -27,7 +33,15 @@ export function buildToolCatalog(
       // Handle name collisions by prefixing with server ID
       let name = tool.name;
       if (toolNames.has(name)) {
-        name = `${manifest.serverId}_${tool.name}`;
+        const prefixedName = `${manifest.serverId}_${tool.name}`;
+        if (logger) {
+          logger.log('mcp_tool_name_collision', {
+            original_name: name,
+            renamed_to: prefixedName,
+            server_id: manifest.serverId,
+          });
+        }
+        name = prefixedName;
       }
       toolNames.add(name);
 
@@ -58,30 +72,78 @@ export function getToolNames(catalog: ToolCatalog): string[] {
   return catalog.tools.map((t) => t.name);
 }
 
+/** Max length for tool summary in catalog */
+const MAX_SUMMARY_LENGTH = 80;
+
 /**
- * Generate tool descriptions for system prompt
+ * Escape markdown special characters to prevent injection
  */
-export function generateToolDescriptions(catalog: ToolCatalog): string {
+function escapeMarkdown(text: string): string {
+  return text.replace(/[|`*_[\]]/g, '\\$&');
+}
+
+/**
+ * Extract a clean summary from a description
+ * - Takes first sentence (ending with period)
+ * - Truncates at word boundary if too long
+ * - Handles empty/missing descriptions
+ */
+function extractSummary(description: string | undefined): string {
+  if (!description || description.trim().length === 0) {
+    return 'No description available';
+  }
+
+  // Get first sentence
+  const periodIndex = description.indexOf('.');
+  const firstSentence = periodIndex > 0 ? description.slice(0, periodIndex) : description;
+
+  // Truncate at word boundary if too long
+  if (firstSentence.length <= MAX_SUMMARY_LENGTH) {
+    return escapeMarkdown(firstSentence.trim());
+  }
+
+  const truncated = firstSentence.slice(0, MAX_SUMMARY_LENGTH);
+  const lastSpace = truncated.lastIndexOf(' ');
+  const summary = lastSpace > 0 ? truncated.slice(0, lastSpace) : truncated;
+  return escapeMarkdown(summary.trim()) + '...';
+}
+
+/**
+ * Generate compact tool catalog for system prompt (lasker-api pattern)
+ *
+ * Only includes name + one-liner description to minimize token usage.
+ * Claude must call get_tool_definitions to get full schemas before using tools.
+ */
+export function generateToolCatalog(catalog: ToolCatalog): string {
   if (catalog.tools.length === 0) {
     return 'No MCP tools are currently available.';
   }
 
-  const lines = ['Available MCP tools:', ''];
+  // Build compact markdown table
+  const rows = catalog.tools.map((t) => {
+    const summary = extractSummary(t.description);
+    return `| ${escapeMarkdown(t.name)} | ${summary} |`;
+  });
 
-  for (const tool of catalog.tools) {
-    lines.push(`- ${tool.name}: ${tool.description}`);
+  return `## Available MCP Tools
 
-    if (tool.inputSchema.properties && Object.keys(tool.inputSchema.properties).length > 0) {
-      const params = Object.entries(tool.inputSchema.properties)
-        .map(([key, schema]) => {
-          const required = tool.inputSchema.required?.includes(key) ? ' (required)' : '';
-          const desc = schema.description ? `: ${schema.description}` : '';
-          return `    - ${key}${required}${desc}`;
-        })
-        .join('\n');
-      lines.push(params);
-    }
-  }
+The following tools are available for use inside \`execute_code\`.
+Before using a tool, call \`get_tool_definitions\` with the tool name(s) to get full documentation.
 
-  return lines.join('\n');
+| Tool | Description |
+|------|-------------|
+${rows.join('\n')}
+
+### How to use MCP tools:
+1. Review the catalog above to identify relevant tools
+2. Call \`get_tool_definitions\` with the tool names you need
+3. Use the tools in \`execute_code\` based on the returned schemas
+
+Example:
+\`\`\`javascript
+// First call get_tool_definitions to learn the schema
+// Then use the tool in execute_code:
+const result = await fetch_scripture({ book: "John", chapter: 3, verse: 16 });
+__result__ = result;
+\`\`\``;
 }

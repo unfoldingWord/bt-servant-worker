@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   ProgressCallbackSender,
   createWebhookCallbacks,
-} from '../src/services/progress/callback.js';
+} from '../../src/services/progress/callback.js';
 
 const mockConfig = {
   url: 'https://example.com/webhook',
@@ -188,8 +188,6 @@ describe('createWebhookCallbacks async operations', () => {
       responses: ['Response 1', 'Response 2'],
       response_language: 'en',
       voice_audio_base64: null,
-      intent_processed: 'test',
-      has_queued_intents: false,
     };
     callbacks.onComplete(response);
     await vi.runAllTimersAsync();

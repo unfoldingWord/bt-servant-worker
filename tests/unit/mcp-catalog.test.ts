@@ -3,9 +3,9 @@ import {
   buildToolCatalog,
   findTool,
   getToolNames,
-  generateToolDescriptions,
-} from '../src/services/mcp/catalog.js';
-import type { MCPServerConfig, MCPServerManifest } from '../src/services/mcp/types.js';
+  generateToolCatalog,
+} from '../../src/services/mcp/catalog.js';
+import type { MCPServerConfig, MCPServerManifest } from '../../src/services/mcp/types.js';
 
 describe('buildToolCatalog', () => {
   const mockServer: MCPServerConfig = {
@@ -101,8 +101,10 @@ describe('getToolNames', () => {
   });
 });
 
-describe('generateToolDescriptions', () => {
-  it('should generate human-readable tool descriptions', () => {
+describe('generateToolCatalog', () => {
+  it('should generate compact catalog format (lasker-api pattern)', () => {
+    // NOTE: The new format shows name + one-liner only (no parameter details).
+    // Full schemas are retrieved via get_tool_definitions.
     const catalog = buildToolCatalog(
       [
         {
@@ -110,7 +112,7 @@ describe('generateToolDescriptions', () => {
           serverName: 'S1',
           tools: [
             {
-              name: 'fetch_data',
+              name: 'fetchData',
               description: 'Fetches data from source',
               inputSchema: {
                 type: 'object',
@@ -126,15 +128,17 @@ describe('generateToolDescriptions', () => {
       [{ id: 's1', name: 'S1', url: 'http://test', enabled: true, priority: 1 }]
     );
 
-    const desc = generateToolDescriptions(catalog);
-    expect(desc).toContain('fetch_data');
+    const desc = generateToolCatalog(catalog);
+    expect(desc).toContain('fetchData');
     expect(desc).toContain('Fetches data from source');
-    expect(desc).toContain('id (required)');
+    // New format does NOT include parameter details - they're fetched on-demand
+    expect(desc).toContain('| Tool | Description |');
+    expect(desc).toContain('get_tool_definitions');
   });
 
   it('should return message when no tools available', () => {
     const catalog = buildToolCatalog([], []);
-    const desc = generateToolDescriptions(catalog);
+    const desc = generateToolCatalog(catalog);
     expect(desc).toBe('No MCP tools are currently available.');
   });
 });

@@ -5,8 +5,8 @@ import {
   buildAllTools,
   isBuiltInTool,
   getToolDefinitions,
-} from '../src/services/claude/tools.js';
-import { buildToolCatalog } from '../src/services/mcp/catalog.js';
+} from '../../src/services/claude/tools.js';
+import { buildToolCatalog } from '../../src/services/mcp/catalog.js';
 
 describe('buildExecuteCodeTool', () => {
   it('should return valid tool definition', () => {
@@ -31,7 +31,9 @@ describe('buildGetToolDefinitionsTool', () => {
 });
 
 describe('buildAllTools', () => {
-  it('should include built-in tools and MCP tools', () => {
+  it('should only include meta-tools, not MCP tools (lasker-api pattern)', () => {
+    // NOTE: MCP tools are NOT exposed directly to Claude anymore.
+    // They're shown in the system prompt catalog and called via execute_code.
     const catalog = buildToolCatalog(
       [
         {
@@ -47,10 +49,11 @@ describe('buildAllTools', () => {
 
     const tools = buildAllTools(catalog);
 
-    expect(tools.length).toBe(3);
+    // Only meta-tools, not MCP tools
+    expect(tools.length).toBe(2);
     expect(tools.map((t) => t.name)).toContain('execute_code');
     expect(tools.map((t) => t.name)).toContain('get_tool_definitions');
-    expect(tools.map((t) => t.name)).toContain('mcp_tool');
+    expect(tools.map((t) => t.name)).not.toContain('mcp_tool');
   });
 });
 

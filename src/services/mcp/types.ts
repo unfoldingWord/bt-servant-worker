@@ -45,6 +45,8 @@ export interface MCPServerManifest {
   serverId: string;
   serverName: string;
   tools: MCPToolDefinition[];
+  /** Error message if discovery failed (helps distinguish failed vs no-tools) */
+  error?: string;
 }
 
 /**
@@ -76,14 +78,6 @@ export interface MCPToolResult {
 }
 
 /**
- * Default MCP servers for Bible translation assistance
+ * No default MCP servers - each org must explicitly configure their servers.
+ * This ensures orgs intentionally set up their MCP infrastructure.
  */
-export const DEFAULT_MCP_SERVERS: MCPServerConfig[] = [
-  {
-    id: 'scripture-api',
-    name: 'Scripture API',
-    url: 'https://api.scripture.example.com/mcp',
-    enabled: true,
-    priority: 1,
-  },
-];

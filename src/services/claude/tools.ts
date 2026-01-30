@@ -1,21 +1,18 @@
 /**
  * Claude tool definitions
  *
- * These are the tools Claude can use:
+ * Claude has access to two meta-tools:
  * - execute_code: Run JS in QuickJS sandbox with MCP tool access
  * - get_tool_definitions: Get full schemas for MCP tools
- * - Direct MCP tools: Individual tools from MCP servers
+ *
+ * MCP tools are NOT exposed directly to Claude. Instead:
+ * - System prompt shows a compact catalog (name + summary)
+ * - Claude calls get_tool_definitions to learn full schemas
+ * - Claude uses execute_code to call MCP tools
  */
 
 import Anthropic from '@anthropic-ai/sdk';
-import { CatalogTool, JSONSchema, ToolCatalog } from '../mcp/types.js';
-
-/**
- * Convert JSON Schema to Anthropic tool input schema format
- */
-function toAnthropicSchema(schema: JSONSchema): Anthropic.Tool.InputSchema {
-  return schema as Anthropic.Tool.InputSchema;
-}
+import { JSONSchema, ToolCatalog } from '../mcp/types.js';
 
 /**
  * Build execute_code tool definition
@@ -61,28 +58,22 @@ export function buildGetToolDefinitionsTool(): Anthropic.Tool {
 }
 
 /**
- * Build Anthropic tool definition from MCP catalog tool
- */
-function buildMCPTool(tool: CatalogTool): Anthropic.Tool {
-  return {
-    name: tool.name,
-    description: tool.description,
-    input_schema: toAnthropicSchema(tool.inputSchema),
-  };
-}
-
-/**
  * Build all tool definitions for Claude
+ *
+ * NOTE: We intentionally do NOT expose MCP tools as direct Claude tools.
+ * This follows the lasker-api pattern where:
+ * - System prompt shows a compact catalog of MCP tools (name + summary)
+ * - Claude uses get_tool_definitions to learn full schemas
+ * - Claude calls MCP tools via execute_code
+ *
+ * Benefits:
+ * - Dramatically reduces tokens when tool count grows (50+ tools)
+ * - Forces Claude to be intentional about which tools to use
+ * - Full schemas are loaded on-demand, not upfront
  */
-export function buildAllTools(catalog: ToolCatalog): Anthropic.Tool[] {
-  const tools: Anthropic.Tool[] = [buildExecuteCodeTool(), buildGetToolDefinitionsTool()];
-
-  // Add all MCP tools as direct tools
-  for (const tool of catalog.tools) {
-    tools.push(buildMCPTool(tool));
-  }
-
-  return tools;
+export function buildAllTools(_catalog: ToolCatalog): Anthropic.Tool[] {
+  // Only expose meta-tools, not individual MCP tools
+  return [buildExecuteCodeTool(), buildGetToolDefinitionsTool()];
 }
 
 /**
