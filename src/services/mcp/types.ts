@@ -45,6 +45,8 @@ export interface MCPServerManifest {
   serverId: string;
   serverName: string;
   tools: MCPToolDefinition[];
+  /** Error message if discovery failed (helps distinguish failed vs no-tools) */
+  error?: string;
 }
 
 /**

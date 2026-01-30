@@ -12,6 +12,11 @@ MAX_ORCHESTRATION_ITERATIONS = "10"
 CODE_EXEC_TIMEOUT_MS = "30000"
 DEFAULT_ORG = "unfoldingWord"
 
+# KV Namespaces
+[[kv_namespaces]]
+binding = "ORG_ADMIN_KEYS"
+id = "placeholder-id-for-dev"
+
 # Durable Objects
 [[durable_objects.bindings]]
 name = "USER_SESSION"

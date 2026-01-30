@@ -59,6 +59,31 @@ app.get('/api/v1/users/:userId/history', async (c) => {
   return handleUserRequest(c.req.raw, c.env, userId, '/history');
 });
 
+// Admin auth middleware - validates org-specific or super admin access
+app.use('/api/v1/admin/orgs/:org/*', async (c, next) => {
+  const org = c.req.param('org');
+  const authHeader = c.req.header('Authorization');
+
+  if (!authHeader?.startsWith('Bearer ')) {
+    return c.json({ error: 'Authorization header with Bearer token required' }, 401);
+  }
+
+  const token = authHeader.slice(7);
+
+  // Check super admin (ENGINE_API_KEY) first
+  if (constantTimeCompare(token, c.env.ENGINE_API_KEY)) {
+    return next();
+  }
+
+  // Check org-specific admin key from KV
+  const orgAdminKey = await c.env.ORG_ADMIN_KEYS.get(org);
+  if (orgAdminKey && constantTimeCompare(token, orgAdminKey)) {
+    return next();
+  }
+
+  return c.json({ error: 'Unauthorized for this organization' }, 403);
+});
+
 // Admin endpoints for MCP server management (org-scoped)
 app.get('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
   const org = c.req.param('org');

@@ -16,6 +16,9 @@ export interface Env {
   ANTHROPIC_API_KEY: string;
   ENGINE_API_KEY: string;
 
+  // KV Namespaces
+  ORG_ADMIN_KEYS: KVNamespace;
+
   // Durable Object bindings
   USER_SESSION: DurableObjectNamespace;
 }

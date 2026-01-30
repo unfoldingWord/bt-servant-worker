@@ -57,6 +57,10 @@ const MAX_HISTORY_ENTRIES = 50;
 const HISTORY_KEY = 'history';
 const PREFERENCES_KEY = 'preferences';
 
+/** Rate limiting constants for admin endpoints */
+const ADMIN_RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute window
+const ADMIN_RATE_LIMIT_MAX_REQUESTS = 100; // max requests per window
+
 /**
  * Validates ISO 639-1 language code format (2 lowercase letters).
  * Does not validate against the full ISO 639-1 standard, just the format.
@@ -384,6 +388,46 @@ export class UserSession {
     await this.state.storage.put(PREFERENCES_KEY, preferences);
   }
 
+  // ==================== Rate Limiting ====================
+
+  /**
+   * Check rate limit for admin endpoints.
+   * Returns null if within limit, or a 429 Response if rate limited.
+   */
+  private async checkAdminRateLimit(org: string): Promise<Response | null> {
+    const key = `rate_limit:admin:${org}`;
+    const now = Date.now();
+
+    const data = await this.state.storage.get<{ count: number; windowStart: number }>(key);
+
+    if (!data || now - data.windowStart > ADMIN_RATE_LIMIT_WINDOW_MS) {
+      // Start new window
+      await this.state.storage.put(key, { count: 1, windowStart: now });
+      return null;
+    }
+
+    if (data.count >= ADMIN_RATE_LIMIT_MAX_REQUESTS) {
+      const retryAfter = Math.ceil((data.windowStart + ADMIN_RATE_LIMIT_WINDOW_MS - now) / 1000);
+      return new Response(
+        JSON.stringify({
+          error: 'Rate limit exceeded',
+          retry_after_seconds: retryAfter,
+        }),
+        {
+          status: 429,
+          headers: {
+            'Content-Type': 'application/json',
+            'Retry-After': String(retryAfter),
+          },
+        }
+      );
+    }
+
+    // Increment count
+    await this.state.storage.put(key, { count: data.count + 1, windowStart: data.windowStart });
+    return null;
+  }
+
   // ==================== MCP Server Management ====================
 
   /** Max length for server ID and name to prevent DoS */
@@ -468,6 +512,10 @@ export class UserSession {
 
   private async handleGetMCPServers(url: URL): Promise<Response> {
     const org = url.searchParams.get('org') ?? this.env.DEFAULT_ORG;
+
+    const rateLimited = await this.checkAdminRateLimit(org);
+    if (rateLimited) return rateLimited;
+
     const servers = await getMCPServers(this.state.storage, org);
     this.logAdminAction('list_mcp_servers', org, { server_count: servers.length });
     return Response.json({ org, servers });
@@ -476,6 +524,10 @@ export class UserSession {
   private async handleReplaceMCPServers(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const org = url.searchParams.get('org') ?? this.env.DEFAULT_ORG;
+
+    const rateLimited = await this.checkAdminRateLimit(org);
+    if (rateLimited) return rateLimited;
+
     const servers = (await request.json()) as MCPServerConfig[];
 
     if (!Array.isArray(servers)) {
@@ -510,6 +562,10 @@ export class UserSession {
   private async handleAddMCPServer(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const org = url.searchParams.get('org') ?? this.env.DEFAULT_ORG;
+
+    const rateLimited = await this.checkAdminRateLimit(org);
+    if (rateLimited) return rateLimited;
+
     const server = (await request.json()) as MCPServerConfig;
 
     const error = this.validateServerConfig(server);
@@ -533,6 +589,9 @@ export class UserSession {
 
   private async handleDeleteMCPServer(url: URL, serverId: string): Promise<Response> {
     const org = url.searchParams.get('org') ?? this.env.DEFAULT_ORG;
+
+    const rateLimited = await this.checkAdminRateLimit(org);
+    if (rateLimited) return rateLimited;
 
     if (!serverId) {
       return Response.json({ error: 'Server ID is required' }, { status: 400 });

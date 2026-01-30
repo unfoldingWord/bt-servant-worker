@@ -164,12 +164,18 @@ export async function discoverServerTools(
 
     return { serverId: server.id, serverName: server.name, tools };
   } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
     logger.error('mcp_discovery_error', error, {
       server_id: server.id,
       server_url: server.url,
       duration_ms: Date.now() - startTime,
     });
-    return { serverId: server.id, serverName: server.name, tools: [] };
+    return {
+      serverId: server.id,
+      serverName: server.name,
+      tools: [],
+      error: errorMessage,
+    };
   }
 }
 
