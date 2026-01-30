@@ -122,13 +122,16 @@ async function handleChatRequest(request: Request, env: Env, doPath: string): Pr
       return Response.json({ error: 'client_id is required' }, { status: 400 });
     }
 
+    const org = body.org ?? env.DEFAULT_ORG;
+
     logger.log('request_received', {
       user_id: body.user_id,
       client_id: body.client_id,
+      org,
       path: doPath,
     });
 
-    const doId = env.USER_SESSION.idFromName(body.user_id);
+    const doId = env.USER_SESSION.idFromName(`org:${org}`);
     const stub = env.USER_SESSION.get(doId);
 
     logger.log('do_routed', { do_id: doId.toString() });

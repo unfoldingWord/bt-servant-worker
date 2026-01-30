@@ -604,7 +604,12 @@ export class UserSession {
     const rateLimited = await this.checkAdminRateLimit(org);
     if (rateLimited) return rateLimited;
 
-    const server = (await request.json()) as MCPServerConfig;
+    const body = (await request.json()) as Partial<MCPServerConfig>;
+    // Default enabled to true if not specified
+    const server: MCPServerConfig = {
+      ...body,
+      enabled: body.enabled ?? true,
+    } as MCPServerConfig;
 
     const error = this.validateServerConfig(server);
     if (error) {
