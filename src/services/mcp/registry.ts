@@ -44,6 +44,13 @@ export async function updateMCPServers(
 
 /**
  * Add a new MCP server for a specific organization
+ *
+ * NOTE: Race condition safety
+ * This uses a read-modify-write pattern which could race in a multi-threaded
+ * environment. However, Durable Objects guarantee single-threaded execution
+ * per instance - all requests to the same DO are serialized. Since we route
+ * org admin requests to a dedicated DO (org:${org}), concurrent requests
+ * to the same org are automatically serialized by the DO runtime.
  */
 export async function addMCPServer(
   storage: DurableObjectStorage,

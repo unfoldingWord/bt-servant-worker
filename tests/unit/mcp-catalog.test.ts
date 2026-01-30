@@ -112,7 +112,7 @@ describe('generateToolDescriptions', () => {
           serverName: 'S1',
           tools: [
             {
-              name: 'fetch_data',
+              name: 'fetchData',
               description: 'Fetches data from source',
               inputSchema: {
                 type: 'object',
@@ -129,7 +129,7 @@ describe('generateToolDescriptions', () => {
     );
 
     const desc = generateToolDescriptions(catalog);
-    expect(desc).toContain('fetch_data');
+    expect(desc).toContain('fetchData');
     expect(desc).toContain('Fetches data from source');
     // New format does NOT include parameter details - they're fetched on-demand
     expect(desc).toContain('| Tool | Description |');

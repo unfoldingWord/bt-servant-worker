@@ -386,9 +386,90 @@ export class UserSession {
 
   // ==================== MCP Server Management ====================
 
+  /** Max length for server ID and name to prevent DoS */
+  private static readonly MAX_SERVER_ID_LENGTH = 64;
+  private static readonly MAX_SERVER_NAME_LENGTH = 128;
+  private static readonly MAX_SERVERS_PER_ORG = 50;
+  private static readonly SERVER_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
+
+  private validateServerId(id: unknown): string | null {
+    if (!id || typeof id !== 'string') return 'Server id is required and must be a string';
+    if (id.length > UserSession.MAX_SERVER_ID_LENGTH) {
+      return `Server id must be <= ${UserSession.MAX_SERVER_ID_LENGTH} characters`;
+    }
+    if (!UserSession.SERVER_ID_PATTERN.test(id)) {
+      return 'Server id must contain only alphanumeric characters, hyphens, and underscores';
+    }
+    return null;
+  }
+
+  private validateServerUrl(url: unknown): string | null {
+    if (!url || typeof url !== 'string') return 'Server url is required and must be a string';
+    try {
+      const parsed = new URL(url);
+      if (!['http:', 'https:'].includes(parsed.protocol)) {
+        return 'Server url must use http or https protocol';
+      }
+    } catch {
+      return 'Server url must be a valid URL';
+    }
+    return null;
+  }
+
+  private validateServerName(name: unknown): string | null {
+    if (name === undefined) return null;
+    if (typeof name !== 'string') return 'Server name must be a string';
+    if (name.length > UserSession.MAX_SERVER_NAME_LENGTH) {
+      return `Server name must be <= ${UserSession.MAX_SERVER_NAME_LENGTH} characters`;
+    }
+    return null;
+  }
+
+  private validateServerPriority(priority: unknown): string | null {
+    if (priority === undefined) return null;
+    if (typeof priority !== 'number' || priority < 0 || priority > 100) {
+      return 'Server priority must be a number between 0 and 100';
+    }
+    return null;
+  }
+
+  private validateAllowedTools(allowedTools: unknown): string | null {
+    if (allowedTools === undefined) return null;
+    if (!Array.isArray(allowedTools)) return 'allowedTools must be an array of strings';
+    if (!allowedTools.every((t) => typeof t === 'string')) {
+      return 'allowedTools must contain only strings';
+    }
+    return null;
+  }
+
+  private validateOptionalFields(server: MCPServerConfig): string | null {
+    return (
+      this.validateServerName(server.name) ||
+      this.validateServerPriority(server.priority) ||
+      this.validateAllowedTools(server.allowedTools)
+    );
+  }
+
+  /** Validate MCP server config. Returns error message if invalid, null if valid */
+  private validateServerConfig(server: MCPServerConfig): string | null {
+    return (
+      this.validateServerId(server.id) ||
+      this.validateServerUrl(server.url) ||
+      this.validateOptionalFields(server)
+    );
+  }
+
+  private logAdminAction(action: string, org: string, details: Record<string, unknown> = {}): void {
+    // Use stderr for admin audit logs (allowed by linter)
+    console.error(
+      JSON.stringify({ event: 'admin_action', timestamp: Date.now(), action, org, ...details })
+    );
+  }
+
   private async handleGetMCPServers(url: URL): Promise<Response> {
     const org = url.searchParams.get('org') ?? this.env.DEFAULT_ORG;
     const servers = await getMCPServers(this.state.storage, org);
+    this.logAdminAction('list_mcp_servers', org, { server_count: servers.length });
     return Response.json({ org, servers });
   }
 
@@ -404,7 +485,25 @@ export class UserSession {
       );
     }
 
+    if (servers.length > UserSession.MAX_SERVERS_PER_ORG) {
+      return Response.json(
+        { error: `Cannot have more than ${UserSession.MAX_SERVERS_PER_ORG} servers per org` },
+        { status: 400 }
+      );
+    }
+
+    for (const server of servers) {
+      const error = this.validateServerConfig(server);
+      if (error) {
+        return Response.json({ error, server_id: server.id }, { status: 400 });
+      }
+    }
+
     await updateMCPServers(this.state.storage, org, servers);
+    this.logAdminAction('replace_mcp_servers', org, {
+      server_count: servers.length,
+      server_ids: servers.map((s) => s.id),
+    });
     return Response.json({ org, servers, message: 'MCP servers updated' });
   }
 
@@ -413,12 +512,22 @@ export class UserSession {
     const org = url.searchParams.get('org') ?? this.env.DEFAULT_ORG;
     const server = (await request.json()) as MCPServerConfig;
 
-    if (!server.id || !server.url) {
-      return Response.json({ error: 'Server config must have id and url' }, { status: 400 });
+    const error = this.validateServerConfig(server);
+    if (error) {
+      return Response.json({ error }, { status: 400 });
+    }
+
+    const existing = await getMCPServers(this.state.storage, org);
+    if (existing.length >= UserSession.MAX_SERVERS_PER_ORG) {
+      return Response.json(
+        { error: `Cannot have more than ${UserSession.MAX_SERVERS_PER_ORG} servers per org` },
+        { status: 400 }
+      );
     }
 
     await addMCPServer(this.state.storage, org, server);
     const servers = await getMCPServers(this.state.storage, org);
+    this.logAdminAction('add_mcp_server', org, { server_id: server.id, server_url: server.url });
     return Response.json({ org, servers, message: 'MCP server added' });
   }
 
@@ -431,6 +540,7 @@ export class UserSession {
 
     await removeMCPServer(this.state.storage, org, serverId);
     const servers = await getMCPServers(this.state.storage, org);
+    this.logAdminAction('remove_mcp_server', org, { server_id: serverId });
     return Response.json({ org, servers, message: 'MCP server removed' });
   }
 }
