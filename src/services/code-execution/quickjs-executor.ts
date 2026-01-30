@@ -8,7 +8,7 @@
  * - No access to Worker APIs, fetch, or environment
  */
 
-import { newQuickJSWASMModule, QuickJSContext } from 'quickjs-emscripten';
+import { getQuickJSWASMModule, QuickJSContext } from '@cf-wasm/quickjs/workerd';
 import { CodeExecutionError, TimeoutError } from '../../utils/errors.js';
 import { RequestLogger } from '../../utils/logger.js';
 import { CodeExecutionOptions, CodeExecutionResult, ConsoleLog, HostFunction } from './types.js';
@@ -27,11 +27,11 @@ import { CodeExecutionOptions, CodeExecutionResult, ConsoleLog, HostFunction } f
  */
 const INTERRUPT_CHECK_CYCLES = 10000;
 
-let quickjsModule: Awaited<ReturnType<typeof newQuickJSWASMModule>> | null = null;
+let quickjsModule: Awaited<ReturnType<typeof getQuickJSWASMModule>> | null = null;
 
 async function getQuickJSModule() {
   if (!quickjsModule) {
-    quickjsModule = await newQuickJSWASMModule();
+    quickjsModule = await getQuickJSWASMModule();
   }
   return quickjsModule;
 }
