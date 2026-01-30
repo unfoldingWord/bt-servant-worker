@@ -1,6 +1,6 @@
 # QuickJS WASM Issue in Cloudflare Workers
 
-**Status**: UNRESOLVED - Critical blocker for MCP tool execution
+**Status**: FIX DEPLOYED - Testing in production
 **Created**: 2026-01-30
 **Last Updated**: 2026-01-30
 
@@ -41,6 +41,24 @@ This error occurs during context disposal (`vm.dispose()`), indicating that Quic
 **Fix Attempted**: Removed module caching (create fresh module per execution).
 
 **Result**: Error persists.
+
+### 3. Third Fix Attempt - Dispose evalCode Handles (2026-01-30)
+
+**Root Cause Identified**: Every `vm.evalCode()` call returns a handle that must be disposed. We were ignoring the return value in several places:
+
+- `setVMResult()` - stores async call results in VM
+- `setupHostFunctions()` - initializes `__pendingResults__` object
+- Main code evaluation in `executeCode()`
+
+These undisposed handles left objects in the GC list, causing the assertion failure when disposing the context.
+
+**Fix Applied** (commit `febdd0c`):
+
+1. Capture and dispose `evalCode()` result in `setVMResult()`
+2. Capture and dispose `evalCode()` result in `setupHostFunctions()`
+3. Extract user code evaluation into `evaluateUserCode()` helper that properly disposes result
+
+**Result**: Deployed to production. Awaiting verification.
 
 ## Technical Analysis
 
