@@ -76,7 +76,13 @@ interface PendingCall {
 function setVMResult(vm: QuickJSContext, id: number, value: unknown): void {
   const jsonValue = JSON.stringify(value);
   const safeStringLiteral = JSON.stringify(jsonValue);
-  vm.evalCode(`__pendingResults__[${id}] = JSON.parse(${safeStringLiteral});`);
+  const result = vm.evalCode(`__pendingResults__[${id}] = JSON.parse(${safeStringLiteral});`);
+  // Must dispose the result handle to prevent GC assertion failure
+  if (result.error) {
+    result.error.dispose();
+  } else {
+    result.value.dispose();
+  }
 }
 
 function registerHostFunction(
@@ -119,7 +125,13 @@ function setupHostFunctions(vm: QuickJSContext, hostFunctions: HostFunction[]): 
   const pendingCalls: PendingCall[] = [];
   const callIdRef = { id: 0 };
 
-  vm.evalCode('var __pendingResults__ = {}; var __result__ = undefined;');
+  const initResult = vm.evalCode('var __pendingResults__ = {}; var __result__ = undefined;');
+  // Must dispose the result handle to prevent GC assertion failure
+  if (initResult.error) {
+    initResult.error.dispose();
+  } else {
+    initResult.value.dispose();
+  }
 
   for (const hostFn of hostFunctions) {
     registerHostFunction(vm, hostFn, pendingCalls, callIdRef);
@@ -155,6 +167,17 @@ function createInterruptHandler(startTime: number, timeoutMs: number) {
   };
 
   return { handler, isInterrupted: () => interrupted };
+}
+
+function evaluateUserCode(vm: QuickJSContext, code: string): void {
+  const result = vm.evalCode(code, 'user-code.js');
+  // Must dispose the result handle to prevent GC assertion failure
+  if (result.error) {
+    const errorValue = vm.dump(result.error);
+    result.error.dispose();
+    throw new CodeExecutionError(String(errorValue));
+  }
+  result.value.dispose();
 }
 
 function extractResult(vm: QuickJSContext): unknown {
@@ -215,10 +238,9 @@ export async function executeCode(
     const interrupt = createInterruptHandler(startTime, options.timeout_ms);
     vm.runtime.setInterruptHandler(interrupt.handler);
 
-    const result = vm.evalCode(code, 'user-code.js');
+    evaluateUserCode(vm, code);
 
     if (interrupt.isInterrupted()) {
-      result.dispose();
       throw new TimeoutError(`Code execution exceeded ${options.timeout_ms}ms`);
     }
 
