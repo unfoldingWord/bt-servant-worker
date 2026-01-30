@@ -15,7 +15,7 @@ DEFAULT_ORG = "unfoldingWord"
 # KV Namespaces
 [[kv_namespaces]]
 binding = "ORG_ADMIN_KEYS"
-id = "placeholder-id-for-dev"
+id = "8b9f2b37a9c04a3392757933fd2d646b"
 
 # Durable Objects
 [[durable_objects.bindings]]
