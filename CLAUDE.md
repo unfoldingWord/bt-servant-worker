@@ -2,6 +2,25 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## CRITICAL: Never Merge Without Permission
+
+**NEVER merge a PR without explicit user approval.** This is non-negotiable.
+
+After pushing changes to a PR:
+
+1. Wait for CI to pass
+2. Wait for Claude PR Review to complete
+3. Report the results to the user
+4. **ASK the user** if they want to merge
+5. Only merge if the user explicitly says yes
+
+Merging without permission bypasses:
+
+- The user's ability to review changes
+- Claude's automated review findings
+- CI checks that may catch issues
+- Any other stakeholders who need to approve
+
 ## CRITICAL: Git Commit Rules
 
 1. **Commit Author**: Claude is the SOLE author. Do NOT include:
