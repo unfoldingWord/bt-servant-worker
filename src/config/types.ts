@@ -6,6 +6,7 @@ export interface Env {
   ENVIRONMENT: string;
   MAX_ORCHESTRATION_ITERATIONS: string;
   CODE_EXEC_TIMEOUT_MS: string;
+  DEFAULT_ORG: string;
 
   // Claude configuration (optional - has defaults)
   CLAUDE_MODEL?: string;

@@ -312,15 +312,13 @@ interface ChatRequest {
 }
 ```
 
-**Response (CHANGED - removed intent fields):**
+**Response:**
 
 ```typescript
 interface ChatResponse {
   responses: string[];
   response_language: string;
   voice_audio_base64: string | null;
-  // REMOVED: intent_processed - no longer needed with agentic flow
-  // REMOVED: has_queued_intents - no queue system
 }
 ```
 

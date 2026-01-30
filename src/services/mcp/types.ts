@@ -80,9 +80,9 @@ export interface MCPToolResult {
  */
 export const DEFAULT_MCP_SERVERS: MCPServerConfig[] = [
   {
-    id: 'scripture-api',
-    name: 'Scripture API',
-    url: 'https://api.scripture.example.com/mcp',
+    id: 'translation-helps',
+    name: 'Translation Helps MCP',
+    url: 'https://translation-helps-mcp.pages.dev/api/mcp',
     enabled: true,
     priority: 1,
   },

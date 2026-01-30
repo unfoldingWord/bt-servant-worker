@@ -1,6 +1,9 @@
 /**
  * MCP Tool Discovery - fetches tool definitions from MCP servers
  *
+ * Uses JSON-RPC 2.0 protocol for communication with MCP servers.
+ * Compatible with servers implementing the MCP Streamable HTTP transport.
+ *
  * SECURITY: MCP Server Trust Model
  * ---------------------------------
  * MCP servers are configured by administrators and are implicitly trusted.
@@ -26,32 +29,79 @@ import { RequestLogger } from '../../utils/logger.js';
 import { MCPServerConfig, MCPServerManifest, MCPToolDefinition } from './types.js';
 
 const DISCOVERY_TIMEOUT_MS = 10000;
+const TOOL_CALL_TIMEOUT_MS = 30000;
+
+/** JSON-RPC 2.0 request structure */
+interface JsonRpcRequest {
+  jsonrpc: '2.0';
+  method: string;
+  params?: Record<string, unknown>;
+  id: number;
+}
+
+/** JSON-RPC 2.0 response structure */
+interface JsonRpcResponse<T> {
+  jsonrpc: '2.0';
+  result?: T;
+  error?: { code: number; message: string };
+  id: number;
+}
+
+/** MCP tools/list response */
+interface ToolsListResult {
+  tools: MCPToolDefinition[];
+}
+
+/** MCP tools/call response */
+interface ToolCallResult {
+  content: Array<{ type: string; text?: string }>;
+}
+
+/** Type guard for JSON-RPC 2.0 responses */
+function isJsonRpcResponse<T>(data: unknown): data is JsonRpcResponse<T> {
+  return (
+    typeof data === 'object' &&
+    data !== null &&
+    'jsonrpc' in data &&
+    (data as { jsonrpc: unknown }).jsonrpc === '2.0'
+  );
+}
 
 function buildHeaders(server: MCPServerConfig): Record<string, string> {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    Accept: 'application/json, text/event-stream',
+  };
   if (server.authToken) {
     headers['Authorization'] = `Bearer ${server.authToken}`;
   }
   return headers;
 }
 
-function filterTools(tools: MCPToolDefinition[], allowedTools?: string[]): MCPToolDefinition[] {
-  if (!allowedTools || allowedTools.length === 0) {
-    return tools;
-  }
-  const allowedSet = new Set(allowedTools);
-  return tools.filter((t) => allowedSet.has(t.name));
-}
-
-async function fetchToolList(server: MCPServerConfig): Promise<MCPToolDefinition[]> {
+/**
+ * Send a JSON-RPC 2.0 request to an MCP server
+ */
+async function sendJsonRpcRequest<T>(
+  server: MCPServerConfig,
+  method: string,
+  params: Record<string, unknown> = {},
+  timeoutMs: number = DISCOVERY_TIMEOUT_MS
+): Promise<T> {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), DISCOVERY_TIMEOUT_MS);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  const request: JsonRpcRequest = {
+    jsonrpc: '2.0',
+    method,
+    params,
+    id: Date.now(),
+  };
 
   try {
-    const response = await fetch(`${server.url}/tools/list`, {
+    const response = await fetch(server.url, {
       method: 'POST',
       headers: buildHeaders(server),
-      body: JSON.stringify({}),
+      body: JSON.stringify(request),
       signal: controller.signal,
     });
 
@@ -62,15 +112,37 @@ async function fetchToolList(server: MCPServerConfig): Promise<MCPToolDefinition
       );
     }
 
-    const data = (await response.json()) as { tools: MCPToolDefinition[] };
-    return data.tools ?? [];
+    const data = (await response.json()) as unknown;
+
+    // Handle both JSON-RPC wrapped and direct responses
+    // Some servers return { jsonrpc, result } while others return the result directly
+    if (isJsonRpcResponse<T>(data)) {
+      if (data.error) {
+        throw new MCPError(
+          `MCP error: ${data.error.message} (code: ${data.error.code})`,
+          server.id
+        );
+      }
+      return data.result as T;
+    }
+
+    // Direct response (not wrapped in JSON-RPC)
+    return data as T;
   } finally {
     clearTimeout(timeoutId);
   }
 }
 
+function filterTools(tools: MCPToolDefinition[], allowedTools?: string[]): MCPToolDefinition[] {
+  if (!allowedTools || allowedTools.length === 0) {
+    return tools;
+  }
+  const allowedSet = new Set(allowedTools);
+  return tools.filter((t) => allowedSet.has(t.name));
+}
+
 /**
- * Discover tools from a single MCP server
+ * Discover tools from a single MCP server using JSON-RPC 2.0
  */
 export async function discoverServerTools(
   server: MCPServerConfig,
@@ -80,7 +152,8 @@ export async function discoverServerTools(
   logger.log('mcp_discovery_start', { server_id: server.id, server_url: server.url });
 
   try {
-    const rawTools = await fetchToolList(server);
+    const result = await sendJsonRpcRequest<ToolsListResult>(server, 'tools/list');
+    const rawTools = result.tools ?? [];
     const tools = filterTools(rawTools, server.allowedTools);
 
     logger.log('mcp_discovery_complete', {
@@ -122,16 +195,13 @@ export async function discoverAllTools(
   return manifests;
 }
 
-function extractTextContent(content: unknown[]): unknown {
-  const textContent = content.find(
-    (c): c is { type: 'text'; text: string } =>
-      typeof c === 'object' && c !== null && 'type' in c && c.type === 'text'
-  );
-  return textContent ? textContent.text : content;
+function extractTextContent(content: Array<{ type: string; text?: string }>): string {
+  const textContent = content.find((c) => c.type === 'text' && c.text);
+  return textContent?.text ?? JSON.stringify(content);
 }
 
 /**
- * Call an MCP tool on a specific server
+ * Call an MCP tool on a specific server using JSON-RPC 2.0
  */
 export async function callMCPTool(
   server: MCPServerConfig,
@@ -143,27 +213,25 @@ export async function callMCPTool(
   logger.log('mcp_tool_call_start', { server_id: server.id, tool_name: toolName });
 
   try {
-    const response = await fetch(`${server.url}/tools/call`, {
-      method: 'POST',
-      headers: buildHeaders(server),
-      body: JSON.stringify({ name: toolName, arguments: args }),
-    });
+    const result = await sendJsonRpcRequest<ToolCallResult>(
+      server,
+      'tools/call',
+      { name: toolName, arguments: args },
+      TOOL_CALL_TIMEOUT_MS
+    );
 
-    if (!response.ok) {
-      throw new MCPError(
-        `MCP tool call failed with ${response.status}: ${response.statusText}`,
-        server.id
-      );
-    }
-
-    const data = (await response.json()) as { content: unknown[] };
     logger.log('mcp_tool_call_complete', {
       server_id: server.id,
       tool_name: toolName,
       duration_ms: Date.now() - startTime,
     });
 
-    return Array.isArray(data.content) ? extractTextContent(data.content) : data.content;
+    // Extract text content from MCP response format
+    if (result.content && Array.isArray(result.content)) {
+      return extractTextContent(result.content);
+    }
+
+    return result;
   } catch (error) {
     logger.error('mcp_tool_call_error', error, {
       server_id: server.id,

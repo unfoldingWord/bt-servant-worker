@@ -35,6 +35,7 @@ export default defineWorkersConfig({
             ENVIRONMENT: 'test',
             MAX_ORCHESTRATION_ITERATIONS: '10',
             CODE_EXEC_TIMEOUT_MS: '30000',
+            DEFAULT_ORG: 'unfoldingWord',
             // Pass API keys for real chat tests
             ENGINE_API_KEY: 'test-api-key',
             ANTHROPIC_API_KEY: anthropicKey,

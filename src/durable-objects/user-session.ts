@@ -252,9 +252,12 @@ export class UserSession {
       throw new ValidationError('Message is required');
     }
 
+    // Use org from request or fall back to default
+    const org = body.org ?? this.env.DEFAULT_ORG;
+
     const [preferences, history] = await Promise.all([this.getPreferences(), this.getHistory()]);
 
-    const servers = await getEnabledMCPServers(this.state.storage);
+    const servers = await getEnabledMCPServers(this.state.storage, org);
     const manifests = await discoverAllTools(servers, logger);
     const catalog = buildToolCatalog(manifests, servers);
 

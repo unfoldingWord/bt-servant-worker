@@ -12,6 +12,7 @@ export interface ChatRequest {
   progress_callback_url?: string;
   progress_throttle_seconds?: number;
   message_key?: string; // WhatsApp message identifier for correlation
+  org?: string; // Organization for MCP server selection (defaults to DEFAULT_ORG)
 }
 
 export interface ChatResponse {
