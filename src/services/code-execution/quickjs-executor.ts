@@ -59,8 +59,6 @@ interface PendingCall {
   id: number;
   fn: HostFunction;
   args: unknown[];
-  resolve: (value: unknown) => void;
-  reject: (error: Error) => void;
 }
 
 /**
@@ -72,17 +70,28 @@ interface PendingCall {
  * 3. JSON.parse in the VM reconstructs the original value
  *
  * This eliminates the risk of special characters breaking out of the value context.
+ *
+ * @throws {Error} If the value cannot be serialized or set in the VM
  */
 function setVMResult(vm: QuickJSContext, id: number, value: unknown): void {
-  const jsonValue = JSON.stringify(value);
+  let jsonValue: string;
+  try {
+    jsonValue = JSON.stringify(value);
+  } catch (e) {
+    throw new Error(
+      `Failed to serialize value for VM: ${e instanceof Error ? e.message : String(e)}`
+    );
+  }
+
   const safeStringLiteral = JSON.stringify(jsonValue);
   const result = vm.evalCode(`__pendingResults__[${id}] = JSON.parse(${safeStringLiteral});`);
   // Must dispose the result handle to prevent GC assertion failure
   if (result.error) {
+    const errorValue = vm.dump(result.error);
     result.error.dispose();
-  } else {
-    result.value.dispose();
+    throw new Error(`Failed to set VM result: ${formatErrorValue(errorValue)}`);
   }
+  result.value.dispose();
 }
 
 function registerHostFunction(
@@ -109,7 +118,7 @@ function registerHostFunction(
     const promiseHandle = promiseResult.value;
 
     // Queue the async call for later execution (resolver called in processPendingCalls)
-    pendingCalls.push({ id, fn: hostFn, args: dumpedArgs, resolve: () => {}, reject: () => {} });
+    pendingCalls.push({ id, fn: hostFn, args: dumpedArgs });
 
     // Return the QuickJS promise handle (user code can await this)
     return promiseHandle;
@@ -123,8 +132,13 @@ function setupHostFunctions(vm: QuickJSContext, hostFunctions: HostFunction[]): 
   const pendingCalls: PendingCall[] = [];
   const callIdRef = { id: 0 };
 
+  // Initialize global variables for async coordination:
+  // - __pendingResults__: Stores results from host function calls
+  // - __resolvers__: Stores { resolve, reject } objects for promises returned by host functions
+  // - __result__: Final return value set by user code
+  // - __executionError__: Captures errors from the async IIFE wrapper's .catch() handler
   const initResult = vm.evalCode(
-    'var __pendingResults__ = {}; var __resolvers__ = {}; var __result__ = undefined;'
+    'var __pendingResults__ = {}; var __resolvers__ = {}; var __result__ = undefined; var __executionError__ = undefined;'
   );
   // Must dispose the result handle to prevent GC assertion failure
   if (initResult.error) {
@@ -164,8 +178,15 @@ async function processPendingCalls(vm: QuickJSContext, pendingCalls: PendingCall
               resolveResult.value.dispose();
             }
           } catch (error) {
-            const msg = error instanceof Error ? error.message : String(error);
-            setVMResult(vm, call.id, { __error__: msg });
+            let msg = error instanceof Error ? error.message : String(error);
+            // Reject the QuickJS promise - setVMResult may fail if msg is not serializable,
+            // so we use a guaranteed-safe fallback message in that case
+            try {
+              setVMResult(vm, call.id, { __error__: msg });
+            } catch {
+              // Serialization failed - use a generic error message that's guaranteed to serialize
+              msg = 'Error: Result serialization failed';
+            }
             const rejectCode = `__resolvers__[${call.id}].reject(new Error(${JSON.stringify(msg)}));`;
             const rejectResult = vm.evalCode(rejectCode);
             if (rejectResult.error) {
@@ -209,14 +230,21 @@ function formatErrorValue(errorValue: unknown): string {
     if (err.message) {
       return err.stack ? `${err.message}\n${err.stack}` : String(err.message);
     }
-    return JSON.stringify(errorValue);
+    // Handle circular references, functions, symbols, etc.
+    try {
+      return JSON.stringify(errorValue);
+    } catch {
+      return String(errorValue);
+    }
   }
   return String(errorValue);
 }
 
 function evaluateUserCode(vm: QuickJSContext, code: string): void {
-  // Wrap in async IIFE to enable top-level await (ES2020 doesn't support it natively)
-  const wrappedCode = `(async () => { ${code} })();`;
+  // Wrap in async IIFE with .catch() to capture rejected promises.
+  // Without this, thrown errors would silently fail (success: true, result: undefined).
+  // The .catch() stores the error in __executionError__ for later extraction.
+  const wrappedCode = `(async () => { ${code} })().catch(e => { __executionError__ = e instanceof Error ? e.message : String(e); });`;
   const result = vm.evalCode(wrappedCode, 'user-code.js');
   // Must dispose the result handle to prevent GC assertion failure
   if (result.error) {
@@ -225,6 +253,22 @@ function evaluateUserCode(vm: QuickJSContext, code: string): void {
     throw new CodeExecutionError(formatErrorValue(errorValue));
   }
   result.value.dispose();
+}
+
+function checkExecutionError(vm: QuickJSContext): void {
+  const errorResult = vm.evalCode('__executionError__', 'get-error.js');
+
+  if (errorResult.error) {
+    errorResult.error.dispose();
+    return; // Can't read error state, assume no error
+  }
+
+  const errorValue = vm.dump(errorResult.value);
+  errorResult.value.dispose();
+
+  if (errorValue !== undefined) {
+    throw new CodeExecutionError(formatErrorValue(errorValue));
+  }
 }
 
 function extractResult(vm: QuickJSContext): unknown {
@@ -292,7 +336,17 @@ export async function executeCode(
       throw new TimeoutError(`Code execution exceeded ${options.timeout_ms}ms`);
     }
 
+    // Execute pending jobs to ensure the async IIFE's .catch() handler runs.
+    // The evaluateUserCode() wrapper creates: (async () => { <code> })().catch(...)
+    // If user code throws synchronously, the .catch() is queued as a pending job.
+    // We must process it before checking __executionError__ in checkExecutionError().
+    vm.runtime.executePendingJobs();
+
     await processPendingCalls(vm, pendingCalls);
+
+    // Check for errors from rejected promises in user code
+    checkExecutionError(vm);
+
     const value = extractResult(vm);
 
     logger.log('code_execution_complete', {
