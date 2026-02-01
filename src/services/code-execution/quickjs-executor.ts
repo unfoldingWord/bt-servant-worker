@@ -59,8 +59,6 @@ interface PendingCall {
   id: number;
   fn: HostFunction;
   args: unknown[];
-  resolve: (value: unknown) => void;
-  reject: (error: Error) => void;
 }
 
 /**
@@ -120,7 +118,7 @@ function registerHostFunction(
     const promiseHandle = promiseResult.value;
 
     // Queue the async call for later execution (resolver called in processPendingCalls)
-    pendingCalls.push({ id, fn: hostFn, args: dumpedArgs, resolve: () => {}, reject: () => {} });
+    pendingCalls.push({ id, fn: hostFn, args: dumpedArgs });
 
     // Return the QuickJS promise handle (user code can await this)
     return promiseHandle;
@@ -136,9 +134,9 @@ function setupHostFunctions(vm: QuickJSContext, hostFunctions: HostFunction[]): 
 
   // Initialize global variables for async coordination:
   // - __pendingResults__: Stores results from host function calls
-  // - __resolvers__: Stores Promise resolve/reject functions
+  // - __resolvers__: Stores { resolve, reject } objects for promises returned by host functions
   // - __result__: Final return value set by user code
-  // - __executionError__: Captures errors from rejected promises in user code
+  // - __executionError__: Captures errors from the async IIFE wrapper's .catch() handler
   const initResult = vm.evalCode(
     'var __pendingResults__ = {}; var __resolvers__ = {}; var __result__ = undefined; var __executionError__ = undefined;'
   );
@@ -180,13 +178,14 @@ async function processPendingCalls(vm: QuickJSContext, pendingCalls: PendingCall
               resolveResult.value.dispose();
             }
           } catch (error) {
-            const msg = error instanceof Error ? error.message : String(error);
+            let msg = error instanceof Error ? error.message : String(error);
             // Reject the QuickJS promise - setVMResult may fail if msg is not serializable,
-            // but we still want to reject the promise with whatever message we can
+            // so we use a guaranteed-safe fallback message in that case
             try {
               setVMResult(vm, call.id, { __error__: msg });
             } catch {
-              // Serialization failed, continue to reject the promise anyway
+              // Serialization failed - use a generic error message that's guaranteed to serialize
+              msg = 'Error: Result serialization failed';
             }
             const rejectCode = `__resolvers__[${call.id}].reject(new Error(${JSON.stringify(msg)}));`;
             const rejectResult = vm.evalCode(rejectCode);
@@ -231,7 +230,12 @@ function formatErrorValue(errorValue: unknown): string {
     if (err.message) {
       return err.stack ? `${err.message}\n${err.stack}` : String(err.message);
     }
-    return JSON.stringify(errorValue);
+    // Handle circular references, functions, symbols, etc.
+    try {
+      return JSON.stringify(errorValue);
+    } catch {
+      return String(errorValue);
+    }
   }
   return String(errorValue);
 }
@@ -332,10 +336,10 @@ export async function executeCode(
       throw new TimeoutError(`Code execution exceeded ${options.timeout_ms}ms`);
     }
 
-    // Execute pending jobs immediately to ensure .catch() handler runs
-    // before we check for errors. This is defensive - processPendingCalls
-    // also calls executePendingJobs, but we want to ensure the error is
-    // captured before any host function processing begins.
+    // Execute pending jobs to ensure the async IIFE's .catch() handler runs.
+    // The evaluateUserCode() wrapper creates: (async () => { <code> })().catch(...)
+    // If user code throws synchronously, the .catch() is queued as a pending job.
+    // We must process it before checking __executionError__ in checkExecutionError().
     vm.runtime.executePendingJobs();
 
     await processPendingCalls(vm, pendingCalls);
