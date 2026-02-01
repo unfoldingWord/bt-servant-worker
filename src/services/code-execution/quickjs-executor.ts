@@ -332,6 +332,12 @@ export async function executeCode(
       throw new TimeoutError(`Code execution exceeded ${options.timeout_ms}ms`);
     }
 
+    // Execute pending jobs immediately to ensure .catch() handler runs
+    // before we check for errors. This is defensive - processPendingCalls
+    // also calls executePendingJobs, but we want to ensure the error is
+    // captured before any host function processing begins.
+    vm.runtime.executePendingJobs();
+
     await processPendingCalls(vm, pendingCalls);
 
     // Check for errors from rejected promises in user code
