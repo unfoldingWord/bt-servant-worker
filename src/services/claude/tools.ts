@@ -22,7 +22,7 @@ export function buildExecuteCodeTool(): Anthropic.Tool {
     name: 'execute_code',
     description: `Execute JavaScript code in a sandboxed QuickJS environment.
 
-SYNTAX: ES2020 JavaScript (not TypeScript). Top-level await is supported.
+SYNTAX: ES2020 JavaScript (not TypeScript). Your code runs in an async context, so you can use await directly.
 
 PATTERN:
 const result = await tool_name({ param: "value" });

@@ -129,19 +129,16 @@ describe('QuickJS error handling', () => {
     expect(result.error).toBeDefined();
   });
 
-  it('should return undefined result when error is thrown in async code', async () => {
+  it('should return error when exception is thrown in async code', async () => {
     const logger = createTestLogger();
-    // Note: throw inside async IIFE creates a rejected promise but doesn't
-    // propagate as a synchronous exception. The code "completes" but __result__
-    // is never set. This is expected async behavior.
+    // Thrown errors inside the async wrapper are captured and propagated as failures
     const result = await executeCode(
       'throw new Error("test error"); __result__ = "never reached";',
       { timeout_ms: 5000, hostFunctions: [] },
       logger
     );
 
-    // The async IIFE completes (the throw becomes a rejected promise)
-    expect(result.success).toBe(true);
-    expect(result.result).toBeUndefined();
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('test error');
   });
 });
