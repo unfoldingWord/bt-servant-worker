@@ -20,14 +20,25 @@ import { JSONSchema, ToolCatalog } from '../mcp/types.js';
 export function buildExecuteCodeTool(): Anthropic.Tool {
   return {
     name: 'execute_code',
-    description: `Execute JavaScript code in a sandboxed environment. The sandbox has access to MCP tool functions that can be called directly (e.g., fetch_scripture({book: "John", chapter: 3, verse: 16})). Use this for complex operations that require multiple tool calls or data transformation. The code should set __result__ to the final value to return.`,
+    description: `Execute JavaScript code in a sandboxed QuickJS environment.
+
+SYNTAX: ES2020 JavaScript (not TypeScript). Top-level await is supported.
+
+PATTERN:
+const result = await tool_name({ param: "value" });
+__result__ = result;
+
+AVAILABLE: console.log/info/warn/error, JSON, all MCP tool functions
+NOT AVAILABLE: fetch, require, import, process, eval, Function constructor
+
+The code MUST set __result__ to return a value.`,
     input_schema: {
       type: 'object',
       properties: {
         code: {
           type: 'string',
           description:
-            'JavaScript code to execute. Available globals: console (log/info/warn/error), and all MCP tool functions. Set __result__ to the value to return.',
+            'ES2020 JavaScript code. Use await for MCP tool calls. Must set __result__ to return a value.',
         },
       },
       required: ['code'],

@@ -95,26 +95,24 @@ function registerHostFunction(
     const id = callIdRef.id++;
     const dumpedArgs = args.map((arg) => vm.dump(arg));
 
-    const promise = new Promise<unknown>((resolve, reject) => {
-      pendingCalls.push({ id, fn: hostFn, args: dumpedArgs, resolve, reject });
-    });
+    // Create a QuickJS Promise that user code can await
+    // Store the resolver in __resolvers__[id] so we can resolve it later
+    const promiseResult = vm.evalCode(
+      `new Promise((resolve, reject) => { __resolvers__[${id}] = { resolve, reject }; })`
+    );
 
-    promise
-      .then((result) => {
-        try {
-          setVMResult(vm, id, result);
-        } catch (serializeError) {
-          const msg =
-            serializeError instanceof Error ? serializeError.message : 'Serialization failed';
-          setVMResult(vm, id, { __error__: msg });
-        }
-      })
-      .catch((error) => {
-        const msg = error instanceof Error ? error.message : String(error);
-        setVMResult(vm, id, { __error__: msg });
-      });
+    if (promiseResult.error) {
+      promiseResult.error.dispose();
+      throw new Error('Failed to create promise in sandbox');
+    }
 
-    return vm.newNumber(id);
+    const promiseHandle = promiseResult.value;
+
+    // Queue the async call for later execution (resolver called in processPendingCalls)
+    pendingCalls.push({ id, fn: hostFn, args: dumpedArgs, resolve: () => {}, reject: () => {} });
+
+    // Return the QuickJS promise handle (user code can await this)
+    return promiseHandle;
   });
 
   vm.setProp(vm.global, hostFn.name, fnHandle);
@@ -125,7 +123,9 @@ function setupHostFunctions(vm: QuickJSContext, hostFunctions: HostFunction[]): 
   const pendingCalls: PendingCall[] = [];
   const callIdRef = { id: 0 };
 
-  const initResult = vm.evalCode('var __pendingResults__ = {}; var __result__ = undefined;');
+  const initResult = vm.evalCode(
+    'var __pendingResults__ = {}; var __resolvers__ = {}; var __result__ = undefined;'
+  );
   // Must dispose the result handle to prevent GC assertion failure
   if (initResult.error) {
     initResult.error.dispose();
@@ -141,16 +141,46 @@ function setupHostFunctions(vm: QuickJSContext, hostFunctions: HostFunction[]): 
 }
 
 async function processPendingCalls(vm: QuickJSContext, pendingCalls: PendingCall[]): Promise<void> {
-  await Promise.all(
-    pendingCalls.map(async (call) => {
-      try {
-        call.resolve(await call.fn.fn(...call.args));
-      } catch (error) {
-        call.reject(error instanceof Error ? error : new Error(String(error)));
-      }
-    })
-  );
-  vm.runtime.executePendingJobs();
+  // Always run pending jobs at least once to handle native Promises (no host calls)
+  // Then loop to handle chained awaits with host function calls
+  do {
+    // Process any pending host function calls
+    if (pendingCalls.length > 0) {
+      // Take current batch of pending calls
+      const batch = pendingCalls.splice(0, pendingCalls.length);
+
+      // Execute all async calls and resolve their QuickJS promises
+      await Promise.all(
+        batch.map(async (call) => {
+          try {
+            const result = await call.fn.fn(...call.args);
+            // Store result and resolve the QuickJS promise
+            setVMResult(vm, call.id, result);
+            const resolveCode = `__resolvers__[${call.id}].resolve(__pendingResults__[${call.id}]);`;
+            const resolveResult = vm.evalCode(resolveCode);
+            if (resolveResult.error) {
+              resolveResult.error.dispose();
+            } else {
+              resolveResult.value.dispose();
+            }
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            setVMResult(vm, call.id, { __error__: msg });
+            const rejectCode = `__resolvers__[${call.id}].reject(new Error(${JSON.stringify(msg)}));`;
+            const rejectResult = vm.evalCode(rejectCode);
+            if (rejectResult.error) {
+              rejectResult.error.dispose();
+            } else {
+              rejectResult.value.dispose();
+            }
+          }
+        })
+      );
+    }
+
+    // Resume async code - this may add new items to pendingCalls
+    vm.runtime.executePendingJobs();
+  } while (pendingCalls.length > 0);
 }
 
 function createInterruptHandler(startTime: number, timeoutMs: number) {
@@ -185,7 +215,9 @@ function formatErrorValue(errorValue: unknown): string {
 }
 
 function evaluateUserCode(vm: QuickJSContext, code: string): void {
-  const result = vm.evalCode(code, 'user-code.js');
+  // Wrap in async IIFE to enable top-level await (ES2020 doesn't support it natively)
+  const wrappedCode = `(async () => { ${code} })();`;
+  const result = vm.evalCode(wrappedCode, 'user-code.js');
   // Must dispose the result handle to prevent GC assertion failure
   if (result.error) {
     const errorValue = vm.dump(result.error);
@@ -240,6 +272,7 @@ export async function executeCode(
 
   logger.log('code_execution_start', {
     code_length: code.length,
+    code_preview: code.length <= 500 ? code : code.slice(0, 500) + '...[truncated]',
     host_functions: options.hostFunctions.map((f) => f.name),
   });
 
@@ -270,7 +303,10 @@ export async function executeCode(
 
     return buildSuccessResult(value, logs, startTime);
   } catch (error) {
-    logger.error('code_execution_error', error, { duration_ms: Date.now() - startTime });
+    logger.error('code_execution_error', error, {
+      duration_ms: Date.now() - startTime,
+      code_preview: code.length <= 500 ? code : code.slice(0, 500) + '...[truncated]',
+    });
     return buildErrorResult(error, logs, startTime);
   } finally {
     vm?.dispose();
