@@ -1,5 +1,17 @@
 import { defineWorkersConfig } from '@cloudflare/vitest-pool-workers/config';
 import { readFileSync, existsSync } from 'fs';
+import { platform } from 'os';
+
+// Windows has issues with workerd's SQLite Durable Objects storage
+// See: https://github.com/cloudflare/workers-sdk/issues - SQLITE_CANTOPEN errors
+const isWindows = platform() === 'win32';
+
+if (isWindows) {
+  console.warn(
+    '\n⚠️  Skipping e2e tests on Windows (SQLite/workerd incompatibility)\n' +
+      '   These tests run in CI on Linux.\n'
+  );
+}
 
 // Read ANTHROPIC_API_KEY from .dev.vars if it exists (for local development)
 function getAnthropicKey(): string {
@@ -48,6 +60,7 @@ export default defineWorkersConfig({
       },
     },
     include: ['tests/**/*.test.ts'],
+    exclude: isWindows ? ['tests/e2e/**'] : [],
     // Increase timeout for real API calls
     testTimeout: 30000,
   },
