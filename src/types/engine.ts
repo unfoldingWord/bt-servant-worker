@@ -3,6 +3,7 @@
  */
 
 import { MCPServerConfig } from './mcp.js';
+import { OrgConfig } from './org-config.js';
 
 export interface ChatRequest {
   client_id: string;
@@ -18,6 +19,9 @@ export interface ChatRequest {
 
   /** Internal: MCP servers injected by worker (not from client) */
   _mcp_servers?: MCPServerConfig[];
+
+  /** Internal: Org config injected by worker (not from client) */
+  _org_config?: OrgConfig;
 }
 
 export interface ChatResponse {

@@ -45,10 +45,9 @@ import {
   UserPreferencesAPI,
   UserPreferencesInternal,
 } from '../types/engine.js';
+import { DEFAULT_ORG_CONFIG, OrgConfig } from '../types/org-config.js';
 import { ValidationError } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger } from '../utils/logger.js';
-
-const MAX_HISTORY_ENTRIES = 50;
 const HISTORY_KEY = 'history';
 const PREFERENCES_KEY = 'preferences';
 
@@ -222,7 +221,7 @@ export class UserSession {
   private async handleGetHistory(url: URL): Promise<Response> {
     const limit = Math.min(
       parseInt(url.searchParams.get('limit') ?? '50', 10),
-      MAX_HISTORY_ENTRIES
+      DEFAULT_ORG_CONFIG.max_history_storage
     );
     const offset = parseInt(url.searchParams.get('offset') ?? '0', 10);
     const userId = url.searchParams.get('user_id') ?? '';
@@ -309,18 +308,23 @@ export class UserSession {
     message: string,
     responses: string[],
     preferences: UserPreferencesInternal,
+    orgConfig: OrgConfig,
     logger: RequestLogger
   ) {
     const startTime = Date.now();
-    await this.addHistoryEntry({
-      user_message: message,
-      assistant_response: responses.join('\n'),
-      timestamp: Date.now(),
-    });
+    const storageMax = orgConfig.max_history_storage ?? DEFAULT_ORG_CONFIG.max_history_storage;
+    await this.addHistoryEntry(
+      {
+        user_message: message,
+        assistant_response: responses.join('\n'),
+        timestamp: Date.now(),
+      },
+      storageMax
+    );
     if (preferences.first_interaction) {
       await this.updatePreferences({ ...preferences, first_interaction: false });
     }
-    logger.log('phase_save_complete', { duration_ms: Date.now() - startTime });
+    logger.log('phase_save_complete', { duration_ms: Date.now() - startTime, storageMax });
   }
 
   private async processChat(
@@ -335,6 +339,8 @@ export class UserSession {
     const { preferences, history } = await this.loadUserContext(logger);
     // Use MCP servers from request body (injected by worker from KV)
     const mcpServers = body._mcp_servers ?? [];
+    // Use org config from request body (injected by worker from KV)
+    const orgConfig = body._org_config ?? {};
     const catalog = await this.discoverMCPTools(mcpServers, logger);
 
     const startTime = Date.now();
@@ -346,6 +352,7 @@ export class UserSession {
         response_language: preferences.response_language,
         first_interaction: preferences.first_interaction,
       },
+      orgConfig,
       logger,
       callbacks,
     });
@@ -354,7 +361,7 @@ export class UserSession {
       duration_ms: Date.now() - startTime,
     });
 
-    await this.saveConversation(body.message, responses, preferences, logger);
+    await this.saveConversation(body.message, responses, preferences, orgConfig, logger);
 
     return {
       responses,
@@ -368,10 +375,10 @@ export class UserSession {
     return history ?? [];
   }
 
-  private async addHistoryEntry(entry: ChatHistoryEntry): Promise<void> {
+  private async addHistoryEntry(entry: ChatHistoryEntry, maxStorage: number): Promise<void> {
     const history = await this.getHistory();
     history.push(entry);
-    const trimmed = history.slice(-MAX_HISTORY_ENTRIES);
+    const trimmed = history.slice(-maxStorage);
     await this.state.storage.put(HISTORY_KEY, trimmed);
   }
 
