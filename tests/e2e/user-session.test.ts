@@ -239,35 +239,6 @@ describe('UserSession user-scoped DO isolation', () => {
   });
 });
 
-describe('UserSession cleanup endpoint', () => {
-  it('deletes all storage when cleanup is called', async () => {
-    const stub = env.USER_SESSION.get(env.USER_SESSION.idFromName('user:cleanup-test:user1'));
-
-    // Set some preferences
-    await stub.fetch('http://fake-host/preferences', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ response_language: 'de' }),
-    });
-
-    // Verify preferences are set
-    const before = await stub.fetch('http://fake-host/preferences');
-    const beforeData = (await before.json()) as { response_language: string };
-    expect(beforeData.response_language).toBe('de');
-
-    // Call cleanup
-    const cleanupResponse = await stub.fetch('http://fake-host/cleanup', {
-      method: 'POST',
-    });
-    expect(cleanupResponse.status).toBe(200);
-
-    // Verify preferences are reset to default
-    const after = await stub.fetch('http://fake-host/preferences');
-    const afterData = (await after.json()) as { response_language: string };
-    expect(afterData.response_language).toBe('en');
-  });
-});
-
 /**
  * Real chat tests that call the Anthropic API.
  * These tests verify the full chat flow with Claude.

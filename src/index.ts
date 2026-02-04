@@ -226,55 +226,6 @@ app.delete('/api/v1/admin/orgs/:org/mcp-servers/:serverId', async (c) => {
   }
 });
 
-// Migration endpoint - temporary, remove after migration complete
-app.post('/api/v1/admin/orgs/:org/migrate-mcp-to-kv', async (c) => {
-  const org = c.req.param('org');
-
-  if (!org) {
-    return c.json({ error: 'org is required in path' }, 400);
-  }
-
-  try {
-    // Read from org DO
-    const orgDoId = c.env.USER_SESSION.idFromName(`org:${org}`);
-    const orgStub = c.env.USER_SESSION.get(orgDoId);
-    const response = await orgStub.fetch(new Request(`https://internal/mcp-servers?org=${org}`));
-    const data = (await response.json()) as { servers: MCPServerConfig[] };
-
-    // Write to KV
-    await c.env.MCP_SERVERS.put(org, JSON.stringify(data.servers));
-    logAdminAction('migrate_mcp_to_kv', org, { server_count: data.servers.length });
-
-    return c.json({ migrated: org, server_count: data.servers.length });
-  } catch (error) {
-    logAdminAction('migrate_mcp_to_kv_error', org, { error: String(error) });
-    return c.json({ error: 'Migration failed' }, 500);
-  }
-});
-
-// Cleanup endpoint - temporary, remove after cleanup complete
-app.post('/api/v1/admin/orgs/:org/cleanup-org-do', async (c) => {
-  const org = c.req.param('org');
-
-  if (!org) {
-    return c.json({ error: 'org is required in path' }, 400);
-  }
-
-  try {
-    const orgDoId = c.env.USER_SESSION.idFromName(`org:${org}`);
-    const orgStub = c.env.USER_SESSION.get(orgDoId);
-
-    // Call DO to delete its storage
-    await orgStub.fetch(new Request('https://internal/cleanup', { method: 'POST' }));
-    logAdminAction('cleanup_org_do', org);
-
-    return c.json({ cleaned: `org:${org}` });
-  } catch (error) {
-    logAdminAction('cleanup_org_do_error', org, { error: String(error) });
-    return c.json({ error: 'Cleanup failed' }, 500);
-  }
-});
-
 export default app;
 
 /**
