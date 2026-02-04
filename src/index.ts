@@ -238,8 +238,14 @@ app.get('/api/v1/admin/orgs/:org/config', async (c) => {
     logAdminAction('get_org_config', org, { config: merged });
     return c.json({ org, config: merged });
   } catch (error) {
-    logAdminAction('get_org_config_error', org, { error: String(error) });
-    return c.json({ error: 'Failed to read org config from storage' }, 500);
+    // Return defaults with warning on read failure (matches chat flow behavior)
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    logAdminAction('get_org_config_error', org, { error: errorMsg });
+    return c.json({
+      org,
+      config: DEFAULT_ORG_CONFIG,
+      warning: 'Failed to read org config from storage, returning defaults',
+    });
   }
 });
 
@@ -254,6 +260,8 @@ app.put('/api/v1/admin/orgs/:org/config', async (c) => {
 
   try {
     // Merge with existing config (upsert behavior)
+    // NOTE: This read-modify-write pattern can race with concurrent requests (last write wins).
+    // This is acceptable for admin endpoints which are low-volume and authenticated.
     const existing = (await c.env.ORG_CONFIG.get<OrgConfig>(org, 'json')) ?? {};
     const merged: OrgConfig = { ...existing };
 
@@ -276,7 +284,8 @@ app.put('/api/v1/admin/orgs/:org/config', async (c) => {
     const withDefaults = { ...DEFAULT_ORG_CONFIG, ...merged };
     return c.json({ org, config: withDefaults, message: 'Org config updated' });
   } catch (error) {
-    logAdminAction('update_org_config_error', org, { error: String(error) });
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    logAdminAction('update_org_config_error', org, { error: errorMsg });
     return c.json({ error: 'Failed to update org config in storage' }, 500);
   }
 });
@@ -289,7 +298,8 @@ app.delete('/api/v1/admin/orgs/:org/config', async (c) => {
     logAdminAction('reset_org_config', org, {});
     return c.json({ org, config: DEFAULT_ORG_CONFIG, message: 'Org config reset to defaults' });
   } catch (error) {
-    logAdminAction('reset_org_config_error', org, { error: String(error) });
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    logAdminAction('reset_org_config_error', org, { error: errorMsg });
     return c.json({ error: 'Failed to delete org config from storage' }, 500);
   }
 });

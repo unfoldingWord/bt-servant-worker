@@ -219,10 +219,11 @@ export class UserSession {
   }
 
   private async handleGetHistory(url: URL): Promise<Response> {
-    const limit = Math.min(
-      parseInt(url.searchParams.get('limit') ?? '50', 10),
-      DEFAULT_ORG_CONFIG.max_history_storage
+    const requestedLimit = parseInt(
+      url.searchParams.get('limit') ?? String(DEFAULT_ORG_CONFIG.max_history_storage),
+      10
     );
+    const limit = Math.min(requestedLimit, DEFAULT_ORG_CONFIG.max_history_storage);
     const offset = parseInt(url.searchParams.get('offset') ?? '0', 10);
     const userId = url.searchParams.get('user_id') ?? '';
 
