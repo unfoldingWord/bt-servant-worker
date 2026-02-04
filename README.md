@@ -183,7 +183,7 @@ Consumer (gateway/web client) calls API
 
 ### Lock Timeout
 
-The processing lock has a 5-minute stale threshold. If a request crashes without releasing the lock, subsequent requests will succeed after 5 minutes. This is a safety mechanism, not expected behavior.
+The processing lock has a 90-second stale threshold. If a request crashes without releasing the lock, subsequent requests will succeed after 90 seconds. This is a safety mechanism, not expected behavior. When a stale lock is overwritten, a warning is logged for monitoring.
 
 ## Project Structure
 

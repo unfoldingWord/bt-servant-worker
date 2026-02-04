@@ -51,7 +51,7 @@ import { createRequestLogger, RequestLogger } from '../utils/logger.js';
 const HISTORY_KEY = 'history';
 const PREFERENCES_KEY = 'preferences';
 const PROCESSING_LOCK_KEY = '_processing_lock';
-const LOCK_STALE_THRESHOLD_MS = 300000; // 5 minutes
+const LOCK_STALE_THRESHOLD_MS = 90000; // 90 seconds
 
 /**
  * Validates ISO 639-1 language code format (2 lowercase letters).
@@ -78,7 +78,7 @@ export class UserSession {
     this.env = env;
 
     this.app = new Hono();
-    this.app.post('/stream', (c) => this.handleStreamingChat(c.req.raw));
+    // Note: /stream is handled directly in fetch() for proper lock management
     this.app.post('/chat', (c) => this.handleChat(c.req.raw));
     this.app.get('/preferences', () => this.handleGetPreferences());
     this.app.put('/preferences', (c) => this.handleUpdatePreferences(c.req.raw));
@@ -117,6 +117,12 @@ export class UserSession {
         );
       }
 
+      // For streaming, lock is released by the streaming handler when complete
+      if (url.pathname === '/stream') {
+        return this.handleStreamingChatWithLock(request);
+      }
+
+      // For non-streaming, release lock when request completes
       try {
         return await this.app.fetch(request);
       } finally {
@@ -129,12 +135,26 @@ export class UserSession {
   }
 
   private async tryAcquireLock(): Promise<boolean> {
-    const lock = await this.state.storage.get<number>(PROCESSING_LOCK_KEY);
-    if (lock && Date.now() - lock < LOCK_STALE_THRESHOLD_MS) {
-      return false; // Already processing
-    }
-    await this.state.storage.put(PROCESSING_LOCK_KEY, Date.now());
-    return true;
+    // Use blockConcurrencyWhile to make the check-and-set atomic
+    return this.state.blockConcurrencyWhile(async () => {
+      const lock = await this.state.storage.get<number>(PROCESSING_LOCK_KEY);
+      const now = Date.now();
+      if (lock && now - lock < LOCK_STALE_THRESHOLD_MS) {
+        return false; // Already processing
+      }
+      if (lock) {
+        // Overwriting a stale lock - log this as it indicates a crash/timeout
+        console.warn(
+          JSON.stringify({
+            event: 'stale_lock_overwritten',
+            lock_age_ms: now - lock,
+            timestamp: now,
+          })
+        );
+      }
+      await this.state.storage.put(PROCESSING_LOCK_KEY, now);
+      return true;
+    });
   }
 
   private async releaseLock(): Promise<void> {
@@ -184,7 +204,11 @@ export class UserSession {
     }
   }
 
-  private async handleStreamingChat(request: Request): Promise<Response> {
+  /**
+   * Handle streaming chat with proper lock management.
+   * Lock is released when streaming completes, not when Response is returned.
+   */
+  private async handleStreamingChatWithLock(request: Request): Promise<Response> {
     const requestId = crypto.randomUUID();
     const startTime = Date.now();
     const body = (await request.json()) as ChatRequest;
@@ -208,15 +232,18 @@ export class UserSession {
       await writer.write(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
     };
 
-    this.processStreamingChat(body, sendEvent, writer, logger, startTime).catch(async (error) => {
-      const totalDuration = Date.now() - startTime;
-      logger.error('do_stream_error', error, { total_duration_ms: totalDuration });
-      await sendEvent({
-        type: 'error',
-        error: error instanceof Error ? error.message : 'Unknown error',
-      });
-      await writer.close();
-    });
+    // Process streaming and release lock when done (success or error)
+    this.processStreamingChat(body, sendEvent, writer, logger, startTime)
+      .catch(async (error) => {
+        const totalDuration = Date.now() - startTime;
+        logger.error('do_stream_error', error, { total_duration_ms: totalDuration });
+        await sendEvent({
+          type: 'error',
+          error: error instanceof Error ? error.message : 'Unknown error',
+        });
+        await writer.close();
+      })
+      .finally(() => this.releaseLock());
 
     return new Response(readable, {
       headers: {
