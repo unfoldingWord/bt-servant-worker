@@ -50,6 +50,8 @@ import { ValidationError } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger } from '../utils/logger.js';
 const HISTORY_KEY = 'history';
 const PREFERENCES_KEY = 'preferences';
+const PROCESSING_LOCK_KEY = '_processing_lock';
+const LOCK_STALE_THRESHOLD_MS = 300000; // 5 minutes
 
 /**
  * Validates ISO 639-1 language code format (2 lowercase letters).
@@ -84,7 +86,59 @@ export class UserSession {
   }
 
   async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    // Only lock chat endpoints (not preferences/history reads)
+    if (url.pathname === '/chat' || url.pathname === '/stream') {
+      const acquired = await this.tryAcquireLock();
+      if (!acquired) {
+        const userId = url.searchParams.get('user_id') || 'unknown';
+        console.warn(
+          JSON.stringify({
+            event: 'concurrent_request_rejected',
+            user_id: userId,
+            timestamp: Date.now(),
+          })
+        );
+        return new Response(
+          JSON.stringify({
+            error: 'Request in progress',
+            code: 'CONCURRENT_REQUEST',
+            message: 'Another request for this user is currently being processed. Please retry.',
+            retry_after_ms: 5000,
+          }),
+          {
+            status: 429,
+            headers: {
+              'Content-Type': 'application/json',
+              'Retry-After': '5',
+            },
+          }
+        );
+      }
+
+      try {
+        return await this.app.fetch(request);
+      } finally {
+        await this.releaseLock();
+      }
+    }
+
+    // Non-chat endpoints don't need locking
     return this.app.fetch(request);
+  }
+
+  private async tryAcquireLock(): Promise<boolean> {
+    const lock = await this.state.storage.get<number>(PROCESSING_LOCK_KEY);
+    if (lock && Date.now() - lock < LOCK_STALE_THRESHOLD_MS) {
+      return false; // Already processing
+    }
+    await this.state.storage.put(PROCESSING_LOCK_KEY, Date.now());
+    return true;
+  }
+
+  private async releaseLock(): Promise<void> {
+    await this.state.storage.delete(PROCESSING_LOCK_KEY);
   }
 
   private async handleChat(request: Request): Promise<Response> {

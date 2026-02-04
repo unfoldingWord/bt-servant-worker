@@ -166,3 +166,13 @@ export interface ProgressCallback {
   text: string;
   timestamp: number;
 }
+
+/**
+ * Error response when a concurrent request is rejected (429)
+ */
+export interface ConcurrentRequestError {
+  error: string;
+  code: 'CONCURRENT_REQUEST';
+  message: string;
+  retry_after_ms: number;
+}
