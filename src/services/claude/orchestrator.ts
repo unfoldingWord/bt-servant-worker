@@ -155,6 +155,11 @@ async function processIteration(ctx: OrchestrationContext, iteration: number): P
     message_count: ctx.messages.length,
   });
 
+  // Add separator before subsequent iterations for streaming
+  if (iteration > 0 && ctx.callbacks) {
+    ctx.callbacks.onProgress('\n\n');
+  }
+
   const startTime = Date.now();
   const response = await callClaude(ctx);
   const duration = Date.now() - startTime;
