@@ -84,3 +84,32 @@ export class MCPCallLimitError extends AppError {
     this.name = 'MCPCallLimitError';
   }
 }
+
+export class MCPBudgetExceededError extends AppError {
+  constructor(
+    public readonly estimated: number,
+    public readonly limit: number
+  ) {
+    super(
+      `MCP downstream API budget exceeded. Estimated calls: ${estimated}, limit: ${limit}. Reduce scope or batch requests.`,
+      'MCP_BUDGET_EXCEEDED',
+      429
+    );
+    this.name = 'MCPBudgetExceededError';
+  }
+}
+
+export class MCPResponseTooLargeError extends AppError {
+  constructor(
+    public readonly actualSize: number,
+    public readonly limit: number,
+    public readonly serverId?: string
+  ) {
+    super(
+      `MCP response too large: ${actualSize} bytes exceeds limit of ${limit} bytes${serverId ? ` (server: ${serverId})` : ''}`,
+      'MCP_RESPONSE_TOO_LARGE',
+      413
+    );
+    this.name = 'MCPResponseTooLargeError';
+  }
+}

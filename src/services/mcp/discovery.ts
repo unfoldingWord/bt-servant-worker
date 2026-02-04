@@ -24,12 +24,19 @@
  * - Consider network isolation (private endpoints) for sensitive servers
  */
 
-import { MCPError } from '../../utils/errors.js';
+import { MCPError, MCPResponseTooLargeError } from '../../utils/errors.js';
 import { RequestLogger } from '../../utils/logger.js';
-import { MCPServerConfig, MCPServerManifest, MCPToolDefinition } from './types.js';
+import { HealthTracker, recordFailure, recordSuccess } from './health.js';
+import {
+  MCPResponseMetadata,
+  MCPServerConfig,
+  MCPServerManifest,
+  MCPToolDefinition,
+} from './types.js';
 
 const DISCOVERY_TIMEOUT_MS = 10000;
 const TOOL_CALL_TIMEOUT_MS = 30000;
+const DEFAULT_MAX_RESPONSE_SIZE_BYTES = 1048576; // 1MB
 
 /** JSON-RPC 2.0 request structure */
 interface JsonRpcRequest {
@@ -55,6 +62,7 @@ interface ToolsListResult {
 /** MCP tools/call response */
 interface ToolCallResult {
   content: Array<{ type: string; text?: string }>;
+  _meta?: MCPResponseMetadata;
 }
 
 /** Type guard for JSON-RPC 2.0 responses */
@@ -78,6 +86,60 @@ function buildHeaders(server: MCPServerConfig): Record<string, string> {
   return headers;
 }
 
+interface SendOptions {
+  timeoutMs?: number;
+  maxResponseSizeBytes?: number;
+}
+
+function checkContentLengthHeader(response: Response, maxSize: number, serverId: string): void {
+  const contentLength = response.headers.get('Content-Length');
+  if (contentLength) {
+    const size = parseInt(contentLength, 10);
+    if (!isNaN(size) && size > maxSize) {
+      throw new MCPResponseTooLargeError(size, maxSize, serverId);
+    }
+  }
+}
+
+async function readResponseWithSizeLimit(
+  response: Response,
+  maxSize: number,
+  serverId: string
+): Promise<string> {
+  const reader = response.body?.getReader();
+  if (!reader) {
+    throw new MCPError('Failed to read response body', serverId);
+  }
+
+  const chunks: Uint8Array[] = [];
+  let totalSize = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    totalSize += value.length;
+    if (totalSize > maxSize) {
+      reader.cancel();
+      throw new MCPResponseTooLargeError(totalSize, maxSize, serverId);
+    }
+    chunks.push(value);
+  }
+
+  const decoder = new TextDecoder();
+  return chunks.map((chunk) => decoder.decode(chunk, { stream: true })).join('');
+}
+
+function parseJsonRpcResponse<T>(data: unknown, serverId: string): T {
+  if (isJsonRpcResponse<T>(data)) {
+    if (data.error) {
+      throw new MCPError(`MCP error: ${data.error.message} (code: ${data.error.code})`, serverId);
+    }
+    return data.result as T;
+  }
+  return data as T;
+}
+
 /**
  * Send a JSON-RPC 2.0 request to an MCP server
  */
@@ -85,8 +147,12 @@ async function sendJsonRpcRequest<T>(
   server: MCPServerConfig,
   method: string,
   params: Record<string, unknown> = {},
-  timeoutMs: number = DISCOVERY_TIMEOUT_MS
+  options: SendOptions = {}
 ): Promise<T> {
+  const {
+    timeoutMs = DISCOVERY_TIMEOUT_MS,
+    maxResponseSizeBytes = DEFAULT_MAX_RESPONSE_SIZE_BYTES,
+  } = options;
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -112,22 +178,10 @@ async function sendJsonRpcRequest<T>(
       );
     }
 
-    const data = (await response.json()) as unknown;
-
-    // Handle both JSON-RPC wrapped and direct responses
-    // Some servers return { jsonrpc, result } while others return the result directly
-    if (isJsonRpcResponse<T>(data)) {
-      if (data.error) {
-        throw new MCPError(
-          `MCP error: ${data.error.message} (code: ${data.error.code})`,
-          server.id
-        );
-      }
-      return data.result as T;
-    }
-
-    // Direct response (not wrapped in JSON-RPC)
-    return data as T;
+    checkContentLengthHeader(response, maxResponseSizeBytes, server.id);
+    const text = await readResponseWithSizeLimit(response, maxResponseSizeBytes, server.id);
+    const data = JSON.parse(text) as unknown;
+    return parseJsonRpcResponse<T>(data, server.id);
   } finally {
     clearTimeout(timeoutId);
   }
@@ -207,43 +261,95 @@ function extractTextContent(content: Array<{ type: string; text?: string }>): st
 }
 
 /**
+ * Options for MCP tool calls
+ */
+export interface CallMCPToolOptions {
+  healthTracker?: HealthTracker;
+  maxResponseSizeBytes?: number;
+}
+
+/**
+ * Result of an MCP tool call with optional metadata
+ */
+export interface MCPToolCallResult {
+  result: unknown;
+  metadata: MCPResponseMetadata | undefined;
+  responseTimeMs: number;
+}
+
+function buildToolCallSendOptions(options?: CallMCPToolOptions): SendOptions {
+  const sendOptions: SendOptions = { timeoutMs: TOOL_CALL_TIMEOUT_MS };
+  if (options?.maxResponseSizeBytes !== undefined) {
+    sendOptions.maxResponseSizeBytes = options.maxResponseSizeBytes;
+  }
+  return sendOptions;
+}
+
+function logToolCallSuccess(
+  logger: RequestLogger,
+  serverId: string,
+  toolName: string,
+  responseTimeMs: number,
+  metadata: MCPResponseMetadata | undefined
+): void {
+  logger.log('mcp_tool_call_complete', {
+    server_id: serverId,
+    tool_name: toolName,
+    duration_ms: responseTimeMs,
+    has_metadata: !!metadata,
+    downstream_calls: metadata?.downstream_api_calls,
+    cache_status: metadata?.cache_status,
+  });
+}
+
+function extractToolResult(result: ToolCallResult): unknown {
+  if (result.content && Array.isArray(result.content)) {
+    return extractTextContent(result.content);
+  }
+  return result;
+}
+
+/**
  * Call an MCP tool on a specific server using JSON-RPC 2.0
  */
 export async function callMCPTool(
   server: MCPServerConfig,
   toolName: string,
   args: unknown,
-  logger: RequestLogger
-): Promise<unknown> {
+  logger: RequestLogger,
+  options?: CallMCPToolOptions
+): Promise<MCPToolCallResult> {
   const startTime = Date.now();
   logger.log('mcp_tool_call_start', { server_id: server.id, tool_name: toolName });
 
   try {
+    const sendOptions = buildToolCallSendOptions(options);
     const result = await sendJsonRpcRequest<ToolCallResult>(
       server,
       'tools/call',
       { name: toolName, arguments: args },
-      TOOL_CALL_TIMEOUT_MS
+      sendOptions
     );
 
-    logger.log('mcp_tool_call_complete', {
-      server_id: server.id,
-      tool_name: toolName,
-      duration_ms: Date.now() - startTime,
-    });
+    const responseTimeMs = Date.now() - startTime;
+    const metadata = result._meta;
 
-    // Extract text content from MCP response format
-    if (result.content && Array.isArray(result.content)) {
-      return extractTextContent(result.content);
+    logToolCallSuccess(logger, server.id, toolName, responseTimeMs, metadata);
+    if (options?.healthTracker) {
+      recordSuccess(options.healthTracker, server.id, responseTimeMs);
     }
 
-    return result;
+    return { result: extractToolResult(result), metadata, responseTimeMs };
   } catch (error) {
+    const responseTimeMs = Date.now() - startTime;
     logger.error('mcp_tool_call_error', error, {
       server_id: server.id,
       tool_name: toolName,
-      duration_ms: Date.now() - startTime,
+      duration_ms: responseTimeMs,
     });
+    if (options?.healthTracker) {
+      recordFailure(options.healthTracker, server.id, error as Error);
+    }
     throw error;
   }
 }
