@@ -27,7 +27,7 @@
 import { Hono } from 'hono';
 import { Env } from '../config/types.js';
 import { orchestrate } from '../services/claude/index.js';
-import { buildToolCatalog, discoverAllTools, getMCPServers } from '../services/mcp/index.js';
+import { buildToolCatalog, discoverAllTools } from '../services/mcp/index.js';
 import { MCPServerConfig } from '../services/mcp/types.js';
 import {
   createWebhookCallbacks,
@@ -82,12 +82,6 @@ export class UserSession {
     this.app.get('/preferences', () => this.handleGetPreferences());
     this.app.put('/preferences', (c) => this.handleUpdatePreferences(c.req.raw));
     this.app.get('/history', (c) => this.handleGetHistory(new URL(c.req.url)));
-
-    // Migration support: read MCP servers from DO storage (for migrate-mcp-to-kv endpoint)
-    this.app.get('/mcp-servers', (c) => this.handleGetMCPServersForMigration(new URL(c.req.url)));
-
-    // Cleanup endpoint for deleting org DO storage
-    this.app.post('/cleanup', () => this.handleCleanup());
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -248,25 +242,6 @@ export class UserSession {
       offset,
     };
     return Response.json(response);
-  }
-
-  /**
-   * Migration support: read MCP servers from DO storage.
-   * Used by the migrate-mcp-to-kv endpoint to extract config before moving to KV.
-   */
-  private async handleGetMCPServersForMigration(url: URL): Promise<Response> {
-    const org = url.searchParams.get('org') ?? this.env.DEFAULT_ORG;
-    const servers = await getMCPServers(this.state.storage, org);
-    return Response.json({ org, servers });
-  }
-
-  /**
-   * Cleanup handler for deleting all storage in this DO.
-   * Used after migration to clean up org DO instances.
-   */
-  private async handleCleanup(): Promise<Response> {
-    await this.state.storage.deleteAll();
-    return Response.json({ success: true });
   }
 
   private async processStreamingChat(
