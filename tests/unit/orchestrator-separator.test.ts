@@ -3,7 +3,7 @@
  *
  * When Claude processes multiple iterations (e.g., tool calls followed by responses),
  * a separator is added between iterations for streaming output. This test verifies
- * the separator is a single space, not double newlines.
+ * the separator is a single newline, not double newlines.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -119,7 +119,7 @@ describe('Orchestrator iteration separator - multi iteration', () => {
   });
   afterEach(() => vi.clearAllMocks());
 
-  it('uses single space separator between iterations during streaming', async () => {
+  it('uses single newline separator between iterations during streaming', async () => {
     setupMultiIterationMock();
     await orchestrate('test message', {
       env: createMockEnv(),
@@ -129,7 +129,7 @@ describe('Orchestrator iteration separator - multi iteration', () => {
       logger: createMockLogger(),
       callbacks: createMockCallbacks(progressChunks),
     });
-    expect(progressChunks.filter((c) => c === ' ').length).toBe(1);
+    expect(progressChunks.filter((c) => c === '\n').length).toBe(1);
     expect(progressChunks.filter((c) => c === '\n\n').length).toBe(0);
   });
 });
@@ -152,6 +152,6 @@ describe('Orchestrator iteration separator - single iteration', () => {
       logger: createMockLogger(),
       callbacks: createMockCallbacks(progressChunks),
     });
-    expect(progressChunks.filter((c) => c === ' ').length).toBe(0);
+    expect(progressChunks.filter((c) => c === '\n').length).toBe(0);
   });
 });
