@@ -2,6 +2,28 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## CRITICAL: Never Deploy Directly
+
+**NEVER run `wrangler deploy` directly.** This is non-negotiable.
+
+All deployments MUST go through the CI/CD pipeline:
+
+1. Commit changes to git
+2. Push to a branch
+3. Create a PR
+4. Wait for CI to pass
+5. Get approval and merge
+6. CI will deploy automatically
+
+Deploying directly bypasses:
+
+- Tests that catch bugs
+- Code review that catches issues
+- The audit trail of what's deployed
+- Rollback capability via git history
+
+The ONLY exception is if the user explicitly asks you to deploy directly for emergency hotfixes.
+
 ## CRITICAL: Never Merge Without Permission
 
 **NEVER merge a PR without explicit user approval.** This is non-negotiable.
@@ -58,7 +80,7 @@ bt-servant-worker is a Cloudflare Worker that integrates with bt-servant-engine.
 - `pnpm format` - Format code with Prettier
 - `pnpm check` - TypeScript type check
 - `pnpm architecture` - Check for circular dependencies
-- `wrangler deploy` - Deploy to Cloudflare
+- `wrangler deploy` - **DO NOT USE DIRECTLY** - Deployments go through CI/CD
 
 ## What to Do After a Push
 

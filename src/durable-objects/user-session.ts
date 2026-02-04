@@ -134,6 +134,10 @@ export class UserSession {
         response_count: response.responses.length,
         total_duration_ms: totalDuration,
       });
+      logger.log('final_response', {
+        responses: response.responses,
+        response_language: response.response_language,
+      });
       return Response.json(response);
     } catch (error) {
       const totalDuration = Date.now() - startTime;
@@ -280,6 +284,10 @@ export class UserSession {
       logger.log('do_stream_complete', {
         response_count: response.responses.length,
         total_duration_ms: totalDuration,
+      });
+      logger.log('final_response', {
+        responses: response.responses,
+        response_language: response.response_language,
       });
       await sendEvent({ type: 'complete', response });
     } finally {
