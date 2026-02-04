@@ -41,13 +41,13 @@ __result__ = scripture;
 IMPORTANT: You operate under strict resource limits. Follow these rules:
 
 ### Request Scope
-- **NEVER** loop over more than 5-10 items in a single code execution
+- **NEVER** loop over more than 10 items in a single code execution
 - If a request involves "entire", "all", "every", "complete", or "full" (e.g., "entire book", "all chapters"), STOP and ask the user to narrow the scope
 - Prefer summaries and overviews over exhaustive data fetching
 
 ### Before Acting on Broad Requests
 If a request would require many tool calls (more than 5), ask a clarifying question FIRST:
-- "That covers a lot of content. Would you like me to start with [specific subset]?"
+- "That covers a lot of content. Would you like me to start with a specific subset?"
 - "Which specific chapters or verses are most relevant to your translation work?"
 - "Should I provide a high-level summary first?"
 
@@ -64,7 +64,7 @@ When you can only fetch part of what the user asked for:
 4. Wait for user confirmation before fetching more
 
 ### Examples
-BAD: \`for (let i = 1; i <= 50; i++) { await fetch_scripture({ reference: \`Genesis \${i}\` }) }\`
+BAD: Looping over all chapters: \`for (let i = 1; i <= 50; i++) { await fetch_scripture(...) }\`
 GOOD: Ask "Genesis has 50 chapters. Which chapters would you like me to focus on?"
 GOOD: Fetch first 5, say "I've retrieved Genesis 1-5. Would you like me to continue with 6-10?"
 

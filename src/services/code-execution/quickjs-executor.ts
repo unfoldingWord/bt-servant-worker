@@ -30,6 +30,9 @@ const INTERRUPT_CHECK_CYCLES = 10000;
 /** Default maximum number of MCP calls per code execution */
 const DEFAULT_MAX_MCP_CALLS = 10;
 
+/** Threshold (as decimal) at which to warn about approaching MCP call limit */
+const MCP_CALL_WARNING_THRESHOLD = 0.8;
+
 /**
  * Counter for tracking MCP calls during code execution
  */
@@ -192,14 +195,18 @@ function rejectPendingCall(vm: QuickJSContext, callId: number, error: unknown): 
   }
 }
 
+/**
+ * Log MCP call execution and warn when approaching the limit.
+ * Call numbers are 1-indexed for human readability (call_number: 1 = first call).
+ */
 function logMcpCall(logger: RequestLogger, mcpCounter: MCPCallCounter, toolName: string): void {
   logger.log('mcp_call_executed', {
     tool_name: toolName,
     call_number: mcpCounter.count,
     limit: mcpCounter.limit,
   });
-  // Warn when approaching limit (at 80%)
-  if (mcpCounter.count >= mcpCounter.limit * 0.8 && mcpCounter.count < mcpCounter.limit) {
+  const warningThreshold = mcpCounter.limit * MCP_CALL_WARNING_THRESHOLD;
+  if (mcpCounter.count >= warningThreshold && mcpCounter.count < mcpCounter.limit) {
     logger.warn('mcp_call_limit_warning', {
       calls_made: mcpCounter.count,
       limit: mcpCounter.limit,
@@ -208,6 +215,9 @@ function logMcpCall(logger: RequestLogger, mcpCounter: MCPCallCounter, toolName:
   }
 }
 
+/**
+ * Execute a single pending MCP call, tracking it in the counter and resolving/rejecting the VM promise.
+ */
 async function executePendingCall(
   vm: QuickJSContext,
   call: PendingCall,
@@ -224,6 +234,10 @@ async function executePendingCall(
   }
 }
 
+/**
+ * Process all pending MCP calls in batches until no more remain.
+ * @throws {MCPCallLimitError} If a batch would exceed the configured limit
+ */
 async function processPendingCalls(
   vm: QuickJSContext,
   pendingCalls: PendingCall[],
@@ -334,14 +348,18 @@ function buildSuccessResult(
   startTime: number,
   mcpCounter: MCPCallCounter
 ): CodeExecutionResult {
-  return {
+  const result: CodeExecutionResult = {
     success: true,
     result: value,
     logs,
     duration_ms: Date.now() - startTime,
-    callsMade: mcpCounter.count,
-    callLimit: mcpCounter.limit,
   };
+  // Only include call info when MCP calls were made
+  if (mcpCounter.count > 0) {
+    result.callsMade = mcpCounter.count;
+    result.callLimit = mcpCounter.limit;
+  }
+  return result;
 }
 
 function buildErrorResult(

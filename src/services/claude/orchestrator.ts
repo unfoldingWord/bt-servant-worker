@@ -31,6 +31,15 @@ const MAX_CODE_LENGTH = 100_000;
 /** Maximum number of tool names that can be requested at once */
 const MAX_TOOL_NAMES = 100;
 
+/** Maximum length of input to include in error messages */
+const MAX_ERROR_INPUT_LENGTH = 100;
+
+/** Truncate input for safe inclusion in error messages */
+function truncateInput(input: unknown): string {
+  const str = JSON.stringify(input);
+  return str.length <= MAX_ERROR_INPUT_LENGTH ? str : str.slice(0, MAX_ERROR_INPUT_LENGTH) + '...';
+}
+
 interface OrchestratorOptions {
   env: Env;
   catalog: ToolCatalog;
@@ -349,7 +358,7 @@ async function dispatchToolCall(
   if (toolCall.name === 'execute_code') {
     if (!isExecuteCodeInput(toolCall.input)) {
       throw new ValidationError(
-        `Invalid input for execute_code: expected { code: string }, got ${JSON.stringify(toolCall.input)}`
+        `Invalid input for execute_code: expected { code: string }, got ${truncateInput(toolCall.input)}`
       );
     }
     return handleExecuteCode(toolCall.input, ctx);
@@ -357,7 +366,7 @@ async function dispatchToolCall(
   if (toolCall.name === 'get_tool_definitions') {
     if (!isGetToolDefinitionsInput(toolCall.input)) {
       throw new ValidationError(
-        `Invalid input for get_tool_definitions: expected { tool_names: string[] }, got ${JSON.stringify(toolCall.input)}`
+        `Invalid input for get_tool_definitions: expected { tool_names: string[] }, got ${truncateInput(toolCall.input)}`
       );
     }
     return getToolDefinitions(ctx.catalog, toolCall.input.tool_names);
@@ -429,6 +438,7 @@ async function handleExecuteCode(
         limit: result.callLimit,
         logs: result.logs,
         suggestion:
+          `You made ${result.callsMade} MCP calls but the limit is ${result.callLimit}. ` +
           'Ask user to narrow scope, or fetch summary instead of individual items. ' +
           'Offer to continue in batches.',
       };
