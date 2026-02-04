@@ -78,7 +78,7 @@ bt-servant-worker processes chat requests **one at a time per user** to ensure c
 
 ### How It Works
 
-Each user's chat session is handled by a dedicated Durable Object instance. When a request arrives:
+Each user's chat session is handled by a dedicated Durable Object instance. When a request arrives at `/chat` or `/stream`:
 
 1. The DO checks if another request is currently processing (via a storage lock)
 2. If **not locked**: acquire lock, process request, release lock
@@ -89,7 +89,11 @@ Each user's chat session is handled by a dedicated Durable Object instance. When
 API consumers **must** implement retry logic for 429 responses:
 
 ```typescript
-async function sendChatRequest(message: string, userId: string): Promise<ChatResponse> {
+async function sendChatRequest(
+  message: string,
+  userId: string,
+  org: string
+): Promise<ChatResponse> {
   const maxRetries = 10;
   const baseDelay = 2000; // Start with 2 second delay
 
@@ -129,7 +133,7 @@ async function sendChatRequest(message: string, userId: string): Promise<ChatRes
 ```json
 {
   "error": "Request in progress",
-  "code": "CONCURRENT_REQUEST",
+  "code": "CONCURRENT_REQUEST_REJECTED",
   "message": "Another request for this user is currently being processed. Please retry.",
   "retry_after_ms": 5000
 }

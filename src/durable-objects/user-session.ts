@@ -52,6 +52,7 @@ const HISTORY_KEY = 'history';
 const PREFERENCES_KEY = 'preferences';
 const PROCESSING_LOCK_KEY = '_processing_lock';
 const LOCK_STALE_THRESHOLD_MS = 90000; // 90 seconds
+const RETRY_AFTER_SECONDS = 5;
 
 /**
  * Validates ISO 639-1 language code format (2 lowercase letters).
@@ -67,6 +68,16 @@ const DEFAULT_PREFERENCES: UserPreferencesInternal = {
   response_language: 'en',
   first_interaction: true,
 };
+
+/** Create a standardized error response */
+function createErrorResponse(
+  error: string,
+  code: string,
+  message: string,
+  status: number
+): Response {
+  return Response.json({ error, code, message }, { status });
+}
 
 export class UserSession {
   private state: DurableObjectState;
@@ -95,7 +106,7 @@ export class UserSession {
         const userId = url.searchParams.get('user_id') || 'unknown';
         console.warn(
           JSON.stringify({
-            event: 'concurrent_request_rejected',
+            event: 'CONCURRENT_REQUEST_REJECTED',
             user_id: userId,
             timestamp: Date.now(),
           })
@@ -103,15 +114,15 @@ export class UserSession {
         return new Response(
           JSON.stringify({
             error: 'Request in progress',
-            code: 'CONCURRENT_REQUEST',
+            code: 'CONCURRENT_REQUEST_REJECTED',
             message: 'Another request for this user is currently being processed. Please retry.',
-            retry_after_ms: 5000,
+            retry_after_ms: RETRY_AFTER_SECONDS * 1000,
           }),
           {
             status: 429,
             headers: {
               'Content-Type': 'application/json',
-              'Retry-After': '5',
+              'Retry-After': String(RETRY_AFTER_SECONDS),
             },
           }
         );
@@ -198,9 +209,10 @@ export class UserSession {
       const totalDuration = Date.now() - startTime;
       logger.error('do_chat_error', error, { total_duration_ms: totalDuration });
       if (error instanceof ValidationError) {
-        return Response.json({ error: error.message }, { status: 400 });
+        return createErrorResponse('Validation error', 'VALIDATION_ERROR', error.message, 400);
       }
-      return Response.json({ error: 'Internal server error' }, { status: 500 });
+      const msg = 'An unexpected error occurred while processing your request.';
+      return createErrorResponse('Internal server error', 'INTERNAL_ERROR', msg, 500);
     }
   }
 

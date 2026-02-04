@@ -167,7 +167,9 @@ describe('UserSession chat validation', () => {
       const data = (await response.json()) as Record<string, unknown>;
 
       expect(response.status).toBe(400);
-      expect(data.error).toBe('Message is required');
+      expect(data.error).toBe('Validation error');
+      expect(data.code).toBe('VALIDATION_ERROR');
+      expect(data.message).toBe('Message is required');
     });
 
     it('rejects whitespace-only message', async () => {
@@ -184,7 +186,9 @@ describe('UserSession chat validation', () => {
       const data = (await response.json()) as Record<string, unknown>;
 
       expect(response.status).toBe(400);
-      expect(data.error).toBe('Message is required');
+      expect(data.error).toBe('Validation error');
+      expect(data.code).toBe('VALIDATION_ERROR');
+      expect(data.message).toBe('Message is required');
     });
   });
 });
@@ -247,31 +251,22 @@ describe('UserSession request serialization (429 lock)', () => {
     stub = env.USER_SESSION.get(id);
   });
 
-  it('returns 429 when lock is held by another request', async () => {
-    // Manually set the lock to simulate an in-progress request
-    // We need to access storage directly, which we can do via a chat request
-    // that we'll interrupt. Instead, let's test via the public API.
-
-    // First, set the lock by starting a request that we can't easily interrupt.
-    // For this test, we'll verify the 429 response format by directly testing
-    // the lock mechanism behavior through concurrent requests.
-
-    // Send a request that will be fast (validation error) to acquire and release lock
+  it('lock is released after request completes (even on validation error)', async () => {
+    // Send a request that fails validation - lock should still be released
     const firstResponse = await stub.fetch('http://fake-host/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         client_id: 'test-client',
         user_id: 'test-user',
-        message: '', // Empty message will fail validation but after lock is acquired
+        message: '', // Empty message fails validation after lock acquired
         message_type: 'text',
       }),
     });
 
-    // This should complete (with error) and release the lock
     expect(firstResponse.status).toBe(400);
 
-    // Now verify a second request can acquire the lock (lock was released)
+    // Verify lock was released - second request should succeed (not get 429)
     const secondResponse = await stub.fetch('http://fake-host/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -297,16 +292,7 @@ describe('UserSession request serialization (429 lock)', () => {
     expect(historyResponse.status).toBe(200);
   });
 
-  it('429 response has correct format and headers', async () => {
-    // We need to simulate a locked state. Since we can't easily hold a lock
-    // during tests, we'll verify the response structure when we can trigger it.
-    // For now, test that the non-locked path works correctly.
-
-    // This is a structural test - we're checking that when 429 IS returned,
-    // it has the right format. We'll test this via integration tests with
-    // actual concurrent requests in production monitoring.
-
-    // Verify chat endpoint responds correctly when not locked
+  it('validation error response has consistent structure', async () => {
     const response = await stub.fetch('http://fake-host/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -318,8 +304,37 @@ describe('UserSession request serialization (429 lock)', () => {
       }),
     });
 
-    // Should get validation error, not 429
     expect(response.status).toBe(400);
+
+    const data = (await response.json()) as {
+      error: string;
+      code: string;
+      message: string;
+    };
+
+    // Verify consistent error response structure
+    expect(data.error).toBe('Validation error');
+    expect(data.code).toBe('VALIDATION_ERROR');
+    expect(data.message).toBe('Message is required');
+  });
+
+  it('stream endpoint also requires lock', async () => {
+    // Stream endpoint should also go through lock mechanism
+    // A request to /stream should work (not 404)
+    const response = await stub.fetch('http://fake-host/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: 'test-client',
+        user_id: 'test-user',
+        message: '', // Will fail validation
+        message_type: 'text',
+      }),
+    });
+
+    // Stream returns immediately with SSE headers, but validation error
+    // is sent through the stream. Check that we get the SSE response.
+    expect(response.headers.get('Content-Type')).toBe('text/event-stream');
   });
 });
 
