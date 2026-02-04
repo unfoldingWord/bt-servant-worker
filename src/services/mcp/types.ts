@@ -2,18 +2,9 @@
  * MCP (Model Context Protocol) types for tool discovery and execution
  */
 
-/**
- * MCP server configuration stored in Durable Object
- */
-export interface MCPServerConfig {
-  id: string;
-  name: string;
-  url: string;
-  authToken?: string;
-  enabled: boolean;
-  priority: number;
-  allowedTools?: string[];
-}
+// Import and re-export MCPServerConfig from shared types to avoid circular imports
+import { MCPServerConfig } from '../../types/mcp.js';
+export type { MCPServerConfig } from '../../types/mcp.js';
 
 /**
  * JSON Schema for tool parameters

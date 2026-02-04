@@ -2,23 +2,7 @@
  * API contract types matching bt-servant-web-client and bt-servant-whatsapp-gateway
  */
 
-/**
- * MCP server config for internal use in ChatRequest.
- * This is a subset of MCPServerConfig - the full type is in services/mcp/types.ts.
- * Duplicated here to avoid circular import (types should not depend on services).
- *
- * TODO: Consider moving MCPServerConfig to src/types/ to eliminate this duplication.
- * If the types drift, update both places or refactor.
- */
-interface InternalMCPServerConfig {
-  id: string;
-  name: string;
-  url: string;
-  authToken?: string;
-  enabled: boolean;
-  priority: number;
-  allowedTools?: string[];
-}
+import { MCPServerConfig } from './mcp.js';
 
 export interface ChatRequest {
   client_id: string;
@@ -33,7 +17,7 @@ export interface ChatRequest {
   org?: string; // Organization for MCP server selection (defaults to DEFAULT_ORG)
 
   /** Internal: MCP servers injected by worker (not from client) */
-  _mcp_servers?: InternalMCPServerConfig[];
+  _mcp_servers?: MCPServerConfig[];
 }
 
 export interface ChatResponse {
