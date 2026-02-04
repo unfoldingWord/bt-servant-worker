@@ -3,6 +3,9 @@
  *
  * These tests run in the actual Cloudflare Workers runtime (via miniflare)
  * and test the real Durable Object implementation.
+ *
+ * NOTE: MCP server admin endpoints have been moved to the worker (using KV).
+ * Tests for those endpoints are in worker-admin.test.ts.
  */
 
 /* eslint-disable max-lines-per-function */
@@ -186,186 +189,82 @@ describe('UserSession chat validation', () => {
   });
 });
 
-describe('UserSession MCP Server Admin', () => {
-  let stub: DurableObjectStub;
+describe('UserSession user-scoped DO isolation', () => {
+  it('different users have separate history', async () => {
+    // Create two user-scoped DOs (same format as the worker uses)
+    const aliceStub = env.USER_SESSION.get(env.USER_SESSION.idFromName('user:test-org:alice'));
+    const bobStub = env.USER_SESSION.get(env.USER_SESSION.idFromName('user:test-org:bob'));
 
-  beforeEach(() => {
-    // Use org-prefixed ID like the real admin routes do
-    const id = env.USER_SESSION.idFromName('org:test-org');
-    stub = env.USER_SESSION.get(id);
+    // Update Alice's preferences
+    await aliceStub.fetch('http://fake-host/preferences', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ response_language: 'es' }),
+    });
+
+    // Update Bob's preferences
+    await bobStub.fetch('http://fake-host/preferences', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ response_language: 'fr' }),
+    });
+
+    // Verify Alice still has Spanish
+    const alicePrefs = await aliceStub.fetch('http://fake-host/preferences');
+    const aliceData = (await alicePrefs.json()) as { response_language: string };
+    expect(aliceData.response_language).toBe('es');
+
+    // Verify Bob has French
+    const bobPrefs = await bobStub.fetch('http://fake-host/preferences');
+    const bobData = (await bobPrefs.json()) as { response_language: string };
+    expect(bobData.response_language).toBe('fr');
   });
 
-  describe('GET /mcp-servers', () => {
-    it('returns empty array for org with no servers', async () => {
-      const response = await stub.fetch('http://fake-host/mcp-servers?org=test-org');
-      const data = (await response.json()) as { org: string; servers: unknown[] };
+  it('users in different orgs are isolated', async () => {
+    // Same user ID, different orgs
+    const org1Stub = env.USER_SESSION.get(env.USER_SESSION.idFromName('user:org1:alice'));
+    const org2Stub = env.USER_SESSION.get(env.USER_SESSION.idFromName('user:org2:alice'));
 
-      expect(response.status).toBe(200);
-      expect(data.org).toBe('test-org');
-      expect(data.servers).toEqual([]);
+    // Update org1 alice's preferences
+    await org1Stub.fetch('http://fake-host/preferences', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ response_language: 'es' }),
     });
+
+    // Verify org2 alice still has default (English)
+    const org2Prefs = await org2Stub.fetch('http://fake-host/preferences');
+    const org2Data = (await org2Prefs.json()) as { response_language: string };
+    expect(org2Data.response_language).toBe('en');
   });
+});
 
-  describe('POST /mcp-servers', () => {
-    it('adds a valid MCP server', async () => {
-      const server = {
-        id: 'test-server',
-        name: 'Test Server',
-        url: 'https://example.com/mcp',
-        enabled: true,
-        priority: 1,
-      };
+describe('UserSession cleanup endpoint', () => {
+  it('deletes all storage when cleanup is called', async () => {
+    const stub = env.USER_SESSION.get(env.USER_SESSION.idFromName('user:cleanup-test:user1'));
 
-      const response = await stub.fetch('http://fake-host/mcp-servers?org=test-org', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(server),
-      });
-      const data = (await response.json()) as { servers: { id: string }[] };
-
-      expect(response.status).toBe(200);
-      expect(data.servers).toHaveLength(1);
-      expect(data.servers[0].id).toBe('test-server');
+    // Set some preferences
+    await stub.fetch('http://fake-host/preferences', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ response_language: 'de' }),
     });
 
-    it('rejects server with invalid URL', async () => {
-      const server = {
-        id: 'test-server',
-        name: 'Test Server',
-        url: 'not-a-valid-url',
-        enabled: true,
-        priority: 1,
-      };
+    // Verify preferences are set
+    const before = await stub.fetch('http://fake-host/preferences');
+    const beforeData = (await before.json()) as { response_language: string };
+    expect(beforeData.response_language).toBe('de');
 
-      const response = await stub.fetch('http://fake-host/mcp-servers?org=test-org', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(server),
-      });
-
-      expect(response.status).toBe(400);
+    // Call cleanup
+    const cleanupResponse = await stub.fetch('http://fake-host/cleanup', {
+      method: 'POST',
     });
+    expect(cleanupResponse.status).toBe(200);
 
-    it('rejects server with invalid ID format', async () => {
-      const server = {
-        id: 'invalid id with spaces!',
-        name: 'Test Server',
-        url: 'https://example.com/mcp',
-        enabled: true,
-        priority: 1,
-      };
-
-      const response = await stub.fetch('http://fake-host/mcp-servers?org=test-org', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(server),
-      });
-
-      expect(response.status).toBe(400);
-    });
-
-    it('accepts http URLs for local development', async () => {
-      // HTTP URLs are allowed for local development scenarios
-      const server = {
-        id: 'test-server',
-        name: 'Test Server',
-        url: 'http://example.com/mcp',
-        enabled: true,
-        priority: 1,
-      };
-
-      const response = await stub.fetch('http://fake-host/mcp-servers?org=test-org', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(server),
-      });
-
-      expect(response.status).toBe(200);
-    });
-  });
-
-  describe('PUT /mcp-servers', () => {
-    it('replaces all servers for an org', async () => {
-      const servers = [
-        { id: 'server-1', name: 'Server 1', url: 'https://a.com', enabled: true, priority: 1 },
-        { id: 'server-2', name: 'Server 2', url: 'https://b.com', enabled: true, priority: 2 },
-      ];
-
-      const response = await stub.fetch('http://fake-host/mcp-servers?org=test-org', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(servers),
-      });
-      const data = (await response.json()) as { servers: unknown[] };
-
-      expect(response.status).toBe(200);
-      expect(data.servers).toHaveLength(2);
-    });
-
-    it('rejects non-array body', async () => {
-      const response = await stub.fetch('http://fake-host/mcp-servers?org=test-org', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: 'single-server' }),
-      });
-
-      expect(response.status).toBe(400);
-    });
-  });
-
-  describe('DELETE /mcp-servers/:serverId', () => {
-    it('removes a server by ID', async () => {
-      // Use unique org to avoid state conflicts with other tests
-      const deleteStub = env.USER_SESSION.get(env.USER_SESSION.idFromName('org:delete-test-org'));
-
-      // First add a server
-      await deleteStub.fetch('http://fake-host/mcp-servers?org=delete-test-org', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          id: 'to-delete',
-          name: 'Delete Me',
-          url: 'https://delete.com',
-          enabled: true,
-          priority: 1,
-        }),
-      });
-
-      // Then delete it
-      const response = await deleteStub.fetch(
-        'http://fake-host/mcp-servers/to-delete?org=delete-test-org',
-        { method: 'DELETE' }
-      );
-      const data = (await response.json()) as { servers: unknown[] };
-
-      expect(response.status).toBe(200);
-      expect(data.servers).toHaveLength(0);
-    });
-  });
-
-  describe('org isolation', () => {
-    it('servers from one org are not visible to another', async () => {
-      // Add server to test-org
-      const org1Stub = env.USER_SESSION.get(env.USER_SESSION.idFromName('org:test-org-1'));
-      await org1Stub.fetch('http://fake-host/mcp-servers?org=test-org-1', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          id: 'org1-server',
-          name: 'Org 1 Server',
-          url: 'https://org1.com',
-          enabled: true,
-          priority: 1,
-        }),
-      });
-
-      // Check test-org-2 doesn't see it
-      const org2Stub = env.USER_SESSION.get(env.USER_SESSION.idFromName('org:test-org-2'));
-      const response = await org2Stub.fetch('http://fake-host/mcp-servers?org=test-org-2');
-      const data = (await response.json()) as { servers: unknown[] };
-
-      expect(data.servers).toHaveLength(0);
-    });
+    // Verify preferences are reset to default
+    const after = await stub.fetch('http://fake-host/preferences');
+    const afterData = (await after.json()) as { response_language: string };
+    expect(afterData.response_language).toBe('en');
   });
 });
 

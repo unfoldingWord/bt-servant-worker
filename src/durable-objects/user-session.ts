@@ -2,7 +2,10 @@
  * UserSession Durable Object
  *
  * Provides per-user request serialization (only one request per user at a time),
- * chat history storage, MCP server registry, and user preferences.
+ * chat history storage, and user preferences.
+ *
+ * MCP server configuration is passed in via the request body (from KV in the worker),
+ * not stored in the DO anymore.
  *
  * DESIGN NOTE: Request Serialization
  * ----------------------------------
@@ -24,15 +27,7 @@
 import { Hono } from 'hono';
 import { Env } from '../config/types.js';
 import { orchestrate } from '../services/claude/index.js';
-import {
-  addMCPServer,
-  buildToolCatalog,
-  discoverAllTools,
-  getEnabledMCPServers,
-  getMCPServers,
-  removeMCPServer,
-  updateMCPServers,
-} from '../services/mcp/index.js';
+import { buildToolCatalog, discoverAllTools, getMCPServers } from '../services/mcp/index.js';
 import { MCPServerConfig } from '../services/mcp/types.js';
 import {
   createWebhookCallbacks,
@@ -56,10 +51,6 @@ import { createRequestLogger, RequestLogger } from '../utils/logger.js';
 const MAX_HISTORY_ENTRIES = 50;
 const HISTORY_KEY = 'history';
 const PREFERENCES_KEY = 'preferences';
-
-/** Default rate limiting for admin endpoints (can be overridden via env vars) */
-const DEFAULT_ADMIN_RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute window
-const DEFAULT_ADMIN_RATE_LIMIT_MAX_REQUESTS = 100; // max requests per window
 
 /**
  * Validates ISO 639-1 language code format (2 lowercase letters).
@@ -92,14 +83,11 @@ export class UserSession {
     this.app.put('/preferences', (c) => this.handleUpdatePreferences(c.req.raw));
     this.app.get('/history', (c) => this.handleGetHistory(new URL(c.req.url)));
 
-    // MCP server management (admin routes)
-    this.app.get('/mcp-servers', (c) => this.handleGetMCPServers(new URL(c.req.url)));
-    this.app.put('/mcp-servers', (c) => this.handleReplaceMCPServers(c.req.raw));
-    this.app.post('/mcp-servers', (c) => this.handleAddMCPServer(c.req.raw));
-    this.app.delete('/mcp-servers/:serverId', (c) => {
-      const serverId = c.req.param('serverId');
-      return this.handleDeleteMCPServer(new URL(c.req.url), serverId);
-    });
+    // Migration support: read MCP servers from DO storage (for migrate-mcp-to-kv endpoint)
+    this.app.get('/mcp-servers', (c) => this.handleGetMCPServersForMigration(new URL(c.req.url)));
+
+    // Cleanup endpoint for deleting org DO storage
+    this.app.post('/cleanup', () => this.handleCleanup());
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -262,6 +250,25 @@ export class UserSession {
     return Response.json(response);
   }
 
+  /**
+   * Migration support: read MCP servers from DO storage.
+   * Used by the migrate-mcp-to-kv endpoint to extract config before moving to KV.
+   */
+  private async handleGetMCPServersForMigration(url: URL): Promise<Response> {
+    const org = url.searchParams.get('org') ?? this.env.DEFAULT_ORG;
+    const servers = await getMCPServers(this.state.storage, org);
+    return Response.json({ org, servers });
+  }
+
+  /**
+   * Cleanup handler for deleting all storage in this DO.
+   * Used after migration to clean up org DO instances.
+   */
+  private async handleCleanup(): Promise<Response> {
+    await this.state.storage.deleteAll();
+    return Response.json({ success: true });
+  }
+
   private async processStreamingChat(
     body: ChatRequest,
     sendEvent: (event: SSEEvent) => Promise<void>,
@@ -305,9 +312,14 @@ export class UserSession {
     return { preferences, history };
   }
 
-  private async discoverMCPTools(org: string, logger: RequestLogger) {
+  /**
+   * Build MCP tool catalog from servers passed via request body.
+   * MCP config is now stored in KV and passed from the worker.
+   */
+  private async discoverMCPTools(mcpServers: MCPServerConfig[], logger: RequestLogger) {
     const startTime = Date.now();
-    const servers = await getEnabledMCPServers(this.state.storage, org);
+    // Filter to enabled servers and sort by priority
+    const servers = mcpServers.filter((s) => s.enabled).sort((a, b) => a.priority - b.priority);
     const manifests = await discoverAllTools(servers, logger);
     const catalog = buildToolCatalog(manifests, servers, logger);
     logger.log('mcp_catalog_built', {
@@ -345,9 +357,10 @@ export class UserSession {
       throw new ValidationError('Message is required');
     }
 
-    const org = body.org ?? this.env.DEFAULT_ORG;
     const { preferences, history } = await this.loadUserContext(logger);
-    const catalog = await this.discoverMCPTools(org, logger);
+    // Use MCP servers from request body (injected by worker from KV)
+    const mcpServers = body._mcp_servers ?? [];
+    const catalog = await this.discoverMCPTools(mcpServers, logger);
 
     const startTime = Date.now();
     const responses = await orchestrate(body.message, {
@@ -394,263 +407,5 @@ export class UserSession {
 
   private async updatePreferences(preferences: UserPreferencesInternal): Promise<void> {
     await this.state.storage.put(PREFERENCES_KEY, preferences);
-  }
-
-  // ==================== Rate Limiting ====================
-
-  /** Get configured rate limit window (ms) */
-  private getRateLimitWindow(): number {
-    return this.env.ADMIN_RATE_LIMIT_WINDOW_MS
-      ? parseInt(this.env.ADMIN_RATE_LIMIT_WINDOW_MS, 10)
-      : DEFAULT_ADMIN_RATE_LIMIT_WINDOW_MS;
-  }
-
-  /** Get configured rate limit max requests */
-  private getRateLimitMax(): number {
-    return this.env.ADMIN_RATE_LIMIT_MAX
-      ? parseInt(this.env.ADMIN_RATE_LIMIT_MAX, 10)
-      : DEFAULT_ADMIN_RATE_LIMIT_MAX_REQUESTS;
-  }
-
-  /**
-   * Check rate limit for admin endpoints.
-   * Returns null if within limit, or a 429 Response if rate limited.
-   */
-  private async checkAdminRateLimit(org: string): Promise<Response | null> {
-    const key = `rate_limit:admin:${org}`;
-    const now = Date.now();
-    const windowMs = this.getRateLimitWindow();
-    const maxRequests = this.getRateLimitMax();
-
-    const data = await this.state.storage.get<{ count: number; windowStart: number }>(key);
-
-    if (!data || now - data.windowStart > windowMs) {
-      // Start new window
-      await this.state.storage.put(key, { count: 1, windowStart: now });
-      return null;
-    }
-
-    if (data.count >= maxRequests) {
-      const retryAfter = Math.ceil((data.windowStart + windowMs - now) / 1000);
-      return new Response(
-        JSON.stringify({
-          error: 'Rate limit exceeded',
-          retry_after_seconds: retryAfter,
-        }),
-        {
-          status: 429,
-          headers: {
-            'Content-Type': 'application/json',
-            'Retry-After': String(retryAfter),
-          },
-        }
-      );
-    }
-
-    // Increment count
-    await this.state.storage.put(key, { count: data.count + 1, windowStart: data.windowStart });
-    return null;
-  }
-
-  // ==================== MCP Server Management ====================
-
-  /** Max length for server ID and name to prevent DoS */
-  private static readonly MAX_SERVER_ID_LENGTH = 64;
-  private static readonly MAX_SERVER_NAME_LENGTH = 128;
-  private static readonly MAX_SERVERS_PER_ORG = 50;
-  private static readonly SERVER_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
-
-  private validateServerId(id: unknown): string | null {
-    if (!id || typeof id !== 'string') return 'Server id is required and must be a string';
-    if (id.length > UserSession.MAX_SERVER_ID_LENGTH) {
-      return `Server id must be <= ${UserSession.MAX_SERVER_ID_LENGTH} characters`;
-    }
-    if (!UserSession.SERVER_ID_PATTERN.test(id)) {
-      return 'Server id must contain only alphanumeric characters, hyphens, and underscores';
-    }
-    return null;
-  }
-
-  private validateServerUrl(url: unknown): string | null {
-    if (!url || typeof url !== 'string') return 'Server url is required and must be a string';
-    try {
-      const parsed = new URL(url);
-      if (!['http:', 'https:'].includes(parsed.protocol)) {
-        return 'Server url must use http or https protocol';
-      }
-    } catch {
-      return 'Server url must be a valid URL';
-    }
-    return null;
-  }
-
-  private validateServerName(name: unknown): string | null {
-    if (name === undefined) return null;
-    if (typeof name !== 'string') return 'Server name must be a string';
-    if (name.length > UserSession.MAX_SERVER_NAME_LENGTH) {
-      return `Server name must be <= ${UserSession.MAX_SERVER_NAME_LENGTH} characters`;
-    }
-    return null;
-  }
-
-  private validateServerPriority(priority: unknown): string | null {
-    if (priority === undefined) return null;
-    if (typeof priority !== 'number' || priority < 0 || priority > 100) {
-      return 'Server priority must be a number between 0 and 100';
-    }
-    return null;
-  }
-
-  private validateAllowedTools(allowedTools: unknown): string | null {
-    if (allowedTools === undefined) return null;
-    if (!Array.isArray(allowedTools)) return 'allowedTools must be an array of strings';
-    if (!allowedTools.every((t) => typeof t === 'string')) {
-      return 'allowedTools must contain only strings';
-    }
-    return null;
-  }
-
-  private validateOptionalFields(server: MCPServerConfig): string | null {
-    return (
-      this.validateServerName(server.name) ||
-      this.validateServerPriority(server.priority) ||
-      this.validateAllowedTools(server.allowedTools)
-    );
-  }
-
-  /** Validate MCP server config. Returns error message if invalid, null if valid */
-  private validateServerConfig(server: MCPServerConfig): string | null {
-    return (
-      this.validateServerId(server.id) ||
-      this.validateServerUrl(server.url) ||
-      this.validateOptionalFields(server)
-    );
-  }
-
-  private logAdminAction(action: string, org: string, details: Record<string, unknown> = {}): void {
-    // Use stderr for admin audit logs (allowed by linter)
-    console.error(
-      JSON.stringify({ event: 'admin_action', timestamp: Date.now(), action, org, ...details })
-    );
-  }
-
-  private async handleGetMCPServers(url: URL): Promise<Response> {
-    const org = url.searchParams.get('org') ?? this.env.DEFAULT_ORG;
-    const discover = url.searchParams.get('discover') === 'true';
-
-    const rateLimited = await this.checkAdminRateLimit(org);
-    if (rateLimited) return rateLimited;
-
-    const servers = await getMCPServers(this.state.storage, org);
-    this.logAdminAction('list_mcp_servers', org, { server_count: servers.length, discover });
-
-    // If discover=true, run discovery and include status/errors in response
-    if (discover && servers.length > 0) {
-      const enabledServers = servers.filter((s) => s.enabled);
-      const logger = createRequestLogger(crypto.randomUUID());
-      const manifests = await discoverAllTools(enabledServers, logger);
-
-      // Build server status map including discovery results
-      const serverStatuses = servers.map((server) => {
-        const manifest = manifests.find((m) => m.serverId === server.id);
-        return {
-          ...server,
-          discovery_status: manifest ? (manifest.error ? 'error' : 'ok') : 'skipped',
-          discovery_error: manifest?.error ?? null,
-          tools_count: manifest?.tools.length ?? 0,
-        };
-      });
-
-      return Response.json({ org, servers: serverStatuses });
-    }
-
-    return Response.json({ org, servers });
-  }
-
-  private async handleReplaceMCPServers(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    const org = url.searchParams.get('org') ?? this.env.DEFAULT_ORG;
-
-    const rateLimited = await this.checkAdminRateLimit(org);
-    if (rateLimited) return rateLimited;
-
-    const servers = (await request.json()) as MCPServerConfig[];
-
-    if (!Array.isArray(servers)) {
-      return Response.json(
-        { error: 'Request body must be an array of server configs' },
-        { status: 400 }
-      );
-    }
-
-    if (servers.length > UserSession.MAX_SERVERS_PER_ORG) {
-      return Response.json(
-        { error: `Cannot have more than ${UserSession.MAX_SERVERS_PER_ORG} servers per org` },
-        { status: 400 }
-      );
-    }
-
-    for (const server of servers) {
-      const error = this.validateServerConfig(server);
-      if (error) {
-        return Response.json({ error, server_id: server.id }, { status: 400 });
-      }
-    }
-
-    await updateMCPServers(this.state.storage, org, servers);
-    this.logAdminAction('replace_mcp_servers', org, {
-      server_count: servers.length,
-      server_ids: servers.map((s) => s.id),
-    });
-    return Response.json({ org, servers, message: 'MCP servers updated' });
-  }
-
-  private async handleAddMCPServer(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    const org = url.searchParams.get('org') ?? this.env.DEFAULT_ORG;
-
-    const rateLimited = await this.checkAdminRateLimit(org);
-    if (rateLimited) return rateLimited;
-
-    const body = (await request.json()) as Partial<MCPServerConfig>;
-    // Default enabled to true if not specified
-    const server: MCPServerConfig = {
-      ...body,
-      enabled: body.enabled ?? true,
-    } as MCPServerConfig;
-
-    const error = this.validateServerConfig(server);
-    if (error) {
-      return Response.json({ error }, { status: 400 });
-    }
-
-    const existing = await getMCPServers(this.state.storage, org);
-    if (existing.length >= UserSession.MAX_SERVERS_PER_ORG) {
-      return Response.json(
-        { error: `Cannot have more than ${UserSession.MAX_SERVERS_PER_ORG} servers per org` },
-        { status: 400 }
-      );
-    }
-
-    await addMCPServer(this.state.storage, org, server);
-    const servers = await getMCPServers(this.state.storage, org);
-    this.logAdminAction('add_mcp_server', org, { server_id: server.id, server_url: server.url });
-    return Response.json({ org, servers, message: 'MCP server added' });
-  }
-
-  private async handleDeleteMCPServer(url: URL, serverId: string): Promise<Response> {
-    const org = url.searchParams.get('org') ?? this.env.DEFAULT_ORG;
-
-    const rateLimited = await this.checkAdminRateLimit(org);
-    if (rateLimited) return rateLimited;
-
-    if (!serverId) {
-      return Response.json({ error: 'Server ID is required' }, { status: 400 });
-    }
-
-    await removeMCPServer(this.state.storage, org, serverId);
-    const servers = await getMCPServers(this.state.storage, org);
-    this.logAdminAction('remove_mcp_server', org, { server_id: serverId });
-    return Response.json({ org, servers, message: 'MCP server removed' });
   }
 }
