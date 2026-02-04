@@ -75,13 +75,20 @@ export function buildSystemPrompt(
 
 /**
  * Convert chat history to Anthropic message format
+ *
+ * @param history - Full chat history from storage
+ * @param maxForLLM - Maximum number of turns to include (for token efficiency)
  */
 export function historyToMessages(
-  history: ChatHistoryEntry[]
+  history: ChatHistoryEntry[],
+  maxForLLM?: number
 ): Array<{ role: 'user' | 'assistant'; content: string }> {
+  // Truncate history to most recent entries if limit is specified
+  const truncated = maxForLLM !== undefined ? history.slice(-maxForLLM) : history;
+
   const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
 
-  for (const entry of history) {
+  for (const entry of truncated) {
     messages.push({ role: 'user', content: entry.user_message });
     messages.push({ role: 'assistant', content: entry.assistant_response });
   }

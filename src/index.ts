@@ -11,6 +11,7 @@ import { UserSession } from './durable-objects/index.js';
 import { discoverAllTools } from './services/mcp/index.js';
 import { MCPServerConfig } from './services/mcp/types.js';
 import { ChatRequest } from './types/engine.js';
+import { DEFAULT_ORG_CONFIG, OrgConfig, validateOrgConfig } from './types/org-config.js';
 import { constantTimeCompare } from './utils/crypto.js';
 import { createRequestLogger } from './utils/logger.js';
 import {
@@ -226,6 +227,83 @@ app.delete('/api/v1/admin/orgs/:org/mcp-servers/:serverId', async (c) => {
   }
 });
 
+// Admin endpoints for org config management
+app.get('/api/v1/admin/orgs/:org/config', async (c) => {
+  const org = c.req.param('org');
+
+  try {
+    const stored = (await c.env.ORG_CONFIG.get<OrgConfig>(org, 'json')) ?? {};
+    const merged = { ...DEFAULT_ORG_CONFIG, ...stored };
+
+    logAdminAction('get_org_config', org, { config: merged });
+    return c.json({ org, config: merged });
+  } catch (error) {
+    // Return defaults with warning on read failure (matches chat flow behavior)
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    logAdminAction('get_org_config_error', org, { error: errorMsg });
+    return c.json({
+      org,
+      config: DEFAULT_ORG_CONFIG,
+      warning: 'Failed to read org config from storage, returning defaults',
+    });
+  }
+});
+
+app.put('/api/v1/admin/orgs/:org/config', async (c) => {
+  const org = c.req.param('org');
+  const updates = (await c.req.json()) as OrgConfig;
+
+  const validationError = validateOrgConfig(updates);
+  if (validationError) {
+    return c.json({ error: validationError }, 400);
+  }
+
+  try {
+    // Merge with existing config (upsert behavior)
+    // NOTE: This read-modify-write pattern can race with concurrent requests (last write wins).
+    // This is acceptable for admin endpoints which are low-volume and authenticated.
+    const existing = (await c.env.ORG_CONFIG.get<OrgConfig>(org, 'json')) ?? {};
+    const merged: OrgConfig = { ...existing };
+
+    if (updates.max_history_storage !== undefined) {
+      merged.max_history_storage = updates.max_history_storage;
+    }
+    if (updates.max_history_llm !== undefined) {
+      merged.max_history_llm = updates.max_history_llm;
+    }
+
+    // Re-validate merged config for cross-field constraints
+    const mergedValidationError = validateOrgConfig(merged);
+    if (mergedValidationError) {
+      return c.json({ error: mergedValidationError }, 400);
+    }
+
+    await c.env.ORG_CONFIG.put(org, JSON.stringify(merged));
+    logAdminAction('update_org_config', org, { config: merged });
+
+    const withDefaults = { ...DEFAULT_ORG_CONFIG, ...merged };
+    return c.json({ org, config: withDefaults, message: 'Org config updated' });
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    logAdminAction('update_org_config_error', org, { error: errorMsg });
+    return c.json({ error: 'Failed to update org config in storage' }, 500);
+  }
+});
+
+app.delete('/api/v1/admin/orgs/:org/config', async (c) => {
+  const org = c.req.param('org');
+
+  try {
+    await c.env.ORG_CONFIG.delete(org);
+    logAdminAction('reset_org_config', org, {});
+    return c.json({ org, config: DEFAULT_ORG_CONFIG, message: 'Org config reset to defaults' });
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    logAdminAction('reset_org_config_error', org, { error: errorMsg });
+    return c.json({ error: 'Failed to delete org config from storage' }, 500);
+  }
+});
+
 export default app;
 
 /**
@@ -257,6 +335,22 @@ async function getMCPServersFromKV(
 }
 
 /**
+ * Read org config from KV, returning empty object on error (will use defaults).
+ */
+async function getOrgConfigFromKV(
+  env: Env,
+  org: string,
+  logger: ReturnType<typeof createRequestLogger>
+): Promise<OrgConfig> {
+  try {
+    return (await env.ORG_CONFIG.get<OrgConfig>(org, 'json')) ?? {};
+  } catch (error) {
+    logger.error('org_config_kv_read_error', error);
+    return {}; // Continue with defaults - chat can still work
+  }
+}
+
+/**
  * Handle chat requests
  *
  * Routes to user-scoped DO (user:org:userId) and passes MCP config from KV.
@@ -283,11 +377,20 @@ async function handleChatRequest(request: Request, env: Env, doPath: string): Pr
       path: doPath,
     });
 
-    const mcpServers = await getMCPServersFromKV(env, org, logger);
+    // Fetch MCP servers and org config in parallel
+    const [mcpServers, orgConfig] = await Promise.all([
+      getMCPServersFromKV(env, org, logger),
+      getOrgConfigFromKV(env, org, logger),
+    ]);
+
     const doId = env.USER_SESSION.idFromName(`user:${org}:${body.user_id}`);
     const stub = env.USER_SESSION.get(doId);
 
-    logger.log('do_routed', { do_id: doId.toString(), mcp_server_count: mcpServers.length });
+    logger.log('do_routed', {
+      do_id: doId.toString(),
+      mcp_server_count: mcpServers.length,
+      org_config: orgConfig,
+    });
 
     const doUrl = new URL(request.url);
     doUrl.pathname = doPath;
@@ -295,7 +398,7 @@ async function handleChatRequest(request: Request, env: Env, doPath: string): Pr
     const doRequest = new Request(doUrl.toString(), {
       method: 'POST',
       headers: request.headers,
-      body: JSON.stringify({ ...body, _mcp_servers: mcpServers }),
+      body: JSON.stringify({ ...body, _mcp_servers: mcpServers, _org_config: orgConfig }),
     });
 
     return stub.fetch(doRequest);

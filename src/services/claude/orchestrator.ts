@@ -11,6 +11,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { Env } from '../../config/types.js';
 import { ChatHistoryEntry, StreamCallbacks } from '../../types/engine.js';
+import { DEFAULT_ORG_CONFIG, OrgConfig } from '../../types/org-config.js';
 import { ClaudeAPIError, MCPError, ValidationError } from '../../utils/errors.js';
 import { RequestLogger } from '../../utils/logger.js';
 import { createMCPHostFunctions, executeCode } from '../code-execution/index.js';
@@ -35,6 +36,7 @@ interface OrchestratorOptions {
   catalog: ToolCatalog;
   history: ChatHistoryEntry[];
   preferences: { response_language: string; first_interaction: boolean };
+  orgConfig?: OrgConfig;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
 }
@@ -244,7 +246,10 @@ function createOrchestrationContext(
   options: OrchestratorOptions,
   config: ReturnType<typeof parseEnvConfig>
 ): OrchestrationContext {
-  const { env, catalog, history, preferences, logger, callbacks } = options;
+  const { env, catalog, history, preferences, orgConfig, logger, callbacks } = options;
+
+  // Use LLM limit from org config (default: 5)
+  const llmMax = orgConfig?.max_history_llm ?? DEFAULT_ORG_CONFIG.max_history_llm;
 
   return {
     client: new Anthropic({ apiKey: env.ANTHROPIC_API_KEY }),
@@ -252,7 +257,7 @@ function createOrchestrationContext(
     maxTokens: config.maxTokens,
     systemPrompt: buildSystemPrompt(catalog, preferences, history),
     tools: buildAllTools(catalog),
-    messages: [...historyToMessages(history), { role: 'user', content: userMessage }],
+    messages: [...historyToMessages(history, llmMax), { role: 'user', content: userMessage }],
     responses: [],
     codeExecTimeout: config.codeExecTimeout,
     catalog,
