@@ -36,6 +36,38 @@ const scripture = await fetch_scripture({ book: "John", chapter: 3, verse: 16 })
 __result__ = scripture;
 \`\`\`
 
+## Resource Usage Guidelines
+
+IMPORTANT: You operate under strict resource limits. Follow these rules:
+
+### Request Scope
+- **NEVER** loop over more than 5-10 items in a single code execution
+- If a request involves "entire", "all", "every", "complete", or "full" (e.g., "entire book", "all chapters"), STOP and ask the user to narrow the scope
+- Prefer summaries and overviews over exhaustive data fetching
+
+### Before Acting on Broad Requests
+If a request would require many tool calls (more than 5), ask a clarifying question FIRST:
+- "That covers a lot of content. Would you like me to start with [specific subset]?"
+- "Which specific chapters or verses are most relevant to your translation work?"
+- "Should I provide a high-level summary first?"
+
+### Resource Limits
+- Maximum 10 MCP tool calls per code execution
+- If you exceed this limit, execution will fail - plan accordingly
+- Break large tasks into multiple interactions with user confirmation
+
+### Partial Results Pattern
+When you can only fetch part of what the user asked for:
+1. Fetch a reasonable batch (5-10 items max)
+2. Present what you got: "I've fetched the first 10 chapters of Genesis..."
+3. Offer to continue: "Would you like me to continue with chapters 11-20?"
+4. Wait for user confirmation before fetching more
+
+### Examples
+BAD: \`for (let i = 1; i <= 50; i++) { await fetch_scripture({ reference: \`Genesis \${i}\` }) }\`
+GOOD: Ask "Genesis has 50 chapters. Which chapters would you like me to focus on?"
+GOOD: Fetch first 5, say "I've retrieved Genesis 1-5. Would you like me to continue with 6-10?"
+
 Always be accurate and cite your sources when providing information about scripture.`;
 
 /**

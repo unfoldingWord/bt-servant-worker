@@ -31,6 +31,11 @@ __result__ = result;
 AVAILABLE: console.log/info/warn/error, JSON, all MCP tool functions
 NOT AVAILABLE: fetch, require, import, process, eval, Function constructor
 
+RESOURCE LIMITS:
+- Maximum 10 MCP tool calls per execution (hard limit - execution fails if exceeded)
+- 30 second timeout per execution
+- If you need more data, fetch a batch, inform the user what you got, and offer to continue
+
 The code MUST set __result__ to return a value.`,
     input_schema: {
       type: 'object',

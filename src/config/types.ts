@@ -16,6 +16,9 @@ export interface Env {
   CLAUDE_MODEL?: string;
   CLAUDE_MAX_TOKENS?: string;
 
+  // MCP call limits (optional - has defaults)
+  MAX_MCP_CALLS_PER_EXECUTION?: string;
+
   // Secrets (set via wrangler secret put)
   ANTHROPIC_API_KEY: string;
   ENGINE_API_KEY: string;

@@ -9,7 +9,7 @@
  */
 
 import { getQuickJSWASMModule, QuickJSContext } from '@cf-wasm/quickjs/workerd';
-import { CodeExecutionError, TimeoutError } from '../../utils/errors.js';
+import { CodeExecutionError, MCPCallLimitError, TimeoutError } from '../../utils/errors.js';
 import { RequestLogger } from '../../utils/logger.js';
 import { CodeExecutionOptions, CodeExecutionResult, ConsoleLog, HostFunction } from './types.js';
 
@@ -26,6 +26,17 @@ import { CodeExecutionOptions, CodeExecutionResult, ConsoleLog, HostFunction } f
  * - Minimal performance overhead (<1% of execution time)
  */
 const INTERRUPT_CHECK_CYCLES = 10000;
+
+/** Default maximum number of MCP calls per code execution */
+const DEFAULT_MAX_MCP_CALLS = 10;
+
+/**
+ * Counter for tracking MCP calls during code execution
+ */
+interface MCPCallCounter {
+  count: number;
+  limit: number;
+}
 
 // Note: Don't cache the module - it causes assertion failures on context disposal
 // in Cloudflare Workers. Creating a fresh module per execution is safer.
@@ -154,52 +165,84 @@ function setupHostFunctions(vm: QuickJSContext, hostFunctions: HostFunction[]): 
   return pendingCalls;
 }
 
-async function processPendingCalls(vm: QuickJSContext, pendingCalls: PendingCall[]): Promise<void> {
-  // Always run pending jobs at least once to handle native Promises (no host calls)
-  // Then loop to handle chained awaits with host function calls
+function resolvePendingCall(vm: QuickJSContext, callId: number, result: unknown): void {
+  setVMResult(vm, callId, result);
+  const resolveCode = `__resolvers__[${callId}].resolve(__pendingResults__[${callId}]);`;
+  const resolveResult = vm.evalCode(resolveCode);
+  if (resolveResult.error) {
+    resolveResult.error.dispose();
+  } else {
+    resolveResult.value.dispose();
+  }
+}
+
+function rejectPendingCall(vm: QuickJSContext, callId: number, error: unknown): void {
+  let msg = error instanceof Error ? error.message : String(error);
+  try {
+    setVMResult(vm, callId, { __error__: msg });
+  } catch {
+    msg = 'Error: Result serialization failed';
+  }
+  const rejectCode = `__resolvers__[${callId}].reject(new Error(${JSON.stringify(msg)}));`;
+  const rejectResult = vm.evalCode(rejectCode);
+  if (rejectResult.error) {
+    rejectResult.error.dispose();
+  } else {
+    rejectResult.value.dispose();
+  }
+}
+
+function logMcpCall(logger: RequestLogger, mcpCounter: MCPCallCounter, toolName: string): void {
+  logger.log('mcp_call_executed', {
+    tool_name: toolName,
+    call_number: mcpCounter.count,
+    limit: mcpCounter.limit,
+  });
+  // Warn when approaching limit (at 80%)
+  if (mcpCounter.count >= mcpCounter.limit * 0.8 && mcpCounter.count < mcpCounter.limit) {
+    logger.warn('mcp_call_limit_warning', {
+      calls_made: mcpCounter.count,
+      limit: mcpCounter.limit,
+      remaining: mcpCounter.limit - mcpCounter.count,
+    });
+  }
+}
+
+async function executePendingCall(
+  vm: QuickJSContext,
+  call: PendingCall,
+  mcpCounter: MCPCallCounter,
+  logger: RequestLogger
+): Promise<void> {
+  mcpCounter.count++;
+  logMcpCall(logger, mcpCounter, call.fn.name);
+  try {
+    const result = await call.fn.fn(...call.args);
+    resolvePendingCall(vm, call.id, result);
+  } catch (error) {
+    rejectPendingCall(vm, call.id, error);
+  }
+}
+
+async function processPendingCalls(
+  vm: QuickJSContext,
+  pendingCalls: PendingCall[],
+  mcpCounter: MCPCallCounter,
+  logger: RequestLogger
+): Promise<void> {
   do {
-    // Process any pending host function calls
     if (pendingCalls.length > 0) {
-      // Take current batch of pending calls
       const batch = pendingCalls.splice(0, pendingCalls.length);
-
-      // Execute all async calls and resolve their QuickJS promises
-      await Promise.all(
-        batch.map(async (call) => {
-          try {
-            const result = await call.fn.fn(...call.args);
-            // Store result and resolve the QuickJS promise
-            setVMResult(vm, call.id, result);
-            const resolveCode = `__resolvers__[${call.id}].resolve(__pendingResults__[${call.id}]);`;
-            const resolveResult = vm.evalCode(resolveCode);
-            if (resolveResult.error) {
-              resolveResult.error.dispose();
-            } else {
-              resolveResult.value.dispose();
-            }
-          } catch (error) {
-            let msg = error instanceof Error ? error.message : String(error);
-            // Reject the QuickJS promise - setVMResult may fail if msg is not serializable,
-            // so we use a guaranteed-safe fallback message in that case
-            try {
-              setVMResult(vm, call.id, { __error__: msg });
-            } catch {
-              // Serialization failed - use a generic error message that's guaranteed to serialize
-              msg = 'Error: Result serialization failed';
-            }
-            const rejectCode = `__resolvers__[${call.id}].reject(new Error(${JSON.stringify(msg)}));`;
-            const rejectResult = vm.evalCode(rejectCode);
-            if (rejectResult.error) {
-              rejectResult.error.dispose();
-            } else {
-              rejectResult.value.dispose();
-            }
-          }
-        })
-      );
+      if (mcpCounter.count + batch.length > mcpCounter.limit) {
+        logger.warn('mcp_call_limit_exceeded', {
+          calls_made: mcpCounter.count,
+          calls_attempted: mcpCounter.count + batch.length,
+          limit: mcpCounter.limit,
+        });
+        throw new MCPCallLimitError(mcpCounter.count, mcpCounter.limit);
+      }
+      await Promise.all(batch.map((call) => executePendingCall(vm, call, mcpCounter, logger)));
     }
-
-    // Resume async code - this may add new items to pendingCalls
     vm.runtime.executePendingJobs();
   } while (pendingCalls.length > 0);
 }
@@ -288,18 +331,96 @@ function extractResult(vm: QuickJSContext): unknown {
 function buildSuccessResult(
   value: unknown,
   logs: ConsoleLog[],
-  startTime: number
+  startTime: number,
+  mcpCounter: MCPCallCounter
 ): CodeExecutionResult {
-  return { success: true, result: value, logs, duration_ms: Date.now() - startTime };
+  return {
+    success: true,
+    result: value,
+    logs,
+    duration_ms: Date.now() - startTime,
+    callsMade: mcpCounter.count,
+    callLimit: mcpCounter.limit,
+  };
 }
 
 function buildErrorResult(
   error: unknown,
   logs: ConsoleLog[],
-  startTime: number
+  startTime: number,
+  mcpCounter?: MCPCallCounter
 ): CodeExecutionResult {
   const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-  return { success: false, error: errorMessage, logs, duration_ms: Date.now() - startTime };
+
+  // Handle MCPCallLimitError specially with structured error info
+  if (error instanceof MCPCallLimitError) {
+    return {
+      success: false,
+      error: errorMessage,
+      errorCode: 'MCP_CALL_LIMIT_EXCEEDED',
+      callsMade: error.callsMade,
+      callLimit: error.limit,
+      logs,
+      duration_ms: Date.now() - startTime,
+    };
+  }
+
+  return {
+    success: false,
+    error: errorMessage,
+    logs,
+    duration_ms: Date.now() - startTime,
+    ...(mcpCounter && { callsMade: mcpCounter.count, callLimit: mcpCounter.limit }),
+  };
+}
+
+function truncateCode(code: string): string {
+  return code.length <= 500 ? code : code.slice(0, 500) + '...[truncated]';
+}
+
+function logExecutionError(
+  logger: RequestLogger,
+  error: unknown,
+  startTime: number,
+  mcpCounter: MCPCallCounter,
+  codePreview: string
+): void {
+  const baseData = {
+    duration_ms: Date.now() - startTime,
+    mcp_calls_made: mcpCounter.count,
+    mcp_calls_limit: mcpCounter.limit,
+    code_preview: codePreview,
+  };
+  if (error instanceof MCPCallLimitError) {
+    logger.warn('code_execution_limit_error', { ...baseData, error: 'MCP_CALL_LIMIT_EXCEEDED' });
+  } else {
+    logger.error('code_execution_error', error, baseData);
+  }
+}
+
+interface VMExecutionContext {
+  vm: QuickJSContext;
+  code: string;
+  options: CodeExecutionOptions;
+  logs: ConsoleLog[];
+  mcpCounter: MCPCallCounter;
+  logger: RequestLogger;
+}
+
+async function runCodeInVM(ctx: VMExecutionContext): Promise<unknown> {
+  const startTime = Date.now();
+  setupConsole(ctx.vm, ctx.logs);
+  const pendingCalls = setupHostFunctions(ctx.vm, ctx.options.hostFunctions);
+  const interrupt = createInterruptHandler(startTime, ctx.options.timeout_ms);
+  ctx.vm.runtime.setInterruptHandler(interrupt.handler);
+  evaluateUserCode(ctx.vm, ctx.code);
+  if (interrupt.isInterrupted()) {
+    throw new TimeoutError(`Code execution exceeded ${ctx.options.timeout_ms}ms`);
+  }
+  ctx.vm.runtime.executePendingJobs();
+  await processPendingCalls(ctx.vm, pendingCalls, ctx.mcpCounter, ctx.logger);
+  checkExecutionError(ctx.vm);
+  return extractResult(ctx.vm);
 }
 
 /**
@@ -313,55 +434,34 @@ export async function executeCode(
   const startTime = Date.now();
   const logs: ConsoleLog[] = [];
   let vm: QuickJSContext | null = null;
+  const mcpCounter: MCPCallCounter = {
+    count: 0,
+    limit: options.maxMcpCalls ?? DEFAULT_MAX_MCP_CALLS,
+  };
+  const codePreview = truncateCode(code);
 
   logger.log('code_execution_start', {
     code_length: code.length,
-    code_preview: code.length <= 500 ? code : code.slice(0, 500) + '...[truncated]',
+    code_preview: codePreview,
     host_functions: options.hostFunctions.map((f) => f.name),
+    max_mcp_calls: mcpCounter.limit,
   });
 
   try {
     const module = await getQuickJSModule();
     vm = module.newContext();
-
-    setupConsole(vm, logs);
-    const pendingCalls = setupHostFunctions(vm, options.hostFunctions);
-
-    const interrupt = createInterruptHandler(startTime, options.timeout_ms);
-    vm.runtime.setInterruptHandler(interrupt.handler);
-
-    evaluateUserCode(vm, code);
-
-    if (interrupt.isInterrupted()) {
-      throw new TimeoutError(`Code execution exceeded ${options.timeout_ms}ms`);
-    }
-
-    // Execute pending jobs to ensure the async IIFE's .catch() handler runs.
-    // The evaluateUserCode() wrapper creates: (async () => { <code> })().catch(...)
-    // If user code throws synchronously, the .catch() is queued as a pending job.
-    // We must process it before checking __executionError__ in checkExecutionError().
-    vm.runtime.executePendingJobs();
-
-    await processPendingCalls(vm, pendingCalls);
-
-    // Check for errors from rejected promises in user code
-    checkExecutionError(vm);
-
-    const value = extractResult(vm);
-
+    const value = await runCodeInVM({ vm, code, options, logs, mcpCounter, logger });
     logger.log('code_execution_complete', {
       duration_ms: Date.now() - startTime,
       console_logs_count: logs.length,
+      mcp_calls_made: mcpCounter.count,
+      mcp_calls_limit: mcpCounter.limit,
       success: true,
     });
-
-    return buildSuccessResult(value, logs, startTime);
+    return buildSuccessResult(value, logs, startTime, mcpCounter);
   } catch (error) {
-    logger.error('code_execution_error', error, {
-      duration_ms: Date.now() - startTime,
-      code_preview: code.length <= 500 ? code : code.slice(0, 500) + '...[truncated]',
-    });
-    return buildErrorResult(error, logs, startTime);
+    logExecutionError(logger, error, startTime, mcpCounter, codePreview);
+    return buildErrorResult(error, logs, startTime, mcpCounter);
   } finally {
     vm?.dispose();
   }

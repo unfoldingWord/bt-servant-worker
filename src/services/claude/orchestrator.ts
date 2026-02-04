@@ -95,6 +95,7 @@ interface OrchestrationContext {
   messages: Anthropic.MessageParam[];
   responses: string[];
   codeExecTimeout: number;
+  maxMcpCalls: number;
   catalog: ToolCatalog;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
@@ -237,8 +238,14 @@ function parseEnvConfig(env: Env, logger: RequestLogger) {
     DEFAULT_MAX_ITERATIONS,
     logger
   );
+  const maxMcpCalls = parseIntEnvVar(
+    env.MAX_MCP_CALLS_PER_EXECUTION,
+    'MAX_MCP_CALLS_PER_EXECUTION',
+    10,
+    logger
+  );
 
-  return { model, maxTokens, codeExecTimeout, maxIterations };
+  return { model, maxTokens, codeExecTimeout, maxIterations, maxMcpCalls };
 }
 
 function createOrchestrationContext(
@@ -260,6 +267,7 @@ function createOrchestrationContext(
     messages: [...historyToMessages(history, llmMax), { role: 'user', content: userMessage }],
     responses: [],
     codeExecTimeout: config.codeExecTimeout,
+    maxMcpCalls: config.maxMcpCalls,
     catalog,
     logger,
     callbacks,
@@ -401,11 +409,30 @@ async function handleExecuteCode(
 
   const result = await executeCode(
     input.code,
-    { timeout_ms: ctx.codeExecTimeout, hostFunctions },
+    { timeout_ms: ctx.codeExecTimeout, hostFunctions, maxMcpCalls: ctx.maxMcpCalls },
     ctx.logger
   );
 
   if (!result.success) {
+    // Handle MCP call limit exceeded with structured error and guidance
+    if (result.errorCode === 'MCP_CALL_LIMIT_EXCEEDED') {
+      ctx.logger.log('tool_result_limit_error', {
+        tool_name: 'execute_code',
+        calls_made: result.callsMade,
+        limit: result.callLimit,
+        suggestion_sent: true,
+      });
+      return {
+        error: result.error,
+        errorCode: result.errorCode,
+        callsMade: result.callsMade,
+        limit: result.callLimit,
+        logs: result.logs,
+        suggestion:
+          'Ask user to narrow scope, or fetch summary instead of individual items. ' +
+          'Offer to continue in batches.',
+      };
+    }
     return { error: result.error, logs: result.logs };
   }
   return { result: result.result, logs: result.logs, duration_ms: result.duration_ms };

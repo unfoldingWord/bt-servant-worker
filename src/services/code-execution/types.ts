@@ -9,6 +9,12 @@ export interface CodeExecutionResult {
   success: boolean;
   result?: unknown;
   error?: string;
+  /** Error code for structured error handling (e.g., 'MCP_CALL_LIMIT_EXCEEDED') */
+  errorCode?: string;
+  /** Number of MCP calls made before failure (when errorCode is set) */
+  callsMade?: number;
+  /** Configured MCP call limit (when errorCode is set) */
+  callLimit?: number;
   logs: ConsoleLog[];
   duration_ms: number;
 }
@@ -36,4 +42,6 @@ export interface HostFunction {
 export interface CodeExecutionOptions {
   timeout_ms: number;
   hostFunctions: HostFunction[];
+  /** Maximum number of MCP calls allowed per execution (default: 10) */
+  maxMcpCalls?: number;
 }
