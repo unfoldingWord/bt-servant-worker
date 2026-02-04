@@ -2,6 +2,8 @@
  * API contract types matching bt-servant-web-client and bt-servant-whatsapp-gateway
  */
 
+import { MCPServerConfig } from './mcp.js';
+
 export interface ChatRequest {
   client_id: string;
   user_id: string;
@@ -13,6 +15,9 @@ export interface ChatRequest {
   progress_throttle_seconds?: number;
   message_key?: string; // WhatsApp message identifier for correlation
   org?: string; // Organization for MCP server selection (defaults to DEFAULT_ORG)
+
+  /** Internal: MCP servers injected by worker (not from client) */
+  _mcp_servers?: MCPServerConfig[];
 }
 
 export interface ChatResponse {

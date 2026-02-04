@@ -22,6 +22,7 @@ export interface Env {
 
   // KV Namespaces
   ORG_ADMIN_KEYS: KVNamespace;
+  MCP_SERVERS: KVNamespace;
 
   // Durable Object bindings
   USER_SESSION: DurableObjectNamespace;

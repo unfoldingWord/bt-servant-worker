@@ -1,8 +1,8 @@
 /**
- * MCP Server Registry - manages MCP server configurations in DO storage
+ * MCP Server Registry - legacy DO storage access
  *
- * Storage is org-scoped: each organization has its own list of MCP servers.
- * Key format: mcp_servers:${org}
+ * This module is kept for migration purposes only.
+ * MCP server config is now stored in KV and managed by the worker.
  */
 
 import { MCPServerConfig } from './types.js';
@@ -15,11 +15,11 @@ function buildStorageKey(org: string): string {
 }
 
 /**
- * Get MCP servers from Durable Object storage for a specific organization
- */
-/**
  * Get MCP servers from Durable Object storage for a specific organization.
  * Returns empty array if org has no servers configured.
+ *
+ * NOTE: This function is kept for migration purposes only.
+ * New code should read from KV (env.MCP_SERVERS).
  */
 export async function getMCPServers(
   storage: DurableObjectStorage,
@@ -28,68 +28,4 @@ export async function getMCPServers(
   const key = buildStorageKey(org);
   const servers = await storage.get<MCPServerConfig[]>(key);
   return servers ?? [];
-}
-
-/**
- * Update MCP servers in Durable Object storage for a specific organization
- */
-export async function updateMCPServers(
-  storage: DurableObjectStorage,
-  org: string,
-  servers: MCPServerConfig[]
-): Promise<void> {
-  const key = buildStorageKey(org);
-  await storage.put(key, servers);
-}
-
-/**
- * Add a new MCP server for a specific organization
- *
- * NOTE: Race condition safety
- * This uses a read-modify-write pattern which could race in a multi-threaded
- * environment. However, Durable Objects guarantee single-threaded execution
- * per instance - all requests to the same DO are serialized. Since we route
- * org admin requests to a dedicated DO (org:${org}), concurrent requests
- * to the same org are automatically serialized by the DO runtime.
- */
-export async function addMCPServer(
-  storage: DurableObjectStorage,
-  org: string,
-  server: MCPServerConfig
-): Promise<void> {
-  const servers = await getMCPServers(storage, org);
-  const existing = servers.findIndex((s) => s.id === server.id);
-
-  if (existing >= 0) {
-    // eslint-disable-next-line security/detect-object-injection -- existing is from findIndex
-    servers[existing] = server;
-  } else {
-    servers.push(server);
-  }
-
-  await updateMCPServers(storage, org, servers);
-}
-
-/**
- * Remove an MCP server by ID for a specific organization
- */
-export async function removeMCPServer(
-  storage: DurableObjectStorage,
-  org: string,
-  serverId: string
-): Promise<void> {
-  const servers = await getMCPServers(storage, org);
-  const filtered = servers.filter((s) => s.id !== serverId);
-  await updateMCPServers(storage, org, filtered);
-}
-
-/**
- * Get only enabled MCP servers for a specific organization, sorted by priority
- */
-export async function getEnabledMCPServers(
-  storage: DurableObjectStorage,
-  org: string
-): Promise<MCPServerConfig[]> {
-  const servers = await getMCPServers(storage, org);
-  return servers.filter((s) => s.enabled).sort((a, b) => a.priority - b.priority);
 }

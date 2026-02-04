@@ -17,6 +17,10 @@ DEFAULT_ORG = "unfoldingWord"
 binding = "ORG_ADMIN_KEYS"
 id = "8b9f2b37a9c04a3392757933fd2d646b"
 
+[[kv_namespaces]]
+binding = "MCP_SERVERS"
+id = "a101cdbc8fc347e8b88b9dadc328dbe0"
+
 # Durable Objects
 [[durable_objects.bindings]]
 name = "USER_SESSION"
