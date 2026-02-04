@@ -10,6 +10,7 @@ head_sampling_rate = 1
 ENVIRONMENT = "development"
 MAX_ORCHESTRATION_ITERATIONS = "10"
 CODE_EXEC_TIMEOUT_MS = "30000"
+MAX_MCP_CALLS_PER_EXECUTION = "10"
 DEFAULT_ORG = "unfoldingWord"
 
 # KV Namespaces

@@ -70,3 +70,17 @@ export class TimeoutError extends AppError {
     this.name = 'TimeoutError';
   }
 }
+
+export class MCPCallLimitError extends AppError {
+  constructor(
+    public readonly callsMade: number,
+    public readonly limit: number
+  ) {
+    super(
+      `Maximum MCP calls (${limit}) exceeded. Calls made: ${callsMade}. Refactor to fetch less data.`,
+      'MCP_CALL_LIMIT_EXCEEDED',
+      429
+    );
+    this.name = 'MCPCallLimitError';
+  }
+}

@@ -31,6 +31,15 @@ const MAX_CODE_LENGTH = 100_000;
 /** Maximum number of tool names that can be requested at once */
 const MAX_TOOL_NAMES = 100;
 
+/** Maximum length of input to include in error messages */
+const MAX_ERROR_INPUT_LENGTH = 100;
+
+/** Truncate input for safe inclusion in error messages */
+function truncateInput(input: unknown): string {
+  const str = JSON.stringify(input);
+  return str.length <= MAX_ERROR_INPUT_LENGTH ? str : str.slice(0, MAX_ERROR_INPUT_LENGTH) + '...';
+}
+
 interface OrchestratorOptions {
   env: Env;
   catalog: ToolCatalog;
@@ -95,6 +104,7 @@ interface OrchestrationContext {
   messages: Anthropic.MessageParam[];
   responses: string[];
   codeExecTimeout: number;
+  maxMcpCalls: number;
   catalog: ToolCatalog;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
@@ -144,6 +154,11 @@ async function processIteration(ctx: OrchestrationContext, iteration: number): P
     iteration,
     message_count: ctx.messages.length,
   });
+
+  // Add separator before subsequent iterations for streaming
+  if (iteration > 0 && ctx.callbacks) {
+    ctx.callbacks.onProgress('\n\n');
+  }
 
   const startTime = Date.now();
   const response = await callClaude(ctx);
@@ -237,8 +252,14 @@ function parseEnvConfig(env: Env, logger: RequestLogger) {
     DEFAULT_MAX_ITERATIONS,
     logger
   );
+  const maxMcpCalls = parseIntEnvVar(
+    env.MAX_MCP_CALLS_PER_EXECUTION,
+    'MAX_MCP_CALLS_PER_EXECUTION',
+    10,
+    logger
+  );
 
-  return { model, maxTokens, codeExecTimeout, maxIterations };
+  return { model, maxTokens, codeExecTimeout, maxIterations, maxMcpCalls };
 }
 
 function createOrchestrationContext(
@@ -260,6 +281,7 @@ function createOrchestrationContext(
     messages: [...historyToMessages(history, llmMax), { role: 'user', content: userMessage }],
     responses: [],
     codeExecTimeout: config.codeExecTimeout,
+    maxMcpCalls: config.maxMcpCalls,
     catalog,
     logger,
     callbacks,
@@ -341,7 +363,7 @@ async function dispatchToolCall(
   if (toolCall.name === 'execute_code') {
     if (!isExecuteCodeInput(toolCall.input)) {
       throw new ValidationError(
-        `Invalid input for execute_code: expected { code: string }, got ${JSON.stringify(toolCall.input)}`
+        `Invalid input for execute_code: expected { code: string }, got ${truncateInput(toolCall.input)}`
       );
     }
     return handleExecuteCode(toolCall.input, ctx);
@@ -349,7 +371,7 @@ async function dispatchToolCall(
   if (toolCall.name === 'get_tool_definitions') {
     if (!isGetToolDefinitionsInput(toolCall.input)) {
       throw new ValidationError(
-        `Invalid input for get_tool_definitions: expected { tool_names: string[] }, got ${JSON.stringify(toolCall.input)}`
+        `Invalid input for get_tool_definitions: expected { tool_names: string[] }, got ${truncateInput(toolCall.input)}`
       );
     }
     return getToolDefinitions(ctx.catalog, toolCall.input.tool_names);
@@ -401,11 +423,31 @@ async function handleExecuteCode(
 
   const result = await executeCode(
     input.code,
-    { timeout_ms: ctx.codeExecTimeout, hostFunctions },
+    { timeout_ms: ctx.codeExecTimeout, hostFunctions, maxMcpCalls: ctx.maxMcpCalls },
     ctx.logger
   );
 
   if (!result.success) {
+    // Handle MCP call limit exceeded with structured error and guidance
+    if (result.errorCode === 'MCP_CALL_LIMIT_EXCEEDED') {
+      ctx.logger.log('tool_result_limit_error', {
+        tool_name: 'execute_code',
+        calls_made: result.callsMade,
+        limit: result.callLimit,
+        suggestion_sent: true,
+      });
+      return {
+        error: result.error,
+        errorCode: result.errorCode,
+        callsMade: result.callsMade,
+        limit: result.callLimit,
+        logs: result.logs,
+        suggestion:
+          `You made ${result.callsMade} MCP calls but the limit is ${result.callLimit}. ` +
+          'Ask user to narrow scope, or fetch summary instead of individual items. ' +
+          'Offer to continue in batches.',
+      };
+    }
     return { error: result.error, logs: result.logs };
   }
   return { result: result.result, logs: result.logs, duration_ms: result.duration_ms };
