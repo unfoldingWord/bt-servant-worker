@@ -100,30 +100,35 @@ app.get('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
   const org = c.req.param('org');
   const discover = c.req.query('discover') === 'true';
 
-  const servers = (await c.env.MCP_SERVERS.get<MCPServerConfig[]>(org, 'json')) ?? [];
+  try {
+    const servers = (await c.env.MCP_SERVERS.get<MCPServerConfig[]>(org, 'json')) ?? [];
 
-  logAdminAction('list_mcp_servers', org, { server_count: servers.length, discover });
+    logAdminAction('list_mcp_servers', org, { server_count: servers.length, discover });
 
-  // If discover=true, run discovery and include status/errors in response
-  if (discover && servers.length > 0) {
-    const enabledServers = servers.filter((s) => s.enabled);
-    const logger = createRequestLogger(crypto.randomUUID());
-    const manifests = await discoverAllTools(enabledServers, logger);
+    // If discover=true, run discovery and include status/errors in response
+    if (discover && servers.length > 0) {
+      const enabledServers = servers.filter((s) => s.enabled);
+      const logger = createRequestLogger(crypto.randomUUID());
+      const manifests = await discoverAllTools(enabledServers, logger);
 
-    const serverStatuses = servers.map((server) => {
-      const manifest = manifests.find((m) => m.serverId === server.id);
-      return {
-        ...server,
-        discovery_status: manifest ? (manifest.error ? 'error' : 'ok') : 'skipped',
-        discovery_error: manifest?.error ?? null,
-        tools_count: manifest?.tools.length ?? 0,
-      };
-    });
+      const serverStatuses = servers.map((server) => {
+        const manifest = manifests.find((m) => m.serverId === server.id);
+        return {
+          ...server,
+          discovery_status: manifest ? (manifest.error ? 'error' : 'ok') : 'skipped',
+          discovery_error: manifest?.error ?? null,
+          tools_count: manifest?.tools.length ?? 0,
+        };
+      });
 
-    return c.json({ org, servers: serverStatuses });
+      return c.json({ org, servers: serverStatuses });
+    }
+
+    return c.json({ org, servers });
+  } catch (error) {
+    logAdminAction('list_mcp_servers_error', org, { error: String(error) });
+    return c.json({ error: 'Failed to read MCP servers from storage' }, 500);
   }
-
-  return c.json({ org, servers });
 });
 
 app.put('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
@@ -145,12 +150,17 @@ app.put('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
     }
   }
 
-  await c.env.MCP_SERVERS.put(org, JSON.stringify(servers));
-  logAdminAction('replace_mcp_servers', org, {
-    server_count: servers.length,
-    server_ids: servers.map((s) => s.id),
-  });
-  return c.json({ org, servers, message: 'MCP servers updated' });
+  try {
+    await c.env.MCP_SERVERS.put(org, JSON.stringify(servers));
+    logAdminAction('replace_mcp_servers', org, {
+      server_count: servers.length,
+      server_ids: servers.map((s) => s.id),
+    });
+    return c.json({ org, servers, message: 'MCP servers updated' });
+  } catch (error) {
+    logAdminAction('replace_mcp_servers_error', org, { error: String(error) });
+    return c.json({ error: 'Failed to write MCP servers to storage' }, 500);
+  }
 });
 
 app.post('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
@@ -168,23 +178,30 @@ app.post('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
     return c.json({ error }, 400);
   }
 
-  const existing = (await c.env.MCP_SERVERS.get<MCPServerConfig[]>(org, 'json')) ?? [];
-  if (existing.length >= MAX_SERVERS_PER_ORG) {
-    return c.json({ error: `Cannot have more than ${MAX_SERVERS_PER_ORG} servers per org` }, 400);
-  }
+  try {
+    const existing = (await c.env.MCP_SERVERS.get<MCPServerConfig[]>(org, 'json')) ?? [];
+    if (existing.length >= MAX_SERVERS_PER_ORG) {
+      return c.json({ error: `Cannot have more than ${MAX_SERVERS_PER_ORG} servers per org` }, 400);
+    }
 
-  // Check for duplicate ID and update if exists
-  const existingIndex = existing.findIndex((s) => s.id === server.id);
-  if (existingIndex >= 0) {
-    // eslint-disable-next-line security/detect-object-injection -- existingIndex is from findIndex
-    existing[existingIndex] = server;
-  } else {
-    existing.push(server);
-  }
+    // Check for duplicate ID and update if exists
+    // NOTE: This read-modify-write pattern can race with concurrent requests (last write wins).
+    // This is acceptable for admin endpoints which are low-volume and authenticated.
+    const existingIndex = existing.findIndex((s) => s.id === server.id);
+    if (existingIndex >= 0) {
+      // eslint-disable-next-line security/detect-object-injection -- existingIndex is from findIndex
+      existing[existingIndex] = server;
+    } else {
+      existing.push(server);
+    }
 
-  await c.env.MCP_SERVERS.put(org, JSON.stringify(existing));
-  logAdminAction('add_mcp_server', org, { server_id: server.id, server_url: server.url });
-  return c.json({ org, servers: existing, message: 'MCP server added' });
+    await c.env.MCP_SERVERS.put(org, JSON.stringify(existing));
+    logAdminAction('add_mcp_server', org, { server_id: server.id, server_url: server.url });
+    return c.json({ org, servers: existing, message: 'MCP server added' });
+  } catch (error) {
+    logAdminAction('add_mcp_server_error', org, { error: String(error) });
+    return c.json({ error: 'Failed to update MCP servers in storage' }, 500);
+  }
 });
 
 app.delete('/api/v1/admin/orgs/:org/mcp-servers/:serverId', async (c) => {
@@ -196,55 +213,96 @@ app.delete('/api/v1/admin/orgs/:org/mcp-servers/:serverId', async (c) => {
     return c.json({ error: idError }, 400);
   }
 
-  const existing = (await c.env.MCP_SERVERS.get<MCPServerConfig[]>(org, 'json')) ?? [];
-  const filtered = existing.filter((s) => s.id !== serverId);
+  try {
+    const existing = (await c.env.MCP_SERVERS.get<MCPServerConfig[]>(org, 'json')) ?? [];
+    const filtered = existing.filter((s) => s.id !== serverId);
 
-  await c.env.MCP_SERVERS.put(org, JSON.stringify(filtered));
-  logAdminAction('remove_mcp_server', org, { server_id: serverId });
-  return c.json({ org, servers: filtered, message: 'MCP server removed' });
+    await c.env.MCP_SERVERS.put(org, JSON.stringify(filtered));
+    logAdminAction('remove_mcp_server', org, { server_id: serverId });
+    return c.json({ org, servers: filtered, message: 'MCP server removed' });
+  } catch (error) {
+    logAdminAction('remove_mcp_server_error', org, { error: String(error) });
+    return c.json({ error: 'Failed to update MCP servers in storage' }, 500);
+  }
 });
 
-// Migration endpoint - temporary, remove after migration
-app.post('/api/v1/admin/migrate-mcp-to-kv', async (c) => {
-  // Super admin only (ENGINE_API_KEY check already done by middleware)
-  const org = 'unfoldingWord'; // Hardcode for safety
+// Migration endpoint - temporary, remove after migration complete
+app.post('/api/v1/admin/orgs/:org/migrate-mcp-to-kv', async (c) => {
+  const org = c.req.param('org');
 
-  // Read from org DO
-  const orgDoId = c.env.USER_SESSION.idFromName(`org:${org}`);
-  const orgStub = c.env.USER_SESSION.get(orgDoId);
-  const response = await orgStub.fetch(new Request(`https://internal/mcp-servers?org=${org}`));
-  const data = (await response.json()) as { servers: MCPServerConfig[] };
+  if (!org) {
+    return c.json({ error: 'org is required in path' }, 400);
+  }
 
-  // Write to KV
-  await c.env.MCP_SERVERS.put(org, JSON.stringify(data.servers));
-  logAdminAction('migrate_mcp_to_kv', org, { server_count: data.servers.length });
+  try {
+    // Read from org DO
+    const orgDoId = c.env.USER_SESSION.idFromName(`org:${org}`);
+    const orgStub = c.env.USER_SESSION.get(orgDoId);
+    const response = await orgStub.fetch(new Request(`https://internal/mcp-servers?org=${org}`));
+    const data = (await response.json()) as { servers: MCPServerConfig[] };
 
-  return c.json({ migrated: org, server_count: data.servers.length });
+    // Write to KV
+    await c.env.MCP_SERVERS.put(org, JSON.stringify(data.servers));
+    logAdminAction('migrate_mcp_to_kv', org, { server_count: data.servers.length });
+
+    return c.json({ migrated: org, server_count: data.servers.length });
+  } catch (error) {
+    logAdminAction('migrate_mcp_to_kv_error', org, { error: String(error) });
+    return c.json({ error: 'Migration failed' }, 500);
+  }
 });
 
-// Cleanup endpoint - temporary, remove after cleanup
-app.post('/api/v1/admin/cleanup-org-do', async (c) => {
-  // Super admin only
-  const org = 'unfoldingWord'; // Hardcode for safety
-  const orgDoId = c.env.USER_SESSION.idFromName(`org:${org}`);
-  const orgStub = c.env.USER_SESSION.get(orgDoId);
+// Cleanup endpoint - temporary, remove after cleanup complete
+app.post('/api/v1/admin/orgs/:org/cleanup-org-do', async (c) => {
+  const org = c.req.param('org');
 
-  // Call DO to delete its storage
-  await orgStub.fetch(new Request('https://internal/cleanup', { method: 'POST' }));
-  logAdminAction('cleanup_org_do', org);
+  if (!org) {
+    return c.json({ error: 'org is required in path' }, 400);
+  }
 
-  return c.json({ cleaned: `org:${org}` });
+  try {
+    const orgDoId = c.env.USER_SESSION.idFromName(`org:${org}`);
+    const orgStub = c.env.USER_SESSION.get(orgDoId);
+
+    // Call DO to delete its storage
+    await orgStub.fetch(new Request('https://internal/cleanup', { method: 'POST' }));
+    logAdminAction('cleanup_org_do', org);
+
+    return c.json({ cleaned: `org:${org}` });
+  } catch (error) {
+    logAdminAction('cleanup_org_do_error', org, { error: String(error) });
+    return c.json({ error: 'Cleanup failed' }, 500);
+  }
 });
 
 export default app;
 
 /**
- * Log admin actions for audit trail
+ * Log admin actions for audit trail.
+ *
+ * Uses console.error to ensure logs are captured in Cloudflare's logging
+ * (console.log may be buffered/dropped in some scenarios).
  */
 function logAdminAction(action: string, org: string, details: Record<string, unknown> = {}): void {
   console.error(
     JSON.stringify({ event: 'admin_action', timestamp: Date.now(), action, org, ...details })
   );
+}
+
+/**
+ * Read MCP servers from KV, returning empty array on error.
+ */
+async function getMCPServersFromKV(
+  env: Env,
+  org: string,
+  logger: ReturnType<typeof createRequestLogger>
+): Promise<MCPServerConfig[]> {
+  try {
+    return (await env.MCP_SERVERS.get<MCPServerConfig[]>(org, 'json')) ?? [];
+  } catch (error) {
+    logger.error('mcp_kv_read_error', error);
+    return []; // Continue with empty servers - chat can still work without MCP tools
+  }
 }
 
 /**
@@ -267,7 +325,6 @@ async function handleChatRequest(request: Request, env: Env, doPath: string): Pr
     }
 
     const org = body.org ?? env.DEFAULT_ORG;
-
     logger.log('request_received', {
       user_id: body.user_id,
       client_id: body.client_id,
@@ -275,10 +332,7 @@ async function handleChatRequest(request: Request, env: Env, doPath: string): Pr
       path: doPath,
     });
 
-    // Read MCP config from KV
-    const mcpServers = (await env.MCP_SERVERS.get<MCPServerConfig[]>(org, 'json')) ?? [];
-
-    // Route to user-scoped DO (instead of org-scoped)
+    const mcpServers = await getMCPServersFromKV(env, org, logger);
     const doId = env.USER_SESSION.idFromName(`user:${org}:${body.user_id}`);
     const stub = env.USER_SESSION.get(doId);
 
@@ -287,13 +341,10 @@ async function handleChatRequest(request: Request, env: Env, doPath: string): Pr
     const doUrl = new URL(request.url);
     doUrl.pathname = doPath;
 
-    // Pass MCP config in request body
-    const enrichedBody: ChatRequest = { ...body, _mcp_servers: mcpServers };
-
     const doRequest = new Request(doUrl.toString(), {
       method: 'POST',
       headers: request.headers,
-      body: JSON.stringify(enrichedBody),
+      body: JSON.stringify({ ...body, _mcp_servers: mcpServers }),
     });
 
     return stub.fetch(doRequest);

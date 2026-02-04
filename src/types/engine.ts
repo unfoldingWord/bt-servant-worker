@@ -6,6 +6,9 @@
  * MCP server config for internal use in ChatRequest.
  * This is a subset of MCPServerConfig - the full type is in services/mcp/types.ts.
  * Duplicated here to avoid circular import (types should not depend on services).
+ *
+ * TODO: Consider moving MCPServerConfig to src/types/ to eliminate this duplication.
+ * If the types drift, update both places or refactor.
  */
 interface InternalMCPServerConfig {
   id: string;
