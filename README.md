@@ -66,6 +66,129 @@ Each user gets their own Durable Object instance that:
 - Persists data across requests (survives Worker eviction)
 - Matches the `asyncio.Lock` behavior from bt-servant-engine
 
+## Request Serialization & Concurrency
+
+### Why Requests Are Serialized Per User
+
+bt-servant-worker processes chat requests **one at a time per user** to ensure conversation history integrity. This prevents race conditions where:
+
+- Two concurrent requests read the same history state
+- Both generate responses based on stale context
+- History becomes inconsistent with what the user sees in their chat interface
+
+### How It Works
+
+Each user's chat session is handled by a dedicated Durable Object instance. When a request arrives at `/chat` or `/stream`:
+
+1. The DO checks if another request is currently processing (via a storage lock)
+2. If **not locked**: acquire lock, process request, release lock
+3. If **locked**: return `429 Too Many Requests` immediately
+
+### Handling 429 Responses
+
+API consumers **must** implement retry logic for 429 responses:
+
+```typescript
+async function sendChatRequest(
+  message: string,
+  userId: string,
+  org: string
+): Promise<ChatResponse> {
+  const maxRetries = 10;
+  const baseDelay = 2000; // Start with 2 second delay
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const response = await fetch(`${API_URL}/api/v1/orgs/${org}/users/${userId}/chat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${API_KEY}`,
+      },
+      body: JSON.stringify({ message, user_id: userId }),
+    });
+
+    if (response.status === 429) {
+      // Another request is processing - wait and retry
+      const retryAfter = response.headers.get('Retry-After');
+      const delay = retryAfter ? parseInt(retryAfter) * 1000 : baseDelay * Math.pow(1.5, attempt);
+
+      console.log(`Request queued, retrying in ${delay}ms...`);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      continue;
+    }
+
+    if (!response.ok) {
+      throw new Error(`API error: ${response.status}`);
+    }
+
+    return response.json();
+  }
+
+  throw new Error('Max retries exceeded - request could not be processed');
+}
+```
+
+### 429 Response Format
+
+```json
+{
+  "error": "Request in progress",
+  "code": "CONCURRENT_REQUEST_REJECTED",
+  "message": "Another request for this user is currently being processed. Please retry.",
+  "retry_after_ms": 5000
+}
+```
+
+**Headers:**
+
+- `Retry-After: 5` (suggested wait time in seconds)
+- `Content-Type: application/json`
+
+### Why Not Queue in the Server?
+
+We considered server-side request queuing but chose client-side retry because:
+
+1. **Resilience**: If the server crashes, queued requests would be lost. With client retry, the client still has the message.
+2. **Standard HTTP**: 429 is a well-understood pattern that clients expect to handle.
+3. **Observability**: 429 responses are logged and can be monitored for contention issues.
+4. **Simplicity**: Keeps the Durable Object focused on chat logic, not queue management.
+
+### Typical Request Flow
+
+```
+User sends message
+        ↓
+Consumer (gateway/web client) calls API
+        ↓
+    ┌─────────────────┐
+    │ Lock available? │
+    └────────┬────────┘
+             │
+      ┌──────┴──────┐
+      ↓             ↓
+     YES           NO
+      ↓             ↓
+  Process      Return 429
+  request          ↓
+      ↓        Consumer waits
+  Return       and retries
+  response         ↓
+             (loop until
+              lock available)
+```
+
+### Expected Behavior by Client Type
+
+| Client                          | Behavior                                                                                               |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| **bt-servant-web-client**       | Should disable send button while awaiting response, preventing most 429s. Implement retry as fallback. |
+| **bt-servant-whatsapp-gateway** | Cannot control WhatsApp UI. Must implement robust retry with exponential backoff.                      |
+| **Future API consumers**        | Must implement 429 handling per this documentation.                                                    |
+
+### Lock Timeout
+
+The processing lock has a 90-second stale threshold. If a request crashes without releasing the lock, subsequent requests will succeed after 90 seconds. This is a safety mechanism, not expected behavior. When a stale lock is overwritten, a warning is logged for monitoring.
+
 ## Project Structure
 
 ```

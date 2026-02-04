@@ -166,3 +166,34 @@ export interface ProgressCallback {
   text: string;
   timestamp: number;
 }
+
+/**
+ * Standard error response format used across all error responses
+ */
+export interface ApiError {
+  error: string;
+  code: string;
+  message: string;
+}
+
+/**
+ * Error response when a concurrent request is rejected (429)
+ */
+export interface ConcurrentRequestError extends ApiError {
+  code: 'CONCURRENT_REQUEST_REJECTED';
+  retry_after_ms: number;
+}
+
+/**
+ * Validation error response (400)
+ */
+export interface ValidationErrorResponse extends ApiError {
+  code: 'VALIDATION_ERROR';
+}
+
+/**
+ * Internal error response (500)
+ */
+export interface InternalErrorResponse extends ApiError {
+  code: 'INTERNAL_ERROR';
+}

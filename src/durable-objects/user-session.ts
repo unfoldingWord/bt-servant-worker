@@ -50,6 +50,9 @@ import { ValidationError } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger } from '../utils/logger.js';
 const HISTORY_KEY = 'history';
 const PREFERENCES_KEY = 'preferences';
+const PROCESSING_LOCK_KEY = '_processing_lock';
+const LOCK_STALE_THRESHOLD_MS = 90000; // 90 seconds
+const RETRY_AFTER_SECONDS = 5;
 
 /**
  * Validates ISO 639-1 language code format (2 lowercase letters).
@@ -66,6 +69,16 @@ const DEFAULT_PREFERENCES: UserPreferencesInternal = {
   first_interaction: true,
 };
 
+/** Create a standardized error response */
+function createErrorResponse(
+  error: string,
+  code: string,
+  message: string,
+  status: number
+): Response {
+  return Response.json({ error, code, message }, { status });
+}
+
 export class UserSession {
   private state: DurableObjectState;
   private env: Env;
@@ -76,7 +89,7 @@ export class UserSession {
     this.env = env;
 
     this.app = new Hono();
-    this.app.post('/stream', (c) => this.handleStreamingChat(c.req.raw));
+    // Note: /stream is handled directly in fetch() for proper lock management
     this.app.post('/chat', (c) => this.handleChat(c.req.raw));
     this.app.get('/preferences', () => this.handleGetPreferences());
     this.app.put('/preferences', (c) => this.handleUpdatePreferences(c.req.raw));
@@ -84,7 +97,79 @@ export class UserSession {
   }
 
   async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    // Only lock chat endpoints (not preferences/history reads)
+    if (url.pathname === '/chat' || url.pathname === '/stream') {
+      const acquired = await this.tryAcquireLock();
+      if (!acquired) {
+        const userId = url.searchParams.get('user_id') || 'unknown';
+        console.warn(
+          JSON.stringify({
+            event: 'CONCURRENT_REQUEST_REJECTED',
+            user_id: userId,
+            timestamp: Date.now(),
+          })
+        );
+        return new Response(
+          JSON.stringify({
+            error: 'Request in progress',
+            code: 'CONCURRENT_REQUEST_REJECTED',
+            message: 'Another request for this user is currently being processed. Please retry.',
+            retry_after_ms: RETRY_AFTER_SECONDS * 1000,
+          }),
+          {
+            status: 429,
+            headers: {
+              'Content-Type': 'application/json',
+              'Retry-After': String(RETRY_AFTER_SECONDS),
+            },
+          }
+        );
+      }
+
+      // For streaming, lock is released by the streaming handler when complete
+      if (url.pathname === '/stream') {
+        return this.handleStreamingChatWithLock(request);
+      }
+
+      // For non-streaming, release lock when request completes
+      try {
+        return await this.app.fetch(request);
+      } finally {
+        await this.releaseLock();
+      }
+    }
+
+    // Non-chat endpoints don't need locking
     return this.app.fetch(request);
+  }
+
+  private async tryAcquireLock(): Promise<boolean> {
+    // Use blockConcurrencyWhile to make the check-and-set atomic
+    return this.state.blockConcurrencyWhile(async () => {
+      const lock = await this.state.storage.get<number>(PROCESSING_LOCK_KEY);
+      const now = Date.now();
+      if (lock && now - lock < LOCK_STALE_THRESHOLD_MS) {
+        return false; // Already processing
+      }
+      if (lock) {
+        // Overwriting a stale lock - log this as it indicates a crash/timeout
+        console.warn(
+          JSON.stringify({
+            event: 'stale_lock_overwritten',
+            lock_age_ms: now - lock,
+            timestamp: now,
+          })
+        );
+      }
+      await this.state.storage.put(PROCESSING_LOCK_KEY, now);
+      return true;
+    });
+  }
+
+  private async releaseLock(): Promise<void> {
+    await this.state.storage.delete(PROCESSING_LOCK_KEY);
   }
 
   private async handleChat(request: Request): Promise<Response> {
@@ -124,13 +209,18 @@ export class UserSession {
       const totalDuration = Date.now() - startTime;
       logger.error('do_chat_error', error, { total_duration_ms: totalDuration });
       if (error instanceof ValidationError) {
-        return Response.json({ error: error.message }, { status: 400 });
+        return createErrorResponse('Validation error', 'VALIDATION_ERROR', error.message, 400);
       }
-      return Response.json({ error: 'Internal server error' }, { status: 500 });
+      const msg = 'An unexpected error occurred while processing your request.';
+      return createErrorResponse('Internal server error', 'INTERNAL_ERROR', msg, 500);
     }
   }
 
-  private async handleStreamingChat(request: Request): Promise<Response> {
+  /**
+   * Handle streaming chat with proper lock management.
+   * Lock is released when streaming completes, not when Response is returned.
+   */
+  private async handleStreamingChatWithLock(request: Request): Promise<Response> {
     const requestId = crypto.randomUUID();
     const startTime = Date.now();
     const body = (await request.json()) as ChatRequest;
@@ -154,15 +244,18 @@ export class UserSession {
       await writer.write(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
     };
 
-    this.processStreamingChat(body, sendEvent, writer, logger, startTime).catch(async (error) => {
-      const totalDuration = Date.now() - startTime;
-      logger.error('do_stream_error', error, { total_duration_ms: totalDuration });
-      await sendEvent({
-        type: 'error',
-        error: error instanceof Error ? error.message : 'Unknown error',
-      });
-      await writer.close();
-    });
+    // Process streaming and release lock when done (success or error)
+    this.processStreamingChat(body, sendEvent, writer, logger, startTime)
+      .catch(async (error) => {
+        const totalDuration = Date.now() - startTime;
+        logger.error('do_stream_error', error, { total_duration_ms: totalDuration });
+        await sendEvent({
+          type: 'error',
+          error: error instanceof Error ? error.message : 'Unknown error',
+        });
+        await writer.close();
+      })
+      .finally(() => this.releaseLock());
 
     return new Response(readable, {
       headers: {

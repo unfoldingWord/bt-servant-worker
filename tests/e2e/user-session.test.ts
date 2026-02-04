@@ -167,7 +167,9 @@ describe('UserSession chat validation', () => {
       const data = (await response.json()) as Record<string, unknown>;
 
       expect(response.status).toBe(400);
-      expect(data.error).toBe('Message is required');
+      expect(data.error).toBe('Validation error');
+      expect(data.code).toBe('VALIDATION_ERROR');
+      expect(data.message).toBe('Message is required');
     });
 
     it('rejects whitespace-only message', async () => {
@@ -184,7 +186,9 @@ describe('UserSession chat validation', () => {
       const data = (await response.json()) as Record<string, unknown>;
 
       expect(response.status).toBe(400);
-      expect(data.error).toBe('Message is required');
+      expect(data.error).toBe('Validation error');
+      expect(data.code).toBe('VALIDATION_ERROR');
+      expect(data.message).toBe('Message is required');
     });
   });
 });
@@ -236,6 +240,101 @@ describe('UserSession user-scoped DO isolation', () => {
     const org2Prefs = await org2Stub.fetch('http://fake-host/preferences');
     const org2Data = (await org2Prefs.json()) as { response_language: string };
     expect(org2Data.response_language).toBe('en');
+  });
+});
+
+describe('UserSession request serialization (429 lock)', () => {
+  let stub: DurableObjectStub;
+
+  beforeEach(() => {
+    const id = env.USER_SESSION.newUniqueId();
+    stub = env.USER_SESSION.get(id);
+  });
+
+  it('lock is released after request completes (even on validation error)', async () => {
+    // Send a request that fails validation - lock should still be released
+    const firstResponse = await stub.fetch('http://fake-host/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: 'test-client',
+        user_id: 'test-user',
+        message: '', // Empty message fails validation after lock acquired
+        message_type: 'text',
+      }),
+    });
+
+    expect(firstResponse.status).toBe(400);
+
+    // Verify lock was released - second request should succeed (not get 429)
+    const secondResponse = await stub.fetch('http://fake-host/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: 'test-client',
+        user_id: 'test-user',
+        message: '', // Will also fail validation
+        message_type: 'text',
+      }),
+    });
+
+    // Should get 400 (validation error), not 429 (lock held)
+    expect(secondResponse.status).toBe(400);
+  });
+
+  it('non-chat endpoints do not require lock', async () => {
+    // Preferences endpoint should work without lock
+    const prefsResponse = await stub.fetch('http://fake-host/preferences');
+    expect(prefsResponse.status).toBe(200);
+
+    // History endpoint should work without lock
+    const historyResponse = await stub.fetch('http://fake-host/history?user_id=test');
+    expect(historyResponse.status).toBe(200);
+  });
+
+  it('validation error response has consistent structure', async () => {
+    const response = await stub.fetch('http://fake-host/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: 'test-client',
+        user_id: 'test-user',
+        message: '',
+        message_type: 'text',
+      }),
+    });
+
+    expect(response.status).toBe(400);
+
+    const data = (await response.json()) as {
+      error: string;
+      code: string;
+      message: string;
+    };
+
+    // Verify consistent error response structure
+    expect(data.error).toBe('Validation error');
+    expect(data.code).toBe('VALIDATION_ERROR');
+    expect(data.message).toBe('Message is required');
+  });
+
+  it('stream endpoint also requires lock', async () => {
+    // Stream endpoint should also go through lock mechanism
+    // A request to /stream should work (not 404)
+    const response = await stub.fetch('http://fake-host/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: 'test-client',
+        user_id: 'test-user',
+        message: '', // Will fail validation
+        message_type: 'text',
+      }),
+    });
+
+    // Stream returns immediately with SSE headers, but validation error
+    // is sent through the stream. Check that we get the SSE response.
+    expect(response.headers.get('Content-Type')).toBe('text/event-stream');
   });
 });
 
