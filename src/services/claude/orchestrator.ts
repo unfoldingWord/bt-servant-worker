@@ -216,6 +216,9 @@ async function processIteration(ctx: OrchestrationContext, iteration: number): P
   });
   ctx.messages.push({ role: 'user', content: toolResults });
 
+  // Notify iteration complete for progress callbacks (only when tools were used)
+  ctx.callbacks?.onIterationComplete?.(ctx.responses.join('\n'));
+
   return false;
 }
 
