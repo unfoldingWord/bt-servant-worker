@@ -2,6 +2,23 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## CRITICAL: Ask Before Pushing to Main
+
+**ALWAYS ask the user before pushing changes.** This is non-negotiable.
+
+Before committing and pushing, ask:
+
+> "Should I push this directly to main, or create a feature branch and PR?"
+
+**Default to creating a branch and PR** unless the user explicitly says to push to main. PRs enable:
+
+- Claude PR Review to catch issues
+- Code review before deployment
+- Discussion and iteration on changes
+- Clean git history with context
+
+Pushing directly to main bypasses all review mechanisms and should only be done when the user explicitly requests it.
+
 ## CRITICAL: Never Deploy Directly
 
 **NEVER run `wrangler deploy` directly.** This is non-negotiable.
