@@ -169,7 +169,11 @@ export class IncrementalProgressSender {
 
   private checkSentenceBoundary(): void {
     const unsent = this.accumulatedText.slice(this.lastSentText.length);
-    // Match sentence-ending punctuation followed by space or end of string
+    // Match sentence-ending punctuation followed by space or end of string.
+    // Known limitations: May incorrectly trigger on abbreviations (Dr. Smith),
+    // decimal numbers (3.14), or ellipsis (...). A more sophisticated sentence
+    // detector would be needed for these edge cases, but for progress callbacks
+    // occasional false positives are acceptable.
     const sentenceEndPattern = /[.!?](?:\s|$)/g;
     let lastMatch: RegExpExecArray | null = null;
     let match: RegExpExecArray | null;

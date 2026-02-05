@@ -194,9 +194,14 @@ export class UserSession {
           token: this.env.ENGINE_API_KEY,
         };
         const sender = new ProgressCallbackSender(senderConfig);
+        // Validate and sanitize throttle seconds: must be positive number, min 1 second
+        const throttleSeconds =
+          typeof body.progress_throttle_seconds === 'number' && body.progress_throttle_seconds > 0
+            ? body.progress_throttle_seconds
+            : DEFAULT_THROTTLE_SECONDS;
         const progressConfig: IncrementalProgressConfig = {
           mode: body.progress_mode ?? DEFAULT_PROGRESS_MODE,
-          throttleSeconds: body.progress_throttle_seconds ?? DEFAULT_THROTTLE_SECONDS,
+          throttleSeconds,
         };
         callbacks = createWebhookCallbacks(sender, progressConfig);
       }
