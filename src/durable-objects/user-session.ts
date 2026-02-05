@@ -31,6 +31,9 @@ import { buildToolCatalog, discoverAllTools } from '../services/mcp/index.js';
 import { MCPServerConfig } from '../services/mcp/types.js';
 import {
   createWebhookCallbacks,
+  DEFAULT_PROGRESS_MODE,
+  DEFAULT_THROTTLE_SECONDS,
+  IncrementalProgressConfig,
   ProgressCallbackConfig,
   ProgressCallbackSender,
 } from '../services/progress/index.js';
@@ -184,14 +187,23 @@ export class UserSession {
       // Create webhook callbacks if progress_callback_url is provided
       let callbacks: StreamCallbacks | undefined;
       if (body.progress_callback_url && body.message_key) {
-        const config: ProgressCallbackConfig = {
+        const senderConfig: ProgressCallbackConfig = {
           url: body.progress_callback_url,
           user_id: body.user_id,
           message_key: body.message_key,
           token: this.env.ENGINE_API_KEY,
         };
-        const sender = new ProgressCallbackSender(config);
-        callbacks = createWebhookCallbacks(sender);
+        const sender = new ProgressCallbackSender(senderConfig);
+        // Validate and sanitize throttle seconds: must be positive number, min 1 second
+        const throttleSeconds =
+          typeof body.progress_throttle_seconds === 'number' && body.progress_throttle_seconds > 0
+            ? body.progress_throttle_seconds
+            : DEFAULT_THROTTLE_SECONDS;
+        const progressConfig: IncrementalProgressConfig = {
+          mode: body.progress_mode ?? DEFAULT_PROGRESS_MODE,
+          throttleSeconds,
+        };
+        callbacks = createWebhookCallbacks(sender, progressConfig);
       }
 
       const response = await this.processChat(body, logger, callbacks);

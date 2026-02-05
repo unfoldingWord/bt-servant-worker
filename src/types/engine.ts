@@ -5,6 +5,15 @@
 import { MCPServerConfig } from './mcp.js';
 import { OrgConfig } from './org-config.js';
 
+/**
+ * Progress mode for webhook callbacks.
+ * - 'complete': Legacy behavior - only send on completion
+ * - 'iteration': Send after each orchestration iteration (default)
+ * - 'periodic': Send accumulated text every N seconds
+ * - 'sentence': Send after each complete sentence
+ */
+export type ProgressMode = 'complete' | 'iteration' | 'periodic' | 'sentence';
+
 export interface ChatRequest {
   client_id: string;
   user_id: string;
@@ -14,6 +23,7 @@ export interface ChatRequest {
   audio_format?: string;
   progress_callback_url?: string;
   progress_throttle_seconds?: number;
+  progress_mode?: ProgressMode;
   message_key?: string; // WhatsApp message identifier for correlation
   org?: string; // Organization for MCP server selection (defaults to DEFAULT_ORG)
 
@@ -155,6 +165,7 @@ export interface StreamCallbacks {
   onError: (error: string) => void;
   onToolUse?: (toolName: string, input: unknown) => void;
   onToolResult?: (toolName: string, result: unknown) => void;
+  onIterationComplete?: (text: string) => void;
 }
 
 /**
