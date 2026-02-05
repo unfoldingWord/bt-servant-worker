@@ -392,22 +392,18 @@ function buildErrorResult(
   };
 }
 
-function truncateCode(code: string): string {
-  return code.length <= 500 ? code : code.slice(0, 500) + '...[truncated]';
-}
-
 function logExecutionError(
   logger: RequestLogger,
   error: unknown,
   startTime: number,
   mcpCounter: MCPCallCounter,
-  codePreview: string
+  code: string
 ): void {
   const baseData = {
     duration_ms: Date.now() - startTime,
     mcp_calls_made: mcpCounter.count,
     mcp_calls_limit: mcpCounter.limit,
-    code_preview: codePreview,
+    code,
   };
   if (error instanceof MCPCallLimitError) {
     logger.warn('code_execution_limit_error', { ...baseData, error: 'MCP_CALL_LIMIT_EXCEEDED' });
@@ -456,11 +452,9 @@ export async function executeCode(
     count: 0,
     limit: options.maxMcpCalls ?? DEFAULT_MAX_MCP_CALLS,
   };
-  const codePreview = truncateCode(code);
-
   logger.log('code_execution_start', {
     code_length: code.length,
-    code_preview: codePreview,
+    code,
     host_functions: options.hostFunctions.map((f) => f.name),
     max_mcp_calls: mcpCounter.limit,
   });
@@ -478,7 +472,7 @@ export async function executeCode(
     });
     return buildSuccessResult(value, logs, startTime, mcpCounter);
   } catch (error) {
-    logExecutionError(logger, error, startTime, mcpCounter, codePreview);
+    logExecutionError(logger, error, startTime, mcpCounter, code);
     return buildErrorResult(error, logs, startTime, mcpCounter);
   } finally {
     vm?.dispose();
