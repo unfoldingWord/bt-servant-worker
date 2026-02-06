@@ -12,6 +12,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { Env } from '../../config/types.js';
 import { ChatHistoryEntry, StreamCallbacks } from '../../types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig } from '../../types/org-config.js';
+import { DEFAULT_PROMPT_VALUES, PromptSlot } from '../../types/prompt-overrides.js';
 import {
   ClaudeAPIError,
   MCPBudgetExceededError,
@@ -70,6 +71,7 @@ interface OrchestratorOptions {
   history: ChatHistoryEntry[];
   preferences: { response_language: string; first_interaction: boolean };
   orgConfig?: OrgConfig;
+  resolvedPromptValues?: Required<Record<PromptSlot, string>>;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
 }
@@ -334,6 +336,7 @@ function createOrchestrationContext(
   config: ReturnType<typeof parseEnvConfig>
 ): OrchestrationContext {
   const { env, catalog, history, preferences, orgConfig, logger, callbacks } = options;
+  const promptValues = options.resolvedPromptValues ?? DEFAULT_PROMPT_VALUES;
 
   // Use LLM limit from org config (default: 5)
   const llmMax = orgConfig?.max_history_llm ?? DEFAULT_ORG_CONFIG.max_history_llm;
@@ -342,7 +345,7 @@ function createOrchestrationContext(
     client: new Anthropic({ apiKey: env.ANTHROPIC_API_KEY }),
     model: config.model,
     maxTokens: config.maxTokens,
-    systemPrompt: buildSystemPrompt(catalog, preferences, history),
+    systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues),
     tools: buildAllTools(catalog),
     messages: [...historyToMessages(history, llmMax), { role: 'user', content: userMessage }],
     responses: [],

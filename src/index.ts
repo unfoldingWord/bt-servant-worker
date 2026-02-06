@@ -12,6 +12,13 @@ import { discoverAllTools } from './services/mcp/index.js';
 import { MCPServerConfig } from './services/mcp/types.js';
 import { ChatRequest } from './types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig, validateOrgConfig } from './types/org-config.js';
+import {
+  DEFAULT_PROMPT_VALUES,
+  mergePromptOverrides,
+  PromptOverrides,
+  resolvePromptOverrides,
+  validatePromptOverrides,
+} from './types/prompt-overrides.js';
 import { constantTimeCompare } from './utils/crypto.js';
 import { createRequestLogger } from './utils/logger.js';
 import {
@@ -304,6 +311,88 @@ app.delete('/api/v1/admin/orgs/:org/config', async (c) => {
   }
 });
 
+// Admin endpoints for org-level prompt overrides
+app.get('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
+  const org = c.req.param('org');
+
+  try {
+    const overrides = (await c.env.PROMPT_OVERRIDES.get<PromptOverrides>(org, 'json')) ?? {};
+    const resolved = resolvePromptOverrides(overrides, {});
+
+    logAdminAction('get_prompt_overrides', org, { slots_set: Object.keys(overrides).length });
+    return c.json({ org, overrides, resolved });
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    logAdminAction('get_prompt_overrides_error', org, { error: errorMsg });
+    return c.json({ error: 'Failed to read prompt overrides from storage' }, 500);
+  }
+});
+
+app.put('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
+  const org = c.req.param('org');
+  const updates = await c.req.json();
+
+  const validationError = validatePromptOverrides(updates);
+  if (validationError) {
+    return c.json({ error: validationError }, 400);
+  }
+
+  try {
+    // NOTE: This read-modify-write pattern can race with concurrent requests (last write wins).
+    // This is acceptable for admin endpoints which are low-volume and authenticated.
+    const existing = (await c.env.PROMPT_OVERRIDES.get<PromptOverrides>(org, 'json')) ?? {};
+    const merged = mergePromptOverrides(existing, updates as PromptOverrides);
+
+    await c.env.PROMPT_OVERRIDES.put(org, JSON.stringify(merged));
+    const resolved = resolvePromptOverrides(merged, {});
+
+    logAdminAction('update_prompt_overrides', org, { slots_set: Object.keys(merged).length });
+    return c.json({ org, overrides: merged, resolved, message: 'Prompt overrides updated' });
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    logAdminAction('update_prompt_overrides_error', org, { error: errorMsg });
+    return c.json({ error: 'Failed to update prompt overrides in storage' }, 500);
+  }
+});
+
+app.delete('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
+  const org = c.req.param('org');
+
+  try {
+    await c.env.PROMPT_OVERRIDES.delete(org);
+    logAdminAction('reset_prompt_overrides', org, {});
+    return c.json({
+      org,
+      overrides: {},
+      resolved: DEFAULT_PROMPT_VALUES,
+      message: 'Prompt overrides reset to defaults',
+    });
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    logAdminAction('reset_prompt_overrides_error', org, { error: errorMsg });
+    return c.json({ error: 'Failed to delete prompt overrides from storage' }, 500);
+  }
+});
+
+// Admin endpoints for user-level prompt overrides (routed to DO)
+app.get('/api/v1/admin/orgs/:org/users/:userId/prompt-overrides', async (c) => {
+  const org = c.req.param('org');
+  const userId = c.req.param('userId');
+  return handleUserRequest(c.req.raw, c.env, org, userId, '/prompt-overrides');
+});
+
+app.put('/api/v1/admin/orgs/:org/users/:userId/prompt-overrides', async (c) => {
+  const org = c.req.param('org');
+  const userId = c.req.param('userId');
+  return handleUserRequest(c.req.raw, c.env, org, userId, '/prompt-overrides');
+});
+
+app.delete('/api/v1/admin/orgs/:org/users/:userId/prompt-overrides', async (c) => {
+  const org = c.req.param('org');
+  const userId = c.req.param('userId');
+  return handleUserRequest(c.req.raw, c.env, org, userId, '/prompt-overrides');
+});
+
 export default app;
 
 /**
@@ -335,6 +424,22 @@ async function getMCPServersFromKV(
 }
 
 /**
+ * Read prompt overrides from KV, returning empty object on error (will use defaults).
+ */
+async function getPromptOverridesFromKV(
+  env: Env,
+  org: string,
+  logger: ReturnType<typeof createRequestLogger>
+): Promise<PromptOverrides> {
+  try {
+    return (await env.PROMPT_OVERRIDES.get<PromptOverrides>(org, 'json')) ?? {};
+  } catch (error) {
+    logger.error('prompt_overrides_kv_read_error', error);
+    return {}; // Continue with defaults — chat can still work
+  }
+}
+
+/**
  * Read org config from KV, returning empty object on error (will use defaults).
  */
 async function getOrgConfigFromKV(
@@ -348,6 +453,53 @@ async function getOrgConfigFromKV(
     logger.error('org_config_kv_read_error', error);
     return {}; // Continue with defaults - chat can still work
   }
+}
+
+/**
+ * Build a DO request with org-level KV data injected into the body.
+ */
+async function buildDOChatRequest(
+  request: Request,
+  env: Env,
+  opts: {
+    body: ChatRequest;
+    org: string;
+    doPath: string;
+    logger: ReturnType<typeof createRequestLogger>;
+  }
+): Promise<{ stub: DurableObjectStub; doRequest: Request }> {
+  const { body, org, doPath, logger } = opts;
+
+  const [mcpServers, orgConfig, promptOverrides] = await Promise.all([
+    getMCPServersFromKV(env, org, logger),
+    getOrgConfigFromKV(env, org, logger),
+    getPromptOverridesFromKV(env, org, logger),
+  ]);
+
+  const doId = env.USER_SESSION.idFromName(`user:${org}:${body.user_id}`);
+  const stub = env.USER_SESSION.get(doId);
+
+  logger.log('do_routed', {
+    do_id: doId.toString(),
+    mcp_server_count: mcpServers.length,
+    org_config: orgConfig,
+  });
+
+  const doUrl = new URL(request.url);
+  doUrl.pathname = doPath;
+
+  const doRequest = new Request(doUrl.toString(), {
+    method: 'POST',
+    headers: request.headers,
+    body: JSON.stringify({
+      ...body,
+      _mcp_servers: mcpServers,
+      _org_config: orgConfig,
+      _org_prompt_overrides: promptOverrides,
+    }),
+  });
+
+  return { stub, doRequest };
 }
 
 /**
@@ -377,30 +529,12 @@ async function handleChatRequest(request: Request, env: Env, doPath: string): Pr
       path: doPath,
     });
 
-    // Fetch MCP servers and org config in parallel
-    const [mcpServers, orgConfig] = await Promise.all([
-      getMCPServersFromKV(env, org, logger),
-      getOrgConfigFromKV(env, org, logger),
-    ]);
-
-    const doId = env.USER_SESSION.idFromName(`user:${org}:${body.user_id}`);
-    const stub = env.USER_SESSION.get(doId);
-
-    logger.log('do_routed', {
-      do_id: doId.toString(),
-      mcp_server_count: mcpServers.length,
-      org_config: orgConfig,
+    const { stub, doRequest } = await buildDOChatRequest(request, env, {
+      body,
+      org,
+      doPath,
+      logger,
     });
-
-    const doUrl = new URL(request.url);
-    doUrl.pathname = doPath;
-
-    const doRequest = new Request(doUrl.toString(), {
-      method: 'POST',
-      headers: request.headers,
-      body: JSON.stringify({ ...body, _mcp_servers: mcpServers, _org_config: orgConfig }),
-    });
-
     return stub.fetch(doRequest);
   } catch (error) {
     logger.error('request_error', error);

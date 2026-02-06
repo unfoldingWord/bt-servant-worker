@@ -52,7 +52,7 @@ export default defineWorkersConfig({
             ENGINE_API_KEY: 'test-api-key',
             ANTHROPIC_API_KEY: anthropicKey,
           },
-          kvNamespaces: ['ORG_ADMIN_KEYS', 'MCP_SERVERS', 'ORG_CONFIG'],
+          kvNamespaces: ['ORG_ADMIN_KEYS', 'MCP_SERVERS', 'ORG_CONFIG', 'PROMPT_OVERRIDES'],
         },
         // Disable isolated storage to avoid issues with multi-request DO tests
         // See: https://developers.cloudflare.com/workers/testing/vitest-integration/known-issues/#isolated-storage

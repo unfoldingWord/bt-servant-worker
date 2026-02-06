@@ -4,6 +4,7 @@
 
 import { MCPServerConfig } from './mcp.js';
 import { OrgConfig } from './org-config.js';
+import { PromptOverrides } from './prompt-overrides.js';
 
 /**
  * Progress mode for webhook callbacks.
@@ -32,6 +33,9 @@ export interface ChatRequest {
 
   /** Internal: Org config injected by worker (not from client) */
   _org_config?: OrgConfig;
+
+  /** Internal: Org-level prompt overrides injected by worker from KV (not from client) */
+  _org_prompt_overrides?: PromptOverrides;
 }
 
 export interface ChatResponse {
