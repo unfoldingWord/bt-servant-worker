@@ -3,6 +3,7 @@
  */
 
 import { ChatHistoryEntry } from '../../types/engine.js';
+import { PromptSlot } from '../../types/prompt-overrides.js';
 import { generateToolCatalog, ToolCatalog } from '../mcp/index.js';
 
 /**
@@ -13,96 +14,61 @@ export interface OrchestrationPreferences {
   first_interaction: boolean;
 }
 
-const BASE_SYSTEM_PROMPT = `You are BT Servant, a helpful assistant for Bible translators. You help with:
-- Looking up scripture passages and references
-- Checking translation notes and resources
-- Answering questions about biblical languages (Hebrew, Greek, Aramaic)
-- Providing translation suggestions and alternatives
-- Explaining cultural and historical context
-
-## How to Use Tools
-
-You have access to MCP tools for Bible translation data. To use them:
-
-1. **Review the catalog below** to identify which tools you need
-2. **Call get_tool_definitions** with the tool names to get their full schemas
-3. **Use execute_code** to call the tools with the correct parameters
-
-Example workflow:
-\`\`\`
-// 1. First, call get_tool_definitions to learn the schema
-// 2. Then use execute_code:
-const scripture = await fetch_scripture({ book: "John", chapter: 3, verse: 16 });
-__result__ = scripture;
-\`\`\`
-
-## Resource Usage Guidelines
-
-IMPORTANT: You operate under strict resource limits. Follow these rules:
-
-### Request Scope
-- **NEVER** loop over more than 10 items in a single code execution
-- If a request involves "entire", "all", "every", "complete", or "full" (e.g., "entire book", "all chapters"), STOP and ask the user to narrow the scope
-- Prefer summaries and overviews over exhaustive data fetching
-
-### Before Acting on Broad Requests
-If a request would require many tool calls (more than 5), ask a clarifying question FIRST:
-- "That covers a lot of content. Would you like me to start with a specific subset?"
-- "Which specific chapters or verses are most relevant to your translation work?"
-- "Should I provide a high-level summary first?"
-
-### Resource Limits
-- Maximum 10 MCP tool calls per code execution
-- If you exceed this limit, execution will fail - plan accordingly
-- Break large tasks into multiple interactions with user confirmation
-
-### Partial Results Pattern
-When you can only fetch part of what the user asked for:
-1. Fetch a reasonable batch (5-10 items max)
-2. Present what you got: "I've fetched the first 10 chapters of Genesis..."
-3. Offer to continue: "Would you like me to continue with chapters 11-20?"
-4. Wait for user confirmation before fetching more
-
-### Examples
-BAD: Looping over all chapters: \`for (let i = 1; i <= 50; i++) { await fetch_scripture(...) }\`
-GOOD: Ask "Genesis has 50 chapters. Which chapters would you like me to focus on?"
-GOOD: Fetch first 5, say "I've retrieved Genesis 1-5. Would you like me to continue with 6-10?"
-
-Always be accurate and cite your sources when providing information about scripture.`;
-
 /**
- * Build the full system prompt with tool catalog and user context
+ * Build the full system prompt with tool catalog and user context.
+ *
+ * Assembly order:
+ *   [identity] → [methodology] → [tool_guidance] → [tool catalog] →
+ *   [instructions] → [user preferences] → [conversation context] →
+ *   [first interaction] → [closing]
  */
 export function buildSystemPrompt(
   catalog: ToolCatalog,
   preferences: OrchestrationPreferences,
-  history: ChatHistoryEntry[]
+  history: ChatHistoryEntry[],
+  resolvedPromptValues: Required<Record<PromptSlot, string>>
 ): string {
-  const sections: string[] = [BASE_SYSTEM_PROMPT];
+  const sections: string[] = [];
 
-  // Add tool catalog (compact format - name + one-liner only)
+  // Slot: identity
+  sections.push(resolvedPromptValues.identity);
+
+  // Slot: methodology
+  sections.push(resolvedPromptValues.methodology);
+
+  // Slot: tool_guidance
+  sections.push(resolvedPromptValues.tool_guidance);
+
+  // Tool catalog (always generated from MCP servers — NOT a slot)
   const toolCatalog = generateToolCatalog(catalog);
-  sections.push('\n\n' + toolCatalog);
+  sections.push(toolCatalog);
 
-  // Add user preferences
+  // Slot: instructions
+  sections.push(resolvedPromptValues.instructions);
+
+  // Conditional: user preferences
   if (preferences.response_language !== 'en') {
     sections.push(
-      `\n\n## User Preferences\n\nRespond in ${preferences.response_language} when possible.`
+      `## User Preferences\n\nRespond in ${preferences.response_language} when possible.`
     );
   }
 
-  // Add conversation context if there's history
+  // Conditional: conversation context
   if (history.length > 0) {
-    sections.push('\n\n## Recent Conversation Context');
-    sections.push('The user has been in conversation. Consider this context when responding.');
+    sections.push(
+      '## Recent Conversation Context\nThe user has been in conversation. Consider this context when responding.'
+    );
   }
 
-  // Add first interaction note
+  // Conditional: first interaction
   if (preferences.first_interaction) {
-    sections.push("\n\nThis is the user's first interaction. Briefly welcome them.");
+    sections.push("This is the user's first interaction. Briefly welcome them.");
   }
 
-  return sections.join('');
+  // Slot: closing
+  sections.push(resolvedPromptValues.closing);
+
+  return sections.join('\n\n');
 }
 
 /**

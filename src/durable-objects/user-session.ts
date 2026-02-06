@@ -49,10 +49,16 @@ import {
   UserPreferencesInternal,
 } from '../types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig } from '../types/org-config.js';
+import {
+  PromptOverrides,
+  resolvePromptOverrides,
+  validatePromptOverrides,
+} from '../types/prompt-overrides.js';
 import { ValidationError } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger } from '../utils/logger.js';
 const HISTORY_KEY = 'history';
 const PREFERENCES_KEY = 'preferences';
+const PROMPT_OVERRIDES_KEY = 'prompt_overrides';
 const PROCESSING_LOCK_KEY = '_processing_lock';
 const LOCK_STALE_THRESHOLD_MS = 90000; // 90 seconds
 const RETRY_AFTER_SECONDS = 5;
@@ -97,6 +103,9 @@ export class UserSession {
     this.app.get('/preferences', () => this.handleGetPreferences());
     this.app.put('/preferences', (c) => this.handleUpdatePreferences(c.req.raw));
     this.app.get('/history', (c) => this.handleGetHistory(new URL(c.req.url)));
+    this.app.get('/prompt-overrides', () => this.handleGetPromptOverrides());
+    this.app.put('/prompt-overrides', (c) => this.handleUpdatePromptOverrides(c.req.raw));
+    this.app.delete('/prompt-overrides', () => this.handleDeletePromptOverrides());
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -449,6 +458,11 @@ export class UserSession {
     const orgConfig = body._org_config ?? {};
     const catalog = await this.discoverMCPTools(mcpServers, logger);
 
+    // Resolve prompt overrides: user → org → default
+    const orgOverrides = body._prompt_overrides ?? {};
+    const userOverrides = await this.getPromptOverrides();
+    const resolvedPromptValues = resolvePromptOverrides(orgOverrides, userOverrides);
+
     const startTime = Date.now();
     const responses = await orchestrate(body.message, {
       env: this.env,
@@ -459,6 +473,7 @@ export class UserSession {
         first_interaction: preferences.first_interaction,
       },
       orgConfig,
+      resolvedPromptValues,
       logger,
       callbacks,
     });
@@ -474,6 +489,48 @@ export class UserSession {
       response_language: preferences.response_language,
       voice_audio_base64: null,
     };
+  }
+
+  private async handleGetPromptOverrides(): Promise<Response> {
+    const overrides = await this.getPromptOverrides();
+    return Response.json(overrides);
+  }
+
+  private async handleUpdatePromptOverrides(request: Request): Promise<Response> {
+    const body = await request.json();
+    const error = validatePromptOverrides(body);
+    if (error) {
+      return Response.json({ error }, { status: 400 });
+    }
+
+    const current = await this.getPromptOverrides();
+    const updates = body as PromptOverrides;
+    const merged: PromptOverrides = { ...current };
+
+    for (const [key, value] of Object.entries(updates)) {
+      if (value === null) {
+        delete merged[key as keyof PromptOverrides];
+      } else if (typeof value === 'string') {
+        // eslint-disable-next-line security/detect-object-injection -- key validated by validatePromptOverrides
+        (merged as Record<string, unknown>)[key] = value;
+      }
+    }
+
+    await this.updatePromptOverrides(merged);
+    return Response.json(merged);
+  }
+
+  private async handleDeletePromptOverrides(): Promise<Response> {
+    await this.state.storage.delete(PROMPT_OVERRIDES_KEY);
+    return Response.json({ message: 'User prompt overrides cleared' });
+  }
+
+  private async getPromptOverrides(): Promise<PromptOverrides> {
+    return (await this.state.storage.get<PromptOverrides>(PROMPT_OVERRIDES_KEY)) ?? {};
+  }
+
+  private async updatePromptOverrides(overrides: PromptOverrides): Promise<void> {
+    await this.state.storage.put(PROMPT_OVERRIDES_KEY, overrides);
   }
 
   private async getHistory(): Promise<ChatHistoryEntry[]> {

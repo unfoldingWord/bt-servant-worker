@@ -26,6 +26,10 @@ id = "a101cdbc8fc347e8b88b9dadc328dbe0"
 binding = "ORG_CONFIG"
 id = "d7149c3d69f34cff87146557163f0a6c"
 
+[[kv_namespaces]]
+binding = "PROMPT_OVERRIDES"
+id = "PLACEHOLDER_CREATE_VIA_WRANGLER"
+
 # Durable Objects
 [[durable_objects.bindings]]
 name = "USER_SESSION"
