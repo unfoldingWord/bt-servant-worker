@@ -34,8 +34,8 @@ export interface ChatRequest {
   /** Internal: Org config injected by worker (not from client) */
   _org_config?: OrgConfig;
 
-  /** Internal: Org-level prompt overrides injected by worker (not from client) */
-  _prompt_overrides?: PromptOverrides;
+  /** Internal: Org-level prompt overrides injected by worker from KV (not from client) */
+  _org_prompt_overrides?: PromptOverrides;
 }
 
 export interface ChatResponse {

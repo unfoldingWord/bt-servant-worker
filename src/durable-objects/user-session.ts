@@ -50,6 +50,9 @@ import {
 } from '../types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig } from '../types/org-config.js';
 import {
+  DEFAULT_PROMPT_VALUES,
+  mergePromptOverrides,
+  PROMPT_OVERRIDE_SLOTS,
   PromptOverrides,
   resolvePromptOverrides,
   validatePromptOverrides,
@@ -459,9 +462,21 @@ export class UserSession {
     const catalog = await this.discoverMCPTools(mcpServers, logger);
 
     // Resolve prompt overrides: user → org → default
-    const orgOverrides = body._prompt_overrides ?? {};
+    const orgOverrides = body._org_prompt_overrides ?? {};
     const userOverrides = await this.getPromptOverrides();
     const resolvedPromptValues = resolvePromptOverrides(orgOverrides, userOverrides);
+
+    const overriddenSlots = PROMPT_OVERRIDE_SLOTS.filter(
+      // eslint-disable-next-line security/detect-object-injection -- s is from PROMPT_OVERRIDE_SLOTS constant
+      (s) => resolvedPromptValues[s] !== DEFAULT_PROMPT_VALUES[s]
+    );
+    if (overriddenSlots.length > 0) {
+      logger.log('prompt_overrides_applied', {
+        org_overrides: Object.keys(orgOverrides).length,
+        user_overrides: Object.keys(userOverrides).length,
+        overridden_slots: overriddenSlots,
+      });
+    }
 
     const startTime = Date.now();
     const responses = await orchestrate(body.message, {
@@ -492,8 +507,13 @@ export class UserSession {
   }
 
   private async handleGetPromptOverrides(): Promise<Response> {
-    const overrides = await this.getPromptOverrides();
-    return Response.json(overrides);
+    try {
+      const overrides = await this.getPromptOverrides();
+      return Response.json(overrides);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
+    }
   }
 
   private async handleUpdatePromptOverrides(request: Request): Promise<Response> {
@@ -503,26 +523,25 @@ export class UserSession {
       return Response.json({ error }, { status: 400 });
     }
 
-    const current = await this.getPromptOverrides();
-    const updates = body as PromptOverrides;
-    const merged: PromptOverrides = { ...current };
-
-    for (const [key, value] of Object.entries(updates)) {
-      if (value === null) {
-        delete merged[key as keyof PromptOverrides];
-      } else if (typeof value === 'string') {
-        // eslint-disable-next-line security/detect-object-injection -- key validated by validatePromptOverrides
-        (merged as Record<string, unknown>)[key] = value;
-      }
+    try {
+      const current = await this.getPromptOverrides();
+      const merged = mergePromptOverrides(current, body as PromptOverrides);
+      await this.updatePromptOverrides(merged);
+      return Response.json(merged);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
     }
-
-    await this.updatePromptOverrides(merged);
-    return Response.json(merged);
   }
 
   private async handleDeletePromptOverrides(): Promise<Response> {
-    await this.state.storage.delete(PROMPT_OVERRIDES_KEY);
-    return Response.json({ message: 'User prompt overrides cleared' });
+    try {
+      await this.state.storage.delete(PROMPT_OVERRIDES_KEY);
+      return Response.json({ message: 'User prompt overrides cleared' });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
+    }
   }
 
   private async getPromptOverrides(): Promise<PromptOverrides> {

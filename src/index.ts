@@ -14,6 +14,7 @@ import { ChatRequest } from './types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig, validateOrgConfig } from './types/org-config.js';
 import {
   DEFAULT_PROMPT_VALUES,
+  mergePromptOverrides,
   PromptOverrides,
   resolvePromptOverrides,
   validatePromptOverrides,
@@ -337,18 +338,10 @@ app.put('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
   }
 
   try {
-    // Merge with existing overrides (upsert behavior)
+    // NOTE: This read-modify-write pattern can race with concurrent requests (last write wins).
+    // This is acceptable for admin endpoints which are low-volume and authenticated.
     const existing = (await c.env.PROMPT_OVERRIDES.get<PromptOverrides>(org, 'json')) ?? {};
-    const merged: PromptOverrides = { ...existing };
-
-    for (const [key, value] of Object.entries(updates as PromptOverrides)) {
-      if (value === null) {
-        delete merged[key as keyof PromptOverrides];
-      } else if (typeof value === 'string') {
-        // eslint-disable-next-line security/detect-object-injection -- key validated by validatePromptOverrides
-        (merged as Record<string, unknown>)[key] = value;
-      }
-    }
+    const merged = mergePromptOverrides(existing, updates as PromptOverrides);
 
     await c.env.PROMPT_OVERRIDES.put(org, JSON.stringify(merged));
     const resolved = resolvePromptOverrides(merged, {});
@@ -502,7 +495,7 @@ async function buildDOChatRequest(
       ...body,
       _mcp_servers: mcpServers,
       _org_config: orgConfig,
-      _prompt_overrides: promptOverrides,
+      _org_prompt_overrides: promptOverrides,
     }),
   });
 

@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   validatePromptOverrides,
   resolvePromptOverrides,
+  mergePromptOverrides,
   DEFAULT_PROMPT_VALUES,
   MAX_OVERRIDE_LENGTH,
   PROMPT_OVERRIDE_SLOTS,
@@ -141,5 +142,45 @@ describe('resolvePromptOverrides - user overrides', () => {
     const userOverrides: PromptOverrides = { identity: null };
     const result = resolvePromptOverrides(orgOverrides, userOverrides);
     expect(result.identity).toBe('Org persona');
+  });
+});
+
+describe('resolvePromptOverrides - defensive validation', () => {
+  it('empty strings do not override defaults', () => {
+    const result = resolvePromptOverrides({ identity: '' }, {});
+    expect(result.identity).toBe(DEFAULT_PROMPT_VALUES.identity);
+  });
+
+  it('whitespace-only strings do not override defaults', () => {
+    const result = resolvePromptOverrides({ identity: '   ' }, {});
+    expect(result.identity).toBe(DEFAULT_PROMPT_VALUES.identity);
+  });
+
+  it('empty user strings do not override org values', () => {
+    const result = resolvePromptOverrides({ identity: 'Org' }, { identity: '' });
+    expect(result.identity).toBe('Org');
+  });
+});
+
+describe('mergePromptOverrides', () => {
+  it('sets new slot values', () => {
+    const result = mergePromptOverrides({}, { identity: 'New persona' });
+    expect(result.identity).toBe('New persona');
+  });
+
+  it('deletes slots set to null', () => {
+    const result = mergePromptOverrides({ identity: 'Old' }, { identity: null });
+    expect(result.identity).toBeUndefined();
+  });
+
+  it('preserves existing slots not in updates', () => {
+    const result = mergePromptOverrides({ identity: 'Keep', closing: 'Keep' }, { identity: 'New' });
+    expect(result.identity).toBe('New');
+    expect(result.closing).toBe('Keep');
+  });
+
+  it('strips control characters from values', () => {
+    const result = mergePromptOverrides({}, { identity: 'Hello\x00World\x01!' });
+    expect(result.identity).toBe('HelloWorld!');
   });
 });

@@ -21,9 +21,10 @@ export const MAX_OVERRIDE_LENGTH = 4000;
 
 /**
  * Prompt overrides — each slot is optional.
- * undefined = not set (inherit from next level)
- * null = explicitly cleared (in PUT requests)
- * string = override value
+ * - undefined = not set (inherit from next level)
+ * - null = used in PUT requests to delete an override; after merge it becomes
+ *   undefined in storage, so resolution only ever sees string | undefined
+ * - string = override value
  */
 export interface PromptOverrides {
   identity?: string | null;
@@ -100,6 +101,12 @@ GOOD: Fetch first 5, say "I've retrieved Genesis 1-5. Would you like me to conti
   closing: `Always be accurate and cite your sources when providing information about scripture.`,
 };
 
+/** Strip control characters (except newline, tab, carriage return) from a string */
+function stripControlChars(value: string): string {
+  // eslint-disable-next-line no-control-regex -- intentional: stripping control chars for safety
+  return value.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+}
+
 /**
  * Validate prompt overrides.
  * Returns an error message if invalid, null if valid.
@@ -136,8 +143,35 @@ export function validatePromptOverrides(overrides: unknown): string | null {
 }
 
 /**
+ * Type-safe merge of prompt override updates into an existing overrides object.
+ * - null values delete the slot (revert to inherited behavior)
+ * - string values set the slot (after stripping control characters)
+ * - undefined values are ignored
+ */
+export function mergePromptOverrides(
+  existing: PromptOverrides,
+  updates: PromptOverrides
+): PromptOverrides {
+  const merged: PromptOverrides = { ...existing };
+  for (const slot of PROMPT_OVERRIDE_SLOTS) {
+    // eslint-disable-next-line security/detect-object-injection -- slot is from PROMPT_OVERRIDE_SLOTS constant
+    const value = updates[slot];
+    if (value === null) {
+      // eslint-disable-next-line security/detect-object-injection -- slot is from PROMPT_OVERRIDE_SLOTS constant
+      delete merged[slot];
+    } else if (typeof value === 'string') {
+      // eslint-disable-next-line security/detect-object-injection -- slot is from PROMPT_OVERRIDE_SLOTS constant
+      merged[slot] = stripControlChars(value);
+    }
+  }
+  return merged;
+}
+
+/**
  * Resolve prompt overrides: user → org → default.
- * Only string values override; null/undefined are skipped (inherit from next level).
+ * Only non-empty string values override; null/undefined/empty are skipped
+ * (inherit from next level). This provides defensive validation against
+ * corrupted or manually-edited KV/DO data.
  */
 export function resolvePromptOverrides(
   orgOverrides: PromptOverrides,
@@ -146,9 +180,17 @@ export function resolvePromptOverrides(
   const resolved = { ...DEFAULT_PROMPT_VALUES };
   for (const slot of PROMPT_OVERRIDE_SLOTS) {
     // eslint-disable-next-line security/detect-object-injection -- slot is from PROMPT_OVERRIDE_SLOTS constant
-    if (typeof orgOverrides[slot] === 'string') resolved[slot] = orgOverrides[slot];
+    const orgVal = orgOverrides[slot];
+    if (typeof orgVal === 'string' && orgVal.trim()) {
+      // eslint-disable-next-line security/detect-object-injection -- slot is from PROMPT_OVERRIDE_SLOTS constant
+      resolved[slot] = orgVal;
+    }
     // eslint-disable-next-line security/detect-object-injection -- slot is from PROMPT_OVERRIDE_SLOTS constant
-    if (typeof userOverrides[slot] === 'string') resolved[slot] = userOverrides[slot];
+    const userVal = userOverrides[slot];
+    if (typeof userVal === 'string' && userVal.trim()) {
+      // eslint-disable-next-line security/detect-object-injection -- slot is from PROMPT_OVERRIDE_SLOTS constant
+      resolved[slot] = userVal;
+    }
   }
   return resolved;
 }

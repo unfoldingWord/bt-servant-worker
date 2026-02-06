@@ -79,6 +79,7 @@ describe('buildSystemPrompt - tool catalog', () => {
 
     const prompt = buildSystemPrompt(catalog, defaultPrefs, [], DEFAULT_PROMPT_VALUES);
 
+    // Underscores are escaped in the markdown tool catalog table (my_tool → my\_tool)
     expect(prompt).toContain('my\\_tool');
     expect(prompt).toContain('A test tool');
 
