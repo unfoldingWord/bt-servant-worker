@@ -324,7 +324,7 @@ app.get('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
     logAdminAction('get_prompt_overrides_error', org, { error: errorMsg });
-    return c.json({ org, overrides: {}, resolved: DEFAULT_PROMPT_VALUES });
+    return c.json({ error: 'Failed to read prompt overrides from storage' }, 500);
   }
 });
 

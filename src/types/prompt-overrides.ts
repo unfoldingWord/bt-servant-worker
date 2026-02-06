@@ -183,13 +183,13 @@ export function resolvePromptOverrides(
     const orgVal = orgOverrides[slot];
     if (typeof orgVal === 'string' && orgVal.trim()) {
       // eslint-disable-next-line security/detect-object-injection -- slot is from PROMPT_OVERRIDE_SLOTS constant
-      resolved[slot] = orgVal;
+      resolved[slot] = stripControlChars(orgVal);
     }
     // eslint-disable-next-line security/detect-object-injection -- slot is from PROMPT_OVERRIDE_SLOTS constant
     const userVal = userOverrides[slot];
     if (typeof userVal === 'string' && userVal.trim()) {
       // eslint-disable-next-line security/detect-object-injection -- slot is from PROMPT_OVERRIDE_SLOTS constant
-      resolved[slot] = userVal;
+      resolved[slot] = stripControlChars(userVal);
     }
   }
   return resolved;
