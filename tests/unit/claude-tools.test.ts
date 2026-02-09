@@ -2,8 +2,12 @@ import { describe, it, expect } from 'vitest';
 import {
   buildExecuteCodeTool,
   buildGetToolDefinitionsTool,
+  buildReadMemoryTool,
+  buildUpdateMemoryTool,
   buildAllTools,
   isBuiltInTool,
+  isReadMemoryInput,
+  isUpdateMemoryInput,
   getToolDefinitions,
 } from '../../src/services/claude/tools.js';
 import { buildToolCatalog } from '../../src/services/mcp/catalog.js';
@@ -49,10 +53,12 @@ describe('buildAllTools', () => {
 
     const tools = buildAllTools(catalog);
 
-    // Only meta-tools, not MCP tools
-    expect(tools.length).toBe(2);
+    // Meta-tools + memory tools, not MCP tools
+    expect(tools.length).toBe(4);
     expect(tools.map((t) => t.name)).toContain('execute_code');
     expect(tools.map((t) => t.name)).toContain('get_tool_definitions');
+    expect(tools.map((t) => t.name)).toContain('read_memory');
+    expect(tools.map((t) => t.name)).toContain('update_memory');
     expect(tools.map((t) => t.name)).not.toContain('mcp_tool');
   });
 });
@@ -61,6 +67,8 @@ describe('isBuiltInTool', () => {
   it('should identify built-in tools', () => {
     expect(isBuiltInTool('execute_code')).toBe(true);
     expect(isBuiltInTool('get_tool_definitions')).toBe(true);
+    expect(isBuiltInTool('read_memory')).toBe(true);
+    expect(isBuiltInTool('update_memory')).toBe(true);
     expect(isBuiltInTool('some_mcp_tool')).toBe(false);
   });
 });
@@ -100,5 +108,89 @@ describe('getToolDefinitions', () => {
     const defs = getToolDefinitions(catalog, ['nonexistent']);
 
     expect(Object.keys(defs)).toHaveLength(0);
+  });
+});
+
+describe('buildReadMemoryTool', () => {
+  it('returns valid tool definition', () => {
+    const tool = buildReadMemoryTool();
+    expect(tool.name).toBe('read_memory');
+    expect(tool.description).toContain('persistent user memory');
+    expect(tool.input_schema.type).toBe('object');
+  });
+});
+
+describe('buildUpdateMemoryTool', () => {
+  it('returns valid tool definition', () => {
+    const tool = buildUpdateMemoryTool();
+    expect(tool.name).toBe('update_memory');
+    expect(tool.description).toContain('persistent memory');
+    expect(tool.input_schema.required).toContain('sections');
+  });
+});
+
+describe('isReadMemoryInput', () => {
+  it('accepts empty object (read full)', () => {
+    expect(isReadMemoryInput({})).toBe(true);
+  });
+
+  it('accepts empty sections array (read full)', () => {
+    expect(isReadMemoryInput({ sections: [] })).toBe(true);
+  });
+
+  it('accepts sections array with names', () => {
+    expect(isReadMemoryInput({ sections: ['Progress', 'Notes'] })).toBe(true);
+  });
+
+  it('rejects non-object', () => {
+    expect(isReadMemoryInput('string')).toBe(false);
+    expect(isReadMemoryInput(null)).toBe(false);
+  });
+
+  it('rejects non-array sections', () => {
+    expect(isReadMemoryInput({ sections: 'Progress' })).toBe(false);
+  });
+
+  it('rejects non-string array elements', () => {
+    expect(isReadMemoryInput({ sections: [42] })).toBe(false);
+  });
+
+  it('rejects empty string section names', () => {
+    expect(isReadMemoryInput({ sections: [''] })).toBe(false);
+  });
+});
+
+describe('isUpdateMemoryInput', () => {
+  it('accepts valid string updates', () => {
+    expect(isUpdateMemoryInput({ sections: { Progress: 'Phase 1 done' } })).toBe(true);
+  });
+
+  it('accepts null values for deletion', () => {
+    expect(isUpdateMemoryInput({ sections: { Old: null } })).toBe(true);
+  });
+
+  it('accepts mixed string and null values', () => {
+    expect(isUpdateMemoryInput({ sections: { A: 'new', B: null } })).toBe(true);
+  });
+
+  it('rejects missing sections', () => {
+    expect(isUpdateMemoryInput({})).toBe(false);
+  });
+
+  it('rejects empty sections object', () => {
+    expect(isUpdateMemoryInput({ sections: {} })).toBe(false);
+  });
+
+  it('rejects non-object sections', () => {
+    expect(isUpdateMemoryInput({ sections: 'bad' })).toBe(false);
+    expect(isUpdateMemoryInput({ sections: [] })).toBe(false);
+  });
+
+  it('rejects non-string non-null values', () => {
+    expect(isUpdateMemoryInput({ sections: { A: 42 } })).toBe(false);
+  });
+
+  it('rejects empty key names', () => {
+    expect(isUpdateMemoryInput({ sections: { '': 'value' } })).toBe(false);
   });
 });

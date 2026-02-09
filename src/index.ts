@@ -393,6 +393,19 @@ app.delete('/api/v1/admin/orgs/:org/users/:userId/prompt-overrides', async (c) =
   return handleUserRequest(c.req.raw, c.env, org, userId, '/prompt-overrides');
 });
 
+// Admin endpoints for user memory (routed to DO)
+app.get('/api/v1/admin/orgs/:org/users/:userId/memory', async (c) => {
+  const org = c.req.param('org');
+  const userId = c.req.param('userId');
+  return handleUserRequest(c.req.raw, c.env, org, userId, '/memory');
+});
+
+app.delete('/api/v1/admin/orgs/:org/users/:userId/memory', async (c) => {
+  const org = c.req.param('org');
+  const userId = c.req.param('userId');
+  return handleUserRequest(c.req.raw, c.env, org, userId, '/memory');
+});
+
 export default app;
 
 /**
