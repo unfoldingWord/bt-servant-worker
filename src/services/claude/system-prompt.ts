@@ -48,11 +48,11 @@ export function buildSystemPrompt(
   sections.push(resolvedPromptValues.instructions);
 
   // Slot: memory_instructions (always present so Claude knows tools exist)
-  // Append formatted TOC when memory is non-empty
+  sections.push(resolvedPromptValues.memory_instructions);
+
+  // Append formatted TOC when memory is non-empty (separate section)
   if (memoryTOC) {
-    sections.push(resolvedPromptValues.memory_instructions + '\n\n' + memoryTOC);
-  } else {
-    sections.push(resolvedPromptValues.memory_instructions);
+    sections.push(memoryTOC);
   }
 
   // Conditional: user preferences

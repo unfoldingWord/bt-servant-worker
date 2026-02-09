@@ -218,6 +218,13 @@ describe('updateSection', () => {
     const updated = updateSection(doc, 'Custom', '## Custom\n\nWith header');
     expect(updated.sections[0].content).toBe('## Custom\n\nWith header');
   });
+
+  it('normalizes mismatched header to match section name', () => {
+    const doc = parseMemoryDocument('');
+    const updated = updateSection(doc, 'Progress', '## Current Status\n\nDone');
+    expect(updated.sections[0].name).toBe('Progress');
+    expect(updated.sections[0].content).toBe('## Progress\n\nDone');
+  });
 });
 
 describe('deleteSection', () => {

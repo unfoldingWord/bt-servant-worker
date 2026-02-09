@@ -15,6 +15,7 @@ import {
   updateSection,
 } from './parser.js';
 import { MAX_MEMORY_SIZE_BYTES, MEMORY_STORAGE_KEY, MemoryTOC } from './types.js';
+import { byteLength } from './utils.js';
 
 export interface UserMemoryStore {
   /** Read full memory or specific sections */
@@ -35,11 +36,6 @@ export interface UserMemoryStore {
 
   /** Get raw memory size in bytes */
   getSizeBytes(): Promise<number>;
-}
-
-/** Calculate byte size of a string */
-function byteLength(str: string): number {
-  return new TextEncoder().encode(str).byteLength;
 }
 
 /**

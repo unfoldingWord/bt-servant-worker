@@ -32,7 +32,7 @@ AVAILABLE: console.log/info/warn/error, JSON, all MCP tool functions
 NOT AVAILABLE: fetch, require, import, process, eval, Function constructor
 
 RESOURCE LIMITS:
-- Maximum 10 MCP tool calls per execution (hard limit - execution fails if exceeded)
+- Maximum 10 MCP tool calls per execute_code invocation (hard limit - execution fails if exceeded)
 - 30 second timeout per execution
 - If you need more data, fetch a batch, inform the user what you got, and offer to continue
 
@@ -101,7 +101,7 @@ export function buildReadMemoryTool(): Anthropic.Tool {
 export function buildUpdateMemoryTool(): Anthropic.Tool {
   return {
     name: 'update_memory',
-    description: `Create, update, or delete sections in the user's persistent memory. Pass an object where keys are section names and values are either markdown content (to create/update) or null (to delete). Multiple sections can be updated in a single call.`,
+    description: `Create, update, or delete sections in the user's persistent memory. Pass an object where keys are section names and values are either markdown content (to create/update) or null (to delete). Multiple sections can be updated in a single call. The sections object must contain at least one entry.`,
     input_schema: {
       type: 'object',
       properties: {
@@ -169,7 +169,7 @@ export function isReadMemoryInput(input: unknown): input is { sections?: string[
   if (!('sections' in input)) return true; // no sections = read full
   const sections = (input as { sections: unknown }).sections;
   if (!Array.isArray(sections)) return false;
-  if (sections.length === 0) return true; // empty array = read full
+  if (sections.length === 0) return false; // empty array not allowed — omit parameter for full reads
   return (
     sections.length <= MAX_READ_SECTIONS &&
     sections.every((s) => typeof s === 'string' && s.length > 0)

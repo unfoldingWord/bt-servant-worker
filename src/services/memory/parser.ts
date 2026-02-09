@@ -6,14 +6,10 @@
  */
 
 import { MAX_MEMORY_SIZE_BYTES, MemoryDocument, MemorySection, MemoryTOC } from './types.js';
+import { byteLength } from './utils.js';
 
 /** Regex to match markdown headings (## or deeper) at the start of a line */
 const HEADING_REGEX = /^(#{2,6})\s+(.+)$/;
-
-/** Calculate byte size of a string using TextEncoder */
-function byteLength(str: string): number {
-  return new TextEncoder().encode(str).byteLength;
-}
 
 /** Format byte size as human-readable string */
 function formatSize(bytes: number): string {
@@ -142,7 +138,11 @@ export function getSection(doc: MemoryDocument, name: string): string | null {
  * If it doesn't exist, appends a new ## section.
  */
 export function updateSection(doc: MemoryDocument, name: string, content: string): MemoryDocument {
-  const fullContent = content.startsWith('##') ? content : `## ${name}\n\n${content}`;
+  let body = content;
+  if (body.startsWith('##')) {
+    body = body.replace(/^##[^\n]*\n?/, '').replace(/^\n/, '');
+  }
+  const fullContent = `## ${name}\n\n${body}`;
   const newSection: MemorySection = {
     name,
     level: 2,

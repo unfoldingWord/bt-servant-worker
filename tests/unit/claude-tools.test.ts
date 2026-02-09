@@ -134,8 +134,8 @@ describe('isReadMemoryInput', () => {
     expect(isReadMemoryInput({})).toBe(true);
   });
 
-  it('accepts empty sections array (read full)', () => {
-    expect(isReadMemoryInput({ sections: [] })).toBe(true);
+  it('rejects empty sections array', () => {
+    expect(isReadMemoryInput({ sections: [] })).toBe(false);
   });
 
   it('accepts sections array with names', () => {
