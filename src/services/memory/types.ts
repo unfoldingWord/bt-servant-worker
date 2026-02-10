@@ -5,7 +5,11 @@
  * The prompt overrides (especially `methodology`) control what Claude tracks.
  */
 
-/** Maximum memory document size in bytes (128KB) */
+/**
+ * Maximum memory document size in bytes (128KB).
+ * Balances storage cost (~$2.50/month at 100K users on DO storage)
+ * with utility. Average expected usage is ~10-20KB per user.
+ */
 export const MAX_MEMORY_SIZE_BYTES = 131072;
 
 /** DO storage key for user memory */

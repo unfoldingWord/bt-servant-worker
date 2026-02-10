@@ -141,7 +141,7 @@ export class MarkdownMemoryStore implements UserMemoryStore {
     const toc = extractTOC(doc);
 
     if (toc.entries.length === 0) {
-      this.logger.log('memory_empty', {});
+      this.logger.log('memory_found_empty', {});
     } else {
       this.logger.log('memory_toc_extracted', {
         section_count: toc.entries.length,

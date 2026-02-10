@@ -566,8 +566,7 @@ export class UserSession {
       const logger = createRequestLogger(crypto.randomUUID());
       const store = new MarkdownMemoryStore(this.state.storage, logger);
       const content = await store.read();
-      const toc = await store.getTableOfContents();
-      return Response.json({ content, toc });
+      return Response.json({ content });
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);

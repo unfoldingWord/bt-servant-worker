@@ -192,9 +192,9 @@ describe('MarkdownMemoryStore - TOC', () => {
     expect(toc.entries[1].name).toBe('Preferences');
   });
 
-  it('logs memory_empty when no memory', async () => {
+  it('logs memory_found_empty when no memory', async () => {
     await store.getTableOfContents();
-    expect(logger.log).toHaveBeenCalledWith('memory_empty', {});
+    expect(logger.log).toHaveBeenCalledWith('memory_found_empty', {});
   });
 
   it('logs memory_toc_extracted when memory exists', async () => {

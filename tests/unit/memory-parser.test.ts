@@ -81,6 +81,13 @@ describe('parseMemoryDocument - edge cases', () => {
     expect(doc.sections[0].sizeBytes).toBe(expected);
   });
 
+  it('calculates byte sizes correctly for large sections', () => {
+    const body = 'x'.repeat(100_000);
+    const md = `## Large\n\n${body}`;
+    const doc = parseMemoryDocument(md);
+    expect(doc.sections[0].sizeBytes).toBe(new TextEncoder().encode(md).byteLength);
+  });
+
   it('ignores # (h1) headers — only splits on ##', () => {
     const md = '# Title\n\nSome text\n## Real Section\n\nContent';
     const doc = parseMemoryDocument(md);
