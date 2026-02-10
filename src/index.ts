@@ -32,7 +32,7 @@ export { UserSession };
 const app = new Hono<{ Bindings: Env }>();
 
 // Health check - no auth required
-app.get('/health', (c) => c.json({ status: 'healthy', version: '0.2.0' }));
+app.get('/health', (c) => c.json({ status: 'healthy', version: '2.0.0' }));
 
 // Auth middleware for all /api routes
 app.use('/api/*', async (c, next) => {
