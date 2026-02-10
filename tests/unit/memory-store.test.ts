@@ -158,6 +158,21 @@ describe('MarkdownMemoryStore - write limits and logging', () => {
     );
   });
 
+  it('accepts a write just under the max size', async () => {
+    const header = '## Big\n\n';
+    const body = 'x'.repeat(MAX_MEMORY_SIZE_BYTES - header.length);
+    const result = await store.writeSections({ Big: body });
+    expect(result.totalSizeBytes).toBe(MAX_MEMORY_SIZE_BYTES);
+  });
+
+  it('rejects a write one byte over the max size', async () => {
+    const header = '## Big\n\n';
+    const body = 'x'.repeat(MAX_MEMORY_SIZE_BYTES - header.length + 1);
+    await expect(store.writeSections({ Big: body })).rejects.toThrow(
+      'Memory would exceed maximum size'
+    );
+  });
+
   it('logs memory_write on success', async () => {
     await store.writeSections({ Test: 'Data' });
     expect(logger.log).toHaveBeenCalledWith(
