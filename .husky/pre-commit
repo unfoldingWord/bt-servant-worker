@@ -1,5 +1,8 @@
 #!/usr/bin/env sh
 
+echo "Running dependency audit (production)..."
+pnpm run audit:prod
+
 echo "Running lint-staged..."
 npx lint-staged
 

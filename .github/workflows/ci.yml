@@ -7,6 +7,30 @@ on:
     branches: [main]
 
 jobs:
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Audit production dependencies
+        run: pnpm audit --prod
+
+      - name: Audit all dependencies (informational)
+        run: pnpm audit || true
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
