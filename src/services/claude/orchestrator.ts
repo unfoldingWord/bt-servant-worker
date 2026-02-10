@@ -38,7 +38,7 @@ import {
   ToolCatalog,
   wouldExceedBudget,
 } from '../mcp/index.js';
-import { UserMemoryStore } from '../memory/index.js';
+import { MAX_MEMORY_SIZE_BYTES, UserMemoryStore } from '../memory/index.js';
 import { buildSystemPrompt, historyToMessages } from './system-prompt.js';
 import {
   buildAllTools,
@@ -511,6 +511,8 @@ async function handleReadMemory(input: unknown, ctx: OrchestrationContext): Prom
   const startTime = Date.now();
   const sections = input.sections?.length ? input.sections : undefined;
   const result = await ctx.memoryStore.read(sections);
+  const sizeBytes = await ctx.memoryStore.getSizeBytes();
+  const capacityPercent = Math.min(100, Math.round((sizeBytes / MAX_MEMORY_SIZE_BYTES) * 100));
 
   ctx.logger.log('memory_tool_dispatch', {
     tool_name: 'read_memory',
@@ -520,10 +522,10 @@ async function handleReadMemory(input: unknown, ctx: OrchestrationContext): Prom
 
   if (typeof result === 'string') {
     const size = new TextEncoder().encode(result).byteLength;
-    return { content: result, total_size_bytes: size };
+    return { content: result, total_size_bytes: size, capacityPercent };
   }
   const totalSize = new TextEncoder().encode(JSON.stringify(result)).byteLength;
-  return { sections: result, total_size_bytes: totalSize };
+  return { sections: result, total_size_bytes: totalSize, capacityPercent };
 }
 
 async function handleUpdateMemory(input: unknown, ctx: OrchestrationContext): Promise<unknown> {
@@ -532,15 +534,15 @@ async function handleUpdateMemory(input: unknown, ctx: OrchestrationContext): Pr
   }
   if (!isUpdateMemoryInput(input)) {
     throw new ValidationError(
-      `Invalid input for update_memory: expected { sections: Record<string, string|null> }, got ${truncateInput(input)}`
+      `Invalid input for update_memory: expected { sections: Record<string, string|null>, pin?: string[], unpin?: string[] }, got ${truncateInput(input)}`
     );
   }
   const startTime = Date.now();
-  const result = await ctx.memoryStore.writeSections(input.sections);
+  const result = await ctx.memoryStore.writeSections(input.sections, input.pin, input.unpin);
 
   ctx.logger.log('memory_tool_dispatch', {
     tool_name: 'update_memory',
-    input_summary: `updated: [${result.updated.join(', ')}], deleted: [${result.deleted.join(', ')}]`,
+    input_summary: `updated: [${result.updated.join(', ')}], deleted: [${result.deleted.join(', ')}], evicted: [${result.evicted.join(', ')}]`,
     duration_ms: Date.now() - startTime,
   });
 

@@ -145,7 +145,7 @@ describe('buildSystemPrompt - memory TOC', () => {
   });
 
   it('appends TOC after memory_instructions when provided', () => {
-    const toc = '- **Progress** (1.2 KB)\n\nTotal: 1.2 KB / 128.0 KB';
+    const toc = '- **Progress** (1.2 KB) [pinned]\n\nTotal: 1.2 KB / 128.0 KB';
     const prompt = buildSystemPrompt(
       createEmptyCatalog(),
       defaultPrefs,
@@ -154,7 +154,7 @@ describe('buildSystemPrompt - memory TOC', () => {
       toc
     );
     expect(prompt).toContain(DEFAULT_PROMPT_VALUES.memory_instructions);
-    expect(prompt).toContain('- **Progress** (1.2 KB)');
+    expect(prompt).toContain('- **Progress** (1.2 KB) [pinned]');
 
     // TOC should come after memory_instructions and before closing
     const memIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.memory_instructions);

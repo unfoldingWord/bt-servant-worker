@@ -1,8 +1,8 @@
 /**
- * User persisted memory types
+ * User persisted memory types (v2 — JSON storage with per-entry metadata)
  *
- * Schema-free markdown document per user, stored in the Durable Object.
- * The prompt overrides (especially `methodology`) control what Claude tracks.
+ * Each entry has timestamps and an optional pinned flag.
+ * Prompt overrides (especially `methodology`) control what Claude tracks.
  */
 
 /**
@@ -15,28 +15,27 @@ export const MAX_MEMORY_SIZE_BYTES = 131072;
 /** DO storage key for user memory */
 export const MEMORY_STORAGE_KEY = 'user_memory';
 
-/** A parsed section from the memory document */
-export interface MemorySection {
-  name: string;
-  level: number; // heading level (2 for ##, 3 for ###, etc.)
-  content: string; // full section content including sub-headings
-  sizeBytes: number;
+/** A single entry in the memory store */
+export interface MemoryEntry {
+  content: string; // markdown text for this section
+  updatedAt: number; // ms timestamp of last update
+  createdAt: number; // ms timestamp of creation
+  pinned?: boolean; // if true, never auto-evicted
 }
 
-/** Parsed memory document: preamble + sections */
-export interface MemoryDocument {
-  preamble: string; // text before first section header
-  sections: MemorySection[];
+/** What's stored in DO storage as a single JSON blob */
+export interface MemoryStorage {
+  entries: Record<string, MemoryEntry>;
 }
 
 /** Single entry in the table of contents */
 export interface MemoryTOCEntry {
   name: string;
-  level: number;
   sizeBytes: number;
+  pinned: boolean;
 }
 
-/** Table of contents extracted from a memory document */
+/** Table of contents extracted from memory */
 export interface MemoryTOC {
   entries: MemoryTOCEntry[];
   totalSizeBytes: number;

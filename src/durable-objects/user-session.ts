@@ -27,7 +27,7 @@
 import { Hono } from 'hono';
 import { Env } from '../config/types.js';
 import { orchestrate } from '../services/claude/index.js';
-import { formatTOCForPrompt, MarkdownMemoryStore } from '../services/memory/index.js';
+import { formatTOCForPrompt, JsonMemoryStore } from '../services/memory/index.js';
 import { buildToolCatalog, discoverAllTools } from '../services/mcp/index.js';
 import { MCPServerConfig } from '../services/mcp/types.js';
 import {
@@ -417,7 +417,7 @@ export class UserSession {
   }
 
   private async loadMemoryContext(logger: RequestLogger) {
-    const memoryStore = new MarkdownMemoryStore(this.state.storage, logger);
+    const memoryStore = new JsonMemoryStore(this.state.storage, logger);
     const memoryTOC = await memoryStore.getTableOfContents();
     const formattedTOC = formatTOCForPrompt(memoryTOC);
     return { memoryStore, formattedTOC: formattedTOC || undefined };
@@ -564,9 +564,10 @@ export class UserSession {
   private async handleGetMemory(): Promise<Response> {
     try {
       const logger = createRequestLogger(crypto.randomUUID());
-      const store = new MarkdownMemoryStore(this.state.storage, logger);
+      const store = new JsonMemoryStore(this.state.storage, logger);
       const content = await store.read();
-      return Response.json({ content });
+      const toc = await store.getTableOfContents();
+      return Response.json({ content, toc });
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
@@ -576,7 +577,7 @@ export class UserSession {
   private async handleDeleteMemory(): Promise<Response> {
     try {
       const logger = createRequestLogger(crypto.randomUUID());
-      const store = new MarkdownMemoryStore(this.state.storage, logger);
+      const store = new JsonMemoryStore(this.state.storage, logger);
       await store.clear();
       return Response.json({ message: 'User memory cleared' });
     } catch (error) {
