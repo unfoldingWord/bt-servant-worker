@@ -127,6 +127,13 @@ describe('buildUpdateMemoryTool', () => {
     expect(tool.description).toContain('persistent memory');
     expect(tool.input_schema.required).toContain('sections');
   });
+
+  it('includes pin and unpin in schema properties', () => {
+    const tool = buildUpdateMemoryTool();
+    const properties = tool.input_schema.properties as Record<string, unknown>;
+    expect(properties).toHaveProperty('pin');
+    expect(properties).toHaveProperty('unpin');
+  });
 });
 
 describe('isReadMemoryInput', () => {
@@ -192,5 +199,33 @@ describe('isUpdateMemoryInput', () => {
 
   it('rejects empty key names', () => {
     expect(isUpdateMemoryInput({ sections: { '': 'value' } })).toBe(false);
+  });
+
+  it('accepts valid pin array', () => {
+    expect(isUpdateMemoryInput({ sections: { A: 'data' }, pin: ['A'] })).toBe(true);
+  });
+
+  it('accepts valid unpin array', () => {
+    expect(isUpdateMemoryInput({ sections: { A: 'data' }, unpin: ['B'] })).toBe(true);
+  });
+
+  it('accepts both pin and unpin arrays', () => {
+    expect(isUpdateMemoryInput({ sections: { A: 'data' }, pin: ['A'], unpin: ['B'] })).toBe(true);
+  });
+
+  it('rejects non-array pin', () => {
+    expect(isUpdateMemoryInput({ sections: { A: 'data' }, pin: 'A' })).toBe(false);
+  });
+
+  it('rejects pin with empty strings', () => {
+    expect(isUpdateMemoryInput({ sections: { A: 'data' }, pin: [''] })).toBe(false);
+  });
+
+  it('rejects pin with non-string elements', () => {
+    expect(isUpdateMemoryInput({ sections: { A: 'data' }, pin: [42] })).toBe(false);
+  });
+
+  it('rejects non-array unpin', () => {
+    expect(isUpdateMemoryInput({ sections: { A: 'data' }, unpin: 'B' })).toBe(false);
   });
 });

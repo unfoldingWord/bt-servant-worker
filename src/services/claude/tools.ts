@@ -101,7 +101,7 @@ export function buildReadMemoryTool(): Anthropic.Tool {
 export function buildUpdateMemoryTool(): Anthropic.Tool {
   return {
     name: 'update_memory',
-    description: `Create, update, or delete sections in the user's persistent memory. Pass an object where keys are section names and values are either markdown content (to create/update) or null (to delete). Multiple sections can be updated in a single call. The sections object must contain at least one entry.`,
+    description: `Create, update, or delete sections in the user's persistent memory. Pass an object where keys are section names and values are either markdown content (to create/update) or null (to delete). Multiple sections can be updated in a single call. The sections object must contain at least one entry. Use pin/unpin arrays to control which entries are protected from automatic eviction.`,
     input_schema: {
       type: 'object',
       properties: {
@@ -112,6 +112,18 @@ export function buildUpdateMemoryTool(): Anthropic.Tool {
           },
           description:
             'Object of section updates. String values create/replace sections. Null values delete sections.',
+        },
+        pin: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Optional list of section names to pin. Pinned sections are never automatically evicted.',
+        },
+        unpin: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Optional list of section names to unpin. Unpinned sections may be evicted when memory is full.',
         },
       },
       required: ['sections'],
@@ -176,20 +188,34 @@ export function isReadMemoryInput(input: unknown): input is { sections?: string[
   );
 }
 
-/**
- * Type guard for update_memory input.
- * sections is required, keys are section names, values are string|null.
- */
-export function isUpdateMemoryInput(
-  input: unknown
-): input is { sections: Record<string, string | null> } {
-  if (typeof input !== 'object' || input === null) return false;
-  if (!('sections' in input)) return false;
+/** Validate an optional string array field on input (for pin/unpin) */
+function isValidOptionalStringArray(input: object, field: string): boolean {
+  if (!(field in input)) return true;
+  const value = (input as Record<string, unknown>)[field]; // eslint-disable-line security/detect-object-injection -- field is a hardcoded string
+  return Array.isArray(value) && value.every((s) => typeof s === 'string' && s.length > 0);
+}
+
+/** Validate that sections is a valid Record<string, string|null> with constraints */
+function isValidSectionsObject(input: object): boolean {
   const sections = (input as { sections: unknown }).sections;
   if (typeof sections !== 'object' || sections === null || Array.isArray(sections)) return false;
   const entries = Object.entries(sections as Record<string, unknown>);
   if (entries.length === 0 || entries.length > MAX_UPDATE_SECTIONS) return false;
   return entries.every(([key, val]) => key.length > 0 && (typeof val === 'string' || val === null));
+}
+
+/**
+ * Type guard for update_memory input.
+ * sections is required, keys are section names, values are string|null.
+ * pin and unpin are optional string arrays.
+ */
+export function isUpdateMemoryInput(
+  input: unknown
+): input is { sections: Record<string, string | null>; pin?: string[]; unpin?: string[] } {
+  if (typeof input !== 'object' || input === null) return false;
+  if (!('sections' in input)) return false;
+  if (!isValidSectionsObject(input)) return false;
+  return isValidOptionalStringArray(input, 'pin') && isValidOptionalStringArray(input, 'unpin');
 }
 
 /**
