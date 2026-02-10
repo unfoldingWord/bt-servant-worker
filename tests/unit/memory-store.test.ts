@@ -194,6 +194,37 @@ describe('JsonMemoryStore - write', () => {
   });
 });
 
+describe('JsonMemoryStore - section name validation', () => {
+  it('skips sections with names exceeding 200 characters', async () => {
+    const longName = 'A'.repeat(201);
+    const result = await store.writeSections({ [longName]: 'Content' });
+    expect(result.updated).toEqual([]);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'memory_invalid_section_name',
+      expect.objectContaining({ name: longName })
+    );
+  });
+
+  it('skips sections with control characters in name', async () => {
+    const result = await store.writeSections({ 'Bad\x00Name': 'Content' });
+    expect(result.updated).toEqual([]);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'memory_invalid_section_name',
+      expect.objectContaining({ name: 'Bad\x00Name' })
+    );
+  });
+
+  it('rejects prototype pollution keys', async () => {
+    const result = await store.writeSections({ __proto__: 'Content' });
+    expect(result.updated).toEqual([]);
+  });
+
+  it('accepts valid section names', async () => {
+    const result = await store.writeSections({ 'UTC: Romans 8:1-4': 'Content' });
+    expect(result.updated).toEqual(['UTC: Romans 8:1-4']);
+  });
+});
+
 describe('JsonMemoryStore - pinning', () => {
   it('pins sections via pin array', async () => {
     seedEntries(storage, { Notes: { content: 'Data' } });

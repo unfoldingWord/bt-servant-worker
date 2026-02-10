@@ -512,7 +512,7 @@ async function handleReadMemory(input: unknown, ctx: OrchestrationContext): Prom
   const sections = input.sections?.length ? input.sections : undefined;
   const result = await ctx.memoryStore.read(sections);
   const sizeBytes = await ctx.memoryStore.getSizeBytes();
-  const capacityPercent = Math.round((sizeBytes / MAX_MEMORY_SIZE_BYTES) * 100);
+  const capacityPercent = Math.min(100, Math.round((sizeBytes / MAX_MEMORY_SIZE_BYTES) * 100));
 
   ctx.logger.log('memory_tool_dispatch', {
     tool_name: 'read_memory',

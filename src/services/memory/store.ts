@@ -46,6 +46,43 @@ export interface UserMemoryStore {
   getSizeBytes(): Promise<number>;
 }
 
+/** Maximum section name length in characters */
+const MAX_SECTION_NAME_LENGTH = 200;
+
+/** Prototype pollution keys to reject */
+const RESERVED_NAMES = new Set(['__proto__', 'constructor', 'prototype']);
+
+/** Check if a string contains control characters (excluding normal whitespace: \t, \n, \r) */
+function containsControlChars(str: string): boolean {
+  for (let i = 0; i < str.length; i++) {
+    const code = str.charCodeAt(i);
+    if (
+      code <= 0x08 ||
+      code === 0x0b ||
+      code === 0x0c ||
+      (code >= 0x0e && code <= 0x1f) ||
+      code === 0x7f
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Validate a section name. Returns error string or null if valid. */
+function validateSectionName(name: string): string | null {
+  if (name.length > MAX_SECTION_NAME_LENGTH) {
+    return `Section name exceeds ${MAX_SECTION_NAME_LENGTH} characters`;
+  }
+  if (containsControlChars(name)) {
+    return 'Section name contains control characters';
+  }
+  if (RESERVED_NAMES.has(name)) {
+    return `Section name "${name}" is reserved`;
+  }
+  return null;
+}
+
 /**
  * v2 implementation: JSON entries in DO storage with auto-eviction
  */
@@ -122,7 +159,7 @@ export class JsonMemoryStore implements UserMemoryStore {
       deleted: deletedNames,
       evicted: evictedNames,
       totalSizeBytes: sizeAfter,
-      capacityPercent: Math.round((sizeAfter / MAX_MEMORY_SIZE_BYTES) * 100),
+      capacityPercent: Math.min(100, Math.round((sizeAfter / MAX_MEMORY_SIZE_BYTES) * 100)),
     };
   }
 
@@ -136,6 +173,11 @@ export class JsonMemoryStore implements UserMemoryStore {
     const now = Date.now();
 
     for (const [name, value] of Object.entries(updates)) {
+      const nameError = validateSectionName(name);
+      if (nameError) {
+        this.logger.warn('memory_invalid_section_name', { name, reason: nameError });
+        continue;
+      }
       if (value === null) {
         // eslint-disable-next-line security/detect-object-injection -- name from controlled iteration
         delete data.entries[name];
@@ -283,15 +325,24 @@ export class JsonMemoryStore implements UserMemoryStore {
     return evicted;
   }
 
-  /** Truncate a string to fit within a byte budget */
+  /**
+   * Truncate a string to fit within a byte budget.
+   * Walks backward from the target to find a clean character boundary,
+   * avoiding split multi-byte UTF-8 sequences.
+   */
   private truncateToBytes(str: string, maxBytes: number): string {
-    const encoder = new TextEncoder();
-    const encoded = encoder.encode(str);
-    if (encoded.byteLength <= maxBytes) return str;
+    if (byteLength(str) <= maxBytes) return str;
 
-    const truncated = encoded.slice(0, maxBytes);
-    const decoder = new TextDecoder();
-    return decoder.decode(truncated);
+    // Binary search would be faster but O(n) is fine for our use case
+    let result = '';
+    let currentBytes = 0;
+    for (const char of str) {
+      const charBytes = byteLength(char);
+      if (currentBytes + charBytes > maxBytes) break;
+      result += char;
+      currentBytes += charBytes;
+    }
+    return result;
   }
 
   /** Serialize all entries to a flat markdown string (for full reads) */
@@ -330,6 +381,9 @@ export class JsonMemoryStore implements UserMemoryStore {
 
   /**
    * Migrate v1 markdown memory to v2 JSON format.
+   *
+   * Race safety: Durable Object storage serializes all requests to a single
+   * instance, so concurrent migrations cannot occur.
    */
   private async migrateV1(markdown: string): Promise<MemoryStorage> {
     const now = Date.now();
