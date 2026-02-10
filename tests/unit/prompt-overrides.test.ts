@@ -81,7 +81,7 @@ describe('resolvePromptOverrides - defaults', () => {
     expect(result).toEqual(DEFAULT_PROMPT_VALUES);
   });
 
-  it('returns all 5 slots in the result', () => {
+  it('returns all 6 slots in the result', () => {
     const result = resolvePromptOverrides({}, {});
     expect(Object.keys(result).sort()).toEqual([...PROMPT_OVERRIDE_SLOTS].sort());
   });
@@ -102,6 +102,7 @@ describe('resolvePromptOverrides - org overrides', () => {
       methodology: 'O methodology',
       tool_guidance: 'O tool_guidance',
       instructions: 'O instructions',
+      memory_instructions: 'O memory_instructions',
       closing: 'O closing',
     };
     const result = resolvePromptOverrides(orgOverrides, {});

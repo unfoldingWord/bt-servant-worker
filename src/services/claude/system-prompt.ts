@@ -19,14 +19,15 @@ export interface OrchestrationPreferences {
  *
  * Assembly order:
  *   [identity] → [methodology] → [tool_guidance] → [tool catalog] →
- *   [instructions] → [user preferences] → [conversation context] →
- *   [first interaction] → [closing]
+ *   [instructions] → [memory_instructions + TOC] → [user preferences] →
+ *   [conversation context] → [first interaction] → [closing]
  */
 export function buildSystemPrompt(
   catalog: ToolCatalog,
   preferences: OrchestrationPreferences,
   history: ChatHistoryEntry[],
-  resolvedPromptValues: Required<Record<PromptSlot, string>>
+  resolvedPromptValues: Required<Record<PromptSlot, string>>,
+  memoryTOC?: string
 ): string {
   const sections: string[] = [];
 
@@ -45,6 +46,14 @@ export function buildSystemPrompt(
 
   // Slot: instructions
   sections.push(resolvedPromptValues.instructions);
+
+  // Slot: memory_instructions (always present so Claude knows tools exist)
+  sections.push(resolvedPromptValues.memory_instructions);
+
+  // Append formatted TOC when memory is non-empty (separate section)
+  if (memoryTOC) {
+    sections.push(memoryTOC);
+  }
 
   // Conditional: user preferences
   if (preferences.response_language !== 'en') {

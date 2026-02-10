@@ -17,6 +17,7 @@ describe('buildSystemPrompt - slot assembly', () => {
     expect(prompt).toContain(DEFAULT_PROMPT_VALUES.methodology);
     expect(prompt).toContain(DEFAULT_PROMPT_VALUES.tool_guidance);
     expect(prompt).toContain(DEFAULT_PROMPT_VALUES.instructions);
+    expect(prompt).toContain(DEFAULT_PROMPT_VALUES.memory_instructions);
     expect(prompt).toContain(DEFAULT_PROMPT_VALUES.closing);
   });
 
@@ -27,12 +28,14 @@ describe('buildSystemPrompt - slot assembly', () => {
     const methodologyIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.methodology);
     const toolGuidanceIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.tool_guidance);
     const instructionsIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.instructions);
+    const memoryIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.memory_instructions);
     const closingIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.closing);
 
     expect(identityIdx).toBeLessThan(methodologyIdx);
     expect(methodologyIdx).toBeLessThan(toolGuidanceIdx);
     expect(toolGuidanceIdx).toBeLessThan(instructionsIdx);
-    expect(instructionsIdx).toBeLessThan(closingIdx);
+    expect(instructionsIdx).toBeLessThan(memoryIdx);
+    expect(memoryIdx).toBeLessThan(closingIdx);
   });
 
   it('sections are separated by double newlines', () => {
@@ -49,6 +52,7 @@ describe('buildSystemPrompt - custom overrides', () => {
       methodology: 'CUSTOM_METHODOLOGY',
       tool_guidance: 'CUSTOM_TOOL_GUIDANCE',
       instructions: 'CUSTOM_INSTRUCTIONS',
+      memory_instructions: 'CUSTOM_MEMORY',
       closing: 'CUSTOM_CLOSING',
     };
 
@@ -58,6 +62,7 @@ describe('buildSystemPrompt - custom overrides', () => {
     expect(prompt).toContain('CUSTOM_METHODOLOGY');
     expect(prompt).toContain('CUSTOM_TOOL_GUIDANCE');
     expect(prompt).toContain('CUSTOM_INSTRUCTIONS');
+    expect(prompt).toContain('CUSTOM_MEMORY');
     expect(prompt).toContain('CUSTOM_CLOSING');
     expect(prompt).not.toContain(DEFAULT_PROMPT_VALUES.identity);
     expect(prompt).not.toContain(DEFAULT_PROMPT_VALUES.methodology);
@@ -130,5 +135,47 @@ describe('buildSystemPrompt - conditional sections', () => {
   it('excludes first interaction note when first_interaction is false', () => {
     const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
     expect(prompt).not.toContain("This is the user's first interaction");
+  });
+});
+
+describe('buildSystemPrompt - memory TOC', () => {
+  it('includes memory_instructions slot even without TOC', () => {
+    const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
+    expect(prompt).toContain(DEFAULT_PROMPT_VALUES.memory_instructions);
+  });
+
+  it('appends TOC after memory_instructions when provided', () => {
+    const toc = '- **Progress** (1.2 KB)\n\nTotal: 1.2 KB / 128.0 KB';
+    const prompt = buildSystemPrompt(
+      createEmptyCatalog(),
+      defaultPrefs,
+      [],
+      DEFAULT_PROMPT_VALUES,
+      toc
+    );
+    expect(prompt).toContain(DEFAULT_PROMPT_VALUES.memory_instructions);
+    expect(prompt).toContain('- **Progress** (1.2 KB)');
+
+    // TOC should come after memory_instructions and before closing
+    const memIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.memory_instructions);
+    const tocIdx = prompt.indexOf('- **Progress**');
+    const closingIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.closing);
+    expect(memIdx).toBeLessThan(tocIdx);
+    expect(tocIdx).toBeLessThan(closingIdx);
+  });
+
+  it('does not include TOC text when memoryTOC is undefined', () => {
+    const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
+    expect(prompt).not.toContain('Total:');
+  });
+
+  it('memory_instructions appears between instructions and closing', () => {
+    const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
+    const instructionsIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.instructions);
+    const memoryIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.memory_instructions);
+    const closingIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.closing);
+
+    expect(instructionsIdx).toBeLessThan(memoryIdx);
+    expect(memoryIdx).toBeLessThan(closingIdx);
   });
 });

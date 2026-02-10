@@ -11,6 +11,7 @@ export const PROMPT_OVERRIDE_SLOTS = [
   'methodology',
   'tool_guidance',
   'instructions',
+  'memory_instructions',
   'closing',
 ] as const;
 
@@ -31,6 +32,7 @@ export interface PromptOverrides {
   methodology?: string | null;
   tool_guidance?: string | null;
   instructions?: string | null;
+  memory_instructions?: string | null;
   closing?: string | null;
 }
 
@@ -97,6 +99,12 @@ When you can only fetch part of what the user asked for:
 BAD: Looping over all chapters: \`for (let i = 1; i <= 50; i++) { await fetch_scripture(...) }\`
 GOOD: Ask "Genesis has 50 chapters. Which chapters would you like me to focus on?"
 GOOD: Fetch first 5, say "I've retrieved Genesis 1-5. Would you like me to continue with 6-10?"`,
+
+  memory_instructions: `## User Memory
+
+Below is a table of contents of this user's persistent memory. Use the read_memory tool to retrieve specific sections when needed for context. Use the update_memory tool to save important information that should persist across conversations — such as progress through teaching frameworks, user preferences discovered through interaction, and key decisions made during translation work.
+
+Keep memory organized with clear section names. Remove outdated information when updating. Be concise — store conclusions and decisions, not full conversation transcripts.`,
 
   closing: `Always be accurate and cite your sources when providing information about scripture.`,
 };

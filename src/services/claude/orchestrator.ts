@@ -38,8 +38,14 @@ import {
   ToolCatalog,
   wouldExceedBudget,
 } from '../mcp/index.js';
+import { UserMemoryStore } from '../memory/index.js';
 import { buildSystemPrompt, historyToMessages } from './system-prompt.js';
-import { buildAllTools, getToolDefinitions } from './tools.js';
+import {
+  buildAllTools,
+  getToolDefinitions,
+  isReadMemoryInput,
+  isUpdateMemoryInput,
+} from './tools.js';
 
 /** Default max response size for MCP calls (1MB) */
 const DEFAULT_MAX_MCP_RESPONSE_SIZE = 1048576;
@@ -72,6 +78,8 @@ interface OrchestratorOptions {
   preferences: { response_language: string; first_interaction: boolean };
   orgConfig?: OrgConfig;
   resolvedPromptValues?: Required<Record<PromptSlot, string>>;
+  memoryStore?: UserMemoryStore | undefined;
+  memoryTOC?: string | undefined;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
 }
@@ -137,6 +145,7 @@ interface OrchestrationContext {
   callbacks?: StreamCallbacks | undefined;
   mcpBudget: MCPCallBudget;
   healthTracker: HealthTracker;
+  memoryStore: UserMemoryStore | undefined;
 }
 
 function extractToolCalls(content: Anthropic.ContentBlock[]): ToolUseBlock[] {
@@ -345,7 +354,7 @@ function createOrchestrationContext(
     client: new Anthropic({ apiKey: env.ANTHROPIC_API_KEY }),
     model: config.model,
     maxTokens: config.maxTokens,
-    systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues),
+    systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues, options.memoryTOC),
     tools: buildAllTools(catalog),
     messages: [...historyToMessages(history, llmMax), { role: 'user', content: userMessage }],
     responses: [],
@@ -357,6 +366,7 @@ function createOrchestrationContext(
     callbacks,
     mcpBudget: createBudget(config.maxDownstreamCalls, config.defaultDownstreamPerCall),
     healthTracker: createHealthTracker(),
+    memoryStore: options.memoryStore,
   };
 }
 
@@ -480,7 +490,61 @@ async function dispatchToolCall(
     }
     return getToolDefinitions(ctx.catalog, toolCall.input.tool_names);
   }
+  if (toolCall.name === 'read_memory') {
+    return handleReadMemory(toolCall.input, ctx);
+  }
+  if (toolCall.name === 'update_memory') {
+    return handleUpdateMemory(toolCall.input, ctx);
+  }
   return handleMCPToolCall(toolCall.name, toolCall.input, ctx);
+}
+
+async function handleReadMemory(input: unknown, ctx: OrchestrationContext): Promise<unknown> {
+  if (!ctx.memoryStore) {
+    return { error: 'Memory is not available for this session.' };
+  }
+  if (!isReadMemoryInput(input)) {
+    throw new ValidationError(
+      `Invalid input for read_memory: expected { sections?: string[] }, got ${truncateInput(input)}`
+    );
+  }
+  const startTime = Date.now();
+  const sections = input.sections?.length ? input.sections : undefined;
+  const result = await ctx.memoryStore.read(sections);
+
+  ctx.logger.log('memory_tool_dispatch', {
+    tool_name: 'read_memory',
+    input_summary: sections ? `sections: [${sections.join(', ')}]` : 'full',
+    duration_ms: Date.now() - startTime,
+  });
+
+  if (typeof result === 'string') {
+    const size = new TextEncoder().encode(result).byteLength;
+    return { content: result, total_size_bytes: size };
+  }
+  const totalSize = new TextEncoder().encode(JSON.stringify(result)).byteLength;
+  return { sections: result, total_size_bytes: totalSize };
+}
+
+async function handleUpdateMemory(input: unknown, ctx: OrchestrationContext): Promise<unknown> {
+  if (!ctx.memoryStore) {
+    return { error: 'Memory is not available for this session.' };
+  }
+  if (!isUpdateMemoryInput(input)) {
+    throw new ValidationError(
+      `Invalid input for update_memory: expected { sections: Record<string, string|null> }, got ${truncateInput(input)}`
+    );
+  }
+  const startTime = Date.now();
+  const result = await ctx.memoryStore.writeSections(input.sections);
+
+  ctx.logger.log('memory_tool_dispatch', {
+    tool_name: 'update_memory',
+    input_summary: `updated: [${result.updated.join(', ')}], deleted: [${result.deleted.join(', ')}]`,
+    duration_ms: Date.now() - startTime,
+  });
+
+  return result;
 }
 
 function logToolSuccess(

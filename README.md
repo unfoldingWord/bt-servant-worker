@@ -4,19 +4,20 @@
 
 > AI-powered assistance for Bible translators, at the edge.
 
-This project is designed to help translators work more efficiently with their Bible translation projects. It provides advanced features for processing natural language queries and executing code in a secure environment.
-
-A Cloudflare Worker that evolves bt-servant-engine into a modern, edge-deployed architecture with QuickJS-based sandboxed code execution for dynamic MCP tool orchestration.
+A Cloudflare Worker that provides AI-powered assistance to Bible translators via Claude, with sandboxed code execution, dynamic MCP tool orchestration, and per-user persistent memory.
 
 ## What This Project Does
 
-bt-servant-worker is an AI-powered assistant for Bible translators, deployed on Cloudflare's edge network. It replaces the existing Python/FastAPI bt-servant-engine with a TypeScript-based Cloudflare Worker that can:
+bt-servant-worker is deployed on Cloudflare's edge network and provides:
 
-- Process natural language queries about Bible translation
-- Dynamically discover and call MCP (Model Context Protocol) tools
-- Execute code in a sandboxed QuickJS environment
-- Maintain per-user chat history and preferences
-- Serialize requests per-user using Durable Objects
+- **Claude-powered chat** with multi-turn orchestration (up to 10 tool-use iterations per request)
+- **Dynamic MCP tool discovery** — discovers and calls MCP tools from configured servers
+- **Sandboxed code execution** via QuickJS compiled to WebAssembly
+- **Per-user state** — chat history, preferences, prompt overrides, and persistent memory via Durable Objects
+- **Request serialization** — one request at a time per user, preventing race conditions
+- **Streaming support** — real-time SSE streaming and webhook progress callbacks
+- **Dynamic prompt overrides** — org and user-level customization of Claude's system prompt
+- **User persistent memory** — schema-free markdown memory that persists across conversations
 
 ## Architecture Overview
 
@@ -24,109 +25,100 @@ bt-servant-worker is an AI-powered assistant for Bible translators, deployed on 
 ┌─────────────────────────────────────────────────────────────────┐
 │  Cloudflare Worker                                              │
 │                                                                 │
-│  POST /api/v1/chat                                              │
+│  POST /api/v1/chat ──► KV (org config, MCP servers, prompts)   │
 │       │                                                         │
 │       ▼                                                         │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────┐  │
-│  │ MCP Registry│───▶│ Discovery   │───▶│ Tool Catalog        │  │
-│  │ (DO Storage)│    │ (fetch MCP) │    │ (for system prompt) │  │
-│  └─────────────┘    └─────────────┘    └─────────────────────┘  │
-│                                               │                 │
-│                                               ▼                 │
-│                     ┌─────────────────────────────────────────┐ │
-│                     │ Claude Orchestrator                     │ │
-│                     │ - System prompt with tool catalog       │ │
-│                     │ - Up to 10 iterations                   │ │
-│                     │ - Parallel tool execution               │ │
-│                     └──────────────┬──────────────────────────┘ │
-│                                    │                            │
-│              ┌─────────────────────┼─────────────────────┐      │
-│              ▼                     ▼                     ▼      │
-│  ┌───────────────────┐  ┌─────────────────┐  ┌───────────────┐  │
-│  │ execute_code      │  │ get_tool_defs   │  │ Direct MCP    │  │
-│  │ (QuickJS sandbox) │  │ (return schemas)│  │ tool call     │  │
-│  └───────────────────┘  └─────────────────┘  └───────────────┘  │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │ Durable Object (per-user)                               │    │
+│  │ - Chat history, preferences, prompt overrides, memory   │    │
+│  │ - Request serialization via storage lock                │    │
+│  └──────────────┬──────────────────────────────────────────┘    │
+│                 ▼                                               │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │ Claude Orchestrator                                     │    │
+│  │ - System prompt with tool catalog + memory TOC          │    │
+│  │ - Up to 10 iterations with parallel tool execution      │    │
+│  └──────────────┬──────────────────────────────────────────┘    │
+│                 │                                               │
+│    ┌────────────┼────────────┬──────────────┐                   │
+│    ▼            ▼            ▼              ▼                   │
+│  execute_code  get_tool_   read_memory   update_memory          │
+│  (QuickJS)     definitions  (DO store)   (DO store)             │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Key Innovation: QuickJS Sandbox
+### Key Components
 
-The project replaces Node.js `isolated-vm` (which uses native V8 snapshots and can't run on Cloudflare) with QuickJS compiled to WebAssembly. This provides:
+**QuickJS Sandbox** — Replaces Node.js `isolated-vm` with QuickJS compiled to WebAssembly. Code runs in a completely isolated sandbox with no access to `fetch`, environment variables, or Worker APIs. Only explicitly injected MCP tool wrappers are available.
 
-- **Security**: Code runs in a completely isolated sandbox with no access to `fetch`, environment variables, or Worker APIs
-- **Controlled Access**: Only explicitly injected functions (MCP tool wrappers) are available
-- **Edge Compatibility**: Runs on Cloudflare's edge network worldwide
+**Durable Objects** — Each user gets their own instance that guarantees single-threaded execution, stores chat history/preferences/memory, and persists data across requests.
 
-### Durable Objects for Request Serialization
+**MCP Budget & Health Tracking** — Downstream API call budget tracking with circuit breaker pattern prevents runaway costs and blocks unhealthy servers.
 
-Each user gets their own Durable Object instance that:
+**User Persistent Memory** — Schema-free markdown document per user. A deterministic TOC is injected into the system prompt; Claude reads/writes specific sections via tools. Memory persists indefinitely across sessions. 128KB storage cap per user.
 
-- Guarantees single-threaded execution (no race conditions)
-- Stores chat history, preferences, and MCP server configs
-- Persists data across requests (survives Worker eviction)
-- Matches the `asyncio.Lock` behavior from bt-servant-engine
+**Dynamic Prompt Overrides** — 6 customizable prompt slots (identity, methodology, tool_guidance, instructions, memory_instructions, closing) with 3-tier resolution: user → org → default.
+
+## API Endpoints
+
+### Chat
+
+| Endpoint              | Method | Description                      |
+| --------------------- | ------ | -------------------------------- |
+| `/health`             | GET    | Health check                     |
+| `/api/v1/chat`        | POST   | Chat with Claude (non-streaming) |
+| `/api/v1/chat/stream` | POST   | Chat with Claude (SSE streaming) |
+
+### User Endpoints
+
+| Endpoint                                      | Method  | Description      |
+| --------------------------------------------- | ------- | ---------------- |
+| `/api/v1/orgs/:org/users/:userId/preferences` | GET/PUT | User preferences |
+| `/api/v1/orgs/:org/users/:userId/history`     | GET     | Chat history     |
+
+### Admin Endpoints
+
+All admin endpoints require Bearer token authentication (super admin or org-specific admin key).
+
+| Endpoint                                                 | Method       | Description                 |
+| -------------------------------------------------------- | ------------ | --------------------------- |
+| `/api/v1/admin/orgs/:org/mcp-servers`                    | GET/PUT/POST | MCP server management       |
+| `/api/v1/admin/orgs/:org/mcp-servers/:serverId`          | DELETE       | Remove MCP server           |
+| `/api/v1/admin/orgs/:org/config`                         | GET/PUT/DEL  | Org config (history limits) |
+| `/api/v1/admin/orgs/:org/prompt-overrides`               | GET/PUT/DEL  | Org-level prompt overrides  |
+| `/api/v1/admin/orgs/:org/users/:userId/prompt-overrides` | GET/PUT/DEL  | User-level prompt overrides |
+| `/api/v1/admin/orgs/:org/users/:userId/memory`           | GET/DEL      | User persistent memory      |
+
+### Chat Request/Response
+
+```typescript
+// Request
+interface ChatRequest {
+  client_id: string;
+  user_id: string;
+  message: string;
+  message_type: 'text' | 'audio';
+  org?: string;
+  progress_callback_url?: string; // webhook URL for progress updates
+  progress_mode?: 'full' | 'incremental';
+  progress_throttle_seconds?: number;
+}
+
+// Response
+interface ChatResponse {
+  responses: string[];
+  response_language: string;
+  voice_audio_base64: string | null;
+}
+```
 
 ## Request Serialization & Concurrency
 
-### Why Requests Are Serialized Per User
+Chat requests are processed **one at a time per user** to ensure conversation history integrity. Concurrent requests receive `429 Too Many Requests` with a `Retry-After` header.
 
-bt-servant-worker processes chat requests **one at a time per user** to ensure conversation history integrity. This prevents race conditions where:
+API consumers **must** implement retry logic for 429 responses. The lock has a 90-second stale threshold as a safety mechanism.
 
-- Two concurrent requests read the same history state
-- Both generate responses based on stale context
-- History becomes inconsistent with what the user sees in their chat interface
-
-### How It Works
-
-Each user's chat session is handled by a dedicated Durable Object instance. When a request arrives at `/chat` or `/stream`:
-
-1. The DO checks if another request is currently processing (via a storage lock)
-2. If **not locked**: acquire lock, process request, release lock
-3. If **locked**: return `429 Too Many Requests` immediately
-
-### Handling 429 Responses
-
-API consumers **must** implement retry logic for 429 responses:
-
-```typescript
-async function sendChatRequest(
-  message: string,
-  userId: string,
-  org: string
-): Promise<ChatResponse> {
-  const maxRetries = 10;
-  const baseDelay = 2000; // Start with 2 second delay
-
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    const response = await fetch(`${API_URL}/api/v1/orgs/${org}/users/${userId}/chat`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${API_KEY}`,
-      },
-      body: JSON.stringify({ message, user_id: userId }),
-    });
-
-    if (response.status === 429) {
-      // Another request is processing - wait and retry
-      const retryAfter = response.headers.get('Retry-After');
-      const delay = retryAfter ? parseInt(retryAfter) * 1000 : baseDelay * Math.pow(1.5, attempt);
-
-      console.log(`Request queued, retrying in ${delay}ms...`);
-      await new Promise((resolve) => setTimeout(resolve, delay));
-      continue;
-    }
-
-    if (!response.ok) {
-      throw new Error(`API error: ${response.status}`);
-    }
-
-    return response.json();
-  }
-
-  throw new Error('Max retries exceeded - request could not be processed');
-}
-```
+See the [429 Response Format](#429-response-format) below.
 
 ### 429 Response Format
 
@@ -139,116 +131,39 @@ async function sendChatRequest(
 }
 ```
 
-**Headers:**
-
-- `Retry-After: 5` (suggested wait time in seconds)
-- `Content-Type: application/json`
-
-### Why Not Queue in the Server?
-
-We considered server-side request queuing but chose client-side retry because:
-
-1. **Resilience**: If the server crashes, queued requests would be lost. With client retry, the client still has the message.
-2. **Standard HTTP**: 429 is a well-understood pattern that clients expect to handle.
-3. **Observability**: 429 responses are logged and can be monitored for contention issues.
-4. **Simplicity**: Keeps the Durable Object focused on chat logic, not queue management.
-
-### Typical Request Flow
-
-```
-User sends message
-        ↓
-Consumer (gateway/web client) calls API
-        ↓
-    ┌─────────────────┐
-    │ Lock available? │
-    └────────┬────────┘
-             │
-      ┌──────┴──────┐
-      ↓             ↓
-     YES           NO
-      ↓             ↓
-  Process      Return 429
-  request          ↓
-      ↓        Consumer waits
-  Return       and retries
-  response         ↓
-             (loop until
-              lock available)
-```
-
-### Expected Behavior by Client Type
-
-| Client                          | Behavior                                                                                               |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| **bt-servant-web-client**       | Should disable send button while awaiting response, preventing most 429s. Implement retry as fallback. |
-| **bt-servant-whatsapp-gateway** | Cannot control WhatsApp UI. Must implement robust retry with exponential backoff.                      |
-| **Future API consumers**        | Must implement 429 handling per this documentation.                                                    |
-
-### Lock Timeout
-
-The processing lock has a 90-second stale threshold. If a request crashes without releasing the lock, subsequent requests will succeed after 90 seconds. This is a safety mechanism, not expected behavior. When a stale lock is overwritten, a warning is logged for monitoring.
-
 ## Project Structure
 
 ```
 bt-servant-worker/
 ├── src/
-│   └── index.ts                      # Worker entry point
+│   ├── index.ts                         # Worker entry point + admin routes
+│   ├── config/                          # Environment configuration types
+│   ├── durable-objects/                 # UserSession Durable Object
+│   ├── services/
+│   │   ├── claude/                      # Orchestrator, system prompt, tools
+│   │   ├── code-execution/             # QuickJS sandbox
+│   │   ├── mcp/                        # MCP discovery, catalog, budget, health
+│   │   ├── memory/                     # User persistent memory (parser, store)
+│   │   └── progress/                   # Webhook progress callbacks
+│   ├── types/                          # Shared TypeScript types
+│   └── utils/                          # Logger, crypto, errors, validation
 ├── tests/
-│   └── index.test.ts                 # Tests
+│   ├── unit/                           # Unit tests
+│   └── e2e/                            # End-to-end tests
 ├── docs/
-│   └── implementation-plan.md        # Full implementation plan
+│   ├── implementation-plan.md          # Full implementation plan
+│   └── plans/                          # Feature implementation plans
 ├── .github/workflows/
-│   ├── ci.yml                        # CI: lint, typecheck, test, build
-│   ├── deploy.yml                    # Deploy to Cloudflare (after CI passes)
-│   └── claude-review.yml             # Claude PR reviews
-├── wrangler.toml                     # Cloudflare Worker config
-├── package.json                      # Dependencies and scripts
-├── tsconfig.json                     # TypeScript config (strict mode)
-├── eslint.config.js                  # ESLint with fitness functions
-├── .dependency-cruiser.js            # Architecture enforcement
-├── .prettierrc                       # Code formatting
-└── .husky/pre-commit                 # Pre-commit hooks
-```
-
-## API Endpoints
-
-### Phase 0 (Current)
-
-| Endpoint       | Method | Response                          |
-| -------------- | ------ | --------------------------------- |
-| `/health`      | GET    | `{"status": "healthy"}`           |
-| `/api/v1/chat` | POST   | `"BT Servant is alive and well."` |
-
-### Phase 1 (Planned)
-
-| Endpoint       | Method | Description                         |
-| -------------- | ------ | ----------------------------------- |
-| `/health`      | GET    | Health check                        |
-| `/api/v1/chat` | POST   | Full chat with Claude orchestration |
-
-**Request:**
-
-```typescript
-interface ChatRequest {
-  client_id: string;
-  user_id: string;
-  message: string;
-  message_type: 'text' | 'audio';
-  audio_base64?: string;
-  audio_format?: string;
-}
-```
-
-**Response:**
-
-```typescript
-interface ChatResponse {
-  responses: string[];
-  response_language: string;
-  voice_audio_base64: string | null;
-}
+│   ├── ci.yml                          # CI: lint, typecheck, test, build
+│   ├── deploy.yml                      # Deploy to Cloudflare (after CI passes)
+│   └── claude-review.yml              # Claude PR reviews
+├── wrangler.toml                       # Cloudflare Worker config
+├── package.json                        # Dependencies and scripts
+├── tsconfig.json                       # TypeScript config (strict mode)
+├── eslint.config.js                    # ESLint with fitness functions
+├── .dependency-cruiser.js              # Architecture enforcement
+├── .prettierrc                         # Code formatting
+└── .husky/pre-commit                   # Pre-commit hooks
 ```
 
 ## Development
@@ -282,7 +197,6 @@ pnpm install
 pnpm dev
 # In another terminal:
 curl http://localhost:8787/health
-curl -X POST http://localhost:8787/api/v1/chat
 ```
 
 ## Code Quality (Fitness Functions)
@@ -308,22 +222,12 @@ Dependency-cruiser enforces onion architecture:
 
 ## Deployment
 
-### Option A: GitHub Actions (Automatic)
+Deployments go through CI/CD (never deploy directly):
 
-1. Add secrets to your GitHub repo:
-   - `CLOUDFLARE_API_TOKEN`
-   - `CLOUDFLARE_ACCOUNT_ID`
-   - `ANTHROPIC_API_KEY` (for Claude PR reviews)
-
-2. Push to `main` branch
-3. CI runs → if passes → Deploy runs automatically
-
-### Option B: Manual Deploy
-
-```bash
-wrangler login      # One-time authentication
-wrangler deploy     # Deploy to Cloudflare
-```
+1. Push to a branch and create a PR
+2. CI runs (lint, typecheck, test, build)
+3. Claude PR Review runs automatically
+4. On merge to `main`, deploy runs automatically
 
 The worker will be available at: `https://bt-servant-worker.<your-subdomain>.workers.dev`
 
@@ -331,43 +235,20 @@ The worker will be available at: `https://bt-servant-worker.<your-subdomain>.wor
 
 Every commit runs:
 
-1. **lint-staged** - ESLint + Prettier on staged files
-2. **Type check** - `tsc --noEmit`
-3. **Architecture check** - dependency-cruiser
-4. **Tests** - vitest
-5. **Build** - wrangler build
+1. **lint-staged** — ESLint + Prettier on staged files
+2. **Type check** — `tsc --noEmit`
+3. **Architecture check** — dependency-cruiser
+4. **Tests** — vitest
+5. **Build** — wrangler build
 
 If any check fails, the commit is blocked.
 
-## CI Watcher (Claude Code)
-
-When using Claude Code, a `ci-watcher` subagent automatically monitors GitHub Actions after every push. It reports CI status and helps fix any failures before moving on.
-
-## Implementation Phases
-
-### Phase 0: Barebones Deployment ✅
-
-- Basic Worker with health and chat endpoints
-- CI/CD pipeline
-- Code quality tooling
-- Pre-commit hooks
-
-### Phase 1: Dynamic Code Execution (Planned)
-
-- Durable Objects for per-user state
-- QuickJS sandbox for code execution
-- MCP tool discovery and orchestration
-- Claude API integration
-- Chat history storage
-
-See [docs/implementation-plan.md](docs/implementation-plan.md) for the full plan.
-
 ## Related Projects
 
-- **bt-servant-engine** - The Python/FastAPI predecessor
-- **bt-servant-web-client** - Next.js frontend
-- **bt-servant-whatsapp-gateway** - WhatsApp integration
-- **lasker-api** - Reference for dynamic code execution pattern
+- **bt-servant-engine** — The Python/FastAPI predecessor
+- **bt-servant-web-client** — Next.js frontend
+- **bt-servant-whatsapp-gateway** — WhatsApp integration
+- **lasker-api** — Reference for dynamic code execution pattern
 
 ## License
 

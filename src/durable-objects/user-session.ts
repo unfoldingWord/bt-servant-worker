@@ -27,6 +27,7 @@
 import { Hono } from 'hono';
 import { Env } from '../config/types.js';
 import { orchestrate } from '../services/claude/index.js';
+import { formatTOCForPrompt, MarkdownMemoryStore } from '../services/memory/index.js';
 import { buildToolCatalog, discoverAllTools } from '../services/mcp/index.js';
 import { MCPServerConfig } from '../services/mcp/types.js';
 import {
@@ -109,6 +110,8 @@ export class UserSession {
     this.app.get('/prompt-overrides', () => this.handleGetPromptOverrides());
     this.app.put('/prompt-overrides', (c) => this.handleUpdatePromptOverrides(c.req.raw));
     this.app.delete('/prompt-overrides', () => this.handleDeletePromptOverrides());
+    this.app.get('/memory', () => this.handleGetMemory());
+    this.app.delete('/memory', () => this.handleDeleteMemory());
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -394,6 +397,32 @@ export class UserSession {
     }
   }
 
+  private async resolvePrompts(body: ChatRequest, logger: RequestLogger) {
+    const orgOverrides = body._org_prompt_overrides ?? {};
+    const userOverrides = await this.getPromptOverrides();
+    const resolved = resolvePromptOverrides(orgOverrides, userOverrides);
+
+    const overriddenSlots = PROMPT_OVERRIDE_SLOTS.filter(
+      // eslint-disable-next-line security/detect-object-injection -- s is from PROMPT_OVERRIDE_SLOTS constant
+      (s) => resolved[s] !== DEFAULT_PROMPT_VALUES[s]
+    );
+    if (overriddenSlots.length > 0) {
+      logger.log('prompt_overrides_applied', {
+        org_overrides: Object.keys(orgOverrides).length,
+        user_overrides: Object.keys(userOverrides).length,
+        overridden_slots: overriddenSlots,
+      });
+    }
+    return resolved;
+  }
+
+  private async loadMemoryContext(logger: RequestLogger) {
+    const memoryStore = new MarkdownMemoryStore(this.state.storage, logger);
+    const memoryTOC = await memoryStore.getTableOfContents();
+    const formattedTOC = formatTOCForPrompt(memoryTOC);
+    return { memoryStore, formattedTOC: formattedTOC || undefined };
+  }
+
   private async loadUserContext(logger: RequestLogger) {
     const startTime = Date.now();
     const [preferences, history] = await Promise.all([this.getPreferences(), this.getHistory()]);
@@ -461,22 +490,8 @@ export class UserSession {
     const orgConfig = body._org_config ?? {};
     const catalog = await this.discoverMCPTools(mcpServers, logger);
 
-    // Resolve prompt overrides: user → org → default
-    const orgOverrides = body._org_prompt_overrides ?? {};
-    const userOverrides = await this.getPromptOverrides();
-    const resolvedPromptValues = resolvePromptOverrides(orgOverrides, userOverrides);
-
-    const overriddenSlots = PROMPT_OVERRIDE_SLOTS.filter(
-      // eslint-disable-next-line security/detect-object-injection -- s is from PROMPT_OVERRIDE_SLOTS constant
-      (s) => resolvedPromptValues[s] !== DEFAULT_PROMPT_VALUES[s]
-    );
-    if (overriddenSlots.length > 0) {
-      logger.log('prompt_overrides_applied', {
-        org_overrides: Object.keys(orgOverrides).length,
-        user_overrides: Object.keys(userOverrides).length,
-        overridden_slots: overriddenSlots,
-      });
-    }
+    const resolvedPromptValues = await this.resolvePrompts(body, logger);
+    const { memoryStore, formattedTOC } = await this.loadMemoryContext(logger);
 
     const startTime = Date.now();
     const responses = await orchestrate(body.message, {
@@ -489,6 +504,8 @@ export class UserSession {
       },
       orgConfig,
       resolvedPromptValues,
+      memoryStore,
+      memoryTOC: formattedTOC || undefined,
       logger,
       callbacks,
     });
@@ -538,6 +555,30 @@ export class UserSession {
     try {
       await this.state.storage.delete(PROMPT_OVERRIDES_KEY);
       return Response.json({ message: 'User prompt overrides cleared' });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
+    }
+  }
+
+  private async handleGetMemory(): Promise<Response> {
+    try {
+      const logger = createRequestLogger(crypto.randomUUID());
+      const store = new MarkdownMemoryStore(this.state.storage, logger);
+      const content = await store.read();
+      return Response.json({ content });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
+    }
+  }
+
+  private async handleDeleteMemory(): Promise<Response> {
+    try {
+      const logger = createRequestLogger(crypto.randomUUID());
+      const store = new MarkdownMemoryStore(this.state.storage, logger);
+      await store.clear();
+      return Response.json({ message: 'User memory cleared' });
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
