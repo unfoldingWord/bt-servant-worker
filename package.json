@@ -15,12 +15,13 @@
     "format:check": "prettier --check .",
     "check": "tsc --noEmit",
     "architecture": "depcruise --config .dependency-cruiser.js src",
+    "audit:prod": "pnpm audit --prod",
     "prepare": "husky"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.71.2",
     "@cf-wasm/quickjs": "^0.2.4",
-    "@modelcontextprotocol/sdk": "^1.25.3",
+    "@modelcontextprotocol/sdk": "^1.26.0",
     "hono": "^4.11.7",
     "zod": "^3.24.0"
   },
