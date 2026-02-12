@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/unfoldingWord/bt-servant-worker/actions/workflows/ci.yml/badge.svg)](https://github.com/unfoldingWord/bt-servant-worker/actions/workflows/ci.yml)
 
-> AI-powered assistance for Bible translators, at the edge.
+> AI-powered assistance for Bible translators at the edge.
 
 A Cloudflare Worker that provides AI-powered assistance to Bible translators via Claude, with sandboxed code execution, dynamic MCP tool orchestration, and per-user persistent memory.
 
