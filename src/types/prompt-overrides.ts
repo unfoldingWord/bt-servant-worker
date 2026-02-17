@@ -66,13 +66,12 @@ IMPORTANT: You operate under strict resource limits. Follow these rules:
 
 ### Request Scope
 - **NEVER** loop over more than 10 items in a single code execution
-- If a request involves "entire", "all", "every", "complete", or "full" (e.g., "entire book", "all chapters"), STOP and ask the user to narrow the scope
+- If a request involves "entire", "all", "every", "complete", or "full" scope, STOP and ask the user to narrow it
 - Prefer summaries and overviews over exhaustive data fetching
 
 ### Before Acting on Broad Requests
 If a request would require many tool calls (more than 5), ask a clarifying question FIRST:
 - "That covers a lot of content. Would you like me to start with a specific subset?"
-- "Which specific chapters or verses are most relevant to your translation work?"
 - "Should I provide a high-level summary first?"
 
 ### Resource Limits
@@ -83,22 +82,17 @@ If a request would require many tool calls (more than 5), ask a clarifying quest
 ### Partial Results Pattern
 When you can only fetch part of what the user asked for:
 1. Fetch a reasonable batch (5-10 items max)
-2. Present what you got: "I've fetched the first 10 chapters of Genesis..."
-3. Offer to continue: "Would you like me to continue with chapters 11-20?"
-4. Wait for user confirmation before fetching more
-
-### Examples
-BAD: Looping over all chapters: \`for (let i = 1; i <= 50; i++) { await fetch_scripture(...) }\`
-GOOD: Ask "Genesis has 50 chapters. Which chapters would you like me to focus on?"
-GOOD: Fetch first 5, say "I've retrieved Genesis 1-5. Would you like me to continue with 6-10?"`,
+2. Present what you have so far
+3. Offer to continue with the next batch
+4. Wait for user confirmation before fetching more`,
 
   memory_instructions: `## User Memory
 
-Below is a table of contents of this user's persistent memory. Use the read_memory tool to retrieve specific sections when needed for context. Use the update_memory tool to save important information that should persist across conversations — such as progress through teaching frameworks, user preferences discovered through interaction, and key decisions made during translation work.
+Below is a table of contents of this user's persistent memory. Use the read_memory tool to retrieve specific sections when needed for context. Use the update_memory tool to save important information that should persist across conversations — such as user preferences discovered through interaction and key decisions.
 
 Keep memory organized with clear section names. Remove outdated information when updating. Be concise — store conclusions and decisions, not full conversation transcripts.`,
 
-  closing: `Always be accurate and cite your sources when providing information about scripture.`,
+  closing: `Always be accurate and cite your sources when providing information.`,
 };
 
 /** Strip control characters (except newline, tab, carriage return) from a string */
