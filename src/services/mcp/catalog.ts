@@ -132,18 +132,5 @@ Before using a tool, call \`get_tool_definitions\` with the tool name(s) to get 
 
 | Tool | Description |
 |------|-------------|
-${rows.join('\n')}
-
-### How to use MCP tools:
-1. Review the catalog above to identify relevant tools
-2. Call \`get_tool_definitions\` with the tool names you need
-3. Use the tools in \`execute_code\` based on the returned schemas
-
-Example:
-\`\`\`javascript
-// First call get_tool_definitions to learn the schema
-// Then use the tool in execute_code:
-const result = await fetch_scripture({ book: "John", chapter: 3, verse: 16 });
-__result__ = result;
-\`\`\``;
+${rows.join('\n')}`;
 }
