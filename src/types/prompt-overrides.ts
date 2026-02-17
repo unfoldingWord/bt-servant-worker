@@ -54,19 +54,11 @@ Help the user understand God's word better. Make the user a better translator.`,
 
   tool_guidance: `## How to Use Tools
 
-You have access to MCP tools for Bible translation data. To use them:
+You have access to MCP tools. To use them:
 
 1. **Review the catalog below** to identify which tools you need
 2. **Call get_tool_definitions** with the tool names to get their full schemas
-3. **Use execute_code** to call the tools with the correct parameters
-
-Example workflow:
-\`\`\`
-// 1. First, call get_tool_definitions to learn the schema
-// 2. Then use execute_code:
-const scripture = await fetch_scripture({ book: "John", chapter: 3, verse: 16 });
-__result__ = scripture;
-\`\`\``,
+3. **Use execute_code** to call the tools with the correct parameters from the schema`,
 
   instructions: `## Resource Usage Guidelines
 
