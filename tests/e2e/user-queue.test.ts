@@ -1,0 +1,147 @@
+/**
+ * E2E tests for UserQueue Durable Object
+ *
+ * These tests run in the actual Cloudflare Workers runtime (via miniflare)
+ * and test the UserQueue implementation (alarm-based per-user message queue).
+ */
+
+/* eslint-disable max-lines-per-function */
+import { env } from 'cloudflare:test';
+import { describe, it, expect, beforeEach } from 'vitest';
+import { EnqueueResponse, QueueStatusResponse } from '../../src/types/queue.js';
+
+describe('UserQueue Durable Object', () => {
+  let stub: DurableObjectStub;
+
+  beforeEach(() => {
+    const id = env.USER_QUEUE.newUniqueId();
+    stub = env.USER_QUEUE.get(id);
+  });
+
+  describe('GET /status', () => {
+    it('returns empty queue for new instance', async () => {
+      const response = await stub.fetch('http://fake-host/status');
+      const data = (await response.json()) as QueueStatusResponse;
+
+      expect(response.status).toBe(200);
+      expect(data.queue_length).toBe(0);
+      expect(data.processing).toBe(false);
+      expect(data.stored_response_count).toBe(0);
+    });
+  });
+
+  describe('POST /enqueue', () => {
+    it('returns 202 with message_id and queue_position', async () => {
+      const response = await stub.fetch('http://fake-host/enqueue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_id: 'test-user',
+          client_id: 'test-client',
+          message: 'Hello',
+          message_type: 'text',
+          org: 'test-org',
+          delivery: 'sse',
+        }),
+      });
+
+      expect(response.status).toBe(202);
+      const data = (await response.json()) as EnqueueResponse;
+      expect(data.message_id).toBeDefined();
+      expect(typeof data.message_id).toBe('string');
+      expect(data.message_id.length).toBeGreaterThan(0);
+      expect(data.queue_position).toBe(1);
+    });
+
+    it('increments queue position for multiple enqueues (FIFO ordering)', async () => {
+      const response1 = await stub.fetch('http://fake-host/enqueue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_id: 'test-user',
+          client_id: 'test-client',
+          message: 'First message',
+          message_type: 'text',
+          org: 'test-org',
+          delivery: 'sse',
+        }),
+      });
+      const data1 = (await response1.json()) as EnqueueResponse;
+
+      const response2 = await stub.fetch('http://fake-host/enqueue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_id: 'test-user',
+          client_id: 'test-client',
+          message: 'Second message',
+          message_type: 'text',
+          org: 'test-org',
+          delivery: 'sse',
+        }),
+      });
+      const data2 = (await response2.json()) as EnqueueResponse;
+
+      expect(data1.queue_position).toBe(1);
+      expect(data2.queue_position).toBe(2);
+      expect(data1.message_id).not.toBe(data2.message_id);
+    });
+
+    it('rejects enqueue with missing required fields', async () => {
+      const response = await stub.fetch('http://fake-host/enqueue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          // Missing user_id, message, etc.
+          client_id: 'test-client',
+        }),
+      });
+
+      expect(response.status).toBe(400);
+    });
+
+    it('reflects queue length in status after enqueue', async () => {
+      await stub.fetch('http://fake-host/enqueue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_id: 'test-user',
+          client_id: 'test-client',
+          message: 'Hello',
+          message_type: 'text',
+          org: 'test-org',
+          delivery: 'sse',
+        }),
+      });
+
+      const statusResponse = await stub.fetch('http://fake-host/status');
+      const statusData = (await statusResponse.json()) as QueueStatusResponse;
+
+      // Queue length should be >= 1 (may have started processing via alarm)
+      expect(statusData.queue_length + (statusData.processing ? 1 : 0)).toBeGreaterThanOrEqual(1);
+    });
+  });
+
+  describe('GET /stream', () => {
+    it('returns 400 without message_id param', async () => {
+      const response = await stub.fetch('http://fake-host/stream');
+
+      expect(response.status).toBe(400);
+      const data = (await response.json()) as { error: string };
+      expect(data.error).toContain('message_id');
+    });
+
+    // NOTE: Testing live SSE streams (open-ended TransformStream responses) is not
+    // possible in miniflare because stub.fetch() waits for the entire response body
+    // to complete before resolving. The SSE Content-Type and streaming behavior are
+    // verified by the implementation and by manual testing with `pnpm dev`.
+  });
+
+  describe('Unknown paths', () => {
+    it('returns 404 for unknown path', async () => {
+      const response = await stub.fetch('http://fake-host/nonexistent');
+
+      expect(response.status).toBe(404);
+    });
+  });
+});

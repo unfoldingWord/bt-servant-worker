@@ -35,6 +35,49 @@ id = "c1828624ab434f079776bddd171882d9"
 name = "USER_SESSION"
 class_name = "UserSession"
 
+[[durable_objects.bindings]]
+name = "USER_QUEUE"
+class_name = "UserQueue"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["UserSession"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["UserQueue"]
+
+# ──── Staging environment ────
+[env.staging]
+name = "bt-servant-worker-staging"
+
+[env.staging.vars]
+ENVIRONMENT = "staging"
+MAX_ORCHESTRATION_ITERATIONS = "10"
+CODE_EXEC_TIMEOUT_MS = "30000"
+MAX_MCP_CALLS_PER_EXECUTION = "10"
+DEFAULT_ORG = "unfoldingWord"
+
+[[env.staging.kv_namespaces]]
+binding = "ORG_ADMIN_KEYS"
+id = "3c8189cb077a463fb95b00f6fcf178c0"
+
+[[env.staging.kv_namespaces]]
+binding = "MCP_SERVERS"
+id = "76b75c5465f0447995db8ec123056f22"
+
+[[env.staging.kv_namespaces]]
+binding = "ORG_CONFIG"
+id = "f0783f5b724b427d94245ecbf810a267"
+
+[[env.staging.kv_namespaces]]
+binding = "PROMPT_OVERRIDES"
+id = "1416f321fbda450095214111d38d211a"
+
+[[env.staging.durable_objects.bindings]]
+name = "USER_SESSION"
+class_name = "UserSession"
+
+[[env.staging.durable_objects.bindings]]
+name = "USER_QUEUE"
+class_name = "UserQueue"

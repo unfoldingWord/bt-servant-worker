@@ -127,6 +127,7 @@ export class UserSession {
             event: 'CONCURRENT_REQUEST_REJECTED',
             user_id: userId,
             timestamp: Date.now(),
+            note: 'UserQueue should prevent this — kept as defense-in-depth',
           })
         );
         return new Response(

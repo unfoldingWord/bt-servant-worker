@@ -22,7 +22,7 @@
     "@anthropic-ai/sdk": "^0.71.2",
     "@cf-wasm/quickjs": "^0.2.4",
     "@modelcontextprotocol/sdk": "^1.26.0",
-    "hono": "^4.11.7",
+    "hono": "^4.12.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {

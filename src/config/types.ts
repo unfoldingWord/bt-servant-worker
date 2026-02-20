@@ -36,6 +36,7 @@ export interface Env {
 
   // Durable Object bindings
   USER_SESSION: DurableObjectNamespace;
+  USER_QUEUE: DurableObjectNamespace;
 }
 
 /**

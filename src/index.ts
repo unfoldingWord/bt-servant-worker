@@ -7,7 +7,7 @@
 
 import { Hono } from 'hono';
 import { Env } from './config/types.js';
-import { UserSession } from './durable-objects/index.js';
+import { UserQueue, UserSession } from './durable-objects/index.js';
 import { discoverAllTools } from './services/mcp/index.js';
 import { MCPServerConfig } from './services/mcp/types.js';
 import { ChatRequest } from './types/engine.js';
@@ -27,7 +27,7 @@ import {
   validateServerId,
 } from './utils/mcp-validation.js';
 
-export { UserSession };
+export { UserQueue, UserSession };
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -57,6 +57,19 @@ app.post('/api/v1/chat', async (c) => {
 
 app.post('/api/v1/chat/stream', async (c) => {
   return handleChatRequest(c.req.raw, c.env, '/stream');
+});
+
+// Queue endpoints (UserQueue DO)
+app.post('/api/v1/message', async (c) => {
+  return handleMessageEnqueue(c.req.raw, c.env);
+});
+
+app.get('/api/v1/stream', async (c) => {
+  return handleQueueStream(c.req.raw, c.env);
+});
+
+app.get('/api/v1/queue/:userId', async (c) => {
+  return handleQueueStatus(c.req.raw, c.env, c.req.param('userId'));
 });
 
 // User endpoints with org scope (new paths)
@@ -605,4 +618,107 @@ async function handleUserRequest(
   });
 
   return stub.fetch(doRequest);
+}
+
+/**
+ * Handle message enqueue (POST /api/v1/message)
+ *
+ * Validates user_id, fetches org config from KV, and routes to UserQueue DO.
+ */
+async function handleMessageEnqueue(request: Request, env: Env): Promise<Response> {
+  const requestId = crypto.randomUUID();
+  const logger = createRequestLogger(requestId);
+
+  try {
+    const body = (await request.clone().json()) as ChatRequest;
+
+    if (!body.user_id) {
+      return Response.json({ error: 'user_id is required' }, { status: 400 });
+    }
+
+    const org = body.org ?? env.DEFAULT_ORG;
+    logger.log('message_enqueue_received', {
+      user_id: body.user_id,
+      org,
+    });
+
+    const [mcpServers, orgConfig, promptOverrides] = await Promise.all([
+      getMCPServersFromKV(env, org, logger),
+      getOrgConfigFromKV(env, org, logger),
+      getPromptOverridesFromKV(env, org, logger),
+    ]);
+
+    // Determine delivery mode based on progress_callback_url
+    const delivery = body.progress_callback_url ? 'callback' : 'sse';
+
+    const doId = env.USER_QUEUE.idFromName(`queue:${org}:${body.user_id}`);
+    const stub = env.USER_QUEUE.get(doId);
+
+    const doRequest = new Request('http://fake-host/enqueue', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...body,
+        org,
+        delivery,
+        _mcp_servers: mcpServers,
+        _org_config: orgConfig,
+        _org_prompt_overrides: promptOverrides,
+      }),
+    });
+
+    return stub.fetch(doRequest);
+  } catch (error) {
+    logger.error('message_enqueue_error', error);
+    if (error instanceof SyntaxError) {
+      return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
+    }
+    return Response.json({ error: 'Internal server error' }, { status: 500 });
+  }
+}
+
+/**
+ * Handle queue stream (GET /api/v1/stream)
+ *
+ * Extracts user_id, message_id, org_id from query params and routes to UserQueue DO.
+ */
+async function handleQueueStream(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const userId = url.searchParams.get('user_id');
+  const messageId = url.searchParams.get('message_id');
+  const orgId = url.searchParams.get('org_id') ?? env.DEFAULT_ORG;
+
+  if (!userId) {
+    return Response.json({ error: 'user_id query parameter is required' }, { status: 400 });
+  }
+  if (!messageId) {
+    return Response.json({ error: 'message_id query parameter is required' }, { status: 400 });
+  }
+
+  const doId = env.USER_QUEUE.idFromName(`queue:${orgId}:${userId}`);
+  const stub = env.USER_QUEUE.get(doId);
+
+  const doUrl = new URL('http://fake-host/stream');
+  doUrl.searchParams.set('message_id', messageId);
+
+  return stub.fetch(new Request(doUrl.toString()));
+}
+
+/**
+ * Handle queue status (GET /api/v1/queue/:userId)
+ *
+ * Debugging endpoint — returns queue length, processing flag, stored response count.
+ */
+async function handleQueueStatus(request: Request, env: Env, userId: string): Promise<Response> {
+  const url = new URL(request.url);
+  const orgId = url.searchParams.get('org_id') ?? env.DEFAULT_ORG;
+
+  if (!userId) {
+    return Response.json({ error: 'userId is required in path' }, { status: 400 });
+  }
+
+  const doId = env.USER_QUEUE.idFromName(`queue:${orgId}:${userId}`);
+  const stub = env.USER_QUEUE.get(doId);
+
+  return stub.fetch(new Request('http://fake-host/status'));
 }
