@@ -87,6 +87,40 @@ describe('UserQueue Durable Object', () => {
       expect(data1.message_id).not.toBe(data2.message_id);
     });
 
+    it('returns 429 when queue depth limit is exceeded', async () => {
+      // Default MAX_QUEUE_DEPTH is 50. Fire 51 concurrent requests so the DO's
+      // input gate serializes them all before the alarm gets a chance to drain.
+      const makeRequest = (i: number) =>
+        stub.fetch('http://fake-host/enqueue', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            user_id: 'test-user',
+            client_id: 'test-client',
+            message: `Message ${i}`,
+            message_type: 'text',
+            org: 'test-org',
+            delivery: 'sse',
+          }),
+        });
+
+      const responses = await Promise.all(Array.from({ length: 51 }, (_, i) => makeRequest(i)));
+      const statuses = responses.map((r) => r.status);
+
+      // First 50 should be 202, the 51st should be 429
+      const accepted = statuses.filter((s) => s === 202);
+      const rejected = statuses.filter((s) => s === 429);
+
+      expect(accepted.length).toBe(50);
+      expect(rejected.length).toBe(1);
+
+      // Verify the rejected response has the right shape
+      const rejectedResponse = responses.find((r) => r.status === 429)!;
+      const data = (await rejectedResponse.json()) as { error: string; code: string };
+      expect(data.code).toBe('QUEUE_DEPTH_EXCEEDED');
+      expect(rejectedResponse.headers.get('Retry-After')).toBe('5');
+    });
+
     it('rejects enqueue with missing required fields', async () => {
       const response = await stub.fetch('http://fake-host/enqueue', {
         method: 'POST',

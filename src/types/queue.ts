@@ -29,6 +29,8 @@ export interface QueueEntry {
   enqueued_at: number;
   /** Delivery mode: 'callback' for webhook, 'sse' for streaming */
   delivery: 'callback' | 'sse';
+  /** Number of times this entry has been retried after transient failures */
+  retry_count: number;
   /** Injected MCP servers from KV */
   _mcp_servers?: MCPServerConfig[] | undefined;
   /** Injected org config from KV */

@@ -15,7 +15,9 @@
  * - 'sse': Forwards to UserSession /stream and pipes SSE events to the connected client
  *
  * If no SSE client is connected when processing completes, the response is stored
- * for later retrieval (5-minute TTL).
+ * for later retrieval (configurable TTL, default 5 minutes).
+ *
+ * Transient failures are retried up to MAX_RETRIES times with re-enqueue.
  */
 
 import { Env } from '../config/types.js';
@@ -28,30 +30,52 @@ import {
 } from '../types/queue.js';
 import { createRequestLogger, RequestLogger } from '../utils/logger.js';
 
-const STORED_RESPONSE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const SSE_CLIENT_CONNECT_TIMEOUT_MS = 30 * 1000; // 30 seconds
+// Defaults for configurable values (overridable via env vars)
+const DEFAULT_STORED_RESPONSE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const DEFAULT_SSE_CLIENT_CONNECT_TIMEOUT_MS = 30 * 1000; // 30 seconds
+const DEFAULT_MAX_QUEUE_DEPTH = 50;
+const DEFAULT_MAX_RETRIES = 3;
 
-/** Parse and validate enqueue request body, returning a QueueEntry or error string. */
-function parseEnqueueBody(body: Record<string, unknown>): QueueEntry | string {
+/** Validate required fields in enqueue request body. Returns error string or null. */
+function validateEnqueueBody(body: Record<string, unknown>): string | null {
   if (!body.user_id || typeof body.user_id !== 'string') return 'user_id is required';
   if (!body.message || typeof body.message !== 'string') return 'message is required';
   if (!body.org || typeof body.org !== 'string') return 'org is required';
+  return null;
+}
+
+/** Extract optional string/number fields from enqueue body. */
+function extractOptionalFields(body: Record<string, unknown>) {
+  return {
+    audio_base64: typeof body.audio_base64 === 'string' ? body.audio_base64 : undefined,
+    audio_format: typeof body.audio_format === 'string' ? body.audio_format : undefined,
+    progress_callback_url:
+      typeof body.progress_callback_url === 'string' ? body.progress_callback_url : undefined,
+    progress_throttle_seconds:
+      typeof body.progress_throttle_seconds === 'number'
+        ? body.progress_throttle_seconds
+        : undefined,
+    progress_mode: body.progress_mode as QueueEntry['progress_mode'],
+    message_key: typeof body.message_key === 'string' ? body.message_key : undefined,
+  };
+}
+
+/** Parse and validate enqueue request body, returning a QueueEntry or error string. */
+function parseEnqueueBody(body: Record<string, unknown>): QueueEntry | string {
+  const error = validateEnqueueBody(body);
+  if (error) return error;
 
   return {
     message_id: crypto.randomUUID(),
-    user_id: body.user_id,
-    client_id: (body.client_id as string) ?? 'unknown',
-    message: body.message,
-    message_type: (body.message_type as 'text' | 'audio') ?? 'text',
-    audio_base64: body.audio_base64 as string | undefined,
-    audio_format: body.audio_format as string | undefined,
-    progress_callback_url: body.progress_callback_url as string | undefined,
-    progress_throttle_seconds: body.progress_throttle_seconds as number | undefined,
-    progress_mode: body.progress_mode as QueueEntry['progress_mode'],
-    message_key: body.message_key as string | undefined,
-    org: body.org,
+    user_id: body.user_id as string,
+    client_id: typeof body.client_id === 'string' ? body.client_id : 'unknown',
+    message: body.message as string,
+    message_type: body.message_type === 'audio' ? ('audio' as const) : ('text' as const),
+    org: body.org as string,
     enqueued_at: Date.now(),
-    delivery: (body.delivery as 'callback' | 'sse') ?? 'sse',
+    delivery: body.delivery === 'callback' ? ('callback' as const) : ('sse' as const),
+    retry_count: 0,
+    ...extractOptionalFields(body),
     _mcp_servers: body._mcp_servers as QueueEntry['_mcp_servers'],
     _org_config: body._org_config as QueueEntry['_org_config'],
     _org_prompt_overrides: body._org_prompt_overrides as QueueEntry['_org_prompt_overrides'],
@@ -147,10 +171,14 @@ export class UserQueue {
       return;
     }
 
+    const startTime = Date.now();
     logger.log('queue_processing_start', {
       message_id: entry.message_id,
       delivery: entry.delivery,
       user_id: entry.user_id,
+      org: entry.org,
+      retry_count: entry.retry_count,
+      queue_wait_ms: startTime - entry.enqueued_at,
     });
 
     try {
@@ -159,10 +187,20 @@ export class UserQueue {
       } else {
         await this.processWithSSE(entry, logger);
       }
-      logger.log('queue_processing_complete', { message_id: entry.message_id });
+      logger.log('queue_processing_complete', {
+        message_id: entry.message_id,
+        user_id: entry.user_id,
+        processing_ms: Date.now() - startTime,
+      });
     } catch (error) {
-      logger.error('queue_processing_error', error, { message_id: entry.message_id });
-      await this.handleProcessingError(entry, error);
+      logger.error('queue_processing_error', error, {
+        message_id: entry.message_id,
+        user_id: entry.user_id,
+        org: entry.org,
+        retry_count: entry.retry_count,
+        processing_ms: Date.now() - startTime,
+      });
+      await this.handleProcessingError(entry, error, logger);
     } finally {
       this.streams.delete(entry.message_id);
       this.streamWaiters.delete(entry.message_id);
@@ -183,7 +221,19 @@ export class UserQueue {
       return Response.json({ error: result }, { status: 400 });
     }
 
-    const position = await this.enqueueEntry(result);
+    const maxDepth = this.getMaxQueueDepth();
+    const position = await this.enqueueEntry(result, maxDepth);
+
+    if (position === -1) {
+      return Response.json(
+        {
+          error: 'Queue full',
+          code: 'QUEUE_DEPTH_EXCEEDED',
+          message: `Queue depth limit (${maxDepth}) exceeded. Please retry later.`,
+        },
+        { status: 429, headers: { 'Retry-After': '5' } }
+      );
+    }
 
     const response: EnqueueResponse = {
       message_id: result.message_id,
@@ -235,17 +285,22 @@ export class UserQueue {
     });
   }
 
-  /** Atomically append entry to queue and schedule alarm if idle. */
-  private async enqueueEntry(entry: QueueEntry): Promise<number> {
+  /** Atomically append entry to queue and schedule alarm if idle. Returns -1 if full. */
+  private async enqueueEntry(entry: QueueEntry, maxDepth: number): Promise<number> {
     return this.state.blockConcurrencyWhile(async () => {
       const queue = (await this.state.storage.get<QueueEntry[]>('queue')) ?? [];
+
+      if (queue.length >= maxDepth) {
+        return -1;
+      }
+
       queue.push(entry);
       await this.state.storage.put('queue', queue);
 
       const isProcessing = (await this.state.storage.get<boolean>('processing')) ?? false;
       if (!isProcessing) {
         await this.state.storage.put('processing', true);
-        this.state.storage.setAlarm(Date.now());
+        await this.state.storage.setAlarm(Date.now());
       }
       return queue.length;
     });
@@ -327,7 +382,11 @@ export class UserQueue {
     });
 
     const response = await stub.fetch(doRequest);
-    logger.log('callback_response', { message_id: entry.message_id, status: response.status });
+    logger.log('callback_response', {
+      message_id: entry.message_id,
+      user_id: entry.user_id,
+      status: response.status,
+    });
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -343,7 +402,11 @@ export class UserQueue {
     if (writer) {
       await this.pipeSSEToClient(writer, response.body!, entry.message_id);
     } else {
-      logger.warn('no_sse_client', { message_id: entry.message_id });
+      logger.warn('no_sse_client', {
+        message_id: entry.message_id,
+        user_id: entry.user_id,
+        org: entry.org,
+      });
       await this.bufferAndStoreResponse(response.body!, entry.message_id);
     }
   }
@@ -371,21 +434,35 @@ export class UserQueue {
     body: ReadableStream<Uint8Array>,
     messageId: string
   ): Promise<void> {
-    await this.writeSSE(writer, 'processing', JSON.stringify({ message_id: messageId }));
-
-    const reader = body.getReader();
     try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        await writer.write(value);
-      }
-    } finally {
-      reader.releaseLock();
-    }
+      await this.writeSSE(writer, 'processing', JSON.stringify({ message_id: messageId }));
 
-    await this.writeSSE(writer, 'done', JSON.stringify({ message_id: messageId }));
-    await writer.close();
+      const reader = body.getReader();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          await writer.write(value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+
+      await this.writeSSE(writer, 'done', JSON.stringify({ message_id: messageId }));
+    } catch (error) {
+      // Client may have disconnected — log but don't propagate
+      const msg = error instanceof Error ? error.message : String(error);
+      if (msg.includes('WritableStream') || msg.includes('closed')) {
+        return; // Client disconnect — not an error
+      }
+      throw error;
+    } finally {
+      try {
+        await writer.close();
+      } catch {
+        // Writer may already be closed from client disconnect
+      }
+    }
   }
 
   /** Buffer SSE response and store for late-connecting clients. */
@@ -404,7 +481,7 @@ export class UserQueue {
     return this.env.USER_SESSION.get(doId);
   }
 
-  /** Wait up to 30s for an SSE client to connect. Returns writer or null. */
+  /** Wait for an SSE client to connect within the configured timeout. Returns writer or null. */
   private async waitForSSEClient(
     messageId: string,
     logger: RequestLogger
@@ -412,6 +489,7 @@ export class UserQueue {
     const existing = this.streams.get(messageId);
     if (existing) return existing;
 
+    const timeout = this.getSSEConnectTimeout();
     let resolveWaiter: () => void;
     const promise = new Promise<void>((resolve) => {
       resolveWaiter = resolve;
@@ -419,7 +497,7 @@ export class UserQueue {
     this.streamWaiters.set(messageId, { resolve: resolveWaiter!, promise });
 
     const timeoutPromise = new Promise<'timeout'>((resolve) => {
-      setTimeout(() => resolve('timeout'), SSE_CLIENT_CONNECT_TIMEOUT_MS);
+      setTimeout(() => resolve('timeout'), timeout);
     });
 
     const result = await Promise.race([promise.then(() => 'connected' as const), timeoutPromise]);
@@ -428,18 +506,40 @@ export class UserQueue {
     if (result === 'timeout') {
       logger.warn('sse_client_connect_timeout', {
         message_id: messageId,
-        timeout_ms: SSE_CLIENT_CONNECT_TIMEOUT_MS,
+        timeout_ms: timeout,
       });
       return null;
     }
     return this.streams.get(messageId) ?? null;
   }
 
-  /** Send error to connected SSE client or store for late retrieval. */
-  private async handleProcessingError(entry: QueueEntry, error: unknown): Promise<void> {
+  /**
+   * Handle errors during queue processing.
+   * For transient failures (5xx from UserSession), re-enqueue with retry counter.
+   * For permanent failures, send error to SSE client or store for late retrieval.
+   */
+  private async handleProcessingError(
+    entry: QueueEntry,
+    error: unknown,
+    logger: RequestLogger
+  ): Promise<void> {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    const writer = this.streams.get(entry.message_id);
+    const maxRetries = this.getMaxRetries();
 
+    // Retry on transient failures (not validation errors)
+    if (this.isTransientError(errorMessage) && entry.retry_count < maxRetries) {
+      logger.warn('queue_entry_retry', {
+        message_id: entry.message_id,
+        user_id: entry.user_id,
+        retry_count: entry.retry_count + 1,
+        max_retries: maxRetries,
+      });
+      await this.reEnqueue({ ...entry, retry_count: entry.retry_count + 1 });
+      return;
+    }
+
+    // Permanent failure — notify client
+    const writer = this.streams.get(entry.message_id);
     if (writer) {
       try {
         await this.writeSSE(writer, 'error', JSON.stringify({ error: errorMessage }));
@@ -452,6 +552,25 @@ export class UserQueue {
         { event: 'error', data: JSON.stringify({ error: errorMessage }) },
       ]);
     }
+  }
+
+  /** Check if an error message indicates a transient (retryable) failure. */
+  private isTransientError(errorMessage: string): boolean {
+    return (
+      errorMessage.includes('returned 5') || // 5xx from UserSession
+      errorMessage.includes('Network') ||
+      errorMessage.includes('timeout') ||
+      errorMessage.includes('ECONNREFUSED')
+    );
+  }
+
+  /** Re-enqueue a failed entry at the front of the queue for retry. */
+  private async reEnqueue(entry: QueueEntry): Promise<void> {
+    await this.state.blockConcurrencyWhile(async () => {
+      const queue = (await this.state.storage.get<QueueEntry[]>('queue')) ?? [];
+      queue.unshift(entry); // Add to front for priority retry
+      await this.state.storage.put('queue', queue);
+    });
   }
 
   /** Write a named SSE event: `event: <type>\ndata: <data>\n\n` */
@@ -471,10 +590,11 @@ export class UserQueue {
 
     // Clean up expired entries
     const now = Date.now();
+    const ttl = this.getStoredResponseTTL();
     for (const key of Object.keys(responses)) {
       // eslint-disable-next-line security/detect-object-injection -- key from Object.keys iteration
       const resp = responses[key];
-      if (resp && now - resp.stored_at > STORED_RESPONSE_TTL_MS) {
+      if (resp && now - resp.stored_at > ttl) {
         // eslint-disable-next-line security/detect-object-injection -- key from Object.keys iteration
         delete responses[key];
       }
@@ -497,7 +617,30 @@ export class UserQueue {
     });
 
     if (hasMore) {
-      this.state.storage.setAlarm(Date.now());
+      await this.state.storage.setAlarm(Date.now());
     }
+  }
+
+  // ── Config helpers (read from env with defaults) ──
+
+  private getMaxQueueDepth(): number {
+    return parseInt(this.env.MAX_QUEUE_DEPTH ?? '', 10) || DEFAULT_MAX_QUEUE_DEPTH;
+  }
+
+  private getStoredResponseTTL(): number {
+    return (
+      parseInt(this.env.QUEUE_STORED_RESPONSE_TTL_MS ?? '', 10) || DEFAULT_STORED_RESPONSE_TTL_MS
+    );
+  }
+
+  private getSSEConnectTimeout(): number {
+    return (
+      parseInt(this.env.QUEUE_SSE_CONNECT_TIMEOUT_MS ?? '', 10) ||
+      DEFAULT_SSE_CLIENT_CONNECT_TIMEOUT_MS
+    );
+  }
+
+  private getMaxRetries(): number {
+    return parseInt(this.env.QUEUE_MAX_RETRIES ?? '', 10) || DEFAULT_MAX_RETRIES;
   }
 }
