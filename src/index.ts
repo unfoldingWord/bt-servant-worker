@@ -19,11 +19,9 @@ import {
   resolvePromptOverrides,
   validatePromptOverrides,
 } from './types/prompt-overrides.js';
+import { DO_BASE_URL } from './config/constants.js';
 import { constantTimeCompare } from './utils/crypto.js';
 import { createRequestLogger } from './utils/logger.js';
-
-/** Base URL for intra-DO fetch requests (hostname is ignored by Durable Objects). */
-const DO_BASE_URL = 'http://do-internal';
 import {
   MAX_SERVERS_PER_ORG,
   validateServerConfig,

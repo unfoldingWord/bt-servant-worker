@@ -20,7 +20,9 @@
  * Transient failures are retried up to MAX_RETRIES times with re-enqueue.
  */
 
+import { DO_BASE_URL } from '../config/constants.js';
 import { Env } from '../config/types.js';
+import { ProgressMode } from '../types/engine.js';
 import {
   EnqueueResponse,
   QueueEntry,
@@ -29,9 +31,6 @@ import {
   StoredSSEEvent,
 } from '../types/queue.js';
 import { createRequestLogger, RequestLogger } from '../utils/logger.js';
-
-/** Base URL for intra-DO fetch requests (hostname is ignored by Durable Objects). */
-const DO_BASE_URL = 'http://do-internal';
 
 // Defaults for configurable values (overridable via env vars)
 const DEFAULT_STORED_RESPONSE_TTL_MS = 5 * 60 * 1000; // 5 minutes
@@ -42,6 +41,12 @@ const DEFAULT_MAX_BUFFERED_RESPONSE_SIZE = 5 * 1024 * 1024; // 5 MB
 const MAX_CLEANUP_PER_STORE = 10;
 const ENQUEUE_RATE_WINDOW_MS = 60 * 1000; // 1 minute
 const ENQUEUE_RATE_LIMIT = 300; // max enqueues per window
+
+const VALID_PROGRESS_MODES: ProgressMode[] = ['complete', 'iteration', 'periodic', 'sentence'];
+
+function isValidProgressMode(value: unknown): value is ProgressMode {
+  return typeof value === 'string' && VALID_PROGRESS_MODES.includes(value as ProgressMode);
+}
 
 /** Validate required fields in enqueue request body. Returns error string or null. */
 function validateEnqueueBody(body: Record<string, unknown>): string | null {
@@ -62,7 +67,7 @@ function extractOptionalFields(body: Record<string, unknown>) {
       typeof body.progress_throttle_seconds === 'number'
         ? body.progress_throttle_seconds
         : undefined,
-    progress_mode: body.progress_mode as QueueEntry['progress_mode'],
+    progress_mode: isValidProgressMode(body.progress_mode) ? body.progress_mode : undefined,
     message_key: typeof body.message_key === 'string' ? body.message_key : undefined,
   };
 }

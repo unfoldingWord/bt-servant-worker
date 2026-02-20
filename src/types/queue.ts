@@ -5,6 +5,7 @@
  * serializing requests per-user via an alarm-based processing loop.
  */
 
+import { ProgressMode } from './engine.js';
 import { MCPServerConfig } from './mcp.js';
 import { OrgConfig } from './org-config.js';
 import { PromptOverrides } from './prompt-overrides.js';
@@ -23,7 +24,7 @@ export interface QueueEntry {
   audio_format?: string | undefined;
   progress_callback_url?: string | undefined;
   progress_throttle_seconds?: number | undefined;
-  progress_mode?: 'complete' | 'iteration' | 'periodic' | 'sentence' | undefined;
+  progress_mode?: ProgressMode | undefined;
   message_key?: string | undefined;
   org: string;
   enqueued_at: number;
