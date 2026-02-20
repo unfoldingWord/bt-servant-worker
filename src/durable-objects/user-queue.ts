@@ -36,6 +36,9 @@ const DEFAULT_SSE_CLIENT_CONNECT_TIMEOUT_MS = 30 * 1000; // 30 seconds
 const DEFAULT_MAX_QUEUE_DEPTH = 50;
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_MAX_BUFFERED_RESPONSE_SIZE = 5 * 1024 * 1024; // 5 MB
+const MAX_CLEANUP_PER_STORE = 10;
+const ENQUEUE_RATE_WINDOW_MS = 60 * 1000; // 1 minute
+const ENQUEUE_RATE_LIMIT = 60; // max enqueues per window
 
 /** Validate required fields in enqueue request body. Returns error string or null. */
 function validateEnqueueBody(body: Record<string, unknown>): string | null {
@@ -61,6 +64,24 @@ function extractOptionalFields(body: Record<string, unknown>) {
   };
 }
 
+/** Extract and validate injected config fields (_mcp_servers, _org_config, _org_prompt_overrides). */
+function extractInjectedConfig(body: Record<string, unknown>) {
+  const isPlainObject = (v: unknown): v is Record<string, unknown> =>
+    typeof v === 'object' && v !== null && !Array.isArray(v);
+
+  return {
+    _mcp_servers: Array.isArray(body._mcp_servers)
+      ? (body._mcp_servers as QueueEntry['_mcp_servers'])
+      : undefined,
+    _org_config: isPlainObject(body._org_config)
+      ? (body._org_config as QueueEntry['_org_config'])
+      : undefined,
+    _org_prompt_overrides: isPlainObject(body._org_prompt_overrides)
+      ? (body._org_prompt_overrides as QueueEntry['_org_prompt_overrides'])
+      : undefined,
+  };
+}
+
 /** Parse and validate enqueue request body, returning a QueueEntry or error string. */
 function parseEnqueueBody(body: Record<string, unknown>): QueueEntry | string {
   const error = validateEnqueueBody(body);
@@ -77,9 +98,7 @@ function parseEnqueueBody(body: Record<string, unknown>): QueueEntry | string {
     delivery: body.delivery === 'callback' ? ('callback' as const) : ('sse' as const),
     retry_count: 0,
     ...extractOptionalFields(body),
-    _mcp_servers: body._mcp_servers as QueueEntry['_mcp_servers'],
-    _org_config: body._org_config as QueueEntry['_org_config'],
-    _org_prompt_overrides: body._org_prompt_overrides as QueueEntry['_org_prompt_overrides'],
+    ...extractInjectedConfig(body),
   };
 }
 
@@ -149,8 +168,11 @@ export class UserQueue {
   /** Live SSE writers keyed by message_id */
   private streams: Map<string, WritableStreamDefaultWriter<Uint8Array>> = new Map();
 
-  /** Coordination for alarm waiting on SSE client connect */
+  /** Coordination for alarm waiting for SSE client to connect */
   private streamWaiters: Map<string, { resolve: () => void; promise: Promise<void> }> = new Map();
+
+  /** Sliding window timestamps for enqueue rate limiting */
+  private enqueueTimestamps: number[] = [];
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -237,6 +259,17 @@ export class UserQueue {
     if (typeof result === 'string') {
       return Response.json({ error: result }, { status: 400 });
     }
+
+    // Rate limiting: sliding window per DO instance
+    const now = Date.now();
+    this.enqueueTimestamps = this.enqueueTimestamps.filter((t) => now - t < ENQUEUE_RATE_WINDOW_MS);
+    if (this.enqueueTimestamps.length >= ENQUEUE_RATE_LIMIT) {
+      return Response.json(
+        { error: 'Rate limit exceeded', code: 'RATE_LIMIT_EXCEEDED' },
+        { status: 429, headers: { 'Retry-After': '10' } }
+      );
+    }
+    this.enqueueTimestamps.push(now);
 
     const maxDepth = this.getMaxQueueDepth();
     const position = await this.enqueueEntry(result, maxDepth);
@@ -407,7 +440,9 @@ export class UserQueue {
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`UserSession returned ${response.status}: ${errorText}`);
+      throw new Error(
+        `UserSession returned ${response.status} for user=${entry.user_id} msg=${entry.message_id} org=${entry.org}: ${errorText}`
+      );
     }
   }
 
@@ -440,7 +475,9 @@ export class UserQueue {
     const response = await stub.fetch(doRequest);
     if (!response.ok || !response.body) {
       const errorText = response.body ? await response.text() : 'No response body';
-      throw new Error(`UserSession stream returned ${response.status}: ${errorText}`);
+      throw new Error(
+        `UserSession stream returned ${response.status} for user=${entry.user_id} msg=${entry.message_id} org=${entry.org}: ${errorText}`
+      );
     }
     return response;
   }
@@ -605,15 +642,18 @@ export class UserQueue {
     const responses =
       (await this.state.storage.get<Record<string, StoredResponse>>('responses')) ?? {};
 
-    // Clean up expired entries
+    // Clean up expired entries (bounded to avoid unbounded loops)
     const now = Date.now();
     const ttl = this.getStoredResponseTTL();
+    let cleaned = 0;
     for (const key of Object.keys(responses)) {
+      if (cleaned >= MAX_CLEANUP_PER_STORE) break;
       // eslint-disable-next-line security/detect-object-injection -- key from Object.keys iteration
       const resp = responses[key];
       if (resp && now - resp.stored_at > ttl) {
         // eslint-disable-next-line security/detect-object-injection -- key from Object.keys iteration
         delete responses[key];
+        cleaned++;
       }
     }
 

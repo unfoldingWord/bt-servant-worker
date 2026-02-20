@@ -680,13 +680,13 @@ async function handleMessageEnqueue(request: Request, env: Env): Promise<Respons
 /**
  * Handle queue stream (GET /api/v1/stream)
  *
- * Extracts user_id, message_id, org_id from query params and routes to UserQueue DO.
+ * Extracts user_id, message_id, org from query params and routes to UserQueue DO.
  */
 async function handleQueueStream(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const userId = url.searchParams.get('user_id');
   const messageId = url.searchParams.get('message_id');
-  const orgId = url.searchParams.get('org_id') ?? env.DEFAULT_ORG;
+  const org = url.searchParams.get('org') ?? env.DEFAULT_ORG;
 
   if (!userId) {
     return Response.json({ error: 'user_id query parameter is required' }, { status: 400 });
@@ -695,7 +695,7 @@ async function handleQueueStream(request: Request, env: Env): Promise<Response> 
     return Response.json({ error: 'message_id query parameter is required' }, { status: 400 });
   }
 
-  const doId = env.USER_QUEUE.idFromName(`queue:${orgId}:${userId}`);
+  const doId = env.USER_QUEUE.idFromName(`queue:${org}:${userId}`);
   const stub = env.USER_QUEUE.get(doId);
 
   const doUrl = new URL('http://fake-host/stream');
@@ -711,13 +711,13 @@ async function handleQueueStream(request: Request, env: Env): Promise<Response> 
  */
 async function handleQueueStatus(request: Request, env: Env, userId: string): Promise<Response> {
   const url = new URL(request.url);
-  const orgId = url.searchParams.get('org_id') ?? env.DEFAULT_ORG;
+  const org = url.searchParams.get('org') ?? env.DEFAULT_ORG;
 
   if (!userId) {
     return Response.json({ error: 'userId is required in path' }, { status: 400 });
   }
 
-  const doId = env.USER_QUEUE.idFromName(`queue:${orgId}:${userId}`);
+  const doId = env.USER_QUEUE.idFromName(`queue:${org}:${userId}`);
   const stub = env.USER_QUEUE.get(doId);
 
   return stub.fetch(new Request('http://fake-host/status'));
