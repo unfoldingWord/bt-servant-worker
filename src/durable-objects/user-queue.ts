@@ -30,6 +30,9 @@ import {
 } from '../types/queue.js';
 import { createRequestLogger, RequestLogger } from '../utils/logger.js';
 
+/** Base URL for intra-DO fetch requests (hostname is ignored by Durable Objects). */
+const DO_BASE_URL = 'http://do-internal';
+
 // Defaults for configurable values (overridable via env vars)
 const DEFAULT_STORED_RESPONSE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const DEFAULT_SSE_CLIENT_CONNECT_TIMEOUT_MS = 30 * 1000; // 30 seconds
@@ -38,7 +41,7 @@ const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_MAX_BUFFERED_RESPONSE_SIZE = 5 * 1024 * 1024; // 5 MB
 const MAX_CLEANUP_PER_STORE = 10;
 const ENQUEUE_RATE_WINDOW_MS = 60 * 1000; // 1 minute
-const ENQUEUE_RATE_LIMIT = 60; // max enqueues per window
+const ENQUEUE_RATE_LIMIT = 300; // max enqueues per window
 
 /** Validate required fields in enqueue request body. Returns error string or null. */
 function validateEnqueueBody(body: Record<string, unknown>): string | null {
@@ -356,13 +359,29 @@ export class UserQueue {
     });
   }
 
-  /** Get and remove a stored response, or null if not found. */
+  /** Get and remove a stored response, cleaning up expired entries opportunistically. */
   private async getAndClearStoredResponse(messageId: string): Promise<StoredResponse | null> {
     const responses =
       (await this.state.storage.get<Record<string, StoredResponse>>('responses')) ?? {};
+
+    // Opportunistic cleanup of expired entries on read
+    const now = Date.now();
+    const ttl = this.getStoredResponseTTL();
+    for (const key of Object.keys(responses)) {
+      // eslint-disable-next-line security/detect-object-injection -- key from Object.keys iteration
+      const resp = responses[key];
+      if (resp && now - resp.stored_at > ttl) {
+        // eslint-disable-next-line security/detect-object-injection -- key from Object.keys iteration
+        delete responses[key];
+      }
+    }
+
     // eslint-disable-next-line security/detect-object-injection -- messageId is from URL param, used as object key
     const stored = responses[messageId];
-    if (!stored) return null;
+    if (!stored) {
+      await this.state.storage.put('responses', responses);
+      return null;
+    }
 
     // eslint-disable-next-line security/detect-object-injection -- messageId is from URL param, used as object key
     delete responses[messageId];
@@ -425,7 +444,7 @@ export class UserQueue {
   /** Forward to UserSession DO /chat with webhook callback. */
   private async processWithCallback(entry: QueueEntry, logger: RequestLogger): Promise<void> {
     const stub = this.getUserSessionStub(entry);
-    const doRequest = new Request('http://fake-host/chat', {
+    const doRequest = new Request(`${DO_BASE_URL}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: buildSessionBody(entry, true),
@@ -466,7 +485,7 @@ export class UserQueue {
   /** Fetch SSE stream from UserSession DO. */
   private async fetchUserSessionStream(entry: QueueEntry): Promise<Response> {
     const stub = this.getUserSessionStub(entry);
-    const doRequest = new Request('http://fake-host/stream', {
+    const doRequest = new Request(`${DO_BASE_URL}/stream`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: buildSessionBody(entry, false),

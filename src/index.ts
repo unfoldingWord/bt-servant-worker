@@ -21,6 +21,9 @@ import {
 } from './types/prompt-overrides.js';
 import { constantTimeCompare } from './utils/crypto.js';
 import { createRequestLogger } from './utils/logger.js';
+
+/** Base URL for intra-DO fetch requests (hostname is ignored by Durable Objects). */
+const DO_BASE_URL = 'http://do-internal';
 import {
   MAX_SERVERS_PER_ORG,
   validateServerConfig,
@@ -654,7 +657,7 @@ async function handleMessageEnqueue(request: Request, env: Env): Promise<Respons
     const doId = env.USER_QUEUE.idFromName(`queue:${org}:${body.user_id}`);
     const stub = env.USER_QUEUE.get(doId);
 
-    const doRequest = new Request('http://fake-host/enqueue', {
+    const doRequest = new Request(`${DO_BASE_URL}/enqueue`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -698,7 +701,7 @@ async function handleQueueStream(request: Request, env: Env): Promise<Response> 
   const doId = env.USER_QUEUE.idFromName(`queue:${org}:${userId}`);
   const stub = env.USER_QUEUE.get(doId);
 
-  const doUrl = new URL('http://fake-host/stream');
+  const doUrl = new URL(`${DO_BASE_URL}/stream`);
   doUrl.searchParams.set('message_id', messageId);
 
   return stub.fetch(new Request(doUrl.toString()));
@@ -720,5 +723,5 @@ async function handleQueueStatus(request: Request, env: Env, userId: string): Pr
   const doId = env.USER_QUEUE.idFromName(`queue:${org}:${userId}`);
   const stub = env.USER_QUEUE.get(doId);
 
-  return stub.fetch(new Request('http://fake-host/status'));
+  return stub.fetch(new Request(`${DO_BASE_URL}/status`));
 }
