@@ -23,6 +23,21 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
+      - name: Type check
+        run: pnpm check
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Architecture check
+        run: pnpm architecture
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
+
       - name: Deploy to Staging
         uses: cloudflare/wrangler-action@v3
         with:

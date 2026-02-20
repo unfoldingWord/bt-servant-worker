@@ -35,6 +35,7 @@ const DEFAULT_STORED_RESPONSE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const DEFAULT_SSE_CLIENT_CONNECT_TIMEOUT_MS = 30 * 1000; // 30 seconds
 const DEFAULT_MAX_QUEUE_DEPTH = 50;
 const DEFAULT_MAX_RETRIES = 3;
+const DEFAULT_MAX_BUFFERED_RESPONSE_SIZE = 5 * 1024 * 1024; // 5 MB
 
 /** Validate required fields in enqueue request body. Returns error string or null. */
 function validateEnqueueBody(body: Record<string, unknown>): string | null {
@@ -104,15 +105,24 @@ function buildSessionBody(entry: QueueEntry, includeCallback: boolean): string {
 }
 
 /** Read an SSE stream body and collect events into a StoredSSEEvent array. */
-async function bufferSSEResponse(body: ReadableStream<Uint8Array>): Promise<StoredSSEEvent[]> {
+async function bufferSSEResponse(
+  body: ReadableStream<Uint8Array>,
+  maxSize: number
+): Promise<StoredSSEEvent[]> {
   const events: StoredSSEEvent[] = [];
   const reader = body.getReader();
   const decoder = new TextDecoder();
+  let totalSize = 0;
   try {
     let buffer = '';
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
+      totalSize += value.byteLength;
+      if (totalSize > maxSize) {
+        events.push({ event: 'error', data: JSON.stringify({ error: 'Response too large' }) });
+        break;
+      }
       buffer += decoder.decode(value, { stream: true });
 
       const lines = buffer.split('\n');
@@ -123,7 +133,7 @@ async function bufferSSEResponse(body: ReadableStream<Uint8Array>): Promise<Stor
         }
       }
     }
-    if (buffer.startsWith('data: ')) {
+    if (totalSize <= maxSize && buffer.startsWith('data: ')) {
       events.push({ event: 'data', data: buffer.slice(6) });
     }
   } finally {
@@ -165,47 +175,54 @@ export class UserQueue {
   async alarm(): Promise<void> {
     const logger = createRequestLogger(crypto.randomUUID());
 
-    const entry = await this.dequeueNext();
-    if (!entry) {
-      logger.log('queue_empty_alarm_done');
-      return;
-    }
-
-    const startTime = Date.now();
-    logger.log('queue_processing_start', {
-      message_id: entry.message_id,
-      delivery: entry.delivery,
-      user_id: entry.user_id,
-      org: entry.org,
-      retry_count: entry.retry_count,
-      queue_wait_ms: startTime - entry.enqueued_at,
-    });
-
     try {
-      if (entry.delivery === 'callback') {
-        await this.processWithCallback(entry, logger);
-      } else {
-        await this.processWithSSE(entry, logger);
+      const entry = await this.dequeueNext();
+      if (!entry) {
+        logger.log('queue_empty_alarm_done');
+        return;
       }
-      logger.log('queue_processing_complete', {
+
+      const startTime = Date.now();
+      logger.log('queue_processing_start', {
         message_id: entry.message_id,
-        user_id: entry.user_id,
-        processing_ms: Date.now() - startTime,
-      });
-    } catch (error) {
-      logger.error('queue_processing_error', error, {
-        message_id: entry.message_id,
+        delivery: entry.delivery,
         user_id: entry.user_id,
         org: entry.org,
         retry_count: entry.retry_count,
-        processing_ms: Date.now() - startTime,
+        queue_wait_ms: startTime - entry.enqueued_at,
       });
-      await this.handleProcessingError(entry, error, logger);
-    } finally {
-      this.streams.delete(entry.message_id);
-      this.streamWaiters.delete(entry.message_id);
-      await this.scheduleNextAlarm();
+
+      try {
+        if (entry.delivery === 'callback') {
+          await this.processWithCallback(entry, logger);
+        } else {
+          await this.processWithSSE(entry, logger);
+        }
+        logger.log('queue_processing_complete', {
+          message_id: entry.message_id,
+          user_id: entry.user_id,
+          processing_ms: Date.now() - startTime,
+        });
+      } catch (error) {
+        logger.error('queue_processing_error', error, {
+          message_id: entry.message_id,
+          user_id: entry.user_id,
+          org: entry.org,
+          retry_count: entry.retry_count,
+          processing_ms: Date.now() - startTime,
+        });
+        await this.handleProcessingError(entry, error, logger);
+      } finally {
+        this.streams.delete(entry.message_id);
+        this.streamWaiters.delete(entry.message_id);
+      }
+    } catch (error) {
+      logger.error('alarm_fatal_error', error);
+      // Reset processing flag to prevent permanent deadlock
+      await this.state.storage.put('processing', false);
     }
+
+    await this.scheduleNextAlarm();
   }
 
   private async handleEnqueue(request: Request): Promise<Response> {
@@ -470,7 +487,7 @@ export class UserQueue {
     body: ReadableStream<Uint8Array>,
     messageId: string
   ): Promise<void> {
-    const events = await bufferSSEResponse(body);
+    const events = await bufferSSEResponse(body, DEFAULT_MAX_BUFFERED_RESPONSE_SIZE);
     events.push({ event: 'done', data: JSON.stringify({ message_id: messageId }) });
     await this.storeResponse(messageId, events);
   }
@@ -557,7 +574,7 @@ export class UserQueue {
   /** Check if an error message indicates a transient (retryable) failure. */
   private isTransientError(errorMessage: string): boolean {
     return (
-      errorMessage.includes('returned 5') || // 5xx from UserSession
+      /returned 5\d{2}/.test(errorMessage) || // 5xx from UserSession
       errorMessage.includes('Network') ||
       errorMessage.includes('timeout') ||
       errorMessage.includes('ECONNREFUSED')
