@@ -34,7 +34,6 @@ import { createRequestLogger, RequestLogger } from '../utils/logger.js';
 
 // Defaults for configurable values (overridable via env vars)
 const DEFAULT_STORED_RESPONSE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const DEFAULT_SSE_CLIENT_CONNECT_TIMEOUT_MS = 30 * 1000; // 30 seconds
 const DEFAULT_MAX_QUEUE_DEPTH = 50;
 const DEFAULT_MAX_RETRIES = 3;
 const DEFAULT_MAX_BUFFERED_RESPONSE_SIZE = 5 * 1024 * 1024; // 5 MB
@@ -176,19 +175,40 @@ export class UserQueue {
   /** Live SSE writers keyed by message_id */
   private streams: Map<string, WritableStreamDefaultWriter<Uint8Array>> = new Map();
 
-  /** Coordination for alarm waiting for SSE client to connect */
-  private streamWaiters: Map<string, { resolve: () => void; promise: Promise<void> }> = new Map();
+  // NOTE: streamWaiters removed — Durable Object alarm handlers cannot be woken
+  // by Promise.resolve() from concurrent fetch handlers. Using polling instead.
 
   /** Sliding window timestamps for enqueue rate limiting */
   private enqueueTimestamps: number[] = [];
 
+  /** Instance-level ID for tracing DO identity across requests */
+  private instanceId = crypto.randomUUID().slice(0, 8);
+
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
+    console.log(
+      JSON.stringify({
+        event: 'do_instance_created',
+        instance_id: this.instanceId,
+        timestamp: Date.now(),
+      })
+    );
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+
+    console.log(
+      JSON.stringify({
+        event: 'do_fetch_received',
+        instance_id: this.instanceId,
+        pathname: url.pathname,
+        search: url.search,
+        timestamp: Date.now(),
+        streams_keys: [...this.streams.keys()],
+      })
+    );
 
     switch (url.pathname) {
       case '/enqueue':
@@ -244,7 +264,6 @@ export class UserQueue {
         await this.handleProcessingError(entry, error, logger);
       } finally {
         this.streams.delete(entry.message_id);
-        this.streamWaiters.delete(entry.message_id);
       }
     } catch (error) {
       logger.error('alarm_fatal_error', error);
@@ -306,9 +325,27 @@ export class UserQueue {
       return Response.json({ error: 'message_id query parameter is required' }, { status: 400 });
     }
 
+    console.log(
+      JSON.stringify({
+        event: 'handle_stream_start',
+        instance_id: this.instanceId,
+        message_id: messageId,
+        timestamp: Date.now(),
+        streams_keys: [...this.streams.keys()],
+      })
+    );
+
     // Check for stored response (late-connect fallback)
     const stored = await this.getAndClearStoredResponse(messageId);
     if (stored) {
+      console.log(
+        JSON.stringify({
+          event: 'handle_stream_found_stored',
+          instance_id: this.instanceId,
+          message_id: messageId,
+          timestamp: Date.now(),
+        })
+      );
       return this.replayStoredResponse(stored);
     }
 
@@ -427,15 +464,22 @@ export class UserQueue {
     const writer = writable.getWriter();
     this.streams.set(messageId, writer);
 
+    console.log(
+      JSON.stringify({
+        event: 'create_live_stream_writer_registered',
+        instance_id: this.instanceId,
+        message_id: messageId,
+        timestamp: Date.now(),
+        streams_keys: [...this.streams.keys()],
+      })
+    );
+
     const encoder = new TextEncoder();
     await writer.write(
       encoder.encode(`event: queued\ndata: ${JSON.stringify({ message_id: messageId })}\n\n`)
     );
 
-    const waiter = this.streamWaiters.get(messageId);
-    if (waiter) {
-      waiter.resolve();
-    }
+    // NOTE: No waiter.resolve() needed — waitForSSEClient uses polling on this.streams Map.
 
     return new Response(readable, {
       headers: {
@@ -470,12 +514,58 @@ export class UserQueue {
     }
   }
 
-  /** Forward to UserSession /stream and pipe SSE events to connected client. */
+  /**
+   * Forward to UserSession /stream and pipe SSE events to connected client.
+   *
+   * Strategy: Fetch from UserSession first (this yields to the DO runtime,
+   * allowing the stream client's fetch handler to run and register its writer
+   * in this.streams). After the UserSession fetch returns, check if a writer
+   * is available. If so, pipe events to it. If not, buffer for late retrieval.
+   */
   private async processWithSSE(entry: QueueEntry, logger: RequestLogger): Promise<void> {
-    const writer = await this.waitForSSEClient(entry.message_id, logger);
+    console.log(
+      JSON.stringify({
+        event: 'process_with_sse_start',
+        instance_id: this.instanceId,
+        message_id: entry.message_id,
+        timestamp: Date.now(),
+        streams_keys: [...this.streams.keys()],
+      })
+    );
+
+    // Fetch from UserSession — this await yields to the DO runtime, giving
+    // the stream client's fetch handler a chance to run and register its writer.
     const response = await this.fetchUserSessionStream(entry);
 
+    console.log(
+      JSON.stringify({
+        event: 'process_with_sse_session_fetched',
+        instance_id: this.instanceId,
+        message_id: entry.message_id,
+        status: response.status,
+        timestamp: Date.now(),
+        streams_keys: [...this.streams.keys()],
+      })
+    );
+
+    // Now check if the stream client connected while we were fetching
+    const writer = this.streams.get(entry.message_id);
+
+    console.log(
+      JSON.stringify({
+        event: 'process_with_sse_writer_check',
+        instance_id: this.instanceId,
+        message_id: entry.message_id,
+        has_writer: !!writer,
+        timestamp: Date.now(),
+      })
+    );
+
     if (writer) {
+      logger.log('sse_client_connected', {
+        message_id: entry.message_id,
+        user_id: entry.user_id,
+      });
       await this.pipeSSEToClient(writer, response.body!, entry.message_id);
     } else {
       logger.warn('no_sse_client', {
@@ -559,37 +649,10 @@ export class UserQueue {
     return this.env.USER_SESSION.get(doId);
   }
 
-  /** Wait for an SSE client to connect within the configured timeout. Returns writer or null. */
-  private async waitForSSEClient(
-    messageId: string,
-    logger: RequestLogger
-  ): Promise<WritableStreamDefaultWriter<Uint8Array> | null> {
-    const existing = this.streams.get(messageId);
-    if (existing) return existing;
-
-    const timeout = this.getSSEConnectTimeout();
-    let resolveWaiter: () => void;
-    const promise = new Promise<void>((resolve) => {
-      resolveWaiter = resolve;
-    });
-    this.streamWaiters.set(messageId, { resolve: resolveWaiter!, promise });
-
-    const timeoutPromise = new Promise<'timeout'>((resolve) => {
-      setTimeout(() => resolve('timeout'), timeout);
-    });
-
-    const result = await Promise.race([promise.then(() => 'connected' as const), timeoutPromise]);
-    this.streamWaiters.delete(messageId);
-
-    if (result === 'timeout') {
-      logger.warn('sse_client_connect_timeout', {
-        message_id: messageId,
-        timeout_ms: timeout,
-      });
-      return null;
-    }
-    return this.streams.get(messageId) ?? null;
-  }
+  // NOTE: waitForSSEClient removed. Durable Object alarm handlers cannot yield
+  // to concurrent fetch handlers — neither Promise-based coordination nor
+  // setTimeout/polling works inside an alarm. Instead, processWithSSE fetches
+  // from UserSession first (which yields via await), then checks this.streams.
 
   /**
    * Handle errors during queue processing.
@@ -711,13 +774,6 @@ export class UserQueue {
   private getStoredResponseTTL(): number {
     return (
       parseInt(this.env.QUEUE_STORED_RESPONSE_TTL_MS ?? '', 10) || DEFAULT_STORED_RESPONSE_TTL_MS
-    );
-  }
-
-  private getSSEConnectTimeout(): number {
-    return (
-      parseInt(this.env.QUEUE_SSE_CONNECT_TIMEOUT_MS ?? '', 10) ||
-      DEFAULT_SSE_CLIENT_CONNECT_TIMEOUT_MS
     );
   }
 

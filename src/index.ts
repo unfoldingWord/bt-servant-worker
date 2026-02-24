@@ -60,6 +60,39 @@ app.post('/api/v1/chat/stream', async (c) => {
   return handleChatRequest(c.req.raw, c.env, '/stream');
 });
 
+// Diagnostic: finite SSE stream directly from worker (no DO)
+app.get('/api/v1/test-stream', async (_c) => {
+  const encoder = new TextEncoder();
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+
+  (async () => {
+    try {
+      for (let i = 1; i <= 5; i++) {
+        await writer.write(
+          encoder.encode(`data: ${JSON.stringify({ type: 'progress', text: `chunk ${i} ` })}\n\n`)
+        );
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      await writer.write(
+        encoder.encode(
+          `data: ${JSON.stringify({ type: 'complete', response: { text: 'chunk 1 chunk 2 chunk 3 chunk 4 chunk 5 ' } })}\n\n`
+        )
+      );
+    } finally {
+      await writer.close();
+    }
+  })();
+
+  return new Response(readable, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    },
+  });
+});
+
 // Queue endpoints (UserQueue DO)
 app.post('/api/v1/message', async (c) => {
   return handleMessageEnqueue(c.req.raw, c.env);
@@ -698,6 +731,17 @@ async function handleQueueStream(request: Request, env: Env): Promise<Response> 
 
   const doId = env.USER_QUEUE.idFromName(`queue:${org}:${userId}`);
   const stub = env.USER_QUEUE.get(doId);
+
+  console.log(
+    JSON.stringify({
+      event: 'handle_queue_stream_routing_to_do',
+      user_id: userId,
+      message_id: messageId,
+      org,
+      do_id: doId.toString(),
+      timestamp: Date.now(),
+    })
+  );
 
   const doUrl = new URL(`${DO_BASE_URL}/stream`);
   doUrl.searchParams.set('message_id', messageId);
