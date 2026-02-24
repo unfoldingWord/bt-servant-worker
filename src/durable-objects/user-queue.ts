@@ -25,7 +25,7 @@ import { Env } from '../config/types.js';
 import { ProgressMode } from '../types/engine.js';
 import {
   EnqueueResponse,
-  IncrementalEventStore,
+  EventStoreMetadata,
   PollResponse,
   QueueEntry,
   QueueStatusResponse,
@@ -327,16 +327,16 @@ export class UserQueue {
 
     const cursor = parseInt(url.searchParams.get('cursor') ?? '0', 10);
 
-    // Check incremental event store (message being processed or recently completed)
-    const store = await this.state.storage.get<IncrementalEventStore>(`events:${messageId}`);
+    // Check chunked event store metadata
+    const meta = await this.state.storage.get<EventStoreMetadata>(`evmeta:${messageId}`);
 
-    if (store) {
-      const newEvents = store.events.slice(cursor);
+    if (meta) {
+      const newEvents = await this.getEventsFromCursor(messageId, cursor, meta.event_count);
       const response: PollResponse = {
         message_id: messageId,
         events: newEvents,
-        done: store.done,
-        cursor: store.events.length,
+        done: meta.done,
+        cursor: meta.event_count,
       };
       return Response.json(response);
     }
@@ -364,6 +364,28 @@ export class UserQueue {
       cursor: 0,
     };
     return Response.json(response);
+  }
+
+  /** Batch-read event keys from cursor to count (reads only what's needed). */
+  private async getEventsFromCursor(
+    messageId: string,
+    cursor: number,
+    eventCount: number
+  ): Promise<StoredSSEEvent[]> {
+    if (cursor >= eventCount) return [];
+
+    const keys = [];
+    for (let i = cursor; i < eventCount; i++) {
+      keys.push(`ev:${messageId}:${i}`);
+    }
+
+    const entries = await this.state.storage.get<StoredSSEEvent>(keys);
+    const events: StoredSSEEvent[] = [];
+    for (const key of keys) {
+      const event = entries.get(key);
+      if (event) events.push(event);
+    }
+    return events;
   }
 
   private async handleStatus(): Promise<Response> {
@@ -536,14 +558,14 @@ export class UserQueue {
    * are also piped to it in real-time.
    */
   private async processWithSSE(entry: QueueEntry, logger: RequestLogger): Promise<void> {
-    // Initialize incremental event store
-    const storageKey = `events:${entry.message_id}`;
-    await this.state.storage.put(storageKey, {
+    // Initialize chunked event store metadata
+    const metaKey = `evmeta:${entry.message_id}`;
+    await this.state.storage.put(metaKey, {
       message_id: entry.message_id,
-      events: [],
+      event_count: 0,
       done: false,
       created_at: Date.now(),
-    } as IncrementalEventStore);
+    } as EventStoreMetadata);
 
     const response = await this.fetchUserSessionStream(entry);
 
@@ -587,12 +609,10 @@ export class UserQueue {
     messageId: string,
     writer: WritableStreamDefaultWriter<Uint8Array> | undefined
   ): Promise<void> {
-    const storageKey = `events:${messageId}`;
-
     writer = await this.sendProcessingEvent(writer, messageId);
-    const lineBuffer = await this.readStreamChunks(body, storageKey, writer);
-    await this.flushLineBuffer(lineBuffer, storageKey);
-    await this.finalizeEventStore(storageKey, messageId);
+    const lineBuffer = await this.readStreamChunks(body, messageId, writer);
+    await this.flushLineBuffer(lineBuffer, messageId);
+    await this.finalizeEventStore(messageId);
     await this.closeLiveWriter(writer, messageId);
   }
 
@@ -616,7 +636,7 @@ export class UserQueue {
   /** Read stream chunks, parse SSE events, store incrementally, and pipe to live writer. */
   private async readStreamChunks(
     body: ReadableStream<Uint8Array>,
-    storageKey: string,
+    messageId: string,
     writer: WritableStreamDefaultWriter<Uint8Array> | undefined
   ): Promise<string> {
     const reader = body.getReader();
@@ -631,7 +651,7 @@ export class UserQueue {
 
         totalSize += value.byteLength;
         if (totalSize > DEFAULT_MAX_BUFFERED_RESPONSE_SIZE) {
-          await this.appendEvents(storageKey, [
+          await this.appendEvents(messageId, [
             { event: 'data', data: JSON.stringify({ type: 'error', error: 'Response too large' }) },
           ]);
           break;
@@ -641,7 +661,7 @@ export class UserQueue {
         buffer = await this.parseAndStoreChunk(
           decoder.decode(value, { stream: true }),
           buffer,
-          storageKey
+          messageId
         );
       }
     } finally {
@@ -668,7 +688,7 @@ export class UserQueue {
   private async parseAndStoreChunk(
     chunk: string,
     buffer: string,
-    storageKey: string
+    messageId: string
   ): Promise<string> {
     const combined = buffer + chunk;
     const lines = combined.split('\n');
@@ -681,25 +701,31 @@ export class UserQueue {
       }
     }
     if (newEvents.length > 0) {
-      await this.appendEvents(storageKey, newEvents);
+      await this.appendEvents(messageId, newEvents);
     }
     return remainder;
   }
 
   /** Flush any remaining data in the line buffer. */
-  private async flushLineBuffer(buffer: string, storageKey: string): Promise<void> {
+  private async flushLineBuffer(buffer: string, messageId: string): Promise<void> {
     if (buffer.startsWith('data: ')) {
-      await this.appendEvents(storageKey, [{ event: 'data', data: buffer.slice(6) }]);
+      await this.appendEvents(messageId, [{ event: 'data', data: buffer.slice(6) }]);
     }
   }
 
-  /** Mark the incremental event store as done. */
-  private async finalizeEventStore(storageKey: string, messageId: string): Promise<void> {
-    const store = await this.state.storage.get<IncrementalEventStore>(storageKey);
-    if (store) {
-      store.events.push({ event: 'done', data: JSON.stringify({ message_id: messageId }) });
-      store.done = true;
-      await this.state.storage.put(storageKey, store);
+  /** Mark the event store as done, appending a final "done" event. */
+  private async finalizeEventStore(messageId: string): Promise<void> {
+    const metaKey = `evmeta:${messageId}`;
+    const meta = await this.state.storage.get<EventStoreMetadata>(metaKey);
+    if (meta) {
+      const doneEvent: StoredSSEEvent = {
+        event: 'done',
+        data: JSON.stringify({ message_id: messageId }),
+      };
+      await this.state.storage.put(`ev:${messageId}:${meta.event_count}`, doneEvent);
+      meta.event_count += 1;
+      meta.done = true;
+      await this.state.storage.put(metaKey, meta);
     }
   }
 
@@ -720,13 +746,23 @@ export class UserQueue {
     }
   }
 
-  /** Append events to the incremental event store. */
-  private async appendEvents(storageKey: string, events: StoredSSEEvent[]): Promise<void> {
-    const store = await this.state.storage.get<IncrementalEventStore>(storageKey);
-    if (store) {
-      store.events.push(...events);
-      await this.state.storage.put(storageKey, store);
+  /** Append events as individual keys and update the metadata counter. */
+  private async appendEvents(messageId: string, events: StoredSSEEvent[]): Promise<void> {
+    const metaKey = `evmeta:${messageId}`;
+    const meta = await this.state.storage.get<EventStoreMetadata>(metaKey);
+    if (!meta) return;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- batch put requires Record<string, T>
+    const entries: Record<string, any> = {};
+    let idx = meta.event_count;
+    for (const event of events) {
+      entries[`ev:${messageId}:${idx}`] = event;
+      idx++;
     }
+    meta.event_count = idx;
+    // eslint-disable-next-line security/detect-object-injection -- metaKey is a computed string, not user input
+    entries[metaKey] = meta;
+    await this.state.storage.put(entries);
   }
 
   /** Get a UserSession DO stub for the given queue entry. */

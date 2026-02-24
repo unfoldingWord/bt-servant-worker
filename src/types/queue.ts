@@ -57,13 +57,18 @@ export interface StoredSSEEvent {
 }
 
 /**
- * Incremental event store for poll-based streaming.
- * Events are appended as they arrive during processing,
- * and `done` is set to true when processing completes.
+ * Metadata for the chunked incremental event store.
+ *
+ * Events are stored in individual keys (`ev:{messageId}:{index}`) rather than
+ * a single array. This allows poll requests to read only new events (from cursor
+ * to event_count) instead of the entire history, significantly reducing DO
+ * storage I/O under concurrent polling.
+ *
+ * Stored at key: `evmeta:{messageId}`
  */
-export interface IncrementalEventStore {
+export interface EventStoreMetadata {
   message_id: string;
-  events: StoredSSEEvent[];
+  event_count: number;
   done: boolean;
   created_at: number;
 }
