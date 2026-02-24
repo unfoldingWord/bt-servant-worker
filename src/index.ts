@@ -102,6 +102,10 @@ app.get('/api/v1/stream', async (c) => {
   return handleQueueStream(c.req.raw, c.env);
 });
 
+app.get('/api/v1/poll', async (c) => {
+  return handleQueuePoll(c.req.raw, c.env);
+});
+
 app.get('/api/v1/queue/:userId', async (c) => {
   return handleQueueStatus(c.req.raw, c.env, c.req.param('userId'));
 });
@@ -745,6 +749,34 @@ async function handleQueueStream(request: Request, env: Env): Promise<Response> 
 
   const doUrl = new URL(`${DO_BASE_URL}/stream`);
   doUrl.searchParams.set('message_id', messageId);
+
+  return stub.fetch(new Request(doUrl.toString()));
+}
+
+/**
+ * Handle poll for incremental events (GET /api/v1/poll)
+ * Returns JSON with events since cursor, suitable for worker-to-worker fetch.
+ */
+async function handleQueuePoll(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const userId = url.searchParams.get('user_id');
+  const messageId = url.searchParams.get('message_id');
+  const org = url.searchParams.get('org') ?? env.DEFAULT_ORG;
+  const cursor = url.searchParams.get('cursor') ?? '0';
+
+  if (!userId) {
+    return Response.json({ error: 'user_id query parameter is required' }, { status: 400 });
+  }
+  if (!messageId) {
+    return Response.json({ error: 'message_id query parameter is required' }, { status: 400 });
+  }
+
+  const doId = env.USER_QUEUE.idFromName(`queue:${org}:${userId}`);
+  const stub = env.USER_QUEUE.get(doId);
+
+  const doUrl = new URL(`${DO_BASE_URL}/poll`);
+  doUrl.searchParams.set('message_id', messageId);
+  doUrl.searchParams.set('cursor', cursor);
 
   return stub.fetch(new Request(doUrl.toString()));
 }

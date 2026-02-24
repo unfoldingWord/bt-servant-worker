@@ -25,6 +25,8 @@ import { Env } from '../config/types.js';
 import { ProgressMode } from '../types/engine.js';
 import {
   EnqueueResponse,
+  IncrementalEventStore,
+  PollResponse,
   QueueEntry,
   QueueStatusResponse,
   StoredResponse,
@@ -130,44 +132,6 @@ function buildSessionBody(entry: QueueEntry, includeCallback: boolean): string {
   });
 }
 
-/** Read an SSE stream body and collect events into a StoredSSEEvent array. */
-async function bufferSSEResponse(
-  body: ReadableStream<Uint8Array>,
-  maxSize: number
-): Promise<StoredSSEEvent[]> {
-  const events: StoredSSEEvent[] = [];
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let totalSize = 0;
-  try {
-    let buffer = '';
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      totalSize += value.byteLength;
-      if (totalSize > maxSize) {
-        events.push({ event: 'error', data: JSON.stringify({ error: 'Response too large' }) });
-        break;
-      }
-      buffer += decoder.decode(value, { stream: true });
-
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          events.push({ event: 'data', data: line.slice(6) });
-        }
-      }
-    }
-    if (totalSize <= maxSize && buffer.startsWith('data: ')) {
-      events.push({ event: 'data', data: buffer.slice(6) });
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  return events;
-}
-
 export class UserQueue {
   private state: DurableObjectState;
   private env: Env;
@@ -215,6 +179,8 @@ export class UserQueue {
         return this.handleEnqueue(request);
       case '/stream':
         return this.handleStream(url);
+      case '/poll':
+        return this.handlePoll(url);
       case '/status':
         return this.handleStatus();
       default:
@@ -350,6 +316,54 @@ export class UserQueue {
     }
 
     return this.createLiveStream(messageId);
+  }
+
+  /** Return incremental events since cursor for poll-based streaming. */
+  private async handlePoll(url: URL): Promise<Response> {
+    const messageId = url.searchParams.get('message_id');
+    if (!messageId) {
+      return Response.json({ error: 'message_id query parameter is required' }, { status: 400 });
+    }
+
+    const cursor = parseInt(url.searchParams.get('cursor') ?? '0', 10);
+
+    // Check incremental event store (message being processed or recently completed)
+    const store = await this.state.storage.get<IncrementalEventStore>(`events:${messageId}`);
+
+    if (store) {
+      const newEvents = store.events.slice(cursor);
+      const response: PollResponse = {
+        message_id: messageId,
+        events: newEvents,
+        done: store.done,
+        cursor: store.events.length,
+      };
+      return Response.json(response);
+    }
+
+    // Check legacy stored responses (backward compatibility)
+    const responses =
+      (await this.state.storage.get<Record<string, StoredResponse>>('responses')) ?? {};
+    // eslint-disable-next-line security/detect-object-injection -- messageId from URL param
+    const stored = responses[messageId];
+    if (stored) {
+      const response: PollResponse = {
+        message_id: messageId,
+        events: stored.events.slice(cursor),
+        done: true,
+        cursor: stored.events.length,
+      };
+      return Response.json(response);
+    }
+
+    // Not found — message may still be in queue waiting to be processed
+    const response: PollResponse = {
+      message_id: messageId,
+      events: [],
+      done: false,
+      cursor: 0,
+    };
+    return Response.json(response);
   }
 
   private async handleStatus(): Promise<Response> {
@@ -515,66 +529,34 @@ export class UserQueue {
   }
 
   /**
-   * Forward to UserSession /stream and pipe SSE events to connected client.
+   * Forward to UserSession /stream and store events incrementally.
    *
-   * Strategy: Fetch from UserSession first (this yields to the DO runtime,
-   * allowing the stream client's fetch handler to run and register its writer
-   * in this.streams). After the UserSession fetch returns, check if a writer
-   * is available. If so, pipe events to it. If not, buffer for late retrieval.
+   * Events are written to DO storage as they arrive so poll-based clients
+   * can retrieve partial results. If a live SSE writer is connected, events
+   * are also piped to it in real-time.
    */
   private async processWithSSE(entry: QueueEntry, logger: RequestLogger): Promise<void> {
-    console.log(
-      JSON.stringify({
-        event: 'process_with_sse_start',
-        instance_id: this.instanceId,
-        message_id: entry.message_id,
-        timestamp: Date.now(),
-        streams_keys: [...this.streams.keys()],
-      })
-    );
+    // Initialize incremental event store
+    const storageKey = `events:${entry.message_id}`;
+    await this.state.storage.put(storageKey, {
+      message_id: entry.message_id,
+      events: [],
+      done: false,
+      created_at: Date.now(),
+    } as IncrementalEventStore);
 
-    // Fetch from UserSession — this await yields to the DO runtime, giving
-    // the stream client's fetch handler a chance to run and register its writer.
     const response = await this.fetchUserSessionStream(entry);
 
-    console.log(
-      JSON.stringify({
-        event: 'process_with_sse_session_fetched',
-        instance_id: this.instanceId,
-        message_id: entry.message_id,
-        status: response.status,
-        timestamp: Date.now(),
-        streams_keys: [...this.streams.keys()],
-      })
-    );
-
-    // Now check if the stream client connected while we were fetching
+    // Check for live SSE writer (may have connected during fetch)
     const writer = this.streams.get(entry.message_id);
-
-    console.log(
-      JSON.stringify({
-        event: 'process_with_sse_writer_check',
-        instance_id: this.instanceId,
-        message_id: entry.message_id,
-        has_writer: !!writer,
-        timestamp: Date.now(),
-      })
-    );
-
     if (writer) {
       logger.log('sse_client_connected', {
         message_id: entry.message_id,
         user_id: entry.user_id,
       });
-      await this.pipeSSEToClient(writer, response.body!, entry.message_id);
-    } else {
-      logger.warn('no_sse_client', {
-        message_id: entry.message_id,
-        user_id: entry.user_id,
-        org: entry.org,
-      });
-      await this.bufferAndStoreResponse(response.body!, entry.message_id);
     }
+
+    await this.bufferIncrementally(response.body!, entry.message_id, writer);
   }
 
   /** Fetch SSE stream from UserSession DO. */
@@ -596,51 +578,155 @@ export class UserQueue {
     return response;
   }
 
-  /** Pipe SSE stream from UserSession to connected client writer. */
-  private async pipeSSEToClient(
-    writer: WritableStreamDefaultWriter<Uint8Array>,
+  /**
+   * Read SSE stream from UserSession and store events incrementally.
+   * Optionally pipes events to a live SSE writer if one is connected.
+   */
+  private async bufferIncrementally(
     body: ReadableStream<Uint8Array>,
-    messageId: string
+    messageId: string,
+    writer: WritableStreamDefaultWriter<Uint8Array> | undefined
   ): Promise<void> {
+    const storageKey = `events:${messageId}`;
+
+    writer = await this.sendProcessingEvent(writer, messageId);
+    const lineBuffer = await this.readStreamChunks(body, storageKey, writer);
+    await this.flushLineBuffer(lineBuffer, storageKey);
+    await this.finalizeEventStore(storageKey, messageId);
+    await this.closeLiveWriter(writer, messageId);
+  }
+
+  /** Send the initial "processing" event to a live writer, or null it on disconnect. */
+  private async sendProcessingEvent(
+    writer: WritableStreamDefaultWriter<Uint8Array> | undefined,
+    messageId: string
+  ): Promise<WritableStreamDefaultWriter<Uint8Array> | undefined> {
+    if (!writer) return undefined;
     try {
-      await this.writeSSE(writer, 'processing', JSON.stringify({ message_id: messageId }));
-
-      const reader = body.getReader();
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          await writer.write(value);
-        }
-      } finally {
-        reader.releaseLock();
-      }
-
-      await this.writeSSE(writer, 'done', JSON.stringify({ message_id: messageId }));
-    } catch (error) {
-      // Client may have disconnected — log but don't propagate
-      const msg = error instanceof Error ? error.message : String(error);
-      if (msg.includes('WritableStream') || msg.includes('closed')) {
-        return; // Client disconnect — not an error
-      }
-      throw error;
-    } finally {
-      try {
-        await writer.close();
-      } catch {
-        // Writer may already be closed from client disconnect
-      }
+      const encoder = new TextEncoder();
+      await writer.write(
+        encoder.encode(`event: processing\ndata: ${JSON.stringify({ message_id: messageId })}\n\n`)
+      );
+      return writer;
+    } catch {
+      return undefined; // Client disconnected
     }
   }
 
-  /** Buffer SSE response and store for late-connecting clients. */
-  private async bufferAndStoreResponse(
+  /** Read stream chunks, parse SSE events, store incrementally, and pipe to live writer. */
+  private async readStreamChunks(
     body: ReadableStream<Uint8Array>,
+    storageKey: string,
+    writer: WritableStreamDefaultWriter<Uint8Array> | undefined
+  ): Promise<string> {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let totalSize = 0;
+
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        totalSize += value.byteLength;
+        if (totalSize > DEFAULT_MAX_BUFFERED_RESPONSE_SIZE) {
+          await this.appendEvents(storageKey, [
+            { event: 'data', data: JSON.stringify({ type: 'error', error: 'Response too large' }) },
+          ]);
+          break;
+        }
+
+        writer = await this.pipeChunkToWriter(writer, value);
+        buffer = await this.parseAndStoreChunk(
+          decoder.decode(value, { stream: true }),
+          buffer,
+          storageKey
+        );
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    return buffer;
+  }
+
+  /** Pipe a raw chunk to the live writer, returning undefined if the writer disconnected. */
+  private async pipeChunkToWriter(
+    writer: WritableStreamDefaultWriter<Uint8Array> | undefined,
+    value: Uint8Array
+  ): Promise<WritableStreamDefaultWriter<Uint8Array> | undefined> {
+    if (!writer) return undefined;
+    try {
+      await writer.write(value);
+      return writer;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Parse SSE `data:` lines from a chunk, store new events, and return remaining buffer. */
+  private async parseAndStoreChunk(
+    chunk: string,
+    buffer: string,
+    storageKey: string
+  ): Promise<string> {
+    const combined = buffer + chunk;
+    const lines = combined.split('\n');
+    const remainder = lines.pop() ?? '';
+
+    const newEvents: StoredSSEEvent[] = [];
+    for (const line of lines) {
+      if (line.startsWith('data: ')) {
+        newEvents.push({ event: 'data', data: line.slice(6) });
+      }
+    }
+    if (newEvents.length > 0) {
+      await this.appendEvents(storageKey, newEvents);
+    }
+    return remainder;
+  }
+
+  /** Flush any remaining data in the line buffer. */
+  private async flushLineBuffer(buffer: string, storageKey: string): Promise<void> {
+    if (buffer.startsWith('data: ')) {
+      await this.appendEvents(storageKey, [{ event: 'data', data: buffer.slice(6) }]);
+    }
+  }
+
+  /** Mark the incremental event store as done. */
+  private async finalizeEventStore(storageKey: string, messageId: string): Promise<void> {
+    const store = await this.state.storage.get<IncrementalEventStore>(storageKey);
+    if (store) {
+      store.events.push({ event: 'done', data: JSON.stringify({ message_id: messageId }) });
+      store.done = true;
+      await this.state.storage.put(storageKey, store);
+    }
+  }
+
+  /** Close a live SSE writer with a "done" event. */
+  private async closeLiveWriter(
+    writer: WritableStreamDefaultWriter<Uint8Array> | undefined,
     messageId: string
   ): Promise<void> {
-    const events = await bufferSSEResponse(body, DEFAULT_MAX_BUFFERED_RESPONSE_SIZE);
-    events.push({ event: 'done', data: JSON.stringify({ message_id: messageId }) });
-    await this.storeResponse(messageId, events);
+    if (!writer) return;
+    try {
+      const encoder = new TextEncoder();
+      await writer.write(
+        encoder.encode(`event: done\ndata: ${JSON.stringify({ message_id: messageId })}\n\n`)
+      );
+      await writer.close();
+    } catch {
+      // Client may have disconnected
+    }
+  }
+
+  /** Append events to the incremental event store. */
+  private async appendEvents(storageKey: string, events: StoredSSEEvent[]): Promise<void> {
+    const store = await this.state.storage.get<IncrementalEventStore>(storageKey);
+    if (store) {
+      store.events.push(...events);
+      await this.state.storage.put(storageKey, store);
+    }
   }
 
   /** Get a UserSession DO stub for the given queue entry. */

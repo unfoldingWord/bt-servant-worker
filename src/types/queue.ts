@@ -57,6 +57,28 @@ export interface StoredSSEEvent {
 }
 
 /**
+ * Incremental event store for poll-based streaming.
+ * Events are appended as they arrive during processing,
+ * and `done` is set to true when processing completes.
+ */
+export interface IncrementalEventStore {
+  message_id: string;
+  events: StoredSSEEvent[];
+  done: boolean;
+  created_at: number;
+}
+
+/**
+ * Response from GET /poll
+ */
+export interface PollResponse {
+  message_id: string;
+  events: StoredSSEEvent[];
+  done: boolean;
+  cursor: number;
+}
+
+/**
  * Response from POST /enqueue
  */
 export interface EnqueueResponse {
