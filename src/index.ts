@@ -674,7 +674,7 @@ async function handleMessageEnqueue(request: Request, env: Env): Promise<Respons
       return Response.json({ error: 'user_id is required' }, { status: 400 });
     }
 
-    const org = body.org ?? env.DEFAULT_ORG;
+    const org = body.org ?? body.org_id ?? env.DEFAULT_ORG;
     logger.log('message_enqueue_received', {
       user_id: body.user_id,
       org,

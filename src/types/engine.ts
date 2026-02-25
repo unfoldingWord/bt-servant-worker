@@ -27,6 +27,7 @@ export interface ChatRequest {
   progress_mode?: ProgressMode;
   message_key?: string; // WhatsApp message identifier for correlation
   org?: string; // Organization for MCP server selection (defaults to DEFAULT_ORG)
+  org_id?: string; // Alias for org (backward compat with whatsapp gateway)
 
   /** Internal: MCP servers injected by worker (not from client) */
   _mcp_servers?: MCPServerConfig[];
