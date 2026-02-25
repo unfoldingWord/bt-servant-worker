@@ -214,16 +214,19 @@ app.post('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
     // Check for duplicate ID and update if exists
     // NOTE: This read-modify-write pattern can race with concurrent requests (last write wins).
     // This is acceptable for admin endpoints which are low-volume and authenticated.
-    const existingIndex = existing.findIndex((s) => s.id === server.id);
-    if (existingIndex >= 0) {
-      // eslint-disable-next-line security/detect-object-injection -- existingIndex is from findIndex
-      existing[existingIndex] = server;
+    const existingIdx = existing.findIndex((s) => s.id === server.id);
+    if (existingIdx >= 0) {
+      existing.splice(existingIdx, 1, server);
     } else {
       existing.push(server);
     }
 
     await c.env.MCP_SERVERS.put(org, JSON.stringify(existing));
-    logAdminAction('add_mcp_server', org, { server_id: server.id, server_url: server.url });
+    logAdminAction('add_mcp_server', org, {
+      server_id: server.id,
+      server_url: server.url,
+      server_count: existing.length,
+    });
     return c.json({ org, servers: existing, message: 'MCP server added' });
   } catch (error) {
     logAdminAction('add_mcp_server_error', org, { error: String(error) });
@@ -245,7 +248,10 @@ app.delete('/api/v1/admin/orgs/:org/mcp-servers/:serverId', async (c) => {
     const filtered = existing.filter((s) => s.id !== serverId);
 
     await c.env.MCP_SERVERS.put(org, JSON.stringify(filtered));
-    logAdminAction('remove_mcp_server', org, { server_id: serverId });
+    logAdminAction('remove_mcp_server', org, {
+      server_id: serverId,
+      server_count: filtered.length,
+    });
     return c.json({ org, servers: filtered, message: 'MCP server removed' });
   } catch (error) {
     logAdminAction('remove_mcp_server_error', org, { error: String(error) });
@@ -321,7 +327,7 @@ app.delete('/api/v1/admin/orgs/:org/config', async (c) => {
 
   try {
     await c.env.ORG_CONFIG.delete(org);
-    logAdminAction('reset_org_config', org, {});
+    logAdminAction('reset_org_config', org, { config: DEFAULT_ORG_CONFIG });
     return c.json({ org, config: DEFAULT_ORG_CONFIG, message: 'Org config reset to defaults' });
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
@@ -379,7 +385,7 @@ app.delete('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
 
   try {
     await c.env.PROMPT_OVERRIDES.delete(org);
-    logAdminAction('reset_prompt_overrides', org, {});
+    logAdminAction('reset_prompt_overrides', org, { slots_cleared: true });
     return c.json({
       org,
       overrides: {},

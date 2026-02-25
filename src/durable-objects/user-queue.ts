@@ -43,7 +43,8 @@ const MAX_CLEANUP_PER_STORE = 10;
 const ENQUEUE_RATE_WINDOW_MS = 60 * 1000; // 1 minute
 const ENQUEUE_RATE_LIMIT = 300; // max enqueues per window
 const POLL_RATE_WINDOW_MS = 60 * 1000; // 1 minute
-const POLL_RATE_LIMIT = 600; // max polls per window (higher than enqueue since polling is frequent)
+const POLL_RATE_LIMIT_MULTIPLIER = 2; // poll is expected to be more frequent than enqueue
+const POLL_RATE_LIMIT = ENQUEUE_RATE_LIMIT * POLL_RATE_LIMIT_MULTIPLIER;
 
 const VALID_PROGRESS_MODES: ProgressMode[] = ['complete', 'iteration', 'periodic', 'sentence'];
 
