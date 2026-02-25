@@ -42,6 +42,8 @@ const DEFAULT_MAX_BUFFERED_RESPONSE_SIZE = 5 * 1024 * 1024; // 5 MB
 const MAX_CLEANUP_PER_STORE = 10;
 const ENQUEUE_RATE_WINDOW_MS = 60 * 1000; // 1 minute
 const ENQUEUE_RATE_LIMIT = 300; // max enqueues per window
+const POLL_RATE_WINDOW_MS = 60 * 1000; // 1 minute
+const POLL_RATE_LIMIT = 600; // max polls per window (higher than enqueue since polling is frequent)
 
 const VALID_PROGRESS_MODES: ProgressMode[] = ['complete', 'iteration', 'periodic', 'sentence'];
 
@@ -145,6 +147,9 @@ export class UserQueue {
   /** Sliding window timestamps for enqueue rate limiting */
   private enqueueTimestamps: number[] = [];
 
+  /** Sliding window timestamps for poll rate limiting */
+  private pollTimestamps: number[] = [];
+
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
@@ -233,25 +238,13 @@ export class UserQueue {
       return Response.json({ error: result }, { status: 400 });
     }
 
-    // Rate limiting: sliding window per DO instance.
-    // Timestamps are monotonic, so splice from the front to avoid allocating a new array.
-    const now = Date.now();
-    const cutoff = now - ENQUEUE_RATE_WINDOW_MS;
-    let expiredCount = 0;
-    while (
-      expiredCount < this.enqueueTimestamps.length &&
-      (this.enqueueTimestamps.at(expiredCount) ?? Infinity) <= cutoff
-    ) {
-      expiredCount++;
-    }
-    if (expiredCount > 0) this.enqueueTimestamps.splice(0, expiredCount);
-    if (this.enqueueTimestamps.length >= ENQUEUE_RATE_LIMIT) {
-      return Response.json(
-        { error: 'Rate limit exceeded', code: 'RATE_LIMIT_EXCEEDED' },
-        { status: 429, headers: { 'Retry-After': '10' } }
-      );
-    }
-    this.enqueueTimestamps.push(now);
+    const rateLimited = this.checkRateLimit(
+      this.enqueueTimestamps,
+      ENQUEUE_RATE_WINDOW_MS,
+      ENQUEUE_RATE_LIMIT,
+      '10'
+    );
+    if (rateLimited) return rateLimited;
 
     const maxDepth = this.getMaxQueueDepth();
     const position = await this.enqueueEntry(result, maxDepth);
@@ -295,6 +288,14 @@ export class UserQueue {
     if (!messageId) {
       return Response.json({ error: 'message_id query parameter is required' }, { status: 400 });
     }
+
+    const rateLimited = this.checkRateLimit(
+      this.pollTimestamps,
+      POLL_RATE_WINDOW_MS,
+      POLL_RATE_LIMIT,
+      '5'
+    );
+    if (rateLimited) return rateLimited;
 
     const cursor = parseInt(url.searchParams.get('cursor') ?? '0', 10);
 
@@ -863,6 +864,36 @@ export class UserQueue {
     if (hasMore) {
       await this.state.storage.setAlarm(Date.now());
     }
+  }
+
+  /**
+   * Sliding-window rate limiter. Prunes expired entries, checks the limit,
+   * and records the current timestamp. Returns a 429 Response if exceeded, or null if allowed.
+   */
+  private checkRateLimit(
+    timestamps: number[],
+    windowMs: number,
+    limit: number,
+    retryAfter: string
+  ): Response | null {
+    const now = Date.now();
+    const cutoff = now - windowMs;
+    let expiredCount = 0;
+    while (
+      expiredCount < timestamps.length &&
+      (timestamps.at(expiredCount) ?? Infinity) <= cutoff
+    ) {
+      expiredCount++;
+    }
+    if (expiredCount > 0) timestamps.splice(0, expiredCount);
+    if (timestamps.length >= limit) {
+      return Response.json(
+        { error: 'Rate limit exceeded', code: 'RATE_LIMIT_EXCEEDED' },
+        { status: 429, headers: { 'Retry-After': retryAfter } }
+      );
+    }
+    timestamps.push(now);
+    return null;
   }
 
   // ── Config helpers (read from env with defaults) ──

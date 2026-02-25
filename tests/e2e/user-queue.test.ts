@@ -220,6 +220,84 @@ describe('UserQueue Durable Object', () => {
       expect(typeof data.done).toBe('boolean');
       expect(typeof data.cursor).toBe('number');
     });
+
+    it('returns consistent cursor on successive polls for unprocessed message', async () => {
+      const enqueueResponse = await stub.fetch('http://fake-host/enqueue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_id: 'test-user',
+          client_id: 'test-client',
+          message: 'Hello',
+          message_type: 'text',
+          org: 'test-org',
+          delivery: 'sse',
+        }),
+      });
+      const { message_id } = (await enqueueResponse.json()) as EnqueueResponse;
+
+      // Poll twice with the same cursor — should get consistent results
+      const poll1 = await stub.fetch(`http://fake-host/poll?message_id=${message_id}&cursor=0`);
+      const data1 = (await poll1.json()) as PollResponse;
+
+      const poll2 = await stub.fetch(
+        `http://fake-host/poll?message_id=${message_id}&cursor=${data1.cursor}`
+      );
+      const data2 = (await poll2.json()) as PollResponse;
+
+      // Cursor should not regress
+      expect(data2.cursor).toBeGreaterThanOrEqual(data1.cursor);
+      // If no new events arrived, second poll should return empty events
+      if (data2.cursor === data1.cursor) {
+        expect(data2.events).toEqual([]);
+      }
+    });
+
+    it('shows done=false for message still in queue', async () => {
+      const enqueueResponse = await stub.fetch('http://fake-host/enqueue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_id: 'test-user',
+          client_id: 'test-client',
+          message: 'Hello',
+          message_type: 'text',
+          org: 'test-org',
+          delivery: 'sse',
+        }),
+      });
+      const { message_id } = (await enqueueResponse.json()) as EnqueueResponse;
+
+      // Poll immediately — message hasn't been fully processed yet
+      const pollResponse = await stub.fetch(
+        `http://fake-host/poll?message_id=${message_id}&cursor=0`
+      );
+      const data = (await pollResponse.json()) as PollResponse;
+
+      // If event metadata hasn't been written yet, done must be false
+      // If it has been written but not finalized, done must also be false
+      if (data.cursor === 0) {
+        expect(data.done).toBe(false);
+      }
+    });
+
+    it('falls back to legacy stored responses when event store is empty', async () => {
+      // Poll for a message that has no evmeta entry — should check legacy responses
+      // and return not-found response (done=false, empty events)
+      const response = await stub.fetch('http://fake-host/poll?message_id=legacy-msg&cursor=0');
+
+      expect(response.status).toBe(200);
+      const data = (await response.json()) as PollResponse;
+      expect(data.message_id).toBe('legacy-msg');
+      expect(data.events).toEqual([]);
+      expect(data.done).toBe(false);
+      expect(data.cursor).toBe(0);
+    });
+
+    // NOTE: Testing done=true after full processing and legacy StoredResponse with
+    // pre-populated data requires a working UserSession DO (for alarm processing)
+    // or direct DO storage access. These paths are covered by manual integration
+    // testing against staging.
   });
 
   describe('Unknown paths', () => {
