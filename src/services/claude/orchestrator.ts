@@ -80,6 +80,7 @@ interface OrchestratorOptions {
   resolvedPromptValues?: Required<Record<PromptSlot, string>>;
   memoryStore?: UserMemoryStore | undefined;
   memoryTOC?: string | undefined;
+  clientId?: string | undefined;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
 }
@@ -354,7 +355,10 @@ function createOrchestrationContext(
     client: new Anthropic({ apiKey: env.ANTHROPIC_API_KEY }),
     model: config.model,
     maxTokens: config.maxTokens,
-    systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues, options.memoryTOC),
+    systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues, {
+      memoryTOC: options.memoryTOC,
+      clientId: options.clientId,
+    }),
     tools: buildAllTools(catalog),
     messages: [...historyToMessages(history, llmMax), { role: 'user', content: userMessage }],
     responses: [],

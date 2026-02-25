@@ -14,21 +14,27 @@ export interface OrchestrationPreferences {
   first_interaction: boolean;
 }
 
+interface SystemPromptOptions {
+  memoryTOC?: string | undefined;
+  clientId?: string | undefined;
+}
+
 /**
  * Build the full system prompt with tool catalog and user context.
  *
  * Assembly order:
  *   [identity] → [methodology] → [tool_guidance] → [tool catalog] →
- *   [instructions] → [memory_instructions + TOC] → [user preferences] →
- *   [conversation context] → [first interaction] → [closing]
+ *   [instructions] → [client_instructions] → [memory_instructions + TOC] →
+ *   [user preferences] → [conversation context] → [first interaction] → [closing]
  */
 export function buildSystemPrompt(
   catalog: ToolCatalog,
   preferences: OrchestrationPreferences,
   history: ChatHistoryEntry[],
   resolvedPromptValues: Required<Record<PromptSlot, string>>,
-  memoryTOC?: string
+  options?: SystemPromptOptions
 ): string {
+  const { memoryTOC, clientId } = options ?? {};
   const sections: string[] = [];
 
   // Slot: identity
@@ -46,6 +52,14 @@ export function buildSystemPrompt(
 
   // Slot: instructions
   sections.push(resolvedPromptValues.instructions);
+
+  // Slot: client_instructions — inject client platform context
+  const clientParts: string[] = [];
+  if (clientId) {
+    clientParts.push(`## Client Platform\nThe user is communicating via: ${clientId}`);
+  }
+  clientParts.push(resolvedPromptValues.client_instructions);
+  sections.push(clientParts.join('\n\n'));
 
   // Slot: memory_instructions (always present so Claude knows tools exist)
   sections.push(resolvedPromptValues.memory_instructions);

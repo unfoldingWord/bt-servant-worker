@@ -507,6 +507,7 @@ export class UserSession {
       resolvedPromptValues,
       memoryStore,
       memoryTOC: formattedTOC || undefined,
+      clientId: body.client_id,
       logger,
       callbacks,
     });

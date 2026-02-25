@@ -11,6 +11,7 @@ export const PROMPT_OVERRIDE_SLOTS = [
   'methodology',
   'tool_guidance',
   'instructions',
+  'client_instructions',
   'memory_instructions',
   'closing',
 ] as const;
@@ -32,6 +33,7 @@ export interface PromptOverrides {
   methodology?: string | null;
   tool_guidance?: string | null;
   instructions?: string | null;
+  client_instructions?: string | null;
   memory_instructions?: string | null;
   closing?: string | null;
 }
@@ -85,6 +87,10 @@ When you can only fetch part of what the user asked for:
 2. Present what you have so far
 3. Offer to continue with the next batch
 4. Wait for user confirmation before fetching more`,
+
+  client_instructions: `Adapt your response style to the client platform the user is on.
+For messaging clients like WhatsApp, keep responses concise and avoid heavy markdown formatting.
+For web clients, feel free to use full markdown with headers, lists, and code blocks.`,
 
   memory_instructions: `## User Memory
 

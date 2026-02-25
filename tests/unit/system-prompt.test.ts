@@ -17,6 +17,7 @@ describe('buildSystemPrompt - slot assembly', () => {
     expect(prompt).toContain(DEFAULT_PROMPT_VALUES.methodology);
     expect(prompt).toContain(DEFAULT_PROMPT_VALUES.tool_guidance);
     expect(prompt).toContain(DEFAULT_PROMPT_VALUES.instructions);
+    expect(prompt).toContain(DEFAULT_PROMPT_VALUES.client_instructions);
     expect(prompt).toContain(DEFAULT_PROMPT_VALUES.memory_instructions);
     expect(prompt).toContain(DEFAULT_PROMPT_VALUES.closing);
   });
@@ -28,13 +29,15 @@ describe('buildSystemPrompt - slot assembly', () => {
     const methodologyIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.methodology);
     const toolGuidanceIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.tool_guidance);
     const instructionsIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.instructions);
+    const clientInstructionsIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.client_instructions);
     const memoryIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.memory_instructions);
     const closingIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.closing);
 
     expect(identityIdx).toBeLessThan(methodologyIdx);
     expect(methodologyIdx).toBeLessThan(toolGuidanceIdx);
     expect(toolGuidanceIdx).toBeLessThan(instructionsIdx);
-    expect(instructionsIdx).toBeLessThan(memoryIdx);
+    expect(instructionsIdx).toBeLessThan(clientInstructionsIdx);
+    expect(clientInstructionsIdx).toBeLessThan(memoryIdx);
     expect(memoryIdx).toBeLessThan(closingIdx);
   });
 
@@ -52,6 +55,7 @@ describe('buildSystemPrompt - custom overrides', () => {
       methodology: 'CUSTOM_METHODOLOGY',
       tool_guidance: 'CUSTOM_TOOL_GUIDANCE',
       instructions: 'CUSTOM_INSTRUCTIONS',
+      client_instructions: 'CUSTOM_CLIENT_INSTRUCTIONS',
       memory_instructions: 'CUSTOM_MEMORY',
       closing: 'CUSTOM_CLOSING',
     };
@@ -62,6 +66,7 @@ describe('buildSystemPrompt - custom overrides', () => {
     expect(prompt).toContain('CUSTOM_METHODOLOGY');
     expect(prompt).toContain('CUSTOM_TOOL_GUIDANCE');
     expect(prompt).toContain('CUSTOM_INSTRUCTIONS');
+    expect(prompt).toContain('CUSTOM_CLIENT_INSTRUCTIONS');
     expect(prompt).toContain('CUSTOM_MEMORY');
     expect(prompt).toContain('CUSTOM_CLOSING');
     expect(prompt).not.toContain(DEFAULT_PROMPT_VALUES.identity);
@@ -151,7 +156,7 @@ describe('buildSystemPrompt - memory TOC', () => {
       defaultPrefs,
       [],
       DEFAULT_PROMPT_VALUES,
-      toc
+      { memoryTOC: toc }
     );
     expect(prompt).toContain(DEFAULT_PROMPT_VALUES.memory_instructions);
     expect(prompt).toContain('- **Progress** (1.2 KB) [pinned]');
@@ -177,5 +182,65 @@ describe('buildSystemPrompt - memory TOC', () => {
 
     expect(instructionsIdx).toBeLessThan(memoryIdx);
     expect(memoryIdx).toBeLessThan(closingIdx);
+  });
+});
+
+describe('buildSystemPrompt - client platform with clientId', () => {
+  it('includes client_id when provided', () => {
+    const prompt = buildSystemPrompt(
+      createEmptyCatalog(),
+      defaultPrefs,
+      [],
+      DEFAULT_PROMPT_VALUES,
+      { clientId: 'whatsapp' }
+    );
+    expect(prompt).toContain('## Client Platform');
+    expect(prompt).toContain('The user is communicating via: whatsapp');
+  });
+
+  it('includes client_instructions slot content', () => {
+    const prompt = buildSystemPrompt(
+      createEmptyCatalog(),
+      defaultPrefs,
+      [],
+      DEFAULT_PROMPT_VALUES,
+      { clientId: 'whatsapp' }
+    );
+    expect(prompt).toContain(DEFAULT_PROMPT_VALUES.client_instructions);
+  });
+
+  it('uses custom client_instructions when overridden', () => {
+    const custom = { ...DEFAULT_PROMPT_VALUES, client_instructions: 'Custom client rules here' };
+    const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], custom, {
+      clientId: 'whatsapp',
+    });
+    expect(prompt).toContain('Custom client rules here');
+    expect(prompt).toContain('The user is communicating via: whatsapp');
+    expect(prompt).not.toContain(DEFAULT_PROMPT_VALUES.client_instructions);
+  });
+});
+
+describe('buildSystemPrompt - client_instructions without clientId', () => {
+  it('includes client_instructions without Client Platform header when clientId is omitted', () => {
+    const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
+    expect(prompt).toContain(DEFAULT_PROMPT_VALUES.client_instructions);
+    expect(prompt).not.toContain('## Client Platform');
+    expect(prompt).not.toContain('communicating via');
+  });
+
+  it('client_instructions appears between instructions and memory_instructions', () => {
+    const prompt = buildSystemPrompt(
+      createEmptyCatalog(),
+      defaultPrefs,
+      [],
+      DEFAULT_PROMPT_VALUES,
+      { clientId: 'bt-servant-web-client' }
+    );
+    const instructionsIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.instructions);
+    const clientIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.client_instructions);
+    const memoryIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.memory_instructions);
+
+    expect(instructionsIdx).toBeLessThan(clientIdx);
+    expect(clientIdx).toBeLessThan(memoryIdx);
   });
 });
