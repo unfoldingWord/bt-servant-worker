@@ -234,6 +234,9 @@ export function createWebhookCallbacks(
       ? new IncrementalProgressSender(sender, config)
       : null;
 
+  // Track text already sent so iteration and complete callbacks only send deltas
+  let lastSentText = '';
+
   const callbacks: StreamCallbacks = {
     onStatus: (message) => {
       void sender.sendStatus(message);
@@ -247,7 +250,11 @@ export function createWebhookCallbacks(
     },
     onComplete: (response: ChatResponse) => {
       incrementalSender?.complete();
-      void sender.sendComplete(response.responses.join('\n'));
+      const fullText = response.responses.join('\n');
+      const delta = fullText.slice(lastSentText.length);
+      if (delta) {
+        void sender.sendComplete(delta);
+      }
     },
     onError: (error) => {
       incrementalSender?.complete();
@@ -257,7 +264,11 @@ export function createWebhookCallbacks(
 
   if (mode === 'iteration') {
     callbacks.onIterationComplete = (text) => {
-      void sender.sendProgressDirect(text);
+      const delta = text.slice(lastSentText.length);
+      if (delta) {
+        lastSentText = text;
+        void sender.sendProgressDirect(delta);
+      }
     };
   }
 
