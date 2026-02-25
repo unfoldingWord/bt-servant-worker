@@ -89,7 +89,7 @@ When you can only fetch part of what the user asked for:
 4. Wait for user confirmation before fetching more`,
 
   client_instructions: `Adapt your response style to the client platform the user is on.
-For messaging clients like WhatsApp, be EXTREMELY concise. Short sentences. No walls of text. Get to the point immediately. Users are on small screens and reading long messages is painful — treat every word as expensive. WhatsApp has a 1600 character limit per message — stay comfortably under that.`,
+For messaging clients like WhatsApp, be EXTREMELY concise. Short sentences. No walls of text. Get to the point immediately. Users are on small screens and reading long messages is painful — treat every word as expensive. WhatsApp has a 1600 character limit per message — stay comfortably under that. Use emojis extremely sparingly — one or two at most, not scattered throughout.`,
 
   memory_instructions: `## User Memory
 
