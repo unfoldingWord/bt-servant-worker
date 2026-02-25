@@ -145,34 +145,13 @@ export class UserQueue {
   /** Sliding window timestamps for enqueue rate limiting */
   private enqueueTimestamps: number[] = [];
 
-  /** Instance-level ID for tracing DO identity across requests */
-  private instanceId = crypto.randomUUID().slice(0, 8);
-
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
-    console.log(
-      JSON.stringify({
-        event: 'do_instance_created',
-        instance_id: this.instanceId,
-        timestamp: Date.now(),
-      })
-    );
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
-
-    console.log(
-      JSON.stringify({
-        event: 'do_fetch_received',
-        instance_id: this.instanceId,
-        pathname: url.pathname,
-        search: url.search,
-        timestamp: Date.now(),
-        streams_keys: [...this.streams.keys()],
-      })
-    );
 
     switch (url.pathname) {
       case '/enqueue':
@@ -238,6 +217,7 @@ export class UserQueue {
     }
 
     await this.scheduleNextAlarm();
+    await this.cleanupExpiredEventStores();
   }
 
   private async handleEnqueue(request: Request): Promise<Response> {
@@ -253,9 +233,18 @@ export class UserQueue {
       return Response.json({ error: result }, { status: 400 });
     }
 
-    // Rate limiting: sliding window per DO instance
+    // Rate limiting: sliding window per DO instance.
+    // Timestamps are monotonic, so splice from the front to avoid allocating a new array.
     const now = Date.now();
-    this.enqueueTimestamps = this.enqueueTimestamps.filter((t) => now - t < ENQUEUE_RATE_WINDOW_MS);
+    const cutoff = now - ENQUEUE_RATE_WINDOW_MS;
+    let expiredCount = 0;
+    while (
+      expiredCount < this.enqueueTimestamps.length &&
+      (this.enqueueTimestamps.at(expiredCount) ?? Infinity) <= cutoff
+    ) {
+      expiredCount++;
+    }
+    if (expiredCount > 0) this.enqueueTimestamps.splice(0, expiredCount);
     if (this.enqueueTimestamps.length >= ENQUEUE_RATE_LIMIT) {
       return Response.json(
         { error: 'Rate limit exceeded', code: 'RATE_LIMIT_EXCEEDED' },
@@ -291,27 +280,9 @@ export class UserQueue {
       return Response.json({ error: 'message_id query parameter is required' }, { status: 400 });
     }
 
-    console.log(
-      JSON.stringify({
-        event: 'handle_stream_start',
-        instance_id: this.instanceId,
-        message_id: messageId,
-        timestamp: Date.now(),
-        streams_keys: [...this.streams.keys()],
-      })
-    );
-
     // Check for stored response (late-connect fallback)
     const stored = await this.getAndClearStoredResponse(messageId);
     if (stored) {
-      console.log(
-        JSON.stringify({
-          event: 'handle_stream_found_stored',
-          instance_id: this.instanceId,
-          message_id: messageId,
-          timestamp: Date.now(),
-        })
-      );
       return this.replayStoredResponse(stored);
     }
 
@@ -342,10 +313,9 @@ export class UserQueue {
     }
 
     // Check legacy stored responses (backward compatibility)
-    const responses =
+    const responsesRecord =
       (await this.state.storage.get<Record<string, StoredResponse>>('responses')) ?? {};
-    // eslint-disable-next-line security/detect-object-injection -- messageId from URL param
-    const stored = responses[messageId];
+    const stored = new Map(Object.entries(responsesRecord)).get(messageId);
     if (stored) {
       const response: PollResponse = {
         message_id: messageId,
@@ -439,32 +409,53 @@ export class UserQueue {
 
   /** Get and remove a stored response, cleaning up expired entries opportunistically. */
   private async getAndClearStoredResponse(messageId: string): Promise<StoredResponse | null> {
-    const responses =
-      (await this.state.storage.get<Record<string, StoredResponse>>('responses')) ?? {};
+    const responses = new Map(
+      Object.entries(
+        (await this.state.storage.get<Record<string, StoredResponse>>('responses')) ?? {}
+      )
+    );
 
     // Opportunistic cleanup of expired entries on read
     const now = Date.now();
     const ttl = this.getStoredResponseTTL();
-    for (const key of Object.keys(responses)) {
-      // eslint-disable-next-line security/detect-object-injection -- key from Object.keys iteration
-      const resp = responses[key];
-      if (resp && now - resp.stored_at > ttl) {
-        // eslint-disable-next-line security/detect-object-injection -- key from Object.keys iteration
-        delete responses[key];
+    for (const [key, resp] of responses) {
+      if (now - resp.stored_at > ttl) {
+        responses.delete(key);
       }
     }
 
-    // eslint-disable-next-line security/detect-object-injection -- messageId is from URL param, used as object key
-    const stored = responses[messageId];
-    if (!stored) {
-      await this.state.storage.put('responses', responses);
-      return null;
+    const stored = responses.get(messageId) ?? null;
+    responses.delete(messageId);
+    await this.state.storage.put('responses', Object.fromEntries(responses));
+    return stored;
+  }
+
+  /**
+   * Clean up expired event store entries (evmeta: and ev: keys).
+   * Bounded to MAX_CLEANUP_PER_STORE to avoid unbounded work per alarm cycle.
+   */
+  private async cleanupExpiredEventStores(): Promise<void> {
+    const ttl = this.getStoredResponseTTL();
+    const now = Date.now();
+
+    const metaEntries = await this.state.storage.list<EventStoreMetadata>({
+      prefix: 'evmeta:',
+      limit: MAX_CLEANUP_PER_STORE,
+    });
+
+    const keysToDelete: string[] = [];
+    for (const [metaKey, meta] of metaEntries) {
+      if (!meta.done || now - meta.created_at <= ttl) continue;
+
+      keysToDelete.push(metaKey);
+      for (let i = 0; i < meta.event_count; i++) {
+        keysToDelete.push(`ev:${meta.message_id}:${i}`);
+      }
     }
 
-    // eslint-disable-next-line security/detect-object-injection -- messageId is from URL param, used as object key
-    delete responses[messageId];
-    await this.state.storage.put('responses', responses);
-    return stored;
+    if (keysToDelete.length > 0) {
+      await this.state.storage.delete(keysToDelete);
+    }
   }
 
   /** Replay a stored response as an SSE stream. */
@@ -499,16 +490,6 @@ export class UserQueue {
     const { readable, writable } = new TransformStream<Uint8Array>();
     const writer = writable.getWriter();
     this.streams.set(messageId, writer);
-
-    console.log(
-      JSON.stringify({
-        event: 'create_live_stream_writer_registered',
-        instance_id: this.instanceId,
-        message_id: messageId,
-        timestamp: Date.now(),
-        streams_keys: [...this.streams.keys()],
-      })
-    );
 
     const encoder = new TextEncoder();
     await writer.write(
@@ -752,17 +733,15 @@ export class UserQueue {
     const meta = await this.state.storage.get<EventStoreMetadata>(metaKey);
     if (!meta) return;
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- batch put requires Record<string, T>
-    const entries: Record<string, any> = {};
+    const entries = new Map<string, StoredSSEEvent | EventStoreMetadata>();
     let idx = meta.event_count;
     for (const event of events) {
-      entries[`ev:${messageId}:${idx}`] = event;
+      entries.set(`ev:${messageId}:${idx}`, event);
       idx++;
     }
     meta.event_count = idx;
-    // eslint-disable-next-line security/detect-object-injection -- metaKey is a computed string, not user input
-    entries[metaKey] = meta;
-    await this.state.storage.put(entries);
+    entries.set(metaKey, meta);
+    await this.state.storage.put(Object.fromEntries(entries));
   }
 
   /** Get a UserSession DO stub for the given queue entry. */
@@ -848,27 +827,26 @@ export class UserQueue {
 
   /** Store response events for late-connecting SSE clients with TTL cleanup. */
   private async storeResponse(messageId: string, events: StoredSSEEvent[]): Promise<void> {
-    const responses =
-      (await this.state.storage.get<Record<string, StoredResponse>>('responses')) ?? {};
+    const responses = new Map(
+      Object.entries(
+        (await this.state.storage.get<Record<string, StoredResponse>>('responses')) ?? {}
+      )
+    );
 
     // Clean up expired entries (bounded to avoid unbounded loops)
     const now = Date.now();
     const ttl = this.getStoredResponseTTL();
     let cleaned = 0;
-    for (const key of Object.keys(responses)) {
+    for (const [key, resp] of responses) {
       if (cleaned >= MAX_CLEANUP_PER_STORE) break;
-      // eslint-disable-next-line security/detect-object-injection -- key from Object.keys iteration
-      const resp = responses[key];
-      if (resp && now - resp.stored_at > ttl) {
-        // eslint-disable-next-line security/detect-object-injection -- key from Object.keys iteration
-        delete responses[key];
+      if (now - resp.stored_at > ttl) {
+        responses.delete(key);
         cleaned++;
       }
     }
 
-    // eslint-disable-next-line security/detect-object-injection -- messageId is a UUID from crypto.randomUUID()
-    responses[messageId] = { message_id: messageId, events, stored_at: now };
-    await this.state.storage.put('responses', responses);
+    responses.set(messageId, { message_id: messageId, events, stored_at: now });
+    await this.state.storage.put('responses', Object.fromEntries(responses));
   }
 
   /** Schedule the next alarm if there are items remaining in the queue. */

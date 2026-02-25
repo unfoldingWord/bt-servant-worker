@@ -8,7 +8,7 @@
 /* eslint-disable max-lines-per-function */
 import { env } from 'cloudflare:test';
 import { describe, it, expect, beforeEach } from 'vitest';
-import { EnqueueResponse, QueueStatusResponse } from '../../src/types/queue.js';
+import { EnqueueResponse, PollResponse, QueueStatusResponse } from '../../src/types/queue.js';
 
 describe('UserQueue Durable Object', () => {
   let stub: DurableObjectStub;
@@ -169,6 +169,57 @@ describe('UserQueue Durable Object', () => {
     // possible in miniflare because stub.fetch() waits for the entire response body
     // to complete before resolving. The SSE Content-Type and streaming behavior are
     // verified by the implementation and by manual testing with `pnpm dev`.
+  });
+
+  describe('GET /poll', () => {
+    it('returns 400 without message_id param', async () => {
+      const response = await stub.fetch('http://fake-host/poll');
+
+      expect(response.status).toBe(400);
+      const data = (await response.json()) as { error: string };
+      expect(data.error).toContain('message_id');
+    });
+
+    it('returns empty events for unknown message_id', async () => {
+      const response = await stub.fetch('http://fake-host/poll?message_id=nonexistent&cursor=0');
+
+      expect(response.status).toBe(200);
+      const data = (await response.json()) as PollResponse;
+      expect(data.message_id).toBe('nonexistent');
+      expect(data.events).toEqual([]);
+      expect(data.done).toBe(false);
+      expect(data.cursor).toBe(0);
+    });
+
+    it('returns events after enqueue with default cursor', async () => {
+      // Enqueue a message first
+      const enqueueResponse = await stub.fetch('http://fake-host/enqueue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_id: 'test-user',
+          client_id: 'test-client',
+          message: 'Hello',
+          message_type: 'text',
+          org: 'test-org',
+          delivery: 'sse',
+        }),
+      });
+      const { message_id } = (await enqueueResponse.json()) as EnqueueResponse;
+
+      // Poll immediately — message is queued but likely not processed yet
+      const pollResponse = await stub.fetch(
+        `http://fake-host/poll?message_id=${message_id}&cursor=0`
+      );
+
+      expect(pollResponse.status).toBe(200);
+      const data = (await pollResponse.json()) as PollResponse;
+      expect(data.message_id).toBe(message_id);
+      // Events may be empty (not yet processed) or have data (alarm ran fast)
+      expect(Array.isArray(data.events)).toBe(true);
+      expect(typeof data.done).toBe('boolean');
+      expect(typeof data.cursor).toBe('number');
+    });
   });
 
   describe('Unknown paths', () => {
