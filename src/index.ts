@@ -62,19 +62,19 @@ app.post('/api/v1/chat/stream', async (c) => {
 });
 
 // Queue endpoints (UserQueue DO)
-app.post('/api/v1/message', async (c) => {
+app.post('/api/v1/chat/queue', async (c) => {
   return handleMessageEnqueue(c.req.raw, c.env);
 });
 
-app.get('/api/v1/stream', async (c) => {
+app.get('/api/v1/chat/queue/stream', async (c) => {
   return handleQueueStream(c.req.raw, c.env);
 });
 
-app.get('/api/v1/poll', async (c) => {
+app.get('/api/v1/chat/queue/poll', async (c) => {
   return handleQueuePoll(c.req.raw, c.env);
 });
 
-app.get('/api/v1/queue/:userId', async (c) => {
+app.get('/api/v1/chat/queue/:userId', async (c) => {
   return handleQueueStatus(c.req.raw, c.env, c.req.param('userId'));
 });
 
@@ -610,7 +610,7 @@ async function handleUserRequest(
 }
 
 /**
- * Handle message enqueue (POST /api/v1/message)
+ * Handle message enqueue (POST /api/v1/chat/queue)
  *
  * Validates user_id, fetches org config from KV, and routes to UserQueue DO.
  */
@@ -673,7 +673,7 @@ async function handleMessageEnqueue(request: Request, env: Env): Promise<Respons
 }
 
 /**
- * Handle queue stream (GET /api/v1/stream)
+ * Handle queue stream (GET /api/v1/chat/queue/stream)
  *
  * Extracts user_id, message_id, org from query params and routes to UserQueue DO.
  */
@@ -700,7 +700,7 @@ async function handleQueueStream(request: Request, env: Env): Promise<Response> 
 }
 
 /**
- * Handle poll for incremental events (GET /api/v1/poll)
+ * Handle poll for incremental events (GET /api/v1/chat/queue/poll)
  * Returns JSON with events since cursor, suitable for worker-to-worker fetch.
  */
 async function handleQueuePoll(request: Request, env: Env): Promise<Response> {
@@ -728,7 +728,7 @@ async function handleQueuePoll(request: Request, env: Env): Promise<Response> {
 }
 
 /**
- * Handle queue status (GET /api/v1/queue/:userId)
+ * Handle queue status (GET /api/v1/chat/queue/:userId)
  *
  * Debugging endpoint — returns queue length, processing flag, stored response count.
  */
