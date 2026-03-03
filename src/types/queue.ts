@@ -8,7 +8,7 @@
 import { ProgressMode } from './engine.js';
 import { MCPServerConfig } from './mcp.js';
 import { OrgConfig } from './org-config.js';
-import { PromptOverrides } from './prompt-overrides.js';
+import { OrgModes, PromptOverrides } from './prompt-overrides.js';
 
 /**
  * Entry in the queue awaiting processing.
@@ -38,6 +38,8 @@ export interface QueueEntry {
   _org_config?: OrgConfig | undefined;
   /** Injected org-level prompt overrides from KV */
   _org_prompt_overrides?: PromptOverrides | undefined;
+  /** Injected org modes from KV */
+  _org_modes?: OrgModes | undefined;
 }
 
 /**

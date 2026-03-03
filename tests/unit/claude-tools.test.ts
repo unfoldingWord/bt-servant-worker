@@ -53,12 +53,14 @@ describe('buildAllTools', () => {
 
     const tools = buildAllTools(catalog);
 
-    // Meta-tools + memory tools, not MCP tools
-    expect(tools.length).toBe(4);
+    // Meta-tools + memory tools + mode tools, not MCP tools
+    expect(tools.length).toBe(6);
     expect(tools.map((t) => t.name)).toContain('execute_code');
     expect(tools.map((t) => t.name)).toContain('get_tool_definitions');
     expect(tools.map((t) => t.name)).toContain('read_memory');
     expect(tools.map((t) => t.name)).toContain('update_memory');
+    expect(tools.map((t) => t.name)).toContain('list_modes');
+    expect(tools.map((t) => t.name)).toContain('switch_mode');
     expect(tools.map((t) => t.name)).not.toContain('mcp_tool');
   });
 });
@@ -69,6 +71,8 @@ describe('isBuiltInTool', () => {
     expect(isBuiltInTool('get_tool_definitions')).toBe(true);
     expect(isBuiltInTool('read_memory')).toBe(true);
     expect(isBuiltInTool('update_memory')).toBe(true);
+    expect(isBuiltInTool('list_modes')).toBe(true);
+    expect(isBuiltInTool('switch_mode')).toBe(true);
     expect(isBuiltInTool('some_mcp_tool')).toBe(false);
   });
 });

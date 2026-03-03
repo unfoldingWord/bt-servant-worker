@@ -132,6 +132,43 @@ export function buildUpdateMemoryTool(): Anthropic.Tool {
 }
 
 /**
+ * Build list_modes tool definition
+ */
+export function buildListModesTool(): Anthropic.Tool {
+  return {
+    name: 'list_modes',
+    description:
+      'List all available assistant modes and which mode is currently active. Modes change how the assistant behaves (e.g., different methodology, instructions, or persona).',
+    input_schema: {
+      type: 'object',
+      properties: {},
+      required: [],
+    },
+  };
+}
+
+/**
+ * Build switch_mode tool definition
+ */
+export function buildSwitchModeTool(): Anthropic.Tool {
+  return {
+    name: 'switch_mode',
+    description:
+      'Switch the assistant to a different mode. The change takes effect on the next message. Pass the mode name to switch to, or null to clear the current mode and return to the default.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        mode: {
+          oneOf: [{ type: 'string' }, { type: 'null' }],
+          description: 'The name of the mode to switch to, or null to clear the current mode.',
+        },
+      },
+      required: ['mode'],
+    },
+  };
+}
+
+/**
  * Build all tool definitions for Claude
  *
  * NOTE: We intentionally do NOT expose MCP tools as direct Claude tools.
@@ -151,6 +188,8 @@ export function buildAllTools(_catalog: ToolCatalog): Anthropic.Tool[] {
     buildGetToolDefinitionsTool(),
     buildReadMemoryTool(),
     buildUpdateMemoryTool(),
+    buildListModesTool(),
+    buildSwitchModeTool(),
   ];
 }
 
@@ -162,7 +201,9 @@ export function isBuiltInTool(toolName: string): boolean {
     toolName === 'execute_code' ||
     toolName === 'get_tool_definitions' ||
     toolName === 'read_memory' ||
-    toolName === 'update_memory'
+    toolName === 'update_memory' ||
+    toolName === 'list_modes' ||
+    toolName === 'switch_mode'
   );
 }
 
@@ -216,6 +257,17 @@ export function isUpdateMemoryInput(
   if (!('sections' in input)) return false;
   if (!isValidSectionsObject(input)) return false;
   return isValidOptionalStringArray(input, 'pin') && isValidOptionalStringArray(input, 'unpin');
+}
+
+/**
+ * Type guard for switch_mode input.
+ * mode is required and must be a string or null.
+ */
+export function isSwitchModeInput(input: unknown): input is { mode: string | null } {
+  if (typeof input !== 'object' || input === null) return false;
+  if (!('mode' in input)) return false;
+  const mode = (input as { mode: unknown }).mode;
+  return mode === null || (typeof mode === 'string' && mode.length > 0);
 }
 
 /**

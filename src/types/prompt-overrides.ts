@@ -2,7 +2,7 @@
  * Prompt override types and utilities
  *
  * Org admins can override individual prompt "slots" to customize Claude's behavior
- * without redeploying the worker. Resolution order: user → org → hardcoded default.
+ * without redeploying the worker. Resolution order: user → mode → org → hardcoded default.
  */
 
 /** Valid prompt slot names */
@@ -36,6 +36,61 @@ export interface PromptOverrides {
   client_instructions?: string | null;
   memory_instructions?: string | null;
   closing?: string | null;
+}
+
+// ─── Mode types ────────────────────────────────────────────────────────────────
+
+/** Maximum number of modes per org */
+export const MAX_MODES_PER_ORG = 20;
+
+/** Maximum length for a mode name (slug) */
+export const MAX_MODE_NAME_LENGTH = 64;
+
+/** Maximum length for a mode label */
+export const MAX_MODE_LABEL_LENGTH = 100;
+
+/** Maximum length for a mode description */
+export const MAX_MODE_DESCRIPTION_LENGTH = 500;
+
+/** Valid mode name pattern: lowercase alphanumeric + hyphens, no leading/trailing hyphen */
+export const MODE_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
+
+/**
+ * A named mode — org-level preset of prompt overrides.
+ * Modes sit between org and user in the override hierarchy.
+ */
+export interface PromptMode {
+  /** Unique slug identifier within the org (e.g., "mast-methodology") */
+  name: string;
+  /** Human-readable display name (e.g., "MAST Methodology") */
+  label?: string;
+  /** Description of what this mode does */
+  description?: string;
+  /** The prompt overrides for this mode — same 7 slots */
+  overrides: PromptOverrides;
+}
+
+/**
+ * Collection of modes stored per org.
+ * Stored in PROMPT_OVERRIDES KV at key "{org}:modes".
+ */
+export interface OrgModes {
+  /** All defined modes for this org */
+  modes: PromptMode[];
+  /** Default mode name applied when user has no explicit selection */
+  default_mode?: string;
+}
+
+/**
+ * Mode context passed to the orchestrator for list_modes / switch_mode tools.
+ */
+export interface ModeContext {
+  /** All modes available for this org */
+  availableModes: PromptMode[];
+  /** Currently active mode name (if any) */
+  activeModeName: string | undefined;
+  /** Callback to persist the user's mode selection */
+  setSelectedMode: (name: string | null) => Promise<void>;
 }
 
 /**
@@ -141,6 +196,85 @@ export function validatePromptOverrides(overrides: unknown): string | null {
   return null;
 }
 
+// ─── Mode validation ───────────────────────────────────────────────────────────
+
+/**
+ * Validate a mode name (slug).
+ * Returns an error message if invalid, null if valid.
+ */
+export function validateModeName(name: unknown): string | null {
+  if (typeof name !== 'string') {
+    return 'Mode name must be a string';
+  }
+  if (name.length === 0) {
+    return 'Mode name must not be empty';
+  }
+  if (name.length > MAX_MODE_NAME_LENGTH) {
+    return `Mode name exceeds maximum length of ${MAX_MODE_NAME_LENGTH} characters`;
+  }
+  if (!MODE_NAME_PATTERN.test(name)) {
+    return 'Mode name must be lowercase alphanumeric with hyphens (e.g., "mast-methodology")';
+  }
+  return null;
+}
+
+/** Validate an optional string field with a max length. */
+function validateOptionalString(
+  obj: Record<string, unknown>,
+  field: string,
+  maxLength: number
+): string | null {
+  const value = obj[field]; // eslint-disable-line security/detect-object-injection -- field is hardcoded
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string') return `Mode ${field} must be a string`;
+  if (value.length > maxLength) {
+    return `Mode ${field} exceeds maximum length of ${maxLength} characters`;
+  }
+  return null;
+}
+
+/**
+ * Validate a prompt mode object (for create/update requests).
+ * Returns an error message if invalid, null if valid.
+ */
+export function validatePromptMode(mode: unknown): string | null {
+  if (typeof mode !== 'object' || mode === null || Array.isArray(mode)) {
+    return 'Mode must be a JSON object';
+  }
+
+  const obj = mode as Record<string, unknown>;
+
+  const labelError = validateOptionalString(obj, 'label', MAX_MODE_LABEL_LENGTH);
+  if (labelError) return labelError;
+
+  const descError = validateOptionalString(obj, 'description', MAX_MODE_DESCRIPTION_LENGTH);
+  if (descError) return descError;
+
+  if (!('overrides' in obj)) {
+    return 'Mode must include an "overrides" object';
+  }
+
+  const overridesError = validatePromptOverrides(obj.overrides);
+  if (overridesError) return `Mode overrides invalid: ${overridesError}`;
+
+  return null;
+}
+
+// ─── Mode resolution ───────────────────────────────────────────────────────────
+
+/**
+ * Determine the active mode name from the selection priority chain.
+ * Returns the first non-empty value, or undefined if no mode is set.
+ *
+ * Priority: user-selected → org default → none
+ */
+export function resolveActiveModeName(
+  userSelectedMode: string | undefined,
+  orgDefaultMode: string | undefined
+): string | undefined {
+  return userSelectedMode ?? orgDefaultMode;
+}
+
 /**
  * Type-safe merge of prompt override updates into an existing overrides object.
  * - null values delete the slot (revert to inherited behavior)
@@ -167,13 +301,14 @@ export function mergePromptOverrides(
 }
 
 /**
- * Resolve prompt overrides: user → org → default.
+ * Resolve prompt overrides: user → mode → org → default.
  * Only non-empty string values override; null/undefined/empty are skipped
  * (inherit from next level). This provides defensive validation against
  * corrupted or manually-edited KV/DO data.
  */
 export function resolvePromptOverrides(
   orgOverrides: PromptOverrides,
+  modeOverrides: PromptOverrides,
   userOverrides: PromptOverrides
 ): Required<Record<PromptSlot, string>> {
   const resolved = { ...DEFAULT_PROMPT_VALUES };
@@ -183,6 +318,12 @@ export function resolvePromptOverrides(
     if (typeof orgVal === 'string' && orgVal.trim()) {
       // eslint-disable-next-line security/detect-object-injection -- slot is from PROMPT_OVERRIDE_SLOTS constant
       resolved[slot] = stripControlChars(orgVal);
+    }
+    // eslint-disable-next-line security/detect-object-injection -- slot is from PROMPT_OVERRIDE_SLOTS constant
+    const modeVal = modeOverrides[slot];
+    if (typeof modeVal === 'string' && modeVal.trim()) {
+      // eslint-disable-next-line security/detect-object-injection -- slot is from PROMPT_OVERRIDE_SLOTS constant
+      resolved[slot] = stripControlChars(modeVal);
     }
     // eslint-disable-next-line security/detect-object-injection -- slot is from PROMPT_OVERRIDE_SLOTS constant
     const userVal = userOverrides[slot];

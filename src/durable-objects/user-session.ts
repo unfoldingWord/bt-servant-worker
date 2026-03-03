@@ -50,10 +50,14 @@ import {
 import { DEFAULT_ORG_CONFIG, OrgConfig } from '../types/org-config.js';
 import {
   DEFAULT_PROMPT_VALUES,
+  ModeContext,
   mergePromptOverrides,
   PROMPT_OVERRIDE_SLOTS,
+  PromptMode,
   PromptOverrides,
+  resolveActiveModeName,
   resolvePromptOverrides,
+  validateModeName,
   validatePromptOverrides,
 } from '../types/prompt-overrides.js';
 import { ValidationError } from '../utils/errors.js';
@@ -61,6 +65,7 @@ import { createRequestLogger, RequestLogger } from '../utils/logger.js';
 const HISTORY_KEY = 'history';
 const PREFERENCES_KEY = 'preferences';
 const PROMPT_OVERRIDES_KEY = 'prompt_overrides';
+const SELECTED_MODE_KEY = 'selected_mode';
 const PROCESSING_LOCK_KEY = '_processing_lock';
 const LOCK_STALE_THRESHOLD_MS = 90000; // 90 seconds
 const RETRY_AFTER_SECONDS = 5;
@@ -108,6 +113,9 @@ export class UserSession {
     this.app.get('/prompt-overrides', () => this.handleGetPromptOverrides());
     this.app.put('/prompt-overrides', (c) => this.handleUpdatePromptOverrides(c.req.raw));
     this.app.delete('/prompt-overrides', () => this.handleDeletePromptOverrides());
+    this.app.get('/mode', () => this.handleGetMode());
+    this.app.put('/mode', (c) => this.handleSetMode(c.req.raw));
+    this.app.delete('/mode', () => this.handleDeleteMode());
     this.app.get('/memory', () => this.handleGetMemory());
     this.app.delete('/memory', () => this.handleDeleteMemory());
   }
@@ -404,8 +412,26 @@ export class UserSession {
 
   private async resolvePrompts(body: ChatRequest, logger: RequestLogger) {
     const orgOverrides = body._org_prompt_overrides ?? {};
+    const orgModes = body._org_modes ?? { modes: [] };
+    const userSelectedMode = await this.getSelectedMode();
+    const activeModeName = resolveActiveModeName(userSelectedMode, orgModes.default_mode);
+
+    // Look up the active mode's overrides
+    let modeOverrides: PromptOverrides = {};
+    if (activeModeName) {
+      const mode = orgModes.modes.find((m) => m.name === activeModeName);
+      if (mode) {
+        modeOverrides = mode.overrides;
+      } else {
+        logger.warn('mode_not_found', {
+          active_mode: activeModeName,
+          available_modes: orgModes.modes.map((m) => m.name),
+        });
+      }
+    }
+
     const userOverrides = await this.getPromptOverrides();
-    const resolved = resolvePromptOverrides(orgOverrides, userOverrides);
+    const resolved = resolvePromptOverrides(orgOverrides, modeOverrides, userOverrides);
 
     const overriddenSlots = PROMPT_OVERRIDE_SLOTS.filter(
       // eslint-disable-next-line security/detect-object-injection -- s is from PROMPT_OVERRIDE_SLOTS constant
@@ -414,11 +440,13 @@ export class UserSession {
     if (overriddenSlots.length > 0) {
       logger.log('prompt_overrides_applied', {
         org_overrides: Object.keys(orgOverrides).length,
+        mode_overrides: Object.keys(modeOverrides).length,
+        active_mode: activeModeName ?? null,
         user_overrides: Object.keys(userOverrides).length,
         overridden_slots: overriddenSlots,
       });
     }
-    return resolved;
+    return { resolved, orgModes, activeModeName };
   }
 
   private async loadMemoryContext(logger: RequestLogger) {
@@ -495,8 +523,13 @@ export class UserSession {
     const orgConfig = body._org_config ?? {};
     const catalog = await this.discoverMCPTools(mcpServers, logger);
 
-    const resolvedPromptValues = await this.resolvePrompts(body, logger);
+    const {
+      resolved: resolvedPromptValues,
+      orgModes,
+      activeModeName,
+    } = await this.resolvePrompts(body, logger);
     const { memoryStore, formattedTOC } = await this.loadMemoryContext(logger);
+    const modeContext = this.buildModeContext(orgModes, activeModeName);
 
     const startTime = Date.now();
     const responses = await orchestrate(body.message, {
@@ -511,6 +544,7 @@ export class UserSession {
       resolvedPromptValues,
       memoryStore,
       memoryTOC: formattedTOC || undefined,
+      modeContext,
       clientId: body.client_id,
       logger,
       callbacks,
@@ -591,6 +625,51 @@ export class UserSession {
       return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
     }
   }
+
+  // ─── Mode selection handlers ──────────────────────────────────────────────────
+
+  private async handleGetMode(): Promise<Response> {
+    const mode = await this.getSelectedMode();
+    return Response.json({ mode: mode ?? null });
+  }
+
+  private async handleSetMode(request: Request): Promise<Response> {
+    const body = (await request.json()) as Record<string, unknown>;
+    const nameError = validateModeName(body.mode);
+    if (nameError) {
+      return Response.json({ error: nameError }, { status: 400 });
+    }
+    await this.state.storage.put(SELECTED_MODE_KEY, body.mode as string);
+    return Response.json({ mode: body.mode, message: 'User mode updated' });
+  }
+
+  private async handleDeleteMode(): Promise<Response> {
+    await this.state.storage.delete(SELECTED_MODE_KEY);
+    return Response.json({ mode: null, message: 'User mode cleared' });
+  }
+
+  private buildModeContext(
+    orgModes: { modes: PromptMode[] },
+    activeModeName: string | undefined
+  ): ModeContext {
+    return {
+      availableModes: orgModes.modes,
+      activeModeName,
+      setSelectedMode: async (name: string | null) => {
+        if (name === null) {
+          await this.state.storage.delete(SELECTED_MODE_KEY);
+        } else {
+          await this.state.storage.put(SELECTED_MODE_KEY, name);
+        }
+      },
+    };
+  }
+
+  private async getSelectedMode(): Promise<string | undefined> {
+    return this.state.storage.get<string>(SELECTED_MODE_KEY);
+  }
+
+  // ─── Prompt overrides storage ────────────────────────────────────────────────
 
   private async getPromptOverrides(): Promise<PromptOverrides> {
     return (await this.state.storage.get<PromptOverrides>(PROMPT_OVERRIDES_KEY)) ?? {};

@@ -76,7 +76,7 @@ function extractOptionalFields(body: Record<string, unknown>) {
   };
 }
 
-/** Extract and validate injected config fields (_mcp_servers, _org_config, _org_prompt_overrides). */
+/** Extract and validate injected config fields (_mcp_servers, _org_config, _org_prompt_overrides, _org_modes). */
 function extractInjectedConfig(body: Record<string, unknown>) {
   const isPlainObject = (v: unknown): v is Record<string, unknown> =>
     typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -90,6 +90,9 @@ function extractInjectedConfig(body: Record<string, unknown>) {
       : undefined,
     _org_prompt_overrides: isPlainObject(body._org_prompt_overrides)
       ? (body._org_prompt_overrides as QueueEntry['_org_prompt_overrides'])
+      : undefined,
+    _org_modes: isPlainObject(body._org_modes)
+      ? (body._org_modes as unknown as QueueEntry['_org_modes'])
       : undefined,
   };
 }
@@ -132,6 +135,7 @@ function buildSessionBody(entry: QueueEntry, includeCallback: boolean): string {
     _mcp_servers: entry._mcp_servers,
     _org_config: entry._org_config,
     _org_prompt_overrides: entry._org_prompt_overrides,
+    _org_modes: entry._org_modes,
   });
 }
 
