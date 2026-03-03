@@ -34,8 +34,6 @@ import {
   createWebhookCallbacks,
   DEFAULT_PROGRESS_MODE,
   DEFAULT_THROTTLE_SECONDS,
-  IncrementalProgressConfig,
-  ProgressCallbackConfig,
   ProgressCallbackSender,
 } from '../services/progress/index.js';
 import {
@@ -127,6 +125,7 @@ export class UserSession {
             event: 'CONCURRENT_REQUEST_REJECTED',
             user_id: userId,
             timestamp: Date.now(),
+            note: 'UserQueue should prevent this — kept as defense-in-depth',
           })
         );
         return new Response(
@@ -190,6 +189,26 @@ export class UserSession {
     await this.state.storage.delete(PROCESSING_LOCK_KEY);
   }
 
+  /** Build webhook callbacks from request body fields, if present. */
+  private buildWebhookCallbacks(body: ChatRequest): StreamCallbacks | undefined {
+    if (!body.progress_callback_url || !body.message_key) return undefined;
+
+    const sender = new ProgressCallbackSender({
+      url: body.progress_callback_url,
+      user_id: body.user_id,
+      message_key: body.message_key,
+      token: this.env.ENGINE_API_KEY,
+    });
+    const throttleSeconds =
+      typeof body.progress_throttle_seconds === 'number' && body.progress_throttle_seconds > 0
+        ? body.progress_throttle_seconds
+        : DEFAULT_THROTTLE_SECONDS;
+    return createWebhookCallbacks(sender, {
+      mode: body.progress_mode ?? DEFAULT_PROGRESS_MODE,
+      throttleSeconds,
+    });
+  }
+
   private async handleChat(request: Request): Promise<Response> {
     const requestId = crypto.randomUUID();
     const startTime = Date.now();
@@ -198,30 +217,13 @@ export class UserSession {
 
     logger.log('do_chat_start', { client_id: body.client_id, message_type: body.message_type });
 
+    const callbacks = this.buildWebhookCallbacks(body);
     try {
-      // Create webhook callbacks if progress_callback_url is provided
-      let callbacks: StreamCallbacks | undefined;
-      if (body.progress_callback_url && body.message_key) {
-        const senderConfig: ProgressCallbackConfig = {
-          url: body.progress_callback_url,
-          user_id: body.user_id,
-          message_key: body.message_key,
-          token: this.env.ENGINE_API_KEY,
-        };
-        const sender = new ProgressCallbackSender(senderConfig);
-        // Validate and sanitize throttle seconds: must be positive number, min 1 second
-        const throttleSeconds =
-          typeof body.progress_throttle_seconds === 'number' && body.progress_throttle_seconds > 0
-            ? body.progress_throttle_seconds
-            : DEFAULT_THROTTLE_SECONDS;
-        const progressConfig: IncrementalProgressConfig = {
-          mode: body.progress_mode ?? DEFAULT_PROGRESS_MODE,
-          throttleSeconds,
-        };
-        callbacks = createWebhookCallbacks(sender, progressConfig);
-      }
-
       const response = await this.processChat(body, logger, callbacks);
+
+      // Send complete callback for webhook-based clients (e.g., WhatsApp gateway)
+      await callbacks?.onComplete?.(response);
+
       const totalDuration = Date.now() - startTime;
       logger.log('do_chat_complete', {
         response_count: response.responses.length,
@@ -233,6 +235,9 @@ export class UserSession {
       });
       return Response.json(response);
     } catch (error) {
+      // Send error callback for webhook-based clients
+      await callbacks?.onError?.(error instanceof Error ? error.message : 'Unknown error');
+
       const totalDuration = Date.now() - startTime;
       logger.error('do_chat_error', error, { total_duration_ms: totalDuration });
       if (error instanceof ValidationError) {
@@ -506,6 +511,7 @@ export class UserSession {
       resolvedPromptValues,
       memoryStore,
       memoryTOC: formattedTOC || undefined,
+      clientId: body.client_id,
       logger,
       callbacks,
     });

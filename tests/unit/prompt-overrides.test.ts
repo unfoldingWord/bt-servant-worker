@@ -81,7 +81,7 @@ describe('resolvePromptOverrides - defaults', () => {
     expect(result).toEqual(DEFAULT_PROMPT_VALUES);
   });
 
-  it('returns all 6 slots in the result', () => {
+  it('returns all 7 slots in the result', () => {
     const result = resolvePromptOverrides({}, {});
     expect(Object.keys(result).sort()).toEqual([...PROMPT_OVERRIDE_SLOTS].sort());
   });
@@ -102,6 +102,7 @@ describe('resolvePromptOverrides - org overrides', () => {
       methodology: 'O methodology',
       tool_guidance: 'O tool_guidance',
       instructions: 'O instructions',
+      client_instructions: 'O client_instructions',
       memory_instructions: 'O memory_instructions',
       closing: 'O closing',
     };
@@ -183,5 +184,33 @@ describe('mergePromptOverrides', () => {
   it('strips control characters from values', () => {
     const result = mergePromptOverrides({}, { identity: 'Hello\x00World\x01!' });
     expect(result.identity).toBe('HelloWorld!');
+  });
+});
+
+describe('resolvePromptOverrides - client_instructions slot', () => {
+  it('returns default client_instructions when no overrides', () => {
+    const result = resolvePromptOverrides({}, {});
+    expect(result.client_instructions).toBe(DEFAULT_PROMPT_VALUES.client_instructions);
+  });
+
+  it('org can override client_instructions', () => {
+    const result = resolvePromptOverrides({ client_instructions: 'Org client rules' }, {});
+    expect(result.client_instructions).toBe('Org client rules');
+  });
+
+  it('user can override client_instructions over org', () => {
+    const result = resolvePromptOverrides(
+      { client_instructions: 'Org client rules' },
+      { client_instructions: 'User client rules' }
+    );
+    expect(result.client_instructions).toBe('User client rules');
+  });
+
+  it('null user value does not override org client_instructions', () => {
+    const result = resolvePromptOverrides(
+      { client_instructions: 'Org client rules' },
+      { client_instructions: null }
+    );
+    expect(result.client_instructions).toBe('Org client rules');
   });
 });

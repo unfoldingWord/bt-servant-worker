@@ -24,6 +24,12 @@ export interface Env {
   DEFAULT_DOWNSTREAM_PER_MCP_CALL?: string;
   MAX_MCP_RESPONSE_SIZE_BYTES?: string;
 
+  // Queue configuration (optional - has defaults)
+  MAX_QUEUE_DEPTH?: string;
+  QUEUE_STORED_RESPONSE_TTL_MS?: string;
+  QUEUE_SSE_CONNECT_TIMEOUT_MS?: string;
+  QUEUE_MAX_RETRIES?: string;
+
   // Secrets (set via wrangler secret put)
   ANTHROPIC_API_KEY: string;
   ENGINE_API_KEY: string;
@@ -36,6 +42,7 @@ export interface Env {
 
   // Durable Object bindings
   USER_SESSION: DurableObjectNamespace;
+  USER_QUEUE: DurableObjectNamespace;
 }
 
 /**

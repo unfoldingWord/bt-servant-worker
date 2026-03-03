@@ -7,7 +7,7 @@
 
 import { Hono } from 'hono';
 import { Env } from './config/types.js';
-import { UserSession } from './durable-objects/index.js';
+import { UserQueue, UserSession } from './durable-objects/index.js';
 import { discoverAllTools } from './services/mcp/index.js';
 import { MCPServerConfig } from './services/mcp/types.js';
 import { ChatRequest } from './types/engine.js';
@@ -19,6 +19,7 @@ import {
   resolvePromptOverrides,
   validatePromptOverrides,
 } from './types/prompt-overrides.js';
+import { DO_BASE_URL } from './config/constants.js';
 import { constantTimeCompare } from './utils/crypto.js';
 import { createRequestLogger } from './utils/logger.js';
 import {
@@ -26,8 +27,9 @@ import {
   validateServerConfig,
   validateServerId,
 } from './utils/mcp-validation.js';
+import { resolveOrgFromBody, resolveOrgFromParams } from './utils/org.js';
 
-export { UserSession };
+export { UserQueue, UserSession };
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -57,6 +59,23 @@ app.post('/api/v1/chat', async (c) => {
 
 app.post('/api/v1/chat/stream', async (c) => {
   return handleChatRequest(c.req.raw, c.env, '/stream');
+});
+
+// Queue endpoints (UserQueue DO)
+app.post('/api/v1/message', async (c) => {
+  return handleMessageEnqueue(c.req.raw, c.env);
+});
+
+app.get('/api/v1/stream', async (c) => {
+  return handleQueueStream(c.req.raw, c.env);
+});
+
+app.get('/api/v1/poll', async (c) => {
+  return handleQueuePoll(c.req.raw, c.env);
+});
+
+app.get('/api/v1/queue/:userId', async (c) => {
+  return handleQueueStatus(c.req.raw, c.env, c.req.param('userId'));
 });
 
 // User endpoints with org scope (new paths)
@@ -195,16 +214,19 @@ app.post('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
     // Check for duplicate ID and update if exists
     // NOTE: This read-modify-write pattern can race with concurrent requests (last write wins).
     // This is acceptable for admin endpoints which are low-volume and authenticated.
-    const existingIndex = existing.findIndex((s) => s.id === server.id);
-    if (existingIndex >= 0) {
-      // eslint-disable-next-line security/detect-object-injection -- existingIndex is from findIndex
-      existing[existingIndex] = server;
+    const existingIdx = existing.findIndex((s) => s.id === server.id);
+    if (existingIdx >= 0) {
+      existing.splice(existingIdx, 1, server);
     } else {
       existing.push(server);
     }
 
     await c.env.MCP_SERVERS.put(org, JSON.stringify(existing));
-    logAdminAction('add_mcp_server', org, { server_id: server.id, server_url: server.url });
+    logAdminAction('add_mcp_server', org, {
+      server_id: server.id,
+      server_url: server.url,
+      server_count: existing.length,
+    });
     return c.json({ org, servers: existing, message: 'MCP server added' });
   } catch (error) {
     logAdminAction('add_mcp_server_error', org, { error: String(error) });
@@ -226,7 +248,10 @@ app.delete('/api/v1/admin/orgs/:org/mcp-servers/:serverId', async (c) => {
     const filtered = existing.filter((s) => s.id !== serverId);
 
     await c.env.MCP_SERVERS.put(org, JSON.stringify(filtered));
-    logAdminAction('remove_mcp_server', org, { server_id: serverId });
+    logAdminAction('remove_mcp_server', org, {
+      server_id: serverId,
+      server_count: filtered.length,
+    });
     return c.json({ org, servers: filtered, message: 'MCP server removed' });
   } catch (error) {
     logAdminAction('remove_mcp_server_error', org, { error: String(error) });
@@ -302,7 +327,7 @@ app.delete('/api/v1/admin/orgs/:org/config', async (c) => {
 
   try {
     await c.env.ORG_CONFIG.delete(org);
-    logAdminAction('reset_org_config', org, {});
+    logAdminAction('reset_org_config', org, { config: DEFAULT_ORG_CONFIG });
     return c.json({ org, config: DEFAULT_ORG_CONFIG, message: 'Org config reset to defaults' });
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
@@ -360,7 +385,7 @@ app.delete('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
 
   try {
     await c.env.PROMPT_OVERRIDES.delete(org);
-    logAdminAction('reset_prompt_overrides', org, {});
+    logAdminAction('reset_prompt_overrides', org, { slots_cleared: true });
     return c.json({
       org,
       overrides: {},
@@ -421,50 +446,21 @@ function logAdminAction(action: string, org: string, details: Record<string, unk
 }
 
 /**
- * Read MCP servers from KV, returning empty array on error.
+ * Read a value from KV by org key, returning a fallback on error.
+ * All KV reads are non-critical — chat can proceed with defaults if KV is unavailable.
  */
-async function getMCPServersFromKV(
-  env: Env,
+async function readOrgKV<T>(
+  kv: KVNamespace,
   org: string,
+  fallback: T,
+  errorEvent: string,
   logger: ReturnType<typeof createRequestLogger>
-): Promise<MCPServerConfig[]> {
+): Promise<T> {
   try {
-    return (await env.MCP_SERVERS.get<MCPServerConfig[]>(org, 'json')) ?? [];
+    return (await kv.get<T>(org, 'json')) ?? fallback;
   } catch (error) {
-    logger.error('mcp_kv_read_error', error);
-    return []; // Continue with empty servers - chat can still work without MCP tools
-  }
-}
-
-/**
- * Read prompt overrides from KV, returning empty object on error (will use defaults).
- */
-async function getPromptOverridesFromKV(
-  env: Env,
-  org: string,
-  logger: ReturnType<typeof createRequestLogger>
-): Promise<PromptOverrides> {
-  try {
-    return (await env.PROMPT_OVERRIDES.get<PromptOverrides>(org, 'json')) ?? {};
-  } catch (error) {
-    logger.error('prompt_overrides_kv_read_error', error);
-    return {}; // Continue with defaults — chat can still work
-  }
-}
-
-/**
- * Read org config from KV, returning empty object on error (will use defaults).
- */
-async function getOrgConfigFromKV(
-  env: Env,
-  org: string,
-  logger: ReturnType<typeof createRequestLogger>
-): Promise<OrgConfig> {
-  try {
-    return (await env.ORG_CONFIG.get<OrgConfig>(org, 'json')) ?? {};
-  } catch (error) {
-    logger.error('org_config_kv_read_error', error);
-    return {}; // Continue with defaults - chat can still work
+    logger.error(errorEvent, error);
+    return fallback;
   }
 }
 
@@ -484,9 +480,15 @@ async function buildDOChatRequest(
   const { body, org, doPath, logger } = opts;
 
   const [mcpServers, orgConfig, promptOverrides] = await Promise.all([
-    getMCPServersFromKV(env, org, logger),
-    getOrgConfigFromKV(env, org, logger),
-    getPromptOverridesFromKV(env, org, logger),
+    readOrgKV<MCPServerConfig[]>(env.MCP_SERVERS, org, [], 'mcp_kv_read_error', logger),
+    readOrgKV<OrgConfig>(env.ORG_CONFIG, org, {}, 'org_config_kv_read_error', logger),
+    readOrgKV<PromptOverrides>(
+      env.PROMPT_OVERRIDES,
+      org,
+      {},
+      'prompt_overrides_kv_read_error',
+      logger
+    ),
   ]);
 
   const doId = env.USER_SESSION.idFromName(`user:${org}:${body.user_id}`);
@@ -534,7 +536,7 @@ async function handleChatRequest(request: Request, env: Env, doPath: string): Pr
       return Response.json({ error: 'client_id is required' }, { status: 400 });
     }
 
-    const org = body.org ?? env.DEFAULT_ORG;
+    const org = resolveOrgFromBody(body, env.DEFAULT_ORG);
     logger.log('request_received', {
       user_id: body.user_id,
       client_id: body.client_id,
@@ -605,4 +607,141 @@ async function handleUserRequest(
   });
 
   return stub.fetch(doRequest);
+}
+
+/**
+ * Handle message enqueue (POST /api/v1/message)
+ *
+ * Validates user_id, fetches org config from KV, and routes to UserQueue DO.
+ */
+async function handleMessageEnqueue(request: Request, env: Env): Promise<Response> {
+  const requestId = crypto.randomUUID();
+  const logger = createRequestLogger(requestId);
+
+  try {
+    const body = (await request.clone().json()) as ChatRequest;
+
+    if (!body.user_id) {
+      return Response.json({ error: 'user_id is required' }, { status: 400 });
+    }
+
+    const org = resolveOrgFromBody(body, env.DEFAULT_ORG);
+    logger.log('message_enqueue_received', {
+      user_id: body.user_id,
+      org,
+    });
+
+    const [mcpServers, orgConfig, promptOverrides] = await Promise.all([
+      readOrgKV<MCPServerConfig[]>(env.MCP_SERVERS, org, [], 'mcp_kv_read_error', logger),
+      readOrgKV<OrgConfig>(env.ORG_CONFIG, org, {}, 'org_config_kv_read_error', logger),
+      readOrgKV<PromptOverrides>(
+        env.PROMPT_OVERRIDES,
+        org,
+        {},
+        'prompt_overrides_kv_read_error',
+        logger
+      ),
+    ]);
+
+    // Determine delivery mode based on progress_callback_url
+    const delivery = body.progress_callback_url ? 'callback' : 'sse';
+
+    const doId = env.USER_QUEUE.idFromName(`queue:${org}:${body.user_id}`);
+    const stub = env.USER_QUEUE.get(doId);
+
+    const doRequest = new Request(`${DO_BASE_URL}/enqueue`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...body,
+        org,
+        delivery,
+        _mcp_servers: mcpServers,
+        _org_config: orgConfig,
+        _org_prompt_overrides: promptOverrides,
+      }),
+    });
+
+    return stub.fetch(doRequest);
+  } catch (error) {
+    logger.error('message_enqueue_error', error);
+    if (error instanceof SyntaxError) {
+      return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
+    }
+    return Response.json({ error: 'Internal server error' }, { status: 500 });
+  }
+}
+
+/**
+ * Handle queue stream (GET /api/v1/stream)
+ *
+ * Extracts user_id, message_id, org from query params and routes to UserQueue DO.
+ */
+async function handleQueueStream(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const userId = url.searchParams.get('user_id');
+  const messageId = url.searchParams.get('message_id');
+  const org = resolveOrgFromParams(url.searchParams, env.DEFAULT_ORG);
+
+  if (!userId) {
+    return Response.json({ error: 'user_id query parameter is required' }, { status: 400 });
+  }
+  if (!messageId) {
+    return Response.json({ error: 'message_id query parameter is required' }, { status: 400 });
+  }
+
+  const doId = env.USER_QUEUE.idFromName(`queue:${org}:${userId}`);
+  const stub = env.USER_QUEUE.get(doId);
+
+  const doUrl = new URL(`${DO_BASE_URL}/stream`);
+  doUrl.searchParams.set('message_id', messageId);
+
+  return stub.fetch(new Request(doUrl.toString()));
+}
+
+/**
+ * Handle poll for incremental events (GET /api/v1/poll)
+ * Returns JSON with events since cursor, suitable for worker-to-worker fetch.
+ */
+async function handleQueuePoll(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const userId = url.searchParams.get('user_id');
+  const messageId = url.searchParams.get('message_id');
+  const org = resolveOrgFromParams(url.searchParams, env.DEFAULT_ORG);
+  const cursor = url.searchParams.get('cursor') ?? '0';
+
+  if (!userId) {
+    return Response.json({ error: 'user_id query parameter is required' }, { status: 400 });
+  }
+  if (!messageId) {
+    return Response.json({ error: 'message_id query parameter is required' }, { status: 400 });
+  }
+
+  const doId = env.USER_QUEUE.idFromName(`queue:${org}:${userId}`);
+  const stub = env.USER_QUEUE.get(doId);
+
+  const doUrl = new URL(`${DO_BASE_URL}/poll`);
+  doUrl.searchParams.set('message_id', messageId);
+  doUrl.searchParams.set('cursor', cursor);
+
+  return stub.fetch(new Request(doUrl.toString()));
+}
+
+/**
+ * Handle queue status (GET /api/v1/queue/:userId)
+ *
+ * Debugging endpoint — returns queue length, processing flag, stored response count.
+ */
+async function handleQueueStatus(request: Request, env: Env, userId: string): Promise<Response> {
+  const url = new URL(request.url);
+  const org = resolveOrgFromParams(url.searchParams, env.DEFAULT_ORG);
+
+  if (!userId) {
+    return Response.json({ error: 'userId is required in path' }, { status: 400 });
+  }
+
+  const doId = env.USER_QUEUE.idFromName(`queue:${org}:${userId}`);
+  const stub = env.USER_QUEUE.get(doId);
+
+  return stub.fetch(new Request(`${DO_BASE_URL}/status`));
 }
