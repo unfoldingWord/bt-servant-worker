@@ -14,9 +14,13 @@ import { ChatRequest } from './types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig, validateOrgConfig } from './types/org-config.js';
 import {
   DEFAULT_PROMPT_VALUES,
+  MAX_MODES_PER_ORG,
   mergePromptOverrides,
+  OrgModes,
   PromptOverrides,
   resolvePromptOverrides,
+  validateModeName,
+  validatePromptMode,
   validatePromptOverrides,
 } from './types/prompt-overrides.js';
 import { DO_BASE_URL } from './config/constants.js';
@@ -342,7 +346,7 @@ app.get('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
 
   try {
     const overrides = (await c.env.PROMPT_OVERRIDES.get<PromptOverrides>(org, 'json')) ?? {};
-    const resolved = resolvePromptOverrides(overrides, {});
+    const resolved = resolvePromptOverrides(overrides, {}, {});
 
     logAdminAction('get_prompt_overrides', org, { slots_set: Object.keys(overrides).length });
     return c.json({ org, overrides, resolved });
@@ -369,7 +373,7 @@ app.put('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
     const merged = mergePromptOverrides(existing, updates as PromptOverrides);
 
     await c.env.PROMPT_OVERRIDES.put(org, JSON.stringify(merged));
-    const resolved = resolvePromptOverrides(merged, {});
+    const resolved = resolvePromptOverrides(merged, {}, {});
 
     logAdminAction('update_prompt_overrides', org, { slots_set: Object.keys(merged).length });
     return c.json({ org, overrides: merged, resolved, message: 'Prompt overrides updated' });
@@ -397,6 +401,213 @@ app.delete('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
     logAdminAction('reset_prompt_overrides_error', org, { error: errorMsg });
     return c.json({ error: 'Failed to delete prompt overrides from storage' }, 500);
   }
+});
+
+// Admin endpoints for org-level mode management
+app.get('/api/v1/admin/orgs/:org/modes', async (c) => {
+  const org = c.req.param('org');
+
+  try {
+    const orgModes = (await c.env.PROMPT_OVERRIDES.get<OrgModes>(`${org}:modes`, 'json')) ?? {
+      modes: [],
+    };
+
+    logAdminAction('list_modes', org, {
+      mode_count: orgModes.modes.length,
+      default_mode: orgModes.default_mode ?? null,
+    });
+    return c.json({ org, ...orgModes });
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    logAdminAction('list_modes_error', org, { error: errorMsg });
+    return c.json({ error: 'Failed to read modes from storage' }, 500);
+  }
+});
+
+app.get('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
+  const org = c.req.param('org');
+  const modeName = c.req.param('modeName');
+
+  const nameError = validateModeName(modeName);
+  if (nameError) {
+    return c.json({ error: nameError }, 400);
+  }
+
+  try {
+    const orgModes = (await c.env.PROMPT_OVERRIDES.get<OrgModes>(`${org}:modes`, 'json')) ?? {
+      modes: [],
+    };
+    const mode = orgModes.modes.find((m) => m.name === modeName);
+    if (!mode) {
+      return c.json({ error: `Mode '${modeName}' not found` }, 404);
+    }
+
+    logAdminAction('get_mode', org, { mode_name: modeName });
+    return c.json({ org, mode });
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    logAdminAction('get_mode_error', org, { error: errorMsg });
+    return c.json({ error: 'Failed to read mode from storage' }, 500);
+  }
+});
+
+app.put('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
+  const org = c.req.param('org');
+  const modeName = c.req.param('modeName');
+
+  const nameError = validateModeName(modeName);
+  if (nameError) {
+    return c.json({ error: nameError }, 400);
+  }
+
+  const body = await c.req.json();
+  const modeInput = { ...body, name: modeName };
+  const modeError = validatePromptMode(modeInput);
+  if (modeError) {
+    return c.json({ error: modeError }, 400);
+  }
+
+  try {
+    // NOTE: This read-modify-write pattern can race with concurrent requests (last write wins).
+    // This is acceptable for admin endpoints which are low-volume and authenticated.
+    const orgModes = (await c.env.PROMPT_OVERRIDES.get<OrgModes>(`${org}:modes`, 'json')) ?? {
+      modes: [],
+    };
+
+    const existingIdx = orgModes.modes.findIndex((m) => m.name === modeName);
+    if (existingIdx >= 0) {
+      orgModes.modes.splice(existingIdx, 1, modeInput);
+    } else {
+      if (orgModes.modes.length >= MAX_MODES_PER_ORG) {
+        return c.json({ error: `Cannot have more than ${MAX_MODES_PER_ORG} modes per org` }, 400);
+      }
+      orgModes.modes.push(modeInput);
+    }
+
+    await c.env.PROMPT_OVERRIDES.put(`${org}:modes`, JSON.stringify(orgModes));
+    logAdminAction('upsert_mode', org, {
+      mode_name: modeName,
+      mode_count: orgModes.modes.length,
+    });
+    return c.json({ org, mode: modeInput, message: 'Mode saved' });
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    logAdminAction('upsert_mode_error', org, { error: errorMsg });
+    return c.json({ error: 'Failed to save mode to storage' }, 500);
+  }
+});
+
+app.delete('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
+  const org = c.req.param('org');
+  const modeName = c.req.param('modeName');
+
+  const nameError = validateModeName(modeName);
+  if (nameError) {
+    return c.json({ error: nameError }, 400);
+  }
+
+  try {
+    const orgModes = (await c.env.PROMPT_OVERRIDES.get<OrgModes>(`${org}:modes`, 'json')) ?? {
+      modes: [],
+    };
+
+    const filtered = orgModes.modes.filter((m) => m.name !== modeName);
+    if (filtered.length === orgModes.modes.length) {
+      return c.json({ error: `Mode '${modeName}' not found` }, 404);
+    }
+
+    orgModes.modes = filtered;
+
+    // Clear default_mode if it pointed to the deleted mode
+    if (orgModes.default_mode === modeName) {
+      delete orgModes.default_mode;
+    }
+
+    await c.env.PROMPT_OVERRIDES.put(`${org}:modes`, JSON.stringify(orgModes));
+    logAdminAction('delete_mode', org, {
+      mode_name: modeName,
+      mode_count: orgModes.modes.length,
+    });
+    return c.json({ org, modes: orgModes.modes, message: 'Mode deleted' });
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    logAdminAction('delete_mode_error', org, { error: errorMsg });
+    return c.json({ error: 'Failed to delete mode from storage' }, 500);
+  }
+});
+
+app.put('/api/v1/admin/orgs/:org/modes-default', async (c) => {
+  const org = c.req.param('org');
+  const body = (await c.req.json()) as { mode: string };
+
+  if (!body.mode || typeof body.mode !== 'string') {
+    return c.json({ error: 'mode is required and must be a string' }, 400);
+  }
+
+  const nameError = validateModeName(body.mode);
+  if (nameError) {
+    return c.json({ error: nameError }, 400);
+  }
+
+  try {
+    const orgModes = (await c.env.PROMPT_OVERRIDES.get<OrgModes>(`${org}:modes`, 'json')) ?? {
+      modes: [],
+    };
+
+    const found = orgModes.modes.find((m) => m.name === body.mode);
+    if (!found) {
+      return c.json({ error: `Mode '${body.mode}' not found` }, 404);
+    }
+
+    orgModes.default_mode = body.mode;
+
+    await c.env.PROMPT_OVERRIDES.put(`${org}:modes`, JSON.stringify(orgModes));
+    logAdminAction('set_default_mode', org, { default_mode: body.mode });
+    return c.json({ org, default_mode: body.mode, message: 'Default mode set' });
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    logAdminAction('set_default_mode_error', org, { error: errorMsg });
+    return c.json({ error: 'Failed to set default mode' }, 500);
+  }
+});
+
+app.delete('/api/v1/admin/orgs/:org/modes-default', async (c) => {
+  const org = c.req.param('org');
+
+  try {
+    const orgModes = (await c.env.PROMPT_OVERRIDES.get<OrgModes>(`${org}:modes`, 'json')) ?? {
+      modes: [],
+    };
+
+    delete orgModes.default_mode;
+
+    await c.env.PROMPT_OVERRIDES.put(`${org}:modes`, JSON.stringify(orgModes));
+    logAdminAction('clear_default_mode', org, {});
+    return c.json({ org, default_mode: null, message: 'Default mode cleared' });
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    logAdminAction('clear_default_mode_error', org, { error: errorMsg });
+    return c.json({ error: 'Failed to clear default mode' }, 500);
+  }
+});
+
+// Admin endpoints for user mode selection (routed to DO)
+app.get('/api/v1/admin/orgs/:org/users/:userId/mode', async (c) => {
+  const org = c.req.param('org');
+  const userId = c.req.param('userId');
+  return handleUserRequest(c.req.raw, c.env, org, userId, '/mode');
+});
+
+app.put('/api/v1/admin/orgs/:org/users/:userId/mode', async (c) => {
+  const org = c.req.param('org');
+  const userId = c.req.param('userId');
+  return handleUserRequest(c.req.raw, c.env, org, userId, '/mode');
+});
+
+app.delete('/api/v1/admin/orgs/:org/users/:userId/mode', async (c) => {
+  const org = c.req.param('org');
+  const userId = c.req.param('userId');
+  return handleUserRequest(c.req.raw, c.env, org, userId, '/mode');
 });
 
 // Admin endpoints for user-level prompt overrides (routed to DO)
@@ -464,6 +675,28 @@ async function readOrgKV<T>(
   }
 }
 
+/** Read all org-level KV data needed for chat requests. */
+async function readAllOrgKV(env: Env, org: string, logger: ReturnType<typeof createRequestLogger>) {
+  return Promise.all([
+    readOrgKV<MCPServerConfig[]>(env.MCP_SERVERS, org, [], 'mcp_kv_read_error', logger),
+    readOrgKV<OrgConfig>(env.ORG_CONFIG, org, {}, 'org_config_kv_read_error', logger),
+    readOrgKV<PromptOverrides>(
+      env.PROMPT_OVERRIDES,
+      org,
+      {},
+      'prompt_overrides_kv_read_error',
+      logger
+    ),
+    readOrgKV<OrgModes>(
+      env.PROMPT_OVERRIDES,
+      `${org}:modes`,
+      { modes: [] },
+      'org_modes_kv_read_error',
+      logger
+    ),
+  ]);
+}
+
 /**
  * Build a DO request with org-level KV data injected into the body.
  */
@@ -479,17 +712,7 @@ async function buildDOChatRequest(
 ): Promise<{ stub: DurableObjectStub; doRequest: Request }> {
   const { body, org, doPath, logger } = opts;
 
-  const [mcpServers, orgConfig, promptOverrides] = await Promise.all([
-    readOrgKV<MCPServerConfig[]>(env.MCP_SERVERS, org, [], 'mcp_kv_read_error', logger),
-    readOrgKV<OrgConfig>(env.ORG_CONFIG, org, {}, 'org_config_kv_read_error', logger),
-    readOrgKV<PromptOverrides>(
-      env.PROMPT_OVERRIDES,
-      org,
-      {},
-      'prompt_overrides_kv_read_error',
-      logger
-    ),
-  ]);
+  const [mcpServers, orgConfig, promptOverrides, orgModes] = await readAllOrgKV(env, org, logger);
 
   const doId = env.USER_SESSION.idFromName(`user:${org}:${body.user_id}`);
   const stub = env.USER_SESSION.get(doId);
@@ -511,6 +734,7 @@ async function buildDOChatRequest(
       _mcp_servers: mcpServers,
       _org_config: orgConfig,
       _org_prompt_overrides: promptOverrides,
+      _org_modes: orgModes,
     }),
   });
 
@@ -631,17 +855,7 @@ async function handleMessageEnqueue(request: Request, env: Env): Promise<Respons
       org,
     });
 
-    const [mcpServers, orgConfig, promptOverrides] = await Promise.all([
-      readOrgKV<MCPServerConfig[]>(env.MCP_SERVERS, org, [], 'mcp_kv_read_error', logger),
-      readOrgKV<OrgConfig>(env.ORG_CONFIG, org, {}, 'org_config_kv_read_error', logger),
-      readOrgKV<PromptOverrides>(
-        env.PROMPT_OVERRIDES,
-        org,
-        {},
-        'prompt_overrides_kv_read_error',
-        logger
-      ),
-    ]);
+    const [mcpServers, orgConfig, promptOverrides, orgModes] = await readAllOrgKV(env, org, logger);
 
     // Determine delivery mode based on progress_callback_url
     const delivery = body.progress_callback_url ? 'callback' : 'sse';
@@ -659,6 +873,7 @@ async function handleMessageEnqueue(request: Request, env: Env): Promise<Respons
         _mcp_servers: mcpServers,
         _org_config: orgConfig,
         _org_prompt_overrides: promptOverrides,
+        _org_modes: orgModes,
       }),
     });
 

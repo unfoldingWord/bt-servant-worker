@@ -12,7 +12,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { Env } from '../../config/types.js';
 import { ChatHistoryEntry, StreamCallbacks } from '../../types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig } from '../../types/org-config.js';
-import { DEFAULT_PROMPT_VALUES, PromptSlot } from '../../types/prompt-overrides.js';
+import { DEFAULT_PROMPT_VALUES, ModeContext, PromptSlot } from '../../types/prompt-overrides.js';
 import {
   ClaudeAPIError,
   MCPBudgetExceededError,
@@ -44,6 +44,7 @@ import {
   buildAllTools,
   getToolDefinitions,
   isReadMemoryInput,
+  isSwitchModeInput,
   isUpdateMemoryInput,
 } from './tools.js';
 
@@ -80,6 +81,7 @@ interface OrchestratorOptions {
   resolvedPromptValues?: Required<Record<PromptSlot, string>>;
   memoryStore?: UserMemoryStore | undefined;
   memoryTOC?: string | undefined;
+  modeContext?: ModeContext | undefined;
   clientId?: string | undefined;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
@@ -147,6 +149,7 @@ interface OrchestrationContext {
   mcpBudget: MCPCallBudget;
   healthTracker: HealthTracker;
   memoryStore: UserMemoryStore | undefined;
+  modeContext: ModeContext | undefined;
 }
 
 function extractToolCalls(content: Anthropic.ContentBlock[]): ToolUseBlock[] {
@@ -359,7 +362,9 @@ function createOrchestrationContext(
       memoryTOC: options.memoryTOC,
       clientId: options.clientId,
     }),
-    tools: buildAllTools(catalog),
+    tools: buildAllTools(catalog, {
+      hasModes: (options.modeContext?.availableModes.length ?? 0) > 0,
+    }),
     messages: [...historyToMessages(history, llmMax), { role: 'user', content: userMessage }],
     responses: [],
     codeExecTimeout: config.codeExecTimeout,
@@ -371,6 +376,7 @@ function createOrchestrationContext(
     mcpBudget: createBudget(config.maxDownstreamCalls, config.defaultDownstreamPerCall),
     healthTracker: createHealthTracker(),
     memoryStore: options.memoryStore,
+    modeContext: options.modeContext,
   };
 }
 
@@ -500,6 +506,12 @@ async function dispatchToolCall(
   if (toolCall.name === 'update_memory') {
     return handleUpdateMemory(toolCall.input, ctx);
   }
+  if (toolCall.name === 'list_modes') {
+    return handleListModes(ctx);
+  }
+  if (toolCall.name === 'switch_mode') {
+    return handleSwitchMode(toolCall.input, ctx);
+  }
   return handleMCPToolCall(toolCall.name, toolCall.input, ctx);
 }
 
@@ -551,6 +563,59 @@ async function handleUpdateMemory(input: unknown, ctx: OrchestrationContext): Pr
   });
 
   return result;
+}
+
+function handleListModes(ctx: OrchestrationContext): unknown {
+  if (!ctx.modeContext) {
+    return { modes: [], active_mode: null };
+  }
+  return {
+    modes: ctx.modeContext.availableModes.map((m) => ({
+      name: m.name,
+      label: m.label ?? m.name,
+      description: m.description ?? null,
+    })),
+    active_mode: ctx.modeContext.activeModeName ?? null,
+  };
+}
+
+async function handleSwitchMode(input: unknown, ctx: OrchestrationContext): Promise<unknown> {
+  if (!ctx.modeContext) {
+    return { error: 'Modes are not configured for this organization.' };
+  }
+  if (!isSwitchModeInput(input)) {
+    throw new ValidationError(
+      `Invalid input for switch_mode: expected { mode: string | null }, got ${truncateInput(input)}`
+    );
+  }
+
+  const { mode } = input;
+
+  // Clearing mode selection
+  if (mode === null) {
+    await ctx.modeContext.setSelectedMode(null);
+    ctx.logger.log('mode_tool_dispatch', { tool_name: 'switch_mode', mode: null });
+    return { success: true, mode: null, message: 'Mode cleared. Using default settings.' };
+  }
+
+  // Validate mode exists
+  const found = ctx.modeContext.availableModes.find((m) => m.name === mode);
+  if (!found) {
+    const available = ctx.modeContext.availableModes.map((m) => m.name).join(', ');
+    return {
+      error: `Mode '${mode}' not found.${available ? ` Available modes: ${available}` : ' No modes are configured.'}`,
+    };
+  }
+
+  await ctx.modeContext.setSelectedMode(mode);
+  ctx.logger.log('mode_tool_dispatch', { tool_name: 'switch_mode', mode });
+
+  const label = found.label ?? found.name;
+  return {
+    success: true,
+    mode: found.name,
+    message: `Switched to ${label} mode. This will take effect on your next message.`,
+  };
 }
 
 function logToolSuccess(

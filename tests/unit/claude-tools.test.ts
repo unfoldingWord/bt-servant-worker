@@ -8,6 +8,7 @@ import {
   isBuiltInTool,
   isReadMemoryInput,
   isUpdateMemoryInput,
+  isSwitchModeInput,
   getToolDefinitions,
 } from '../../src/services/claude/tools.js';
 import { buildToolCatalog } from '../../src/services/mcp/catalog.js';
@@ -35,30 +36,36 @@ describe('buildGetToolDefinitionsTool', () => {
 });
 
 describe('buildAllTools', () => {
-  it('should only include meta-tools, not MCP tools (lasker-api pattern)', () => {
-    // NOTE: MCP tools are NOT exposed directly to Claude anymore.
-    // They're shown in the system prompt catalog and called via execute_code.
-    const catalog = buildToolCatalog(
-      [
-        {
-          serverId: 's1',
-          serverName: 'S1',
-          tools: [
-            { name: 'mcp_tool', description: 'An MCP tool', inputSchema: { type: 'object' } },
-          ],
-        },
-      ],
-      [{ id: 's1', name: 'S1', url: 'http://test', enabled: true, priority: 1 }]
-    );
+  const catalog = buildToolCatalog(
+    [
+      {
+        serverId: 's1',
+        serverName: 'S1',
+        tools: [{ name: 'mcp_tool', description: 'An MCP tool', inputSchema: { type: 'object' } }],
+      },
+    ],
+    [{ id: 's1', name: 'S1', url: 'http://test', enabled: true, priority: 1 }]
+  );
 
+  it('should only include core tools when hasModes is false', () => {
     const tools = buildAllTools(catalog);
 
-    // Meta-tools + memory tools, not MCP tools
     expect(tools.length).toBe(4);
     expect(tools.map((t) => t.name)).toContain('execute_code');
     expect(tools.map((t) => t.name)).toContain('get_tool_definitions');
     expect(tools.map((t) => t.name)).toContain('read_memory');
     expect(tools.map((t) => t.name)).toContain('update_memory');
+    expect(tools.map((t) => t.name)).not.toContain('list_modes');
+    expect(tools.map((t) => t.name)).not.toContain('switch_mode');
+    expect(tools.map((t) => t.name)).not.toContain('mcp_tool');
+  });
+
+  it('should include mode tools when hasModes is true', () => {
+    const tools = buildAllTools(catalog, { hasModes: true });
+
+    expect(tools.length).toBe(6);
+    expect(tools.map((t) => t.name)).toContain('list_modes');
+    expect(tools.map((t) => t.name)).toContain('switch_mode');
     expect(tools.map((t) => t.name)).not.toContain('mcp_tool');
   });
 });
@@ -69,6 +76,8 @@ describe('isBuiltInTool', () => {
     expect(isBuiltInTool('get_tool_definitions')).toBe(true);
     expect(isBuiltInTool('read_memory')).toBe(true);
     expect(isBuiltInTool('update_memory')).toBe(true);
+    expect(isBuiltInTool('list_modes')).toBe(true);
+    expect(isBuiltInTool('switch_mode')).toBe(true);
     expect(isBuiltInTool('some_mcp_tool')).toBe(false);
   });
 });
@@ -227,5 +236,35 @@ describe('isUpdateMemoryInput', () => {
 
   it('rejects non-array unpin', () => {
     expect(isUpdateMemoryInput({ sections: { A: 'data' }, unpin: 'B' })).toBe(false);
+  });
+});
+
+describe('isSwitchModeInput', () => {
+  it('accepts string mode', () => {
+    expect(isSwitchModeInput({ mode: 'fia' })).toBe(true);
+  });
+
+  it('accepts null mode (clear)', () => {
+    expect(isSwitchModeInput({ mode: null })).toBe(true);
+  });
+
+  it('rejects missing mode', () => {
+    expect(isSwitchModeInput({})).toBe(false);
+  });
+
+  it('rejects non-object', () => {
+    expect(isSwitchModeInput('fia')).toBe(false);
+    expect(isSwitchModeInput(null)).toBe(false);
+    expect(isSwitchModeInput(42)).toBe(false);
+  });
+
+  it('rejects empty string mode', () => {
+    expect(isSwitchModeInput({ mode: '' })).toBe(false);
+  });
+
+  it('rejects non-string non-null mode', () => {
+    expect(isSwitchModeInput({ mode: 42 })).toBe(false);
+    expect(isSwitchModeInput({ mode: true })).toBe(false);
+    expect(isSwitchModeInput({ mode: ['fia'] })).toBe(false);
   });
 });
