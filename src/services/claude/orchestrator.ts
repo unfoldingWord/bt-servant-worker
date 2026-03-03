@@ -362,7 +362,9 @@ function createOrchestrationContext(
       memoryTOC: options.memoryTOC,
       clientId: options.clientId,
     }),
-    tools: buildAllTools(catalog),
+    tools: buildAllTools(catalog, {
+      hasModes: (options.modeContext?.availableModes.length ?? 0) > 0,
+    }),
     messages: [...historyToMessages(history, llmMax), { role: 'user', content: userMessage }],
     responses: [],
     codeExecTimeout: config.codeExecTimeout,

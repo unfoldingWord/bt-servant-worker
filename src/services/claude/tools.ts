@@ -182,15 +182,22 @@ export function buildSwitchModeTool(): Anthropic.Tool {
  * - Forces Claude to be intentional about which tools to use
  * - Full schemas are loaded on-demand, not upfront
  */
-export function buildAllTools(_catalog: ToolCatalog): Anthropic.Tool[] {
-  return [
+export function buildAllTools(
+  _catalog: ToolCatalog,
+  opts?: { hasModes?: boolean }
+): Anthropic.Tool[] {
+  const tools: Anthropic.Tool[] = [
     buildExecuteCodeTool(),
     buildGetToolDefinitionsTool(),
     buildReadMemoryTool(),
     buildUpdateMemoryTool(),
-    buildListModesTool(),
-    buildSwitchModeTool(),
   ];
+
+  if (opts?.hasModes) {
+    tools.push(buildListModesTool(), buildSwitchModeTool());
+  }
+
+  return tools;
 }
 
 /**

@@ -419,6 +419,16 @@ describe('validatePromptMode', () => {
   });
 });
 
+describe('validatePromptMode - name field', () => {
+  it('accepts valid name when provided', () => {
+    expect(validatePromptMode({ name: 'fia-mode', overrides: {} })).toBeNull();
+  });
+
+  it('rejects invalid name when provided', () => {
+    expect(validatePromptMode({ name: 'FIA MODE!', overrides: {} })).toBeTruthy();
+  });
+});
+
 // ─── Mode selection priority tests ──────────────────────────────────────────────
 
 describe('resolveActiveModeName', () => {

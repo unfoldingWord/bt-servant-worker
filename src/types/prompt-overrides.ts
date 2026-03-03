@@ -244,6 +244,12 @@ export function validatePromptMode(mode: unknown): string | null {
 
   const obj = mode as Record<string, unknown>;
 
+  // name is required and must pass mode name validation
+  if ('name' in obj) {
+    const nameError = validateModeName(obj.name);
+    if (nameError) return nameError;
+  }
+
   const labelError = validateOptionalString(obj, 'label', MAX_MODE_LABEL_LENGTH);
   if (labelError) return labelError;
 
