@@ -3,11 +3,16 @@ name: Deploy Staging
 on:
   pull_request:
     branches: [main]
+  workflow_run:
+    workflows: ['CI']
+    types: [completed]
+    branches: [main]
 
 jobs:
   deploy-staging:
     name: Deploy to Staging
     runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'pull_request' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       - uses: actions/checkout@v4
 
