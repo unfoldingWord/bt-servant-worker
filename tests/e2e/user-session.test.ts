@@ -142,6 +142,18 @@ describe('UserSession Durable Object', () => {
       expect(data.limit).toBe(50);
     });
   });
+
+  describe('DELETE /history', () => {
+    it('returns success message', async () => {
+      const response = await stub.fetch('http://fake-host/history', {
+        method: 'DELETE',
+      });
+      const data = (await response.json()) as Record<string, unknown>;
+
+      expect(response.status).toBe(200);
+      expect(data.message).toBe('User history cleared');
+    });
+  });
 });
 
 describe('UserSession chat validation', () => {

@@ -646,6 +646,13 @@ app.delete('/api/v1/admin/orgs/:org/users/:userId/memory', async (c) => {
   return handleUserRequest(c.req.raw, c.env, org, userId, '/memory');
 });
 
+// Admin endpoint for user history (routed to DO)
+app.delete('/api/v1/admin/orgs/:org/users/:userId/history', async (c) => {
+  const org = c.req.param('org');
+  const userId = c.req.param('userId');
+  return handleUserRequest(c.req.raw, c.env, org, userId, '/history');
+});
+
 export default app;
 
 /**
