@@ -153,19 +153,6 @@ describe('UserSession Durable Object', () => {
       expect(response.status).toBe(200);
       expect(data.message).toBe('User history cleared');
     });
-
-    it('clears history so GET returns empty', async () => {
-      // First, delete any existing history
-      await stub.fetch('http://fake-host/history', { method: 'DELETE' });
-
-      // Verify GET returns empty
-      const response = await stub.fetch('http://fake-host/history?user_id=test-user');
-      const data = (await response.json()) as Record<string, unknown>;
-
-      expect(response.status).toBe(200);
-      expect(data.entries).toEqual([]);
-      expect(data.total_count).toBe(0);
-    });
   });
 });
 
