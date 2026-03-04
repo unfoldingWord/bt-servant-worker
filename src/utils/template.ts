@@ -7,7 +7,10 @@
 import { APP_VERSION } from '../generated/version.js';
 import { PromptSlot, PROMPT_OVERRIDE_SLOTS } from '../types/prompt-overrides.js';
 
-/** Built-in template variables available in all prompt slots. */
+/**
+ * Built-in template variables available in all prompt slots.
+ * Evaluated once at module load — only add build-time constants here, not request-scoped values.
+ */
 const TEMPLATE_VARIABLES: Record<string, string> = {
   version: APP_VERSION,
 };

@@ -342,6 +342,9 @@ app.delete('/api/v1/admin/orgs/:org/config', async (c) => {
 });
 
 // Admin endpoints for org-level prompt overrides
+// NOTE: The admin GET endpoint intentionally returns raw template variables (e.g. {{version}})
+// in the resolved preview so admins can see what placeholders are configured. Template variables
+// are only substituted at runtime in the chat path (via applyTemplateVariables in user-session).
 app.get('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
   const org = c.req.param('org');
 

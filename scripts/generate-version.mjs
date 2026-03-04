@@ -15,6 +15,11 @@ const root = resolve(__dirname, '..');
 const pkg = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf-8'));
 const version = pkg.version;
 
+if (!/^[0-9a-zA-Z._+-]+$/.test(version)) {
+  console.error(`Invalid version string: "${version}"`);
+  process.exit(1);
+}
+
 const outDir = resolve(root, 'src', 'generated');
 mkdirSync(outDir, { recursive: true });
 

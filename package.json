@@ -11,6 +11,7 @@
     "prebuild": "node scripts/generate-version.mjs",
     "build": "wrangler build",
     "version": "node scripts/generate-version.mjs && git add src/generated/version.ts",
+    "pretest": "node scripts/generate-version.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint src/",
