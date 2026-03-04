@@ -111,6 +111,7 @@ export class UserSession {
     this.app.get('/preferences', () => this.handleGetPreferences());
     this.app.put('/preferences', (c) => this.handleUpdatePreferences(c.req.raw));
     this.app.get('/history', (c) => this.handleGetHistory(new URL(c.req.url)));
+    this.app.delete('/history', () => this.handleDeleteHistory());
     this.app.get('/prompt-overrides', () => this.handleGetPromptOverrides());
     this.app.put('/prompt-overrides', (c) => this.handleUpdatePromptOverrides(c.req.raw));
     this.app.delete('/prompt-overrides', () => this.handleDeletePromptOverrides());
@@ -590,6 +591,16 @@ export class UserSession {
       return Response.json(merged);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
+    }
+  }
+
+  private async handleDeleteHistory(): Promise<Response> {
+    try {
+      await this.state.storage.delete(HISTORY_KEY);
+      return Response.json({ message: 'User history cleared' });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
       return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
     }
   }
