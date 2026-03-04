@@ -106,6 +106,30 @@ bt-servant-worker is a Cloudflare Worker that integrates with bt-servant-engine.
 - `pnpm architecture` - Check for circular dependencies
 - `wrangler deploy` - **DO NOT USE DIRECTLY** - Deployments go through CI/CD
 
+## CRITICAL: Version Bumping
+
+**After every merge to main, you MUST bump the version.** This is non-negotiable.
+
+The version in `package.json` is the single source of truth. A `version` lifecycle hook in `package.json` runs `scripts/generate-version.mjs` to regenerate `src/generated/version.ts` and stage it automatically.
+
+### Process
+
+1. After merging a PR to main, bump the version on main:
+   - **Patch** (`pnpm version patch`): bug fixes, documentation changes, minor tweaks
+   - **Minor** (`pnpm version minor`): new features, new endpoints, behavioral changes
+2. `pnpm version` automatically:
+   - Updates `package.json`
+   - Regenerates `src/generated/version.ts`
+   - Stages both files
+   - Creates a git commit and tag
+3. Push the version commit and tag: `git push && git push --tags`
+4. The new version flows to the health endpoint and `{{version}}` template variables
+
+### Important
+
+- Do NOT manually edit `src/generated/version.ts` — it is auto-generated
+- Always bump version on main, not on feature branches
+
 ## What to Do After a Push
 
 After every `git push`, you MUST invoke the ci-watcher subagent to verify CI passes:
