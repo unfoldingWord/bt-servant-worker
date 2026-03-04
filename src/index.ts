@@ -7,6 +7,7 @@
 
 import { Hono } from 'hono';
 import { Env } from './config/types.js';
+import { APP_VERSION } from './generated/version.js';
 import { UserQueue, UserSession } from './durable-objects/index.js';
 import { discoverAllTools } from './services/mcp/index.js';
 import { MCPServerConfig } from './services/mcp/types.js';
@@ -38,7 +39,7 @@ export { UserQueue, UserSession };
 const app = new Hono<{ Bindings: Env }>();
 
 // Health check - no auth required
-app.get('/health', (c) => c.json({ status: 'healthy', version: '2.0.0' }));
+app.get('/health', (c) => c.json({ status: 'healthy', version: APP_VERSION }));
 
 // Auth middleware for all /api routes
 app.use('/api/*', async (c, next) => {
