@@ -62,6 +62,7 @@ import {
 } from '../types/prompt-overrides.js';
 import { ValidationError } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger } from '../utils/logger.js';
+import { applyTemplateVariables } from '../utils/template.js';
 const HISTORY_KEY = 'history';
 const PREFERENCES_KEY = 'preferences';
 const PROMPT_OVERRIDES_KEY = 'prompt_overrides';
@@ -431,7 +432,9 @@ export class UserSession {
     }
 
     const userOverrides = await this.getPromptOverrides();
-    const resolved = resolvePromptOverrides(orgOverrides, modeOverrides, userOverrides);
+    const resolved = applyTemplateVariables(
+      resolvePromptOverrides(orgOverrides, modeOverrides, userOverrides)
+    );
 
     const overriddenSlots = PROMPT_OVERRIDE_SLOTS.filter(
       // eslint-disable-next-line security/detect-object-injection -- s is from PROMPT_OVERRIDE_SLOTS constant
