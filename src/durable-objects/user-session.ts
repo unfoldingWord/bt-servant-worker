@@ -416,7 +416,7 @@ export class UserSession {
     const orgOverrides = body._org_prompt_overrides ?? {};
     const orgModes = body._org_modes ?? { modes: [] };
     const userSelectedMode = await this.getSelectedMode();
-    const activeModeName = resolveActiveModeName(userSelectedMode, orgModes.default_mode);
+    const activeModeName = resolveActiveModeName(userSelectedMode);
 
     // Look up the active mode's overrides
     let modeOverrides: PromptOverrides = {};
@@ -650,7 +650,7 @@ export class UserSession {
   // NOTE: This handler validates name format but cannot verify that the mode exists in the org's
   // mode list, because the DO does not have access to KV. Mode existence is validated at two other
   // points: (1) the switch_mode tool checks availableModes before persisting, and (2) prompt
-  // resolution gracefully ignores unknown modes (falls through to org default / no mode).
+  // resolution gracefully ignores unknown modes (falls through to no mode).
   private async handleSetMode(request: Request): Promise<Response> {
     const body = (await request.json()) as Record<string, unknown>;
     const nameError = validateModeName(body.mode);

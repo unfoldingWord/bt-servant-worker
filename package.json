@@ -26,8 +26,8 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.71.2",
     "@cf-wasm/quickjs": "^0.2.4",
-    "@modelcontextprotocol/sdk": "^1.26.0",
-    "hono": "^4.12.3",
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "hono": "^4.12.5",
     "zod": "^3.25.76"
   },
   "devDependencies": {
@@ -61,5 +61,11 @@
     "node": ">=20.0.0",
     "pnpm": ">=9.0.0"
   },
-  "packageManager": "pnpm@9.15.4"
+  "packageManager": "pnpm@9.15.4",
+  "pnpm": {
+    "overrides": {
+      "express-rate-limit": ">=8.2.2",
+      "@hono/node-server": ">=1.19.10"
+    }
+  }
 }

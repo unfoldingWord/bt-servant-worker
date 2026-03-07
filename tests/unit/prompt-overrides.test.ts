@@ -433,18 +433,10 @@ describe('validatePromptMode - name field', () => {
 
 describe('resolveActiveModeName', () => {
   it('returns user-selected mode when set', () => {
-    expect(resolveActiveModeName('fia', 'default-mode')).toBe('fia');
+    expect(resolveActiveModeName('fia')).toBe('fia');
   });
 
-  it('falls back to org default when no user selection', () => {
-    expect(resolveActiveModeName(undefined, 'default-mode')).toBe('default-mode');
-  });
-
-  it('returns undefined when nothing is set', () => {
-    expect(resolveActiveModeName(undefined, undefined)).toBeUndefined();
-  });
-
-  it('user selection overrides org default', () => {
-    expect(resolveActiveModeName('user-choice', 'org-default')).toBe('user-choice');
+  it('returns undefined when no user selection', () => {
+    expect(resolveActiveModeName(undefined)).toBeUndefined();
   });
 });
