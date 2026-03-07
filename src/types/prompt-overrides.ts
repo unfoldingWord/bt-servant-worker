@@ -271,7 +271,7 @@ export function validatePromptMode(mode: unknown): string | null {
  * Returns the user-selected mode, or undefined if no mode is set.
  */
 export function resolveActiveModeName(userSelectedMode: string | undefined): string | undefined {
-  return userSelectedMode ?? undefined;
+  return userSelectedMode;
 }
 
 /**
