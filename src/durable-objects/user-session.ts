@@ -416,7 +416,7 @@ export class UserSession {
     const orgOverrides = body._org_prompt_overrides ?? {};
     const orgModes = body._org_modes ?? { modes: [] };
     const userSelectedMode = await this.getSelectedMode();
-    const activeModeName = resolveActiveModeName(userSelectedMode, orgModes.default_mode);
+    const activeModeName = resolveActiveModeName(userSelectedMode);
 
     // Look up the active mode's overrides
     let modeOverrides: PromptOverrides = {};

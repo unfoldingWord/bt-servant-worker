@@ -418,7 +418,6 @@ app.get('/api/v1/admin/orgs/:org/modes', async (c) => {
 
     logAdminAction('list_modes', org, {
       mode_count: orgModes.modes.length,
-      default_mode: orgModes.default_mode ?? null,
     });
     return c.json({ org, ...orgModes });
   } catch (error) {
@@ -522,11 +521,6 @@ app.delete('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
 
     orgModes.modes = filtered;
 
-    // Clear default_mode if it pointed to the deleted mode
-    if (orgModes.default_mode === modeName) {
-      delete orgModes.default_mode;
-    }
-
     await c.env.PROMPT_OVERRIDES.put(`${org}:modes`, JSON.stringify(orgModes));
     logAdminAction('delete_mode', org, {
       mode_name: modeName,
@@ -537,61 +531,6 @@ app.delete('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
     const errorMsg = error instanceof Error ? error.message : String(error);
     logAdminAction('delete_mode_error', org, { error: errorMsg });
     return c.json({ error: 'Failed to delete mode from storage' }, 500);
-  }
-});
-
-app.put('/api/v1/admin/orgs/:org/modes-default', async (c) => {
-  const org = c.req.param('org');
-  const body = (await c.req.json()) as { mode: string };
-
-  if (!body.mode || typeof body.mode !== 'string') {
-    return c.json({ error: 'mode is required and must be a string' }, 400);
-  }
-
-  const nameError = validateModeName(body.mode);
-  if (nameError) {
-    return c.json({ error: nameError }, 400);
-  }
-
-  try {
-    const orgModes = (await c.env.PROMPT_OVERRIDES.get<OrgModes>(`${org}:modes`, 'json')) ?? {
-      modes: [],
-    };
-
-    const found = orgModes.modes.find((m) => m.name === body.mode);
-    if (!found) {
-      return c.json({ error: `Mode '${body.mode}' not found` }, 404);
-    }
-
-    orgModes.default_mode = body.mode;
-
-    await c.env.PROMPT_OVERRIDES.put(`${org}:modes`, JSON.stringify(orgModes));
-    logAdminAction('set_default_mode', org, { default_mode: body.mode });
-    return c.json({ org, default_mode: body.mode, message: 'Default mode set' });
-  } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    logAdminAction('set_default_mode_error', org, { error: errorMsg });
-    return c.json({ error: 'Failed to set default mode' }, 500);
-  }
-});
-
-app.delete('/api/v1/admin/orgs/:org/modes-default', async (c) => {
-  const org = c.req.param('org');
-
-  try {
-    const orgModes = (await c.env.PROMPT_OVERRIDES.get<OrgModes>(`${org}:modes`, 'json')) ?? {
-      modes: [],
-    };
-
-    delete orgModes.default_mode;
-
-    await c.env.PROMPT_OVERRIDES.put(`${org}:modes`, JSON.stringify(orgModes));
-    logAdminAction('clear_default_mode', org, {});
-    return c.json({ org, default_mode: null, message: 'Default mode cleared' });
-  } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    logAdminAction('clear_default_mode_error', org, { error: errorMsg });
-    return c.json({ error: 'Failed to clear default mode' }, 500);
   }
 });
 

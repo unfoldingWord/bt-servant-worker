@@ -77,8 +77,6 @@ export interface PromptMode {
 export interface OrgModes {
   /** All defined modes for this org */
   modes: PromptMode[];
-  /** Default mode name applied when user has no explicit selection */
-  default_mode?: string;
 }
 
 /**
@@ -269,16 +267,11 @@ export function validatePromptMode(mode: unknown): string | null {
 // ─── Mode resolution ───────────────────────────────────────────────────────────
 
 /**
- * Determine the active mode name from the selection priority chain.
- * Returns the first non-empty value, or undefined if no mode is set.
- *
- * Priority: user-selected → org default → none
+ * Determine the active mode name.
+ * Returns the user-selected mode, or undefined if no mode is set.
  */
-export function resolveActiveModeName(
-  userSelectedMode: string | undefined,
-  orgDefaultMode: string | undefined
-): string | undefined {
-  return userSelectedMode ?? orgDefaultMode;
+export function resolveActiveModeName(userSelectedMode: string | undefined): string | undefined {
+  return userSelectedMode ?? undefined;
 }
 
 /**
