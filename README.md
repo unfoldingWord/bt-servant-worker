@@ -262,7 +262,6 @@ These projects depend on bt-servant-worker's API:
 ## Related Projects
 
 - **bt-servant-engine** — The Python/FastAPI predecessor (deprecated)
-- **lasker-api** — Reference for dynamic code execution pattern
 
 ## License
 
