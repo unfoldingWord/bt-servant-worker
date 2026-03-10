@@ -61,7 +61,7 @@ import {
   validatePromptOverrides,
 } from '../types/prompt-overrides.js';
 import { transcribeAudio, synthesizeSpeech } from '../services/audio/index.js';
-import { AudioTranscriptionError, ValidationError } from '../utils/errors.js';
+import { AppError, AudioTranscriptionError, ValidationError } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger } from '../utils/logger.js';
 import { applyTemplateVariables } from '../utils/template.js';
 const HISTORY_KEY = 'history';
@@ -251,8 +251,8 @@ export class UserSession {
 
       const totalDuration = Date.now() - startTime;
       logger.error('do_chat_error', error, { total_duration_ms: totalDuration });
-      if (error instanceof ValidationError) {
-        return createErrorResponse('Validation error', 'VALIDATION_ERROR', error.message, 400);
+      if (error instanceof AppError) {
+        return createErrorResponse(error.name, error.code, error.message, error.statusCode);
       }
       const msg = 'An unexpected error occurred while processing your request.';
       return createErrorResponse('Internal server error', 'INTERNAL_ERROR', msg, 500);

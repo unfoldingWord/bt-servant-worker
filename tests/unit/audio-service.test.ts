@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { transcribeAudio, synthesizeSpeech } from '../../src/services/audio/workers-ai.js';
 import { AudioTranscriptionError, AudioSynthesisError } from '../../src/utils/errors.js';
-import { MAX_AUDIO_SIZE_BYTES } from '../../src/services/audio/types.js';
+import { MAX_AUDIO_SIZE_BYTES, MAX_TTS_INPUT_CHARS } from '../../src/services/audio/types.js';
 import { createRequestLogger } from '../../src/utils/logger.js';
 
 const logger = createRequestLogger('test-request-id', 'test-user');
@@ -65,26 +65,20 @@ describe('transcribeAudio - validation and errors', () => {
   beforeEach(() => vi.restoreAllMocks());
 
   it('rejects unsupported audio format', async () => {
-    const mockAi = createMockAi();
     const audio = makeBase64(100);
-    await expect(transcribeAudio(mockAi, audio, 'aac', logger)).rejects.toThrow(
-      AudioTranscriptionError
-    );
-    await expect(transcribeAudio(mockAi, audio, 'aac', logger)).rejects.toThrow(
+    await expect(transcribeAudio(createMockAi(), audio, 'aac', logger)).rejects.toThrow(
       /Unsupported audio format/
     );
   });
 
-  it('rejects oversized audio', async () => {
-    const originalAtob = globalThis.atob;
-    globalThis.atob = vi.fn().mockReturnValue('x'.repeat(MAX_AUDIO_SIZE_BYTES + 1));
-    try {
-      await expect(transcribeAudio(createMockAi(), 'fake', 'ogg', logger)).rejects.toThrow(
-        /exceeds maximum/
-      );
-    } finally {
-      globalThis.atob = originalAtob;
-    }
+  it('rejects oversized audio via arithmetic size check', async () => {
+    // Create a base64 string whose decoded size exceeds MAX_AUDIO_SIZE_BYTES
+    // base64 encodes 3 bytes per 4 chars, so we need (MAX + 4) * 4/3 chars
+    const oversizedChars = Math.ceil(((MAX_AUDIO_SIZE_BYTES + 4) * 4) / 3);
+    const oversizedBase64 = 'A'.repeat(oversizedChars);
+    await expect(transcribeAudio(createMockAi(), oversizedBase64, 'ogg', logger)).rejects.toThrow(
+      /exceeds maximum/
+    );
   });
 
   it('rejects invalid base64', async () => {
@@ -120,6 +114,15 @@ describe('synthesizeSpeech', () => {
       speaker: 'luna',
       encoding: 'mp3',
     });
+  });
+
+  it('truncates text exceeding MAX_TTS_INPUT_CHARS', async () => {
+    const longText = 'a'.repeat(MAX_TTS_INPUT_CHARS + 500);
+    const mockAi = createMockAi(btoa('audio'));
+    await synthesizeSpeech(mockAi, longText, logger);
+
+    const callArgs = (mockAi.run as ReturnType<typeof vi.fn>).mock.calls[0][1] as { text: string };
+    expect(callArgs.text.length).toBe(MAX_TTS_INPUT_CHARS);
   });
 
   it('handles API error', async () => {

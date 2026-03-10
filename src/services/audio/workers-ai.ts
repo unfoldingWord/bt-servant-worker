@@ -10,10 +10,37 @@ import { RequestLogger } from '../../utils/logger.js';
 import {
   AudioFormat,
   MAX_AUDIO_SIZE_BYTES,
+  MAX_TTS_INPUT_CHARS,
   SpeechSynthesisResult,
   SUPPORTED_AUDIO_FORMATS,
   TranscriptionResult,
 } from './types.js';
+
+/** Validate audio input and return the estimated decoded size in bytes. */
+function validateAudioInput(audioBase64: string, audioFormat: string): number {
+  if (!SUPPORTED_AUDIO_FORMATS.includes(audioFormat as AudioFormat)) {
+    throw new AudioTranscriptionError(
+      `Unsupported audio format: ${audioFormat}. Supported: ${SUPPORTED_AUDIO_FORMATS.join(', ')}`
+    );
+  }
+
+  try {
+    atob(audioBase64.slice(0, 16));
+  } catch {
+    throw new AudioTranscriptionError('Invalid base64 audio data');
+  }
+
+  // Compute decoded size arithmetically to avoid allocating the full decoded buffer
+  const padding = audioBase64.endsWith('==') ? 2 : audioBase64.endsWith('=') ? 1 : 0;
+  const decodedSize = Math.floor((audioBase64.length * 3) / 4) - padding;
+
+  if (decodedSize > MAX_AUDIO_SIZE_BYTES) {
+    throw new AudioTranscriptionError(
+      `Audio size ${decodedSize} bytes exceeds maximum of ${MAX_AUDIO_SIZE_BYTES} bytes (25 MB)`
+    );
+  }
+  return decodedSize;
+}
 
 /**
  * Transcribe audio to text using Cloudflare Workers AI (Whisper).
@@ -25,29 +52,8 @@ export async function transcribeAudio(
   logger: RequestLogger
 ): Promise<TranscriptionResult> {
   const startTime = Date.now();
-
-  // Validate format
-  if (!SUPPORTED_AUDIO_FORMATS.includes(audioFormat as AudioFormat)) {
-    throw new AudioTranscriptionError(
-      `Unsupported audio format: ${audioFormat}. Supported: ${SUPPORTED_AUDIO_FORMATS.join(', ')}`
-    );
-  }
-
-  // Validate base64 and compute decoded size
-  let decodedString: string;
-  try {
-    decodedString = atob(audioBase64);
-  } catch {
-    throw new AudioTranscriptionError('Invalid base64 audio data');
-  }
-
-  if (decodedString.length > MAX_AUDIO_SIZE_BYTES) {
-    throw new AudioTranscriptionError(
-      `Audio size ${decodedString.length} bytes exceeds maximum of ${MAX_AUDIO_SIZE_BYTES} bytes (25 MB)`
-    );
-  }
-
-  logger.log('stt_start', { format: audioFormat, size_bytes: decodedString.length });
+  const decodedSize = validateAudioInput(audioBase64, audioFormat);
+  logger.log('stt_start', { format: audioFormat, size_bytes: decodedSize });
 
   try {
     // Whisper expects base64 string directly
@@ -83,12 +89,18 @@ export async function synthesizeSpeech(
 ): Promise<SpeechSynthesisResult> {
   const startTime = Date.now();
 
-  logger.log('tts_start', { input_chars: text.length });
+  // Truncate to avoid slow/failed requests on very large inputs
+  const truncatedText =
+    text.length > MAX_TTS_INPUT_CHARS ? text.slice(0, MAX_TTS_INPUT_CHARS) : text;
+  logger.log('tts_start', {
+    input_chars: text.length,
+    truncated: text.length > MAX_TTS_INPUT_CHARS,
+  });
 
   try {
     // Aura-2 returns a base64-encoded audio string
     const audioBase64 = await ai.run('@cf/deepgram/aura-2-en', {
-      text,
+      text: truncatedText,
       speaker: 'luna',
       encoding: 'mp3',
     });
