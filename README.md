@@ -66,11 +66,15 @@ bt-servant-worker is deployed on Cloudflare's edge network and provides:
 
 ### Chat
 
-| Endpoint              | Method | Description                      |
-| --------------------- | ------ | -------------------------------- |
-| `/health`             | GET    | Health check                     |
-| `/api/v1/chat`        | POST   | Chat with Claude (non-streaming) |
-| `/api/v1/chat/stream` | POST   | Chat with Claude (SSE streaming) |
+| Endpoint                     | Method | Description                           |
+| ---------------------------- | ------ | ------------------------------------- |
+| `/health`                    | GET    | Health check                          |
+| `/api/v1/chat`               | POST   | Chat with Claude (synchronous)        |
+| `/api/v1/chat/stream`        | POST   | Chat with Claude (SSE streaming)      |
+| `/api/v1/chat/queue`         | POST   | Enqueue message — returns immediately |
+| `/api/v1/chat/queue/poll`    | GET    | Poll for queued message events        |
+| `/api/v1/chat/queue/stream`  | GET    | SSE stream for a queued message       |
+| `/api/v1/chat/queue/:userId` | GET    | Queue status (debug)                  |
 
 ### User Endpoints
 
