@@ -30,6 +30,10 @@ id = "d7149c3d69f34cff87146557163f0a6c"
 binding = "PROMPT_OVERRIDES"
 id = "c1828624ab434f079776bddd171882d9"
 
+# Workers AI
+[ai]
+binding = "AI"
+
 # Durable Objects
 [[durable_objects.bindings]]
 name = "USER_SESSION"
@@ -73,6 +77,9 @@ id = "f0783f5b724b427d94245ecbf810a267"
 [[env.staging.kv_namespaces]]
 binding = "PROMPT_OVERRIDES"
 id = "1416f321fbda450095214111d38d211a"
+
+[env.staging.ai]
+binding = "AI"
 
 [[env.staging.durable_objects.bindings]]
 name = "USER_SESSION"

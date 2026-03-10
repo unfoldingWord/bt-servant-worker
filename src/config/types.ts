@@ -40,6 +40,9 @@ export interface Env {
   ORG_CONFIG: KVNamespace;
   PROMPT_OVERRIDES: KVNamespace;
 
+  // AI binding
+  AI: Ai;
+
   // Durable Object bindings
   USER_SESSION: DurableObjectNamespace;
   USER_QUEUE: DurableObjectNamespace;

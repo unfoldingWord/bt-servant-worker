@@ -99,6 +99,20 @@ export class MCPBudgetExceededError extends AppError {
   }
 }
 
+export class AudioTranscriptionError extends AppError {
+  constructor(message: string) {
+    super(message, 'AUDIO_TRANSCRIPTION_ERROR', 400);
+    this.name = 'AudioTranscriptionError';
+  }
+}
+
+export class AudioSynthesisError extends AppError {
+  constructor(message: string) {
+    super(message, 'AUDIO_SYNTHESIS_ERROR', 502);
+    this.name = 'AudioSynthesisError';
+  }
+}
+
 export class MCPResponseTooLargeError extends AppError {
   constructor(
     public readonly actualSize: number,
