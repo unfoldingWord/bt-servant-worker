@@ -60,7 +60,8 @@ import {
   validateModeName,
   validatePromptOverrides,
 } from '../types/prompt-overrides.js';
-import { ValidationError } from '../utils/errors.js';
+import { transcribeAudio, synthesizeSpeech } from '../services/audio/index.js';
+import { AppError, AudioTranscriptionError, ValidationError } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger } from '../utils/logger.js';
 import { applyTemplateVariables } from '../utils/template.js';
 const HISTORY_KEY = 'history';
@@ -250,8 +251,8 @@ export class UserSession {
 
       const totalDuration = Date.now() - startTime;
       logger.error('do_chat_error', error, { total_duration_ms: totalDuration });
-      if (error instanceof ValidationError) {
-        return createErrorResponse('Validation error', 'VALIDATION_ERROR', error.message, 400);
+      if (error instanceof AppError) {
+        return createErrorResponse(error.name, error.code, error.message, error.statusCode);
       }
       const msg = 'An unexpected error occurred while processing your request.';
       return createErrorResponse('Internal server error', 'INTERNAL_ERROR', msg, 500);
@@ -511,22 +512,78 @@ export class UserSession {
     logger.log('phase_save_complete', { duration_ms: Date.now() - startTime, storageMax });
   }
 
+  /**
+   * Resolve message text from request body, transcribing audio if needed.
+   */
+  private async resolveMessageText(
+    body: ChatRequest,
+    logger: RequestLogger,
+    callbacks?: StreamCallbacks
+  ): Promise<string> {
+    if (body.message_type === 'audio') {
+      if (!body.audio_base64 || !body.audio_format) {
+        throw new ValidationError(
+          'audio_base64 and audio_format are required when message_type is audio'
+        );
+      }
+
+      await callbacks?.onStatus?.('Transcribing audio...');
+      const transcription = await transcribeAudio(
+        this.env.AI,
+        body.audio_base64,
+        body.audio_format,
+        logger
+      );
+
+      if (!transcription.text) {
+        throw new AudioTranscriptionError('Transcription returned empty text');
+      }
+
+      logger.log('audio_transcribed', {
+        original_format: body.audio_format,
+        transcribed_length: transcription.text.length,
+        transcription_ms: transcription.duration_ms,
+      });
+      return transcription.text;
+    }
+
+    if (!body.message?.trim()) {
+      throw new ValidationError('Message is required');
+    }
+    return body.message;
+  }
+
+  /**
+   * Generate TTS audio for a response. Non-fatal: returns null on failure.
+   */
+  private async generateVoiceResponse(
+    responses: string[],
+    logger: RequestLogger,
+    callbacks?: StreamCallbacks
+  ): Promise<string | null> {
+    try {
+      await callbacks?.onStatus?.('Generating audio response...');
+      const synthesis = await synthesizeSpeech(this.env.AI, responses.join('\n'), logger);
+      logger.log('tts_generated', {
+        input_chars: synthesis.input_chars,
+        synthesis_ms: synthesis.duration_ms,
+      });
+      return synthesis.audio_base64;
+    } catch (error) {
+      logger.error('tts_generation_failed', error);
+      return null;
+    }
+  }
+
   private async processChat(
     body: ChatRequest,
     logger: RequestLogger,
     callbacks?: StreamCallbacks
   ): Promise<ChatResponse> {
-    if (!body.message?.trim()) {
-      throw new ValidationError('Message is required');
-    }
-
+    const messageText = await this.resolveMessageText(body, logger, callbacks);
     const { preferences, history } = await this.loadUserContext(logger);
-    // Use MCP servers from request body (injected by worker from KV)
-    const mcpServers = body._mcp_servers ?? [];
-    // Use org config from request body (injected by worker from KV)
     const orgConfig = body._org_config ?? {};
-    const catalog = await this.discoverMCPTools(mcpServers, logger);
-
+    const catalog = await this.discoverMCPTools(body._mcp_servers ?? [], logger);
     const {
       resolved: resolvedPromptValues,
       orgModes,
@@ -534,9 +591,8 @@ export class UserSession {
     } = await this.resolvePrompts(body, logger);
     const { memoryStore, formattedTOC } = await this.loadMemoryContext(logger);
     const modeContext = this.buildModeContext(orgModes, activeModeName);
-
     const startTime = Date.now();
-    const responses = await orchestrate(body.message, {
+    const responses = await orchestrate(messageText, {
       env: this.env,
       catalog,
       history,
@@ -557,13 +613,16 @@ export class UserSession {
       response_count: responses.length,
       duration_ms: Date.now() - startTime,
     });
-
-    await this.saveConversation(body.message, responses, preferences, orgConfig, logger);
-
+    const isAudio = body.message_type === 'audio';
+    const voiceAudioBase64 =
+      isAudio && responses.length > 0
+        ? await this.generateVoiceResponse(responses, logger, callbacks)
+        : null;
+    await this.saveConversation(messageText, responses, preferences, orgConfig, logger);
     return {
       responses,
       response_language: preferences.response_language,
-      voice_audio_base64: null,
+      voice_audio_base64: voiceAudioBase64,
     };
   }
 
