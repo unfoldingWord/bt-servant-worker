@@ -1020,7 +1020,7 @@ Claude sees the user message + tool catalog and naturally determines which MCP t
 | ------------------ | ----------- | ----------------------------------------------------- |
 | Streaming (SSE)    | **Include** | Real-time response delivery via `/api/v1/chat/stream` |
 | Progress callbacks | Skip        | Streaming replaces the need for webhooks              |
-| Audio/TTS          | Skip        | Return `voice_audio_base64: null`                     |
+| Audio/TTS          | **Done**    | STT via Whisper, TTS via Deepgram Aura-2 (Workers AI) |
 | Intent system      | None        | Fully agentic - Claude decides                        |
 
 ---

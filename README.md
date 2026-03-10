@@ -13,6 +13,7 @@ bt-servant-worker is deployed on Cloudflare's edge network and provides:
 - **Claude-powered chat** with multi-turn orchestration (up to 10 tool-use iterations per request)
 - **Dynamic MCP tool discovery** — discovers and calls MCP tools from configured servers
 - **Sandboxed code execution** via QuickJS compiled to WebAssembly
+- **Audio message support** — speech-to-text (STT) via Whisper and text-to-speech (TTS) via Deepgram Aura-2, powered by Cloudflare Workers AI
 - **Per-user state** — chat history, preferences, prompt overrides, and persistent memory via Durable Objects
 - **Request serialization** — one request at a time per user, preventing race conditions
 - **Streaming support** — real-time SSE streaming and webhook progress callbacks
@@ -33,17 +34,17 @@ bt-servant-worker is deployed on Cloudflare's edge network and provides:
 │  │ - Chat history, preferences, prompt overrides, memory   │    │
 │  │ - Request serialization via storage lock                │    │
 │  └──────────────┬──────────────────────────────────────────┘    │
-│                 ▼                                               │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │ Claude Orchestrator                                     │    │
-│  │ - System prompt with tool catalog + memory TOC          │    │
-│  │ - Up to 10 iterations with parallel tool execution      │    │
-│  └──────────────┬──────────────────────────────────────────┘    │
 │                 │                                               │
-│    ┌────────────┼────────────┬──────────────┐                   │
-│    ▼            ▼            ▼              ▼                   │
-│  execute_code  get_tool_   read_memory   update_memory          │
-│  (QuickJS)     definitions  (DO store)   (DO store)             │
+│    ┌────────────┴────────────────────────────┐                  │
+│    ▼                                         ▼                  │
+│  Workers AI (STT/TTS)            Claude Orchestrator            │
+│  ├─ Whisper (transcribe)         ├─ System prompt + tool catalog│
+│  └─ Deepgram Aura-2 (speak)     └─ Up to 10 iterations        │
+│                                         │                       │
+│                    ┌────────────┬────────┴───┬──────────┐       │
+│                    ▼            ▼            ▼          ▼       │
+│                execute_code  get_tool_   read_memory  update_   │
+│                (QuickJS)     definitions (DO store)   memory    │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -58,6 +59,8 @@ bt-servant-worker is deployed on Cloudflare's edge network and provides:
 **User Persistent Memory** — Schema-free markdown document per user. A deterministic TOC is injected into the system prompt; Claude reads/writes specific sections via tools. Memory persists indefinitely across sessions. 128KB storage cap per user.
 
 **Dynamic Prompt Overrides** — 6 customizable prompt slots (identity, methodology, tool_guidance, instructions, memory_instructions, closing) with 3-tier resolution: user → org → default.
+
+**Audio Pipeline (Workers AI)** — When a user sends an audio message (`message_type: 'audio'`), the worker transcribes it using Whisper (`@cf/openai/whisper-large-v3-turbo`), processes the transcribed text through the normal Claude orchestration, then auto-generates a spoken response using Deepgram Aura-2 (`@cf/deepgram/aura-2-en`). TTS failure is non-fatal — the text response is always returned. Requires the `AI` binding in `wrangler.toml`.
 
 ## API Endpoints
 
@@ -74,7 +77,7 @@ bt-servant-worker is deployed on Cloudflare's edge network and provides:
 | Endpoint                                      | Method  | Description      |
 | --------------------------------------------- | ------- | ---------------- |
 | `/api/v1/orgs/:org/users/:userId/preferences` | GET/PUT | User preferences |
-| `/api/v1/orgs/:org/users/:userId/history`     | GET     | Chat history     |
+| `/api/v1/orgs/:org/users/:userId/history`     | GET/DEL | Chat history     |
 
 ### Admin Endpoints
 
@@ -98,9 +101,11 @@ interface ChatRequest {
   user_id: string;
   message: string;
   message_type: 'text' | 'audio';
+  audio_base64?: string; // base64-encoded audio (required when message_type is 'audio')
+  audio_format?: string; // audio format: 'ogg' | 'mp3' | 'wav' | 'webm' | 'flac' | 'm4a'
   org?: string;
   progress_callback_url?: string; // webhook URL for progress updates
-  progress_mode?: 'full' | 'incremental';
+  progress_mode?: 'complete' | 'iteration' | 'periodic' | 'sentence';
   progress_throttle_seconds?: number;
 }
 
@@ -108,7 +113,7 @@ interface ChatRequest {
 interface ChatResponse {
   responses: string[];
   response_language: string;
-  voice_audio_base64: string | null;
+  voice_audio_base64: string | null; // base64 MP3 audio when input was audio, null otherwise
 }
 ```
 
@@ -140,6 +145,7 @@ bt-servant-worker/
 │   ├── config/                          # Environment configuration types
 │   ├── durable-objects/                 # UserSession Durable Object
 │   ├── services/
+│   │   ├── audio/                      # STT/TTS via Workers AI (Whisper, Deepgram)
 │   │   ├── claude/                      # Orchestrator, system prompt, tools
 │   │   ├── code-execution/             # QuickJS sandbox
 │   │   ├── mcp/                        # MCP discovery, catalog, budget, health
@@ -158,6 +164,7 @@ bt-servant-worker/
 │   ├── deploy.yml                      # Deploy to Cloudflare (after CI passes)
 │   └── claude-review.yml              # Claude PR reviews
 ├── wrangler.toml                       # Cloudflare Worker config
+├── wrangler.test.toml                  # Test config (omits [ai] binding for CI)
 ├── package.json                        # Dependencies and scripts
 ├── tsconfig.json                       # TypeScript config (strict mode)
 ├── eslint.config.js                    # ESLint with fitness functions
@@ -243,11 +250,18 @@ Every commit runs:
 
 If any check fails, the commit is blocked.
 
+## Consumers
+
+These projects depend on bt-servant-worker's API:
+
+- **[bt-servant-web-client](../bt-servant-web-client)** — Next.js chat frontend (audio UI gated behind `AUDIO_ENABLED` flag)
+- **[bt-servant-admin-portal](../bt-servant-admin-portal)** — Admin dashboard for org config, MCP servers, prompt overrides, and user management
+- **[bt-servant-whatsapp-gateway](../bt-servant-whatsapp-gateway)** — WhatsApp Business API integration (audio messages forwarded as `message_type: 'audio'`)
+- **[baruch](../baruch)** — Cloudflare Worker companion service (self-administering via Claude tools)
+
 ## Related Projects
 
-- **bt-servant-engine** — The Python/FastAPI predecessor
-- **bt-servant-web-client** — Next.js frontend
-- **bt-servant-whatsapp-gateway** — WhatsApp integration
+- **bt-servant-engine** — The Python/FastAPI predecessor (deprecated)
 - **lasker-api** — Reference for dynamic code execution pattern
 
 ## License
