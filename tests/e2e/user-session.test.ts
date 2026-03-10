@@ -179,7 +179,7 @@ describe('UserSession chat validation', () => {
       const data = (await response.json()) as Record<string, unknown>;
 
       expect(response.status).toBe(400);
-      expect(data.error).toBe('Validation error');
+      expect(data.error).toBe('ValidationError');
       expect(data.code).toBe('VALIDATION_ERROR');
       expect(data.message).toBe('Message is required');
     });
@@ -198,7 +198,7 @@ describe('UserSession chat validation', () => {
       const data = (await response.json()) as Record<string, unknown>;
 
       expect(response.status).toBe(400);
-      expect(data.error).toBe('Validation error');
+      expect(data.error).toBe('ValidationError');
       expect(data.code).toBe('VALIDATION_ERROR');
       expect(data.message).toBe('Message is required');
     });
@@ -325,7 +325,7 @@ describe('UserSession request serialization (429 lock)', () => {
     };
 
     // Verify consistent error response structure
-    expect(data.error).toBe('Validation error');
+    expect(data.error).toBe('ValidationError');
     expect(data.code).toBe('VALIDATION_ERROR');
     expect(data.message).toBe('Message is required');
   });
