@@ -582,9 +582,8 @@ export class UserSession {
   ): Promise<ChatResponse> {
     const messageText = await this.resolveMessageText(body, logger, callbacks);
     const { preferences, history } = await this.loadUserContext(logger);
-    const mcpServers = body._mcp_servers ?? [];
     const orgConfig = body._org_config ?? {};
-    const catalog = await this.discoverMCPTools(mcpServers, logger);
+    const catalog = await this.discoverMCPTools(body._mcp_servers ?? [], logger);
     const {
       resolved: resolvedPromptValues,
       orgModes,
@@ -619,9 +618,7 @@ export class UserSession {
       isAudio && responses.length > 0
         ? await this.generateVoiceResponse(responses, logger, callbacks)
         : null;
-
     await this.saveConversation(messageText, responses, preferences, orgConfig, logger);
-
     return {
       responses,
       response_language: preferences.response_language,
