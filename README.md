@@ -81,7 +81,7 @@ bt-servant-worker is deployed on Cloudflare's edge network and provides:
 | Endpoint                                      | Method  | Description      |
 | --------------------------------------------- | ------- | ---------------- |
 | `/api/v1/orgs/:org/users/:userId/preferences` | GET/PUT | User preferences |
-| `/api/v1/orgs/:org/users/:userId/history`     | GET/DEL | Chat history     |
+| `/api/v1/orgs/:org/users/:userId/history`     | GET     | Chat history     |
 
 ### Admin Endpoints
 
@@ -93,8 +93,12 @@ All admin endpoints require Bearer token authentication (super admin or org-spec
 | `/api/v1/admin/orgs/:org/mcp-servers/:serverId`          | DELETE       | Remove MCP server           |
 | `/api/v1/admin/orgs/:org/config`                         | GET/PUT/DEL  | Org config (history limits) |
 | `/api/v1/admin/orgs/:org/prompt-overrides`               | GET/PUT/DEL  | Org-level prompt overrides  |
+| `/api/v1/admin/orgs/:org/modes`                          | GET          | List org modes              |
+| `/api/v1/admin/orgs/:org/modes/:modeName`                | GET/PUT/DEL  | Manage individual mode      |
+| `/api/v1/admin/orgs/:org/users/:userId/mode`             | GET/PUT/DEL  | User's active mode          |
 | `/api/v1/admin/orgs/:org/users/:userId/prompt-overrides` | GET/PUT/DEL  | User-level prompt overrides |
 | `/api/v1/admin/orgs/:org/users/:userId/memory`           | GET/DEL      | User persistent memory      |
+| `/api/v1/admin/orgs/:org/users/:userId/history`          | DEL          | Delete user history         |
 
 ### Chat Request/Response
 
