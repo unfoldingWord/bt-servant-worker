@@ -18,6 +18,7 @@ import {
   MAX_MODES_PER_ORG,
   mergePromptOverrides,
   OrgModes,
+  PromptMode,
   PromptOverrides,
   resolvePromptOverrides,
   validateModeName,
@@ -477,22 +478,18 @@ app.put('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
       modes: [],
     };
 
-    const existingIdx = orgModes.modes.findIndex((m) => m.name === modeName);
-    if (existingIdx >= 0) {
-      orgModes.modes.splice(existingIdx, 1, modeInput);
-    } else {
-      if (orgModes.modes.length >= MAX_MODES_PER_ORG) {
-        return c.json({ error: `Cannot have more than ${MAX_MODES_PER_ORG} modes per org` }, 400);
-      }
-      orgModes.modes.push(modeInput);
+    const { savedMode, error: upsertError } = upsertMode(orgModes, modeInput, org);
+    if (upsertError) {
+      return c.json({ error: upsertError }, 400);
     }
 
     await c.env.PROMPT_OVERRIDES.put(`${org}:modes`, JSON.stringify(orgModes));
     logAdminAction('upsert_mode', org, {
       mode_name: modeName,
       mode_count: orgModes.modes.length,
+      saved_overrides: savedMode.overrides,
     });
-    return c.json({ org, mode: modeInput, message: 'Mode saved' });
+    return c.json({ org, mode: savedMode, message: 'Mode saved' });
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
     logAdminAction('upsert_mode_error', org, { error: errorMsg });
@@ -604,6 +601,44 @@ function logAdminAction(action: string, org: string, details: Record<string, unk
   console.error(
     JSON.stringify({ event: 'admin_action', timestamp: Date.now(), action, org, ...details })
   );
+}
+
+/** Upsert a mode into an OrgModes array, merging overrides with any existing mode. */
+function upsertMode(
+  orgModes: OrgModes,
+  modeInput: PromptMode,
+  org: string
+): { savedMode: PromptMode; error?: string } {
+  const existingIdx = orgModes.modes.findIndex((m) => m.name === modeInput.name);
+  if (existingIdx >= 0) {
+    const existing = orgModes.modes[existingIdx]!;
+    logAdminAction('upsert_mode_before', org, {
+      mode_name: modeInput.name,
+      existing_overrides: existing.overrides,
+      incoming_overrides: modeInput.overrides,
+    });
+    const savedMode: PromptMode = {
+      ...existing,
+      ...modeInput,
+      overrides: mergePromptOverrides(existing.overrides, modeInput.overrides),
+    };
+    orgModes.modes.splice(existingIdx, 1, savedMode);
+    return { savedMode };
+  }
+
+  if (orgModes.modes.length >= MAX_MODES_PER_ORG) {
+    return {
+      savedMode: modeInput,
+      error: `Cannot have more than ${MAX_MODES_PER_ORG} modes per org`,
+    };
+  }
+  logAdminAction('upsert_mode_before', org, {
+    mode_name: modeInput.name,
+    existing_overrides: null,
+    incoming_overrides: modeInput.overrides,
+  });
+  orgModes.modes.push(modeInput);
+  return { savedMode: modeInput };
 }
 
 /**
