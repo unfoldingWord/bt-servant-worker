@@ -1,7 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { transcribeAudio, synthesizeSpeech } from '../../src/services/audio/workers-ai.js';
 import { AudioTranscriptionError, AudioSynthesisError } from '../../src/utils/errors.js';
-import { MAX_AUDIO_SIZE_BYTES, MAX_TTS_INPUT_CHARS } from '../../src/services/audio/types.js';
+import {
+  MAX_AUDIO_SIZE_BYTES,
+  MAX_TTS_INPUT_CHARS,
+  AudioContext,
+} from '../../src/services/audio/types.js';
 import { createRequestLogger } from '../../src/utils/logger.js';
 
 const logger = createRequestLogger('test-request-id', 'test-user');
@@ -94,6 +98,41 @@ describe('transcribeAudio - validation and errors', () => {
     await expect(transcribeAudio(mockAi, makeBase64(100), 'ogg', logger)).rejects.toThrow(
       /Transcription failed/
     );
+  });
+});
+
+describe('AudioContext', () => {
+  it('starts with audioRequested false', () => {
+    const ctx: AudioContext = {
+      audioRequested: false,
+      requestAudio: () => {
+        ctx.audioRequested = true;
+      },
+    };
+    expect(ctx.audioRequested).toBe(false);
+  });
+
+  it('sets audioRequested to true when requestAudio is called', () => {
+    const ctx: AudioContext = {
+      audioRequested: false,
+      requestAudio: () => {
+        ctx.audioRequested = true;
+      },
+    };
+    ctx.requestAudio();
+    expect(ctx.audioRequested).toBe(true);
+  });
+
+  it('remains true after multiple calls', () => {
+    const ctx: AudioContext = {
+      audioRequested: false,
+      requestAudio: () => {
+        ctx.audioRequested = true;
+      },
+    };
+    ctx.requestAudio();
+    ctx.requestAudio();
+    expect(ctx.audioRequested).toBe(true);
   });
 });
 

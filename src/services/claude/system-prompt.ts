@@ -69,6 +69,14 @@ export function buildSystemPrompt(
     sections.push(memoryTOC);
   }
 
+  // Audio tool guidance (always present so Claude knows when to use request_audio)
+  sections.push(
+    '## Audio Response\n\n' +
+      'You have a `request_audio` tool. Call it when the user asks to "hear", "listen to", ' +
+      'or "read aloud" content, or when they explicitly request audio or voice output. ' +
+      'Call it once before writing your text response.'
+  );
+
   // Conditional: user preferences
   if (preferences.response_language !== 'en') {
     sections.push(

@@ -24,6 +24,7 @@ interface CallbackPayload {
   message?: string;
   text?: string;
   error?: string;
+  voice_audio_base64?: string | null;
 }
 
 export class ProgressCallbackSender {
@@ -51,8 +52,12 @@ export class ProgressCallbackSender {
     }
   }
 
-  async sendComplete(text: string): Promise<void> {
-    await this.post({ type: 'complete', text });
+  async sendComplete(text: string, voiceAudioBase64?: string | null): Promise<void> {
+    await this.post({
+      type: 'complete',
+      ...(text ? { text } : {}),
+      ...(voiceAudioBase64 ? { voice_audio_base64: voiceAudioBase64 } : {}),
+    });
   }
 
   async sendError(error: string): Promise<void> {
@@ -252,8 +257,8 @@ export function createWebhookCallbacks(
       incrementalSender?.complete();
       const fullText = response.responses.join('\n');
       const delta = fullText.slice(lastSentText.length);
-      if (delta) {
-        void sender.sendComplete(delta);
+      if (delta || response.voice_audio_base64) {
+        void sender.sendComplete(delta, response.voice_audio_base64);
       }
     },
     onError: (error) => {

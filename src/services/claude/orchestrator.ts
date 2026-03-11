@@ -10,6 +10,7 @@
 
 import Anthropic from '@anthropic-ai/sdk';
 import { Env } from '../../config/types.js';
+import { AudioContext } from '../audio/index.js';
 import { ChatHistoryEntry, StreamCallbacks } from '../../types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig } from '../../types/org-config.js';
 import { DEFAULT_PROMPT_VALUES, ModeContext, PromptSlot } from '../../types/prompt-overrides.js';
@@ -82,6 +83,7 @@ interface OrchestratorOptions {
   memoryStore?: UserMemoryStore | undefined;
   memoryTOC?: string | undefined;
   modeContext?: ModeContext | undefined;
+  audioContext?: AudioContext | undefined;
   clientId?: string | undefined;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
@@ -150,6 +152,7 @@ interface OrchestrationContext {
   healthTracker: HealthTracker;
   memoryStore: UserMemoryStore | undefined;
   modeContext: ModeContext | undefined;
+  audioContext: AudioContext | undefined;
 }
 
 function extractToolCalls(content: Anthropic.ContentBlock[]): ToolUseBlock[] {
@@ -377,6 +380,7 @@ function createOrchestrationContext(
     healthTracker: createHealthTracker(),
     memoryStore: options.memoryStore,
     modeContext: options.modeContext,
+    audioContext: options.audioContext,
   };
 }
 
@@ -506,6 +510,9 @@ async function dispatchToolCall(
   if (toolCall.name === 'update_memory') {
     return handleUpdateMemory(toolCall.input, ctx);
   }
+  if (toolCall.name === 'request_audio') {
+    return handleRequestAudio(ctx);
+  }
   if (toolCall.name === 'list_modes') {
     return handleListModes(ctx);
   }
@@ -563,6 +570,14 @@ async function handleUpdateMemory(input: unknown, ctx: OrchestrationContext): Pr
   });
 
   return result;
+}
+
+function handleRequestAudio(ctx: OrchestrationContext): unknown {
+  if (!ctx.audioContext) {
+    return { error: 'Audio responses are not available for this session.' };
+  }
+  ctx.audioContext.requestAudio();
+  return 'Audio response requested. Your text response will be converted to speech.';
 }
 
 function handleListModes(ctx: OrchestrationContext): unknown {

@@ -4,6 +4,7 @@ import {
   buildGetToolDefinitionsTool,
   buildReadMemoryTool,
   buildUpdateMemoryTool,
+  buildRequestAudioTool,
   buildAllTools,
   isBuiltInTool,
   isReadMemoryInput,
@@ -50,11 +51,12 @@ describe('buildAllTools', () => {
   it('should only include core tools when hasModes is false', () => {
     const tools = buildAllTools(catalog);
 
-    expect(tools.length).toBe(4);
+    expect(tools.length).toBe(5);
     expect(tools.map((t) => t.name)).toContain('execute_code');
     expect(tools.map((t) => t.name)).toContain('get_tool_definitions');
     expect(tools.map((t) => t.name)).toContain('read_memory');
     expect(tools.map((t) => t.name)).toContain('update_memory');
+    expect(tools.map((t) => t.name)).toContain('request_audio');
     expect(tools.map((t) => t.name)).not.toContain('list_modes');
     expect(tools.map((t) => t.name)).not.toContain('switch_mode');
     expect(tools.map((t) => t.name)).not.toContain('mcp_tool');
@@ -63,9 +65,10 @@ describe('buildAllTools', () => {
   it('should include mode tools when hasModes is true', () => {
     const tools = buildAllTools(catalog, { hasModes: true });
 
-    expect(tools.length).toBe(6);
+    expect(tools.length).toBe(7);
     expect(tools.map((t) => t.name)).toContain('list_modes');
     expect(tools.map((t) => t.name)).toContain('switch_mode');
+    expect(tools.map((t) => t.name)).toContain('request_audio');
     expect(tools.map((t) => t.name)).not.toContain('mcp_tool');
   });
 });
@@ -76,6 +79,7 @@ describe('isBuiltInTool', () => {
     expect(isBuiltInTool('get_tool_definitions')).toBe(true);
     expect(isBuiltInTool('read_memory')).toBe(true);
     expect(isBuiltInTool('update_memory')).toBe(true);
+    expect(isBuiltInTool('request_audio')).toBe(true);
     expect(isBuiltInTool('list_modes')).toBe(true);
     expect(isBuiltInTool('switch_mode')).toBe(true);
     expect(isBuiltInTool('some_mcp_tool')).toBe(false);
@@ -117,6 +121,16 @@ describe('getToolDefinitions', () => {
     const defs = getToolDefinitions(catalog, ['nonexistent']);
 
     expect(Object.keys(defs)).toHaveLength(0);
+  });
+});
+
+describe('buildRequestAudioTool', () => {
+  it('returns valid tool definition', () => {
+    const tool = buildRequestAudioTool();
+    expect(tool.name).toBe('request_audio');
+    expect(tool.description).toContain('audio');
+    expect(tool.input_schema.type).toBe('object');
+    expect(tool.input_schema.required).toEqual([]);
   });
 });
 

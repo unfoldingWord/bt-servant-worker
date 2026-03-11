@@ -60,7 +60,7 @@ import {
   validateModeName,
   validatePromptOverrides,
 } from '../types/prompt-overrides.js';
-import { transcribeAudio, synthesizeSpeech } from '../services/audio/index.js';
+import { transcribeAudio, synthesizeSpeech, AudioContext } from '../services/audio/index.js';
 import { AppError, AudioTranscriptionError, ValidationError } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger } from '../utils/logger.js';
 import { applyTemplateVariables } from '../utils/template.js';
@@ -554,6 +554,21 @@ export class UserSession {
   }
 
   /**
+   * Conditionally generate TTS audio based on message type and audio context.
+   */
+  private async maybeGenerateAudio(
+    body: ChatRequest,
+    audioContext: AudioContext,
+    responses: string[],
+    logger: RequestLogger,
+    callbacks?: StreamCallbacks
+  ): Promise<string | null> {
+    const shouldGenerate = body.message_type === 'audio' || audioContext.audioRequested;
+    if (!shouldGenerate || responses.length === 0) return null;
+    return this.generateVoiceResponse(responses, logger, callbacks);
+  }
+
+  /**
    * Generate TTS audio for a response. Non-fatal: returns null on failure.
    */
   private async generateVoiceResponse(
@@ -591,8 +606,8 @@ export class UserSession {
     } = await this.resolvePrompts(body, logger);
     const { memoryStore, formattedTOC } = await this.loadMemoryContext(logger);
     const modeContext = this.buildModeContext(orgModes, activeModeName);
-    const startTime = Date.now();
-    const responses = await orchestrate(messageText, {
+    const audioContext = this.buildAudioContext();
+    const responses = await this.runOrchestration(messageText, {
       env: this.env,
       catalog,
       history,
@@ -605,19 +620,18 @@ export class UserSession {
       memoryStore,
       memoryTOC: formattedTOC || undefined,
       modeContext,
+      audioContext,
       clientId: body.client_id,
       logger,
       callbacks,
     });
-    logger.log('phase_orchestration_complete', {
-      response_count: responses.length,
-      duration_ms: Date.now() - startTime,
-    });
-    const isAudio = body.message_type === 'audio';
-    const voiceAudioBase64 =
-      isAudio && responses.length > 0
-        ? await this.generateVoiceResponse(responses, logger, callbacks)
-        : null;
+    const voiceAudioBase64 = await this.maybeGenerateAudio(
+      body,
+      audioContext,
+      responses,
+      logger,
+      callbacks
+    );
     await this.saveConversation(messageText, responses, preferences, orgConfig, logger);
     return {
       responses,
@@ -723,6 +737,30 @@ export class UserSession {
   private async handleDeleteMode(): Promise<Response> {
     await this.state.storage.delete(SELECTED_MODE_KEY);
     return Response.json({ mode: null, message: 'User mode cleared' });
+  }
+
+  /** Run orchestration and log duration */
+  private async runOrchestration(
+    messageText: string,
+    options: Parameters<typeof orchestrate>[1]
+  ): Promise<string[]> {
+    const startTime = Date.now();
+    const responses = await orchestrate(messageText, options);
+    options.logger.log('phase_orchestration_complete', {
+      response_count: responses.length,
+      duration_ms: Date.now() - startTime,
+    });
+    return responses;
+  }
+
+  private buildAudioContext(): AudioContext {
+    const ctx: AudioContext = {
+      audioRequested: false,
+      requestAudio: () => {
+        ctx.audioRequested = true;
+      },
+    };
+    return ctx;
   }
 
   private buildModeContext(

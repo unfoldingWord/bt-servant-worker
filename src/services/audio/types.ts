@@ -22,3 +22,9 @@ export const MAX_AUDIO_SIZE_BYTES = 25 * 1024 * 1024;
 
 /** Max characters for TTS input (Deepgram Aura-2 practical limit) */
 export const MAX_TTS_INPUT_CHARS = 10_000;
+
+/** Context for tracking whether audio output has been requested during orchestration */
+export interface AudioContext {
+  audioRequested: boolean;
+  requestAudio: () => void;
+}
