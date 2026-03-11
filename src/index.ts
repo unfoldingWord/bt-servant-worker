@@ -603,12 +603,11 @@ function logAdminAction(action: string, org: string, details: Record<string, unk
   );
 }
 
-/** Upsert a mode into an OrgModes array, merging overrides with any existing mode. */
 /**
  * Upsert a mode into an OrgModes array, merging overrides with any existing mode.
  * Mutates orgModes.modes in-place (splice/push) and returns the result.
  */
-function upsertMode(
+export function upsertMode(
   orgModes: OrgModes,
   modeInput: PromptMode,
   org: string
