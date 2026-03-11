@@ -1,4 +1,5 @@
-export { transcribeAudio, synthesizeSpeech } from './workers-ai.js';
+export { transcribeAudio } from './cloudflare-stt.js';
+export { synthesizeSpeech } from './openai-tts.js';
 export type {
   TranscriptionResult,
   SpeechSynthesisResult,
