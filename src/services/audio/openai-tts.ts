@@ -11,13 +11,17 @@ const TTS_MODEL = 'gpt-4o-mini-tts';
 const TTS_VOICE = 'ash';
 const TTS_FORMAT = 'mp3';
 
-const VOICE_INSTRUCTIONS = [
-  'Speak in a warm, friendly, and natural conversational tone.',
-  'Be clear and articulate but not robotic.',
-  'Use appropriate pacing — not too fast, not too slow.',
-  'Match the emotional tone of the content being read.',
-  'Sound like a helpful, knowledgeable friend.',
-].join(' ');
+const VOICE_INSTRUCTIONS = `Personality/Affect: A knowledgeable and trustworthy guide, providing Scripture readings and translation support with calm confidence.
+
+Voice: Clear, steady, and professional, with a warm and approachable quality, at conversational speaking pace.
+
+Tone: Respectful and engaging, encouraging thoughtful reflection and supporting understanding without distraction.
+
+Dialect: Neutral and standard, avoiding slang or overly casual phrasing; suitable for an international audience.
+
+Pronunciation: Careful and precise, ensuring proper enunciation of biblical names and terms, while remaining natural and fluid.
+
+Features: Uses measured pacing, appropriate pauses, and gentle emphasis to highlight key points. Conveys reverence when reading Scripture and clarity when giving practical instructions.`;
 
 /** Convert an ArrayBuffer to a base64 string. */
 function arrayBufferToBase64(buffer: ArrayBuffer): string {

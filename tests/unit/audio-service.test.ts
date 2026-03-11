@@ -193,7 +193,7 @@ describe('synthesizeSpeech - happy path', () => {
         voice: 'ash',
         input: 'Hello',
         response_format: 'mp3',
-        instructions: expect.stringContaining('warm'),
+        instructions: expect.stringContaining('knowledgeable'),
       })
     );
   });
