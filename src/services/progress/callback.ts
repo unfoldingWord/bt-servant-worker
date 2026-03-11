@@ -78,15 +78,33 @@ export class ProgressCallbackSender {
       timestamp: new Date().toISOString(),
     };
 
+    const hasAudio = 'voice_audio_base64' in payload && !!payload.voice_audio_base64;
+    const textLen = 'text' in payload ? ((payload.text as string)?.length ?? 0) : 0;
+    console.warn(
+      JSON.stringify({
+        event: 'webhook_send',
+        type: payload.type,
+        has_text: textLen > 0,
+        text_length: textLen,
+        has_audio: hasAudio,
+        user_id: this.config.user_id,
+      })
+    );
+
     try {
       const response = await fetch(this.config.url, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Engine-Token': this.config.token,
-        },
+        headers: { 'Content-Type': 'application/json', 'X-Engine-Token': this.config.token },
         body: JSON.stringify(fullPayload),
       });
+      console.warn(
+        JSON.stringify({
+          event: 'webhook_response',
+          type: payload.type,
+          status: response.status,
+          user_id: this.config.user_id,
+        })
+      );
 
       if (!response.ok) {
         console.error('[webhook_failure]', {
