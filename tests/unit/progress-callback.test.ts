@@ -117,6 +117,93 @@ describe('ProgressCallbackSender.sendComplete', () => {
   });
 });
 
+describe('ProgressCallbackSender.sendComplete with audio', () => {
+  beforeEach(setupMocks);
+
+  it('includes voice_audio_base64 when provided', async () => {
+    const sender = new ProgressCallbackSender(mockConfig);
+    await sender.sendComplete('Response text', 'base64audiodata');
+
+    expect(fetch).toHaveBeenCalledWith(mockConfig.url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Engine-Token': mockConfig.token,
+      },
+      body: JSON.stringify({
+        type: 'complete',
+        text: 'Response text',
+        voice_audio_base64: 'base64audiodata',
+        user_id: mockConfig.user_id,
+        message_key: mockConfig.message_key,
+        timestamp: '2024-01-15T12:00:00.000Z',
+      }),
+    });
+  });
+
+  it('omits voice_audio_base64 when null', async () => {
+    const sender = new ProgressCallbackSender(mockConfig);
+    await sender.sendComplete('Response text', null);
+
+    const body = JSON.parse((fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].body as string);
+    expect(body).not.toHaveProperty('voice_audio_base64');
+  });
+
+  it('omits voice_audio_base64 when undefined', async () => {
+    const sender = new ProgressCallbackSender(mockConfig);
+    await sender.sendComplete('Response text');
+
+    const body = JSON.parse((fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].body as string);
+    expect(body).not.toHaveProperty('voice_audio_base64');
+  });
+});
+
+describe('createWebhookCallbacks onComplete forwards audio', () => {
+  beforeEach(setupMocks);
+
+  it('forwards voice_audio_base64 from ChatResponse', async () => {
+    const sender = new ProgressCallbackSender(mockConfig);
+    const callbacks = createWebhookCallbacks(sender);
+    const response = {
+      responses: ['Hello'],
+      response_language: 'en',
+      voice_audio_base64: 'audiodata123',
+    };
+    callbacks.onComplete(response);
+    await vi.runAllTimersAsync();
+
+    const body = JSON.parse((fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].body as string);
+    expect(body.voice_audio_base64).toBe('audiodata123');
+    expect(body.type).toBe('complete');
+  });
+
+  it('sends complete when only audio is present (no text delta)', async () => {
+    const sender = new ProgressCallbackSender(mockConfig);
+    const callbacks = createWebhookCallbacks(sender);
+
+    // Simulate iteration already sent all text
+    callbacks.onProgress('Hello');
+    callbacks.onIterationComplete?.('Hello');
+
+    const response = {
+      responses: ['Hello'],
+      response_language: 'en',
+      voice_audio_base64: 'audioonly',
+    };
+    callbacks.onComplete(response);
+    await vi.runAllTimersAsync();
+
+    // Should still send because audio is present
+    const completeCalls = (fetch as ReturnType<typeof vi.fn>).mock.calls.filter(
+      (call: unknown[]) => {
+        const body = JSON.parse((call as [string, { body: string }])[1].body);
+        return body.type === 'complete';
+      }
+    );
+    expect(completeCalls.length).toBe(1);
+  });
+});
+
 describe('ProgressCallbackSender.sendError', () => {
   beforeEach(setupMocks);
 

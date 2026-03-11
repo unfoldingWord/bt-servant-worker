@@ -132,6 +132,22 @@ export function buildUpdateMemoryTool(): Anthropic.Tool {
 }
 
 /**
+ * Build request_audio tool definition
+ */
+export function buildRequestAudioTool(): Anthropic.Tool {
+  return {
+    name: 'request_audio',
+    description:
+      'Request that the response be delivered as audio. Use when the user asks to hear or listen to content.',
+    input_schema: {
+      type: 'object',
+      properties: {},
+      required: [],
+    },
+  };
+}
+
+/**
  * Build list_modes tool definition
  */
 export function buildListModesTool(): Anthropic.Tool {
@@ -191,6 +207,7 @@ export function buildAllTools(
     buildGetToolDefinitionsTool(),
     buildReadMemoryTool(),
     buildUpdateMemoryTool(),
+    buildRequestAudioTool(),
   ];
 
   if (opts?.hasModes) {
@@ -209,6 +226,7 @@ export function isBuiltInTool(toolName: string): boolean {
     toolName === 'get_tool_definitions' ||
     toolName === 'read_memory' ||
     toolName === 'update_memory' ||
+    toolName === 'request_audio' ||
     toolName === 'list_modes' ||
     toolName === 'switch_mode'
   );
