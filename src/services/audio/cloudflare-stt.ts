@@ -1,17 +1,14 @@
 /**
- * Cloudflare Workers AI audio services (STT + TTS)
+ * Cloudflare Workers AI Speech-to-Text (STT)
  *
- * STT: @cf/openai/whisper-large-v3-turbo
- * TTS: @cf/deepgram/aura-2-en
+ * Model: @cf/openai/whisper-large-v3-turbo
  */
 
-import { AudioTranscriptionError, AudioSynthesisError } from '../../utils/errors.js';
+import { AudioTranscriptionError } from '../../utils/errors.js';
 import { RequestLogger } from '../../utils/logger.js';
 import {
   AudioFormat,
   MAX_AUDIO_SIZE_BYTES,
-  MAX_TTS_INPUT_CHARS,
-  SpeechSynthesisResult,
   SUPPORTED_AUDIO_FORMATS,
   TranscriptionResult,
 } from './types.js';
@@ -75,53 +72,5 @@ export async function transcribeAudio(
     const msg = error instanceof Error ? error.message : String(error);
     logger.error('stt_error', error);
     throw new AudioTranscriptionError(`Transcription failed: ${msg}`);
-  }
-}
-
-/**
- * Synthesize text to speech using Cloudflare Workers AI (Deepgram Aura-2).
- * Returns base64-encoded MP3 audio.
- */
-export async function synthesizeSpeech(
-  ai: Ai,
-  text: string,
-  logger: RequestLogger
-): Promise<SpeechSynthesisResult> {
-  const startTime = Date.now();
-
-  // Truncate to avoid slow/failed requests on very large inputs
-  const truncatedText =
-    text.length > MAX_TTS_INPUT_CHARS ? text.slice(0, MAX_TTS_INPUT_CHARS) : text;
-  logger.log('tts_start', {
-    input_chars: text.length,
-    truncated: text.length > MAX_TTS_INPUT_CHARS,
-  });
-
-  try {
-    // Aura-2 returns a base64-encoded audio string
-    const audioBase64 = await ai.run('@cf/deepgram/aura-2-en', {
-      text: truncatedText,
-      speaker: 'luna',
-      encoding: 'mp3',
-    });
-
-    const durationMs = Date.now() - startTime;
-
-    logger.log('tts_complete', {
-      output_size: audioBase64.length,
-      duration_ms: durationMs,
-    });
-
-    return {
-      audio_base64: audioBase64,
-      audio_format: 'mp3',
-      duration_ms: durationMs,
-      input_chars: text.length,
-    };
-  } catch (error) {
-    if (error instanceof AudioSynthesisError) throw error;
-    const msg = error instanceof Error ? error.message : String(error);
-    logger.error('tts_error', error);
-    throw new AudioSynthesisError(`Speech synthesis failed: ${msg}`);
   }
 }

@@ -33,6 +33,7 @@ export interface Env {
   // Secrets (set via wrangler secret put)
   ANTHROPIC_API_KEY: string;
   ENGINE_API_KEY: string;
+  OPENAI_API_KEY: string;
 
   // KV Namespaces
   ORG_ADMIN_KEYS: KVNamespace;

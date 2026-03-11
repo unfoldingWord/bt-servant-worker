@@ -20,7 +20,7 @@ export type AudioFormat = (typeof SUPPORTED_AUDIO_FORMATS)[number];
 /** 25 MB max audio size in bytes */
 export const MAX_AUDIO_SIZE_BYTES = 25 * 1024 * 1024;
 
-/** Max characters for TTS input (Deepgram Aura-2 practical limit) */
+/** Max characters for TTS input */
 export const MAX_TTS_INPUT_CHARS = 10_000;
 
 /** Context for tracking whether audio output has been requested during orchestration */

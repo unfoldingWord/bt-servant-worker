@@ -586,7 +586,11 @@ export class UserSession {
   ): Promise<string | null> {
     try {
       await callbacks?.onStatus?.('Generating audio response...');
-      const synthesis = await synthesizeSpeech(this.env.AI, responses.join('\n'), logger);
+      const synthesis = await synthesizeSpeech(
+        this.env.OPENAI_API_KEY,
+        responses.join('\n'),
+        logger
+      );
       logger.log('tts_generated', {
         input_chars: synthesis.input_chars,
         synthesis_ms: synthesis.duration_ms,
