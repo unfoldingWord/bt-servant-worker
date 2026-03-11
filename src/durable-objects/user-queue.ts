@@ -52,10 +52,24 @@ function isValidProgressMode(value: unknown): value is ProgressMode {
   return typeof value === 'string' && VALID_PROGRESS_MODES.includes(value as ProgressMode);
 }
 
+/** Validate message/audio payload fields. Returns error string or null. */
+function validateMessagePayload(body: Record<string, unknown>): string | null {
+  if (body.message_type === 'audio') {
+    if (!body.audio_base64 || typeof body.audio_base64 !== 'string')
+      return 'audio_base64 is required when message_type is audio';
+    if (!body.audio_format || typeof body.audio_format !== 'string')
+      return 'audio_format is required when message_type is audio';
+    return null;
+  }
+  if (!body.message || typeof body.message !== 'string') return 'message is required';
+  return null;
+}
+
 /** Validate required fields in enqueue request body. Returns error string or null. */
 function validateEnqueueBody(body: Record<string, unknown>): string | null {
   if (!body.user_id || typeof body.user_id !== 'string') return 'user_id is required';
-  if (!body.message || typeof body.message !== 'string') return 'message is required';
+  const payloadError = validateMessagePayload(body);
+  if (payloadError) return payloadError;
   if (!body.org || typeof body.org !== 'string') return 'org is required';
   return null;
 }
@@ -106,7 +120,7 @@ function parseEnqueueBody(body: Record<string, unknown>): QueueEntry | string {
     message_id: crypto.randomUUID(),
     user_id: body.user_id as string,
     client_id: typeof body.client_id === 'string' ? body.client_id : 'unknown',
-    message: body.message as string,
+    message: typeof body.message === 'string' ? body.message : undefined,
     message_type: body.message_type === 'audio' ? ('audio' as const) : ('text' as const),
     org: body.org as string,
     enqueued_at: Date.now(),

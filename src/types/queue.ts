@@ -18,7 +18,7 @@ export interface QueueEntry {
   message_id: string;
   user_id: string;
   client_id: string;
-  message: string;
+  message: string | undefined;
   message_type: 'text' | 'audio';
   audio_base64?: string | undefined;
   audio_format?: string | undefined;
