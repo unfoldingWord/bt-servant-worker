@@ -71,10 +71,13 @@ export function buildSystemPrompt(
 
   // Audio tool guidance (always present so Claude knows when to use request_audio)
   sections.push(
-    '## Audio Response\n\n' +
-      'You have a `request_audio` tool. Call it when the user asks to "hear", "listen to", ' +
-      'or "read aloud" content, or when they explicitly request audio or voice output. ' +
-      'Call it once before writing your text response.'
+    '## Audio Response (IMPORTANT)\n\n' +
+      'You have a `request_audio` tool. You MUST call it when any of these apply:\n' +
+      '- The user asks to "hear", "listen to", or "read aloud" something\n' +
+      '- The user says "I want to listen to..." or similar\n' +
+      '- The user explicitly requests audio, voice, or spoken output\n\n' +
+      'Call `request_audio` FIRST, before writing your text response. ' +
+      'Your text response will then be automatically converted to speech.'
   );
 
   // Conditional: user preferences

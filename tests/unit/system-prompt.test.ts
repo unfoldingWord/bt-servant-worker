@@ -188,14 +188,15 @@ describe('buildSystemPrompt - memory TOC', () => {
 describe('buildSystemPrompt - audio tool guidance', () => {
   it('includes audio response guidance in system prompt', () => {
     const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
-    expect(prompt).toContain('## Audio Response');
+    expect(prompt).toContain('## Audio Response (IMPORTANT)');
     expect(prompt).toContain('request_audio');
+    expect(prompt).toContain('MUST call it');
   });
 
   it('audio guidance appears after memory and before closing', () => {
     const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
     const memoryIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.memory_instructions);
-    const audioIdx = prompt.indexOf('## Audio Response');
+    const audioIdx = prompt.indexOf('## Audio Response (IMPORTANT)');
     const closingIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.closing);
     expect(memoryIdx).toBeLessThan(audioIdx);
     expect(audioIdx).toBeLessThan(closingIdx);
