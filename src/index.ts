@@ -478,18 +478,18 @@ app.put('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
       modes: [],
     };
 
-    const { savedMode, error: upsertError } = upsertMode(orgModes, modeInput, org);
-    if (upsertError) {
-      return c.json({ error: upsertError }, 400);
+    const result = upsertMode(orgModes, modeInput, org);
+    if (!result.ok) {
+      return c.json({ error: result.error }, 400);
     }
 
     await c.env.PROMPT_OVERRIDES.put(`${org}:modes`, JSON.stringify(orgModes));
     logAdminAction('upsert_mode', org, {
       mode_name: modeName,
       mode_count: orgModes.modes.length,
-      saved_overrides: savedMode.overrides,
+      saved_overrides: result.savedMode.overrides,
     });
-    return c.json({ org, mode: savedMode, message: 'Mode saved' });
+    return c.json({ org, mode: result.savedMode, message: 'Mode saved' });
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
     logAdminAction('upsert_mode_error', org, { error: errorMsg });
@@ -604,11 +604,15 @@ function logAdminAction(action: string, org: string, details: Record<string, unk
 }
 
 /** Upsert a mode into an OrgModes array, merging overrides with any existing mode. */
+/**
+ * Upsert a mode into an OrgModes array, merging overrides with any existing mode.
+ * Mutates orgModes.modes in-place (splice/push) and returns the result.
+ */
 function upsertMode(
   orgModes: OrgModes,
   modeInput: PromptMode,
   org: string
-): { savedMode: PromptMode; error?: string } {
+): { ok: true; savedMode: PromptMode } | { ok: false; error: string } {
   const existingIdx = orgModes.modes.findIndex((m) => m.name === modeInput.name);
   if (existingIdx >= 0) {
     const existing = orgModes.modes[existingIdx]!;
@@ -618,19 +622,19 @@ function upsertMode(
       incoming_overrides: modeInput.overrides,
     });
     const savedMode: PromptMode = {
-      ...existing,
-      ...modeInput,
+      name: modeInput.name,
       overrides: mergePromptOverrides(existing.overrides, modeInput.overrides),
+      ...((modeInput.label ?? existing.label) ? { label: modeInput.label ?? existing.label } : {}),
+      ...((modeInput.description ?? existing.description)
+        ? { description: modeInput.description ?? existing.description }
+        : {}),
     };
     orgModes.modes.splice(existingIdx, 1, savedMode);
-    return { savedMode };
+    return { ok: true, savedMode };
   }
 
   if (orgModes.modes.length >= MAX_MODES_PER_ORG) {
-    return {
-      savedMode: modeInput,
-      error: `Cannot have more than ${MAX_MODES_PER_ORG} modes per org`,
-    };
+    return { ok: false, error: `Cannot have more than ${MAX_MODES_PER_ORG} modes per org` };
   }
   logAdminAction('upsert_mode_before', org, {
     mode_name: modeInput.name,
@@ -638,7 +642,7 @@ function upsertMode(
     incoming_overrides: modeInput.overrides,
   });
   orgModes.modes.push(modeInput);
-  return { savedMode: modeInput };
+  return { ok: true, savedMode: modeInput };
 }
 
 /**
