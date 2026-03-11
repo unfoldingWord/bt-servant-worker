@@ -18,7 +18,7 @@ export type ProgressMode = 'complete' | 'iteration' | 'periodic' | 'sentence';
 export interface ChatRequest {
   client_id: string;
   user_id: string;
-  message: string;
+  message?: string;
   message_type: 'text' | 'audio';
   audio_base64?: string;
   audio_format?: string;
