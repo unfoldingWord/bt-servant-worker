@@ -574,9 +574,11 @@ async function handleUpdateMemory(input: unknown, ctx: OrchestrationContext): Pr
 
 function handleRequestAudio(ctx: OrchestrationContext): unknown {
   if (!ctx.audioContext) {
+    ctx.logger.warn('request_audio_no_context', { reason: 'audioContext is undefined' });
     return { error: 'Audio responses are not available for this session.' };
   }
   ctx.audioContext.requestAudio();
+  ctx.logger.log('request_audio_tool_called', { audioRequested: true });
   return 'Audio response requested. Your text response will be converted to speech.';
 }
 

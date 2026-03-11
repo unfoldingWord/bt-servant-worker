@@ -564,8 +564,16 @@ export class UserSession {
     callbacks?: StreamCallbacks
   ): Promise<string | null> {
     const shouldGenerate = body.message_type === 'audio' || audioContext.audioRequested;
+    logger.log('audio_decision', {
+      message_type: body.message_type,
+      audio_requested_by_tool: audioContext.audioRequested,
+      should_generate: shouldGenerate,
+      has_responses: responses.length > 0,
+    });
     if (!shouldGenerate || responses.length === 0) return null;
-    return this.generateVoiceResponse(responses, logger, callbacks);
+    const audio = await this.generateVoiceResponse(responses, logger, callbacks);
+    logger.log('audio_generation_result', { has_audio: audio !== null });
+    return audio;
   }
 
   /**
