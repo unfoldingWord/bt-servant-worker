@@ -208,7 +208,7 @@ describe('synthesizeSpeech - happy path', () => {
   });
 });
 
-describe('synthesizeSpeech - retry and error handling', () => {
+describe('synthesizeSpeech - retry behavior', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     mockSpeechCreate.mockReset();
@@ -217,10 +217,8 @@ describe('synthesizeSpeech - retry and error handling', () => {
   it('retries once on 5xx error', async () => {
     const OpenAI = (await import('openai')).default;
     const Err = OpenAI as unknown as { APIError: new (s: number, m: string) => Error };
-    const error5xx = new Err.APIError(500, 'Internal server error');
-
     mockSpeechCreate
-      .mockRejectedValueOnce(error5xx)
+      .mockRejectedValueOnce(new Err.APIError(500, 'Internal server error'))
       .mockResolvedValueOnce(mockSpeechResponse('audio'));
 
     const result = await synthesizeSpeech('test-key', 'Hello', logger);
@@ -231,14 +229,24 @@ describe('synthesizeSpeech - retry and error handling', () => {
   it('does not retry on 4xx error', async () => {
     const OpenAI = (await import('openai')).default;
     const Err = OpenAI as unknown as { APIError: new (s: number, m: string) => Error };
-    const error4xx = new Err.APIError(401, 'Unauthorized');
-
-    mockSpeechCreate.mockRejectedValue(error4xx);
+    mockSpeechCreate.mockRejectedValue(new Err.APIError(401, 'Unauthorized'));
 
     await expect(synthesizeSpeech('test-key', 'Hello', logger)).rejects.toThrow(
       AudioSynthesisError
     );
     expect(mockSpeechCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries on 429 rate-limit error', async () => {
+    const OpenAI = (await import('openai')).default;
+    const Err = OpenAI as unknown as { APIError: new (s: number, m: string) => Error };
+    mockSpeechCreate
+      .mockRejectedValueOnce(new Err.APIError(429, 'Rate limit exceeded'))
+      .mockResolvedValueOnce(mockSpeechResponse('audio'));
+
+    const result = await synthesizeSpeech('test-key', 'Hello', logger);
+    expect(result.audio_base64).toBeTruthy();
+    expect(mockSpeechCreate).toHaveBeenCalledTimes(2);
   });
 
   it('retries on network error', async () => {
@@ -249,6 +257,13 @@ describe('synthesizeSpeech - retry and error handling', () => {
     const result = await synthesizeSpeech('test-key', 'Hello', logger);
     expect(result.audio_base64).toBeTruthy();
     expect(mockSpeechCreate).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('synthesizeSpeech - error handling', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    mockSpeechCreate.mockReset();
   });
 
   it('wraps errors in AudioSynthesisError', async () => {

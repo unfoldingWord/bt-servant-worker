@@ -41,9 +41,14 @@ async function callTtsApi(client: OpenAI, text: string): Promise<string> {
   return arrayBufferToBase64(await response.arrayBuffer());
 }
 
-/** Returns true if the error is a 4xx client error that should not be retried. */
+/** Returns true if the error is a non-retryable 4xx client error (excludes 429 rate-limit). */
 function isClientError(error: unknown): boolean {
-  return error instanceof OpenAI.APIError && error.status >= 400 && error.status < 500;
+  return (
+    error instanceof OpenAI.APIError &&
+    error.status >= 400 &&
+    error.status < 500 &&
+    error.status !== 429
+  );
 }
 
 /**
