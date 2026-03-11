@@ -55,7 +55,7 @@ export class ProgressCallbackSender {
   async sendComplete(text: string, voiceAudioBase64?: string | null): Promise<void> {
     await this.post({
       type: 'complete',
-      text,
+      ...(text ? { text } : {}),
       ...(voiceAudioBase64 ? { voice_audio_base64: voiceAudioBase64 } : {}),
     });
   }

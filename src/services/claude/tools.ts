@@ -207,7 +207,7 @@ export function buildAllTools(
     buildGetToolDefinitionsTool(),
     buildReadMemoryTool(),
     buildUpdateMemoryTool(),
-    buildRequestAudioTool(),
+    buildRequestAudioTool(), // Always available — TTS is a platform capability, not org-gated
   ];
 
   if (opts?.hasModes) {

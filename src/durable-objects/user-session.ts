@@ -607,8 +607,7 @@ export class UserSession {
     const { memoryStore, formattedTOC } = await this.loadMemoryContext(logger);
     const modeContext = this.buildModeContext(orgModes, activeModeName);
     const audioContext = this.buildAudioContext();
-    const startTime = Date.now();
-    const responses = await orchestrate(messageText, {
+    const responses = await this.runOrchestration(messageText, {
       env: this.env,
       catalog,
       history,
@@ -625,10 +624,6 @@ export class UserSession {
       clientId: body.client_id,
       logger,
       callbacks,
-    });
-    logger.log('phase_orchestration_complete', {
-      response_count: responses.length,
-      duration_ms: Date.now() - startTime,
     });
     const voiceAudioBase64 = await this.maybeGenerateAudio(
       body,
@@ -742,6 +737,20 @@ export class UserSession {
   private async handleDeleteMode(): Promise<Response> {
     await this.state.storage.delete(SELECTED_MODE_KEY);
     return Response.json({ mode: null, message: 'User mode cleared' });
+  }
+
+  /** Run orchestration and log duration */
+  private async runOrchestration(
+    messageText: string,
+    options: Parameters<typeof orchestrate>[1]
+  ): Promise<string[]> {
+    const startTime = Date.now();
+    const responses = await orchestrate(messageText, options);
+    options.logger.log('phase_orchestration_complete', {
+      response_count: responses.length,
+      duration_ms: Date.now() - startTime,
+    });
+    return responses;
   }
 
   private buildAudioContext(): AudioContext {

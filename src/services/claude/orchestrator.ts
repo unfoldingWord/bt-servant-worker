@@ -572,8 +572,11 @@ async function handleUpdateMemory(input: unknown, ctx: OrchestrationContext): Pr
   return result;
 }
 
-function handleRequestAudio(ctx: OrchestrationContext): string {
-  ctx.audioContext?.requestAudio();
+function handleRequestAudio(ctx: OrchestrationContext): unknown {
+  if (!ctx.audioContext) {
+    return { error: 'Audio responses are not available for this session.' };
+  }
+  ctx.audioContext.requestAudio();
   return 'Audio response requested. Your text response will be converted to speech.';
 }
 
