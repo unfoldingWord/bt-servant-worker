@@ -706,7 +706,8 @@ export class UserSession {
       const store = new JsonMemoryStore(this.state.storage, logger);
       const content = await store.read();
       const toc = await store.getTableOfContents();
-      return Response.json({ content, toc });
+      const entries = await store.readStructured();
+      return Response.json({ content, toc, entries });
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);

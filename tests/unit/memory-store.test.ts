@@ -443,6 +443,63 @@ describe('JsonMemoryStore - TOC', () => {
   });
 });
 
+describe('JsonMemoryStore - readStructured', () => {
+  it('returns empty object when no memory exists', async () => {
+    const entries = await store.readStructured();
+    expect(entries).toEqual({});
+  });
+
+  it('returns entries with pinned normalized to boolean', async () => {
+    const now = Date.now();
+    seedEntries(storage, {
+      Progress: { content: 'Phase 1 done', pinned: true, createdAt: now, updatedAt: now },
+      Preferences: { content: 'Language: es', createdAt: now, updatedAt: now },
+    });
+
+    const entries = await store.readStructured();
+
+    expect(entries['Progress']).toEqual({
+      content: 'Phase 1 done',
+      pinned: true,
+      createdAt: now,
+      updatedAt: now,
+    });
+    expect(entries['Preferences']).toEqual({
+      content: 'Language: es',
+      pinned: false,
+      createdAt: now,
+      updatedAt: now,
+    });
+  });
+
+  it('returns entries with correct structure and types', async () => {
+    seedEntries(storage, {
+      Notes: { content: 'Some notes' },
+    });
+
+    const entries = await store.readStructured();
+    const entry = entries['Notes'];
+
+    expect(entry).toBeDefined();
+    expect(typeof entry.content).toBe('string');
+    expect(typeof entry.updatedAt).toBe('number');
+    expect(typeof entry.createdAt).toBe('number');
+    expect(typeof entry.pinned).toBe('boolean');
+  });
+
+  it('returns a copy that does not mutate internal state', async () => {
+    seedEntries(storage, {
+      Data: { content: 'Original' },
+    });
+
+    const entries = await store.readStructured();
+    entries['Data'].content = 'Mutated';
+
+    const entriesAgain = await store.readStructured();
+    expect(entriesAgain['Data'].content).toBe('Original');
+  });
+});
+
 describe('JsonMemoryStore - clear and size', () => {
   it('removes all memory on clear', async () => {
     seedEntries(storage, { Data: { content: 'Content' } });

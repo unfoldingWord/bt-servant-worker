@@ -29,6 +29,9 @@ export interface UserMemoryStore {
   /** Read full memory or specific sections */
   read(sections?: string[]): Promise<string | Record<string, string>>;
 
+  /** Return all entries with metadata, pinned normalized to boolean */
+  readStructured(): Promise<Record<string, MemoryEntry>>;
+
   /** Create/update sections (string) or delete them (null), with optional pin/unpin */
   writeSections(
     updates: Record<string, string | null>,
@@ -125,6 +128,23 @@ export class JsonMemoryStore implements UserMemoryStore {
       response_size_bytes: byteLength(JSON.stringify(result)),
       duration_ms: Date.now() - startTime,
     });
+
+    return result;
+  }
+
+  async readStructured(): Promise<Record<string, MemoryEntry>> {
+    const data = await this.getMemoryData();
+    const result: Record<string, MemoryEntry> = {};
+
+    for (const [name, entry] of Object.entries(data.entries)) {
+      // eslint-disable-next-line security/detect-object-injection -- name from Object.entries
+      result[name] = {
+        content: entry.content,
+        updatedAt: entry.updatedAt,
+        createdAt: entry.createdAt,
+        pinned: entry.pinned === true,
+      };
+    }
 
     return result;
   }
