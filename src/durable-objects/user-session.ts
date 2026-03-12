@@ -98,6 +98,11 @@ function createErrorResponse(
   return Response.json({ error, code, message }, { status });
 }
 
+function storageErrorResponse(err: unknown): Response {
+  const msg = err instanceof Error ? err.message : String(err);
+  return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
+}
+
 export class UserSession {
   private state: DurableObjectState;
   private env: Env;
@@ -707,91 +712,84 @@ export class UserSession {
   }
 
   private async handleGetPromptOverrides(): Promise<Response> {
-    return withEndpointLogging(this.getLogger(), 'get_prompt_overrides', async () => {
-      try {
+    return withEndpointLogging(
+      this.getLogger(),
+      'get_prompt_overrides',
+      async () => {
         const overrides = await this.getPromptOverrides();
         return Response.json(overrides);
-      } catch (error) {
-        this.getLogger().error('get_prompt_overrides_error', error);
-        const msg = error instanceof Error ? error.message : String(error);
-        return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
-      }
-    });
+      },
+      storageErrorResponse
+    );
   }
 
   private async handleUpdatePromptOverrides(request: Request): Promise<Response> {
-    return withEndpointLogging(this.getLogger(), 'update_prompt_overrides', async () => {
-      const body = await request.json();
-      const error = validatePromptOverrides(body);
-      if (error) {
-        return Response.json({ error }, { status: 400 });
-      }
-
-      try {
+    return withEndpointLogging(
+      this.getLogger(),
+      'update_prompt_overrides',
+      async () => {
+        const body = await request.json();
+        const error = validatePromptOverrides(body);
+        if (error) {
+          return Response.json({ error }, { status: 400 });
+        }
         const current = await this.getPromptOverrides();
         const merged = mergePromptOverrides(current, body as PromptOverrides);
         await this.updatePromptOverrides(merged);
         return Response.json(merged);
-      } catch (err) {
-        this.getLogger().error('update_prompt_overrides_error', err);
-        const msg = err instanceof Error ? err.message : String(err);
-        return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
-      }
-    });
+      },
+      storageErrorResponse
+    );
   }
 
   private async handleDeleteHistory(): Promise<Response> {
-    return withEndpointLogging(this.getLogger(), 'delete_history', async () => {
-      try {
+    return withEndpointLogging(
+      this.getLogger(),
+      'delete_history',
+      async () => {
         await this.state.storage.delete(HISTORY_KEY);
         return Response.json({ message: 'User history cleared' });
-      } catch (error) {
-        this.getLogger().error('delete_history_error', error);
-        const msg = error instanceof Error ? error.message : String(error);
-        return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
-      }
-    });
+      },
+      storageErrorResponse
+    );
   }
 
   private async handleDeletePromptOverrides(): Promise<Response> {
-    return withEndpointLogging(this.getLogger(), 'delete_prompt_overrides', async () => {
-      try {
+    return withEndpointLogging(
+      this.getLogger(),
+      'delete_prompt_overrides',
+      async () => {
         await this.state.storage.delete(PROMPT_OVERRIDES_KEY);
         return Response.json({ message: 'User prompt overrides cleared' });
-      } catch (error) {
-        this.getLogger().error('delete_prompt_overrides_error', error);
-        const msg = error instanceof Error ? error.message : String(error);
-        return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
-      }
-    });
+      },
+      storageErrorResponse
+    );
   }
 
   private async handleGetMemory(): Promise<Response> {
-    return withEndpointLogging(this.getLogger(), 'get_memory', async () => {
-      try {
+    return withEndpointLogging(
+      this.getLogger(),
+      'get_memory',
+      async () => {
         const store = new JsonMemoryStore(this.state.storage, this.getLogger());
         const { content, toc, entries } = await store.readAll();
         return Response.json({ content, toc, entries });
-      } catch (error) {
-        this.getLogger().error('get_memory_error', error);
-        const msg = error instanceof Error ? error.message : String(error);
-        return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
-      }
-    });
+      },
+      storageErrorResponse
+    );
   }
 
   private async handleDeleteMemory(): Promise<Response> {
-    return withEndpointLogging(this.getLogger(), 'delete_memory', async () => {
-      try {
+    return withEndpointLogging(
+      this.getLogger(),
+      'delete_memory',
+      async () => {
         const store = new JsonMemoryStore(this.state.storage, this.getLogger());
         await store.clear();
         return Response.json({ message: 'User memory cleared' });
-      } catch (error) {
-        this.getLogger().error('delete_memory_error', error);
-        const msg = error instanceof Error ? error.message : String(error);
-        return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
-      }
-    });
+      },
+      storageErrorResponse
+    );
   }
 
   // ─── Mode selection handlers ──────────────────────────────────────────────────

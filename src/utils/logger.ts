@@ -95,7 +95,8 @@ export function safeAsync(logger: RequestLogger, event: string, fn: () => Promis
 export function withEndpointLogging(
   logger: RequestLogger,
   endpoint: string,
-  handler: () => Promise<Response>
+  handler: () => Promise<Response>,
+  onError?: (err: unknown) => Response
 ): Promise<Response> {
   const start = Date.now();
   logger.log(`${endpoint}_start`, {});
@@ -106,6 +107,7 @@ export function withEndpointLogging(
     },
     (err) => {
       logger.error(`${endpoint}_error`, err, { duration_ms: Date.now() - start });
+      if (onError) return onError(err);
       throw err;
     }
   );
