@@ -191,6 +191,9 @@ async function streamClaudeResponse(ctx: OrchestrationContext): Promise<Anthropi
     tools: ctx.tools,
   });
   stream.on('text', (text) => ctx.callbacks?.onProgress(text));
+  stream.on('error', (error) => {
+    ctx.logger.error('claude_stream_error', error);
+  });
   return stream.finalMessage();
 }
 

@@ -77,3 +77,38 @@ export function createRequestLogger(requestId: string, userId?: string) {
 }
 
 export type RequestLogger = ReturnType<typeof createRequestLogger>;
+
+/**
+ * Safely run an async function without fire-and-forget `void` pattern.
+ * Catches and logs any error instead of letting it become an unhandled rejection.
+ */
+export function safeAsync(logger: RequestLogger, event: string, fn: () => Promise<unknown>): void {
+  fn().catch((err: unknown) => {
+    logger.error(event, err);
+  });
+}
+
+/**
+ * Wrap an endpoint handler with entry/exit/error logging.
+ * Logs start, completion (with status + duration), and errors.
+ */
+export function withEndpointLogging(
+  logger: RequestLogger,
+  endpoint: string,
+  handler: () => Promise<Response>,
+  onError?: (err: unknown) => Response
+): Promise<Response> {
+  const start = Date.now();
+  logger.log(`${endpoint}_start`, {});
+  return handler().then(
+    (res) => {
+      logger.log(`${endpoint}_complete`, { status: res.status, duration_ms: Date.now() - start });
+      return res;
+    },
+    (err) => {
+      logger.error(`${endpoint}_error`, err, { duration_ms: Date.now() - start });
+      if (onError) return onError(err);
+      throw err;
+    }
+  );
+}

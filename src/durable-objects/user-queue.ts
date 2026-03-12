@@ -178,16 +178,18 @@ export class UserQueue {
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    const requestId = request.headers.get('X-Request-ID') ?? crypto.randomUUID();
+    const logger = createRequestLogger(requestId);
 
     switch (url.pathname) {
       case '/enqueue':
-        return this.handleEnqueue(request);
+        return this.handleEnqueue(request, logger);
       case '/stream':
-        return this.handleStream(url);
+        return this.handleStream(url, logger);
       case '/poll':
-        return this.handlePoll(url);
+        return this.handlePoll(url, logger);
       case '/status':
-        return this.handleStatus();
+        return this.handleStatus(logger);
       default:
         return Response.json({ error: 'Not found' }, { status: 404 });
     }
@@ -202,57 +204,71 @@ export class UserQueue {
         logger.log('queue_empty_alarm_done');
         return;
       }
-
-      const startTime = Date.now();
-      logger.log('queue_processing_start', {
-        message_id: entry.message_id,
-        delivery: entry.delivery,
-        user_id: entry.user_id,
-        org: entry.org,
-        retry_count: entry.retry_count,
-        queue_wait_ms: startTime - entry.enqueued_at,
-        worker_request_id: entry.request_id,
-      });
-
-      try {
-        if (entry.delivery === 'callback') {
-          await this.processWithCallback(entry, logger);
-        } else {
-          await this.processWithSSE(entry, logger);
-        }
-        logger.log('queue_processing_complete', {
-          message_id: entry.message_id,
-          user_id: entry.user_id,
-          processing_ms: Date.now() - startTime,
-          worker_request_id: entry.request_id,
-        });
-      } catch (error) {
-        logger.error('queue_processing_error', error, {
-          message_id: entry.message_id,
-          user_id: entry.user_id,
-          org: entry.org,
-          retry_count: entry.retry_count,
-          processing_ms: Date.now() - startTime,
-        });
-        await this.handleProcessingError(entry, error, logger);
-      } finally {
-        this.streams.delete(entry.message_id);
-      }
+      await this.processAlarmEntry(entry, logger);
     } catch (error) {
       logger.error('alarm_fatal_error', error);
-      // Reset processing flag to prevent permanent deadlock
-      await this.state.storage.put('processing', false);
+      try {
+        await this.state.storage.put('processing', false);
+      } catch (storageErr) {
+        logger.error('alarm_recovery_storage_failed', storageErr, {
+          original_error: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
 
     await this.scheduleNextAlarm();
     await this.cleanupExpiredEventStores();
   }
 
-  private async handleEnqueue(request: Request): Promise<Response> {
+  private async processAlarmEntry(entry: QueueEntry, logger: RequestLogger): Promise<void> {
+    const startTime = Date.now();
+    logger.log('queue_processing_start', {
+      message_id: entry.message_id,
+      delivery: entry.delivery,
+      user_id: entry.user_id,
+      org: entry.org,
+      retry_count: entry.retry_count,
+      queue_wait_ms: startTime - entry.enqueued_at,
+      worker_request_id: entry.request_id,
+    });
+
+    try {
+      if (entry.delivery === 'callback') {
+        await this.processWithCallback(entry, logger);
+      } else {
+        await this.processWithSSE(entry, logger);
+      }
+      logger.log('queue_processing_complete', {
+        message_id: entry.message_id,
+        user_id: entry.user_id,
+        processing_ms: Date.now() - startTime,
+        worker_request_id: entry.request_id,
+      });
+    } catch (error) {
+      logger.error('queue_processing_error', error, {
+        message_id: entry.message_id,
+        user_id: entry.user_id,
+        org: entry.org,
+        retry_count: entry.retry_count,
+        processing_ms: Date.now() - startTime,
+      });
+      await this.handleProcessingError(entry, error, logger);
+    } finally {
+      this.streams.delete(entry.message_id);
+    }
+  }
+
+  private async handleEnqueue(request: Request, logger: RequestLogger): Promise<Response> {
+    const start = Date.now();
+    logger.log('handle_enqueue_start', {});
+
     let body: Record<string, unknown>;
     try {
       body = (await request.json()) as Record<string, unknown>;
-    } catch {
+    } catch (err) {
+      logger.warn('enqueue_invalid_json', {
+        error: err instanceof Error ? err.message : String(err),
+      });
       return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
     }
 
@@ -287,26 +303,37 @@ export class UserQueue {
       message_id: result.message_id,
       queue_position: position,
     };
+    logger.log('handle_enqueue_complete', {
+      message_id: result.message_id,
+      queue_position: position,
+      user_id: result.user_id,
+      org: result.org,
+      duration_ms: Date.now() - start,
+    });
     return Response.json(response, { status: 202 });
   }
 
-  private async handleStream(url: URL): Promise<Response> {
+  private async handleStream(url: URL, logger: RequestLogger): Promise<Response> {
     const messageId = url.searchParams.get('message_id');
     if (!messageId) {
       return Response.json({ error: 'message_id query parameter is required' }, { status: 400 });
     }
 
+    logger.log('handle_stream_start', { message_id: messageId });
+
     // Check for stored response (late-connect fallback)
     const stored = await this.getAndClearStoredResponse(messageId);
     if (stored) {
-      return this.replayStoredResponse(stored);
+      logger.log('handle_stream_complete', { message_id: messageId, source: 'stored_replay' });
+      return this.replayStoredResponse(stored, logger);
     }
 
+    logger.log('handle_stream_complete', { message_id: messageId, source: 'live_stream' });
     return this.createLiveStream(messageId);
   }
 
   /** Return incremental events since cursor for poll-based streaming. */
-  private async handlePoll(url: URL): Promise<Response> {
+  private async handlePoll(url: URL, logger: RequestLogger): Promise<Response> {
     const messageId = url.searchParams.get('message_id');
     if (!messageId) {
       return Response.json({ error: 'message_id query parameter is required' }, { status: 400 });
@@ -321,6 +348,7 @@ export class UserQueue {
     if (rateLimited) return rateLimited;
 
     const cursor = parseInt(url.searchParams.get('cursor') ?? '0', 10);
+    logger.log('handle_poll_start', { message_id: messageId, cursor });
 
     // Check chunked event store metadata
     const meta = await this.state.storage.get<EventStoreMetadata>(`evmeta:${messageId}`);
@@ -382,7 +410,9 @@ export class UserQueue {
     return events;
   }
 
-  private async handleStatus(): Promise<Response> {
+  private async handleStatus(logger: RequestLogger): Promise<Response> {
+    logger.log('handle_status_start', {});
+
     const queue = (await this.state.storage.get<QueueEntry[]>('queue')) ?? [];
     const processing = (await this.state.storage.get<boolean>('processing')) ?? false;
     const responses =
@@ -393,6 +423,7 @@ export class UserQueue {
       processing,
       stored_response_count: Object.keys(responses).length,
     };
+    logger.log('handle_status_complete', { queue_length: queue.length, processing });
     return Response.json(response);
   }
 
@@ -483,7 +514,7 @@ export class UserQueue {
   }
 
   /** Replay a stored response as an SSE stream. */
-  private replayStoredResponse(stored: StoredResponse): Response {
+  private replayStoredResponse(stored: StoredResponse, logger: RequestLogger): Response {
     const { readable, writable } = new TransformStream<Uint8Array>();
     const writer = writable.getWriter();
     const encoder = new TextEncoder();
@@ -495,10 +526,23 @@ export class UserQueue {
             encoder.encode(`event: ${sseEvent.event}\ndata: ${sseEvent.data}\n\n`)
           );
         }
+      } catch (error) {
+        logger.warn('replay_stored_response_failed', {
+          error: error instanceof Error ? error.message : String(error),
+          event_count: stored.events.length,
+        });
       } finally {
-        await writer.close();
+        try {
+          await writer.close();
+        } catch (closeErr) {
+          logger.warn('replay_writer_close_failed', {
+            error: closeErr instanceof Error ? closeErr.message : String(closeErr),
+          });
+        }
       }
-    })();
+    })().catch((err) => {
+      logger.error('replay_stored_response_unhandled', err);
+    });
 
     return new Response(readable, {
       headers: {
@@ -589,7 +633,7 @@ export class UserQueue {
       });
     }
 
-    await this.bufferIncrementally(response.body!, entry.message_id, writer);
+    await this.bufferIncrementally(response.body!, entry.message_id, writer, logger);
   }
 
   /** Fetch SSE stream from UserSession DO. */
@@ -621,19 +665,21 @@ export class UserQueue {
   private async bufferIncrementally(
     body: ReadableStream<Uint8Array>,
     messageId: string,
-    writer: WritableStreamDefaultWriter<Uint8Array> | undefined
+    writer: WritableStreamDefaultWriter<Uint8Array> | undefined,
+    logger: RequestLogger
   ): Promise<void> {
-    writer = await this.sendProcessingEvent(writer, messageId);
-    const lineBuffer = await this.readStreamChunks(body, messageId, writer);
+    writer = await this.sendProcessingEvent(writer, messageId, logger);
+    const lineBuffer = await this.readStreamChunks(body, messageId, writer, logger);
     await this.flushLineBuffer(lineBuffer, messageId);
     await this.finalizeEventStore(messageId);
-    await this.closeLiveWriter(writer, messageId);
+    await this.closeLiveWriter(writer, messageId, logger);
   }
 
   /** Send the initial "processing" event to a live writer, or null it on disconnect. */
   private async sendProcessingEvent(
     writer: WritableStreamDefaultWriter<Uint8Array> | undefined,
-    messageId: string
+    messageId: string,
+    logger: RequestLogger
   ): Promise<WritableStreamDefaultWriter<Uint8Array> | undefined> {
     if (!writer) return undefined;
     try {
@@ -642,8 +688,13 @@ export class UserQueue {
         encoder.encode(`event: processing\ndata: ${JSON.stringify({ message_id: messageId })}\n\n`)
       );
       return writer;
-    } catch {
-      return undefined; // Client disconnected
+    } catch (error) {
+      logger.warn('sse_client_disconnected', {
+        phase: 'processing_event',
+        message_id: messageId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return undefined;
     }
   }
 
@@ -651,7 +702,8 @@ export class UserQueue {
   private async readStreamChunks(
     body: ReadableStream<Uint8Array>,
     messageId: string,
-    writer: WritableStreamDefaultWriter<Uint8Array> | undefined
+    writer: WritableStreamDefaultWriter<Uint8Array> | undefined,
+    logger: RequestLogger
   ): Promise<string> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -671,7 +723,7 @@ export class UserQueue {
           break;
         }
 
-        writer = await this.pipeChunkToWriter(writer, value);
+        writer = await this.pipeChunkToWriter(writer, value, logger);
         buffer = await this.parseAndStoreChunk(
           decoder.decode(value, { stream: true }),
           buffer,
@@ -687,13 +739,18 @@ export class UserQueue {
   /** Pipe a raw chunk to the live writer, returning undefined if the writer disconnected. */
   private async pipeChunkToWriter(
     writer: WritableStreamDefaultWriter<Uint8Array> | undefined,
-    value: Uint8Array
+    value: Uint8Array,
+    logger: RequestLogger
   ): Promise<WritableStreamDefaultWriter<Uint8Array> | undefined> {
     if (!writer) return undefined;
     try {
       await writer.write(value);
       return writer;
-    } catch {
+    } catch (error) {
+      logger.warn('sse_client_disconnected', {
+        phase: 'pipe_chunk',
+        error: error instanceof Error ? error.message : String(error),
+      });
       return undefined;
     }
   }
@@ -746,7 +803,8 @@ export class UserQueue {
   /** Close a live SSE writer with a "done" event. */
   private async closeLiveWriter(
     writer: WritableStreamDefaultWriter<Uint8Array> | undefined,
-    messageId: string
+    messageId: string,
+    logger: RequestLogger
   ): Promise<void> {
     if (!writer) return;
     try {
@@ -755,8 +813,12 @@ export class UserQueue {
         encoder.encode(`event: done\ndata: ${JSON.stringify({ message_id: messageId })}\n\n`)
       );
       await writer.close();
-    } catch {
-      // Client may have disconnected
+    } catch (error) {
+      logger.warn('sse_client_disconnected', {
+        phase: 'close_writer',
+        message_id: messageId,
+        error: error instanceof Error ? error.message : String(error),
+      });
     }
   }
 
@@ -819,8 +881,11 @@ export class UserQueue {
       try {
         await this.writeSSE(writer, 'error', JSON.stringify({ error: errorMessage }));
         await writer.close();
-      } catch {
-        // Writer may already be closed
+      } catch (writeErr) {
+        logger.warn('sse_error_write_failed', {
+          message_id: entry.message_id,
+          error: writeErr instanceof Error ? writeErr.message : String(writeErr),
+        });
       }
     } else if (entry.delivery !== 'callback') {
       await this.storeResponse(entry.message_id, [

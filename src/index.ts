@@ -133,16 +133,21 @@ app.use('/api/v1/admin/orgs/:org/*', async (c, next) => {
 app.get('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
   const org = c.req.param('org');
   const discover = c.req.query('discover') === 'true';
+  const logger = createRequestLogger(crypto.randomUUID());
 
   try {
     const servers = (await c.env.MCP_SERVERS.get<MCPServerConfig[]>(org, 'json')) ?? [];
 
-    logAdminAction('list_mcp_servers', org, { server_count: servers.length, discover });
+    logger.log('admin_action', {
+      action: 'list_mcp_servers',
+      org,
+      server_count: servers.length,
+      discover,
+    });
 
     // If discover=true, run discovery and include status/errors in response
     if (discover && servers.length > 0) {
       const enabledServers = servers.filter((s) => s.enabled);
-      const logger = createRequestLogger(crypto.randomUUID());
       const manifests = await discoverAllTools(enabledServers, logger);
 
       const serverStatuses = servers.map((server) => {
@@ -160,13 +165,14 @@ app.get('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
 
     return c.json({ org, servers });
   } catch (error) {
-    logAdminAction('list_mcp_servers_error', org, { error: String(error) }, 'error');
+    logger.error('admin_action', error, { action: 'list_mcp_servers', org });
     return c.json({ error: 'Failed to read MCP servers from storage' }, 500);
   }
 });
 
 app.put('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
   const org = c.req.param('org');
+  const logger = createRequestLogger(crypto.randomUUID());
   const servers = (await c.req.json()) as MCPServerConfig[];
 
   if (!Array.isArray(servers)) {
@@ -186,19 +192,22 @@ app.put('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
 
   try {
     await c.env.MCP_SERVERS.put(org, JSON.stringify(servers));
-    logAdminAction('replace_mcp_servers', org, {
+    logger.log('admin_action', {
+      action: 'replace_mcp_servers',
+      org,
       server_count: servers.length,
       server_ids: servers.map((s) => s.id),
     });
     return c.json({ org, servers, message: 'MCP servers updated' });
   } catch (error) {
-    logAdminAction('replace_mcp_servers_error', org, { error: String(error) }, 'error');
+    logger.error('admin_action', error, { action: 'replace_mcp_servers', org });
     return c.json({ error: 'Failed to write MCP servers to storage' }, 500);
   }
 });
 
 app.post('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
   const org = c.req.param('org');
+  const logger = createRequestLogger(crypto.randomUUID());
   const body = (await c.req.json()) as Partial<MCPServerConfig>;
 
   // Default enabled to true if not specified
@@ -229,14 +238,16 @@ app.post('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
     }
 
     await c.env.MCP_SERVERS.put(org, JSON.stringify(existing));
-    logAdminAction('add_mcp_server', org, {
+    logger.log('admin_action', {
+      action: 'add_mcp_server',
+      org,
       server_id: server.id,
       server_url: server.url,
       server_count: existing.length,
     });
     return c.json({ org, servers: existing, message: 'MCP server added' });
   } catch (error) {
-    logAdminAction('add_mcp_server_error', org, { error: String(error) }, 'error');
+    logger.error('admin_action', error, { action: 'add_mcp_server', org });
     return c.json({ error: 'Failed to update MCP servers in storage' }, 500);
   }
 });
@@ -244,6 +255,7 @@ app.post('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
 app.delete('/api/v1/admin/orgs/:org/mcp-servers/:serverId', async (c) => {
   const org = c.req.param('org');
   const serverId = c.req.param('serverId');
+  const logger = createRequestLogger(crypto.randomUUID());
 
   const idError = validateServerId(serverId);
   if (idError) {
@@ -255,13 +267,15 @@ app.delete('/api/v1/admin/orgs/:org/mcp-servers/:serverId', async (c) => {
     const filtered = existing.filter((s) => s.id !== serverId);
 
     await c.env.MCP_SERVERS.put(org, JSON.stringify(filtered));
-    logAdminAction('remove_mcp_server', org, {
+    logger.log('admin_action', {
+      action: 'remove_mcp_server',
+      org,
       server_id: serverId,
       server_count: filtered.length,
     });
     return c.json({ org, servers: filtered, message: 'MCP server removed' });
   } catch (error) {
-    logAdminAction('remove_mcp_server_error', org, { error: String(error) }, 'error');
+    logger.error('admin_action', error, { action: 'remove_mcp_server', org });
     return c.json({ error: 'Failed to update MCP servers in storage' }, 500);
   }
 });
@@ -269,17 +283,17 @@ app.delete('/api/v1/admin/orgs/:org/mcp-servers/:serverId', async (c) => {
 // Admin endpoints for org config management
 app.get('/api/v1/admin/orgs/:org/config', async (c) => {
   const org = c.req.param('org');
+  const logger = createRequestLogger(crypto.randomUUID());
 
   try {
     const stored = (await c.env.ORG_CONFIG.get<OrgConfig>(org, 'json')) ?? {};
     const merged = { ...DEFAULT_ORG_CONFIG, ...stored };
 
-    logAdminAction('get_org_config', org, { config: merged });
+    logger.log('admin_action', { action: 'get_org_config', org, config: merged });
     return c.json({ org, config: merged });
   } catch (error) {
     // Return defaults with warning on read failure (matches chat flow behavior)
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    logAdminAction('get_org_config_error', org, { error: errorMsg }, 'error');
+    logger.error('admin_action', error, { action: 'get_org_config', org });
     return c.json({
       org,
       config: DEFAULT_ORG_CONFIG,
@@ -290,6 +304,7 @@ app.get('/api/v1/admin/orgs/:org/config', async (c) => {
 
 app.put('/api/v1/admin/orgs/:org/config', async (c) => {
   const org = c.req.param('org');
+  const logger = createRequestLogger(crypto.randomUUID());
   const updates = (await c.req.json()) as OrgConfig;
 
   const validationError = validateOrgConfig(updates);
@@ -318,27 +333,26 @@ app.put('/api/v1/admin/orgs/:org/config', async (c) => {
     }
 
     await c.env.ORG_CONFIG.put(org, JSON.stringify(merged));
-    logAdminAction('update_org_config', org, { config: merged });
+    logger.log('admin_action', { action: 'update_org_config', org, config: merged });
 
     const withDefaults = { ...DEFAULT_ORG_CONFIG, ...merged };
     return c.json({ org, config: withDefaults, message: 'Org config updated' });
   } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    logAdminAction('update_org_config_error', org, { error: errorMsg }, 'error');
+    logger.error('admin_action', error, { action: 'update_org_config', org });
     return c.json({ error: 'Failed to update org config in storage' }, 500);
   }
 });
 
 app.delete('/api/v1/admin/orgs/:org/config', async (c) => {
   const org = c.req.param('org');
+  const logger = createRequestLogger(crypto.randomUUID());
 
   try {
     await c.env.ORG_CONFIG.delete(org);
-    logAdminAction('reset_org_config', org, { config: DEFAULT_ORG_CONFIG });
+    logger.log('admin_action', { action: 'reset_org_config', org, config: DEFAULT_ORG_CONFIG });
     return c.json({ org, config: DEFAULT_ORG_CONFIG, message: 'Org config reset to defaults' });
   } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    logAdminAction('reset_org_config_error', org, { error: errorMsg }, 'error');
+    logger.error('admin_action', error, { action: 'reset_org_config', org });
     return c.json({ error: 'Failed to delete org config from storage' }, 500);
   }
 });
@@ -349,22 +363,27 @@ app.delete('/api/v1/admin/orgs/:org/config', async (c) => {
 // are only substituted at runtime in the chat path (via applyTemplateVariables in user-session).
 app.get('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
   const org = c.req.param('org');
+  const logger = createRequestLogger(crypto.randomUUID());
 
   try {
     const overrides = (await c.env.PROMPT_OVERRIDES.get<PromptOverrides>(org, 'json')) ?? {};
     const resolved = resolvePromptOverrides(overrides, {}, {});
 
-    logAdminAction('get_prompt_overrides', org, { slots_set: Object.keys(overrides).length });
+    logger.log('admin_action', {
+      action: 'get_prompt_overrides',
+      org,
+      slots_set: Object.keys(overrides).length,
+    });
     return c.json({ org, overrides, resolved });
   } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    logAdminAction('get_prompt_overrides_error', org, { error: errorMsg }, 'error');
+    logger.error('admin_action', error, { action: 'get_prompt_overrides', org });
     return c.json({ error: 'Failed to read prompt overrides from storage' }, 500);
   }
 });
 
 app.put('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
   const org = c.req.param('org');
+  const logger = createRequestLogger(crypto.randomUUID());
   const updates = await c.req.json();
 
   const validationError = validatePromptOverrides(updates);
@@ -381,21 +400,25 @@ app.put('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
     await c.env.PROMPT_OVERRIDES.put(org, JSON.stringify(merged));
     const resolved = resolvePromptOverrides(merged, {}, {});
 
-    logAdminAction('update_prompt_overrides', org, { slots_set: Object.keys(merged).length });
+    logger.log('admin_action', {
+      action: 'update_prompt_overrides',
+      org,
+      slots_set: Object.keys(merged).length,
+    });
     return c.json({ org, overrides: merged, resolved, message: 'Prompt overrides updated' });
   } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    logAdminAction('update_prompt_overrides_error', org, { error: errorMsg }, 'error');
+    logger.error('admin_action', error, { action: 'update_prompt_overrides', org });
     return c.json({ error: 'Failed to update prompt overrides in storage' }, 500);
   }
 });
 
 app.delete('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
   const org = c.req.param('org');
+  const logger = createRequestLogger(crypto.randomUUID());
 
   try {
     await c.env.PROMPT_OVERRIDES.delete(org);
-    logAdminAction('reset_prompt_overrides', org, { slots_cleared: true });
+    logger.log('admin_action', { action: 'reset_prompt_overrides', org, slots_cleared: true });
     return c.json({
       org,
       overrides: {},
@@ -403,8 +426,7 @@ app.delete('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
       message: 'Prompt overrides reset to defaults',
     });
   } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    logAdminAction('reset_prompt_overrides_error', org, { error: errorMsg }, 'error');
+    logger.error('admin_action', error, { action: 'reset_prompt_overrides', org });
     return c.json({ error: 'Failed to delete prompt overrides from storage' }, 500);
   }
 });
@@ -412,19 +434,17 @@ app.delete('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
 // Admin endpoints for org-level mode management
 app.get('/api/v1/admin/orgs/:org/modes', async (c) => {
   const org = c.req.param('org');
+  const logger = createRequestLogger(crypto.randomUUID());
 
   try {
     const orgModes = (await c.env.PROMPT_OVERRIDES.get<OrgModes>(`${org}:modes`, 'json')) ?? {
       modes: [],
     };
 
-    logAdminAction('list_modes', org, {
-      mode_count: orgModes.modes.length,
-    });
+    logger.log('admin_action', { action: 'list_modes', org, mode_count: orgModes.modes.length });
     return c.json({ org, ...orgModes });
   } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    logAdminAction('list_modes_error', org, { error: errorMsg }, 'error');
+    logger.error('admin_action', error, { action: 'list_modes', org });
     return c.json({ error: 'Failed to read modes from storage' }, 500);
   }
 });
@@ -432,6 +452,7 @@ app.get('/api/v1/admin/orgs/:org/modes', async (c) => {
 app.get('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
   const org = c.req.param('org');
   const modeName = c.req.param('modeName');
+  const logger = createRequestLogger(crypto.randomUUID());
 
   const nameError = validateModeName(modeName);
   if (nameError) {
@@ -447,11 +468,10 @@ app.get('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
       return c.json({ error: `Mode '${modeName}' not found` }, 404);
     }
 
-    logAdminAction('get_mode', org, { mode_name: modeName });
+    logger.log('admin_action', { action: 'get_mode', org, mode_name: modeName });
     return c.json({ org, mode });
   } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    logAdminAction('get_mode_error', org, { error: errorMsg }, 'error');
+    logger.error('admin_action', error, { action: 'get_mode', org });
     return c.json({ error: 'Failed to read mode from storage' }, 500);
   }
 });
@@ -459,6 +479,7 @@ app.get('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
 app.put('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
   const org = c.req.param('org');
   const modeName = c.req.param('modeName');
+  const logger = createRequestLogger(crypto.randomUUID());
 
   const nameError = validateModeName(modeName);
   if (nameError) {
@@ -479,21 +500,22 @@ app.put('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
       modes: [],
     };
 
-    const result = upsertMode(orgModes, modeInput, org);
+    const result = upsertMode(orgModes, modeInput, org, logger);
     if (!result.ok) {
       return c.json({ error: result.error }, 400);
     }
 
     await c.env.PROMPT_OVERRIDES.put(`${org}:modes`, JSON.stringify(orgModes));
-    logAdminAction('upsert_mode', org, {
+    logger.log('admin_action', {
+      action: 'upsert_mode',
+      org,
       mode_name: modeName,
       mode_count: orgModes.modes.length,
       saved_overrides: result.savedMode.overrides,
     });
     return c.json({ org, mode: result.savedMode, message: 'Mode saved' });
   } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    logAdminAction('upsert_mode_error', org, { error: errorMsg }, 'error');
+    logger.error('admin_action', error, { action: 'upsert_mode', org });
     return c.json({ error: 'Failed to save mode to storage' }, 500);
   }
 });
@@ -501,6 +523,7 @@ app.put('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
 app.delete('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
   const org = c.req.param('org');
   const modeName = c.req.param('modeName');
+  const logger = createRequestLogger(crypto.randomUUID());
 
   const nameError = validateModeName(modeName);
   if (nameError) {
@@ -520,14 +543,15 @@ app.delete('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
     orgModes.modes = filtered;
 
     await c.env.PROMPT_OVERRIDES.put(`${org}:modes`, JSON.stringify(orgModes));
-    logAdminAction('delete_mode', org, {
+    logger.log('admin_action', {
+      action: 'delete_mode',
+      org,
       mode_name: modeName,
       mode_count: orgModes.modes.length,
     });
     return c.json({ org, modes: orgModes.modes, message: 'Mode deleted' });
   } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : String(error);
-    logAdminAction('delete_mode_error', org, { error: errorMsg }, 'error');
+    logger.error('admin_action', error, { action: 'delete_mode', org });
     return c.json({ error: 'Failed to delete mode from storage' }, 500);
   }
 });
@@ -592,16 +616,16 @@ app.delete('/api/v1/admin/orgs/:org/users/:userId/history', async (c) => {
 
 export default app;
 
-/** Log admin actions for audit trail. */
-function logAdminAction(
-  action: string,
-  org: string,
-  details: Record<string, unknown> = {},
-  level: 'log' | 'error' = 'log'
-): void {
-  console[level](
-    JSON.stringify({ event: 'admin_action', timestamp: Date.now(), action, org, ...details })
-  );
+/** Merge an incoming mode with an existing one, combining overrides and optional fields. */
+function mergeExistingMode(existing: PromptMode, incoming: PromptMode): PromptMode {
+  return {
+    name: incoming.name,
+    overrides: mergePromptOverrides(existing.overrides, incoming.overrides),
+    ...((incoming.label ?? existing.label) ? { label: incoming.label ?? existing.label } : {}),
+    ...((incoming.description ?? existing.description)
+      ? { description: incoming.description ?? existing.description }
+      : {}),
+  };
 }
 
 /**
@@ -611,24 +635,19 @@ function logAdminAction(
 export function upsertMode(
   orgModes: OrgModes,
   modeInput: PromptMode,
-  org: string
+  org: string,
+  logger?: ReturnType<typeof createRequestLogger>
 ): { ok: true; savedMode: PromptMode } | { ok: false; error: string } {
   const existingIdx = orgModes.modes.findIndex((m) => m.name === modeInput.name);
   if (existingIdx >= 0) {
-    const existing = orgModes.modes[existingIdx]!;
-    logAdminAction('upsert_mode_before', org, {
+    const savedMode = mergeExistingMode(orgModes.modes[existingIdx]!, modeInput);
+    logger?.log('admin_action', {
+      action: 'upsert_mode_before',
+      org,
       mode_name: modeInput.name,
-      existing_overrides: existing.overrides,
+      existing_overrides: orgModes.modes[existingIdx]!.overrides,
       incoming_overrides: modeInput.overrides,
     });
-    const savedMode: PromptMode = {
-      name: modeInput.name,
-      overrides: mergePromptOverrides(existing.overrides, modeInput.overrides),
-      ...((modeInput.label ?? existing.label) ? { label: modeInput.label ?? existing.label } : {}),
-      ...((modeInput.description ?? existing.description)
-        ? { description: modeInput.description ?? existing.description }
-        : {}),
-    };
     orgModes.modes.splice(existingIdx, 1, savedMode);
     return { ok: true, savedMode };
   }
@@ -636,7 +655,9 @@ export function upsertMode(
   if (orgModes.modes.length >= MAX_MODES_PER_ORG) {
     return { ok: false, error: `Cannot have more than ${MAX_MODES_PER_ORG} modes per org` };
   }
-  logAdminAction('upsert_mode_before', org, {
+  logger?.log('admin_action', {
+    action: 'upsert_mode_before',
+    org,
     mode_name: modeInput.name,
     existing_overrides: null,
     incoming_overrides: modeInput.overrides,
@@ -803,6 +824,7 @@ async function handleUserRequest(
 ): Promise<Response> {
   const requestId = crypto.randomUUID();
   const logger = createRequestLogger(requestId, userId);
+  const start = Date.now();
 
   if (!org) {
     return Response.json({ error: 'org is required in path' }, { status: 400 });
@@ -835,7 +857,13 @@ async function handleUserRequest(
     body: request.method !== 'GET' ? request.body : null,
   });
 
-  return stub.fetch(doRequest);
+  const response = await stub.fetch(doRequest);
+  logger.log('user_request_complete', {
+    path: doPath,
+    status: response.status,
+    duration_ms: Date.now() - start,
+  });
+  return response;
 }
 
 /**
@@ -846,6 +874,7 @@ async function handleUserRequest(
 async function handleMessageEnqueue(request: Request, env: Env): Promise<Response> {
   const requestId = crypto.randomUUID();
   const logger = createRequestLogger(requestId);
+  const start = Date.now();
 
   try {
     const body = (await request.clone().json()) as ChatRequest;
@@ -883,9 +912,16 @@ async function handleMessageEnqueue(request: Request, env: Env): Promise<Respons
       }),
     });
 
-    return stub.fetch(doRequest);
+    const response = await stub.fetch(doRequest);
+    logger.log('message_enqueue_complete', {
+      user_id: body.user_id,
+      org,
+      status: response.status,
+      duration_ms: Date.now() - start,
+    });
+    return response;
   } catch (error) {
-    logger.error('message_enqueue_error', error);
+    logger.error('message_enqueue_error', error, { duration_ms: Date.now() - start });
     if (error instanceof SyntaxError) {
       return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
     }
@@ -903,6 +939,9 @@ async function handleQueueStream(request: Request, env: Env): Promise<Response> 
   const userId = url.searchParams.get('user_id');
   const messageId = url.searchParams.get('message_id');
   const org = resolveOrgFromParams(url.searchParams, env.DEFAULT_ORG);
+  const requestId = crypto.randomUUID();
+  const logger = createRequestLogger(requestId, userId ?? undefined);
+  const start = Date.now();
 
   if (!userId) {
     return Response.json({ error: 'user_id query parameter is required' }, { status: 400 });
@@ -911,13 +950,21 @@ async function handleQueueStream(request: Request, env: Env): Promise<Response> 
     return Response.json({ error: 'message_id query parameter is required' }, { status: 400 });
   }
 
+  logger.log('queue_stream_start', { message_id: messageId, org });
+
   const doId = env.USER_QUEUE.idFromName(`queue:${org}:${userId}`);
   const stub = env.USER_QUEUE.get(doId);
 
   const doUrl = new URL(`${DO_BASE_URL}/stream`);
   doUrl.searchParams.set('message_id', messageId);
 
-  return stub.fetch(new Request(doUrl.toString()));
+  const response = await stub.fetch(new Request(doUrl.toString()));
+  logger.log('queue_stream_complete', {
+    message_id: messageId,
+    status: response.status,
+    duration_ms: Date.now() - start,
+  });
+  return response;
 }
 
 /**
@@ -930,6 +977,9 @@ async function handleQueuePoll(request: Request, env: Env): Promise<Response> {
   const messageId = url.searchParams.get('message_id');
   const org = resolveOrgFromParams(url.searchParams, env.DEFAULT_ORG);
   const cursor = url.searchParams.get('cursor') ?? '0';
+  const requestId = crypto.randomUUID();
+  const logger = createRequestLogger(requestId, userId ?? undefined);
+  const start = Date.now();
 
   if (!userId) {
     return Response.json({ error: 'user_id query parameter is required' }, { status: 400 });
@@ -938,6 +988,8 @@ async function handleQueuePoll(request: Request, env: Env): Promise<Response> {
     return Response.json({ error: 'message_id query parameter is required' }, { status: 400 });
   }
 
+  logger.log('queue_poll_start', { message_id: messageId, org, cursor });
+
   const doId = env.USER_QUEUE.idFromName(`queue:${org}:${userId}`);
   const stub = env.USER_QUEUE.get(doId);
 
@@ -945,7 +997,13 @@ async function handleQueuePoll(request: Request, env: Env): Promise<Response> {
   doUrl.searchParams.set('message_id', messageId);
   doUrl.searchParams.set('cursor', cursor);
 
-  return stub.fetch(new Request(doUrl.toString()));
+  const response = await stub.fetch(new Request(doUrl.toString()));
+  logger.log('queue_poll_complete', {
+    message_id: messageId,
+    status: response.status,
+    duration_ms: Date.now() - start,
+  });
+  return response;
 }
 
 /**
@@ -956,13 +1014,19 @@ async function handleQueuePoll(request: Request, env: Env): Promise<Response> {
 async function handleQueueStatus(request: Request, env: Env, userId: string): Promise<Response> {
   const url = new URL(request.url);
   const org = resolveOrgFromParams(url.searchParams, env.DEFAULT_ORG);
+  const logger = createRequestLogger(crypto.randomUUID(), userId);
+  const start = Date.now();
 
   if (!userId) {
     return Response.json({ error: 'userId is required in path' }, { status: 400 });
   }
 
+  logger.log('queue_status_start', { org });
+
   const doId = env.USER_QUEUE.idFromName(`queue:${org}:${userId}`);
   const stub = env.USER_QUEUE.get(doId);
 
-  return stub.fetch(new Request(`${DO_BASE_URL}/status`));
+  const response = await stub.fetch(new Request(`${DO_BASE_URL}/status`));
+  logger.log('queue_status_complete', { status: response.status, duration_ms: Date.now() - start });
+  return response;
 }
