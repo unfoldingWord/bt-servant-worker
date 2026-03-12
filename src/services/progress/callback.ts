@@ -168,12 +168,12 @@ export class IncrementalProgressSender {
   private timerId: ReturnType<typeof setTimeout> | null = null;
   private isComplete = false;
   private config: IncrementalProgressConfig;
-  private logger: RequestLogger | undefined;
+  private logger: RequestLogger;
 
   constructor(
     private sender: ProgressCallbackSender,
-    config?: Partial<IncrementalProgressConfig>,
-    logger?: RequestLogger
+    logger: RequestLogger,
+    config?: Partial<IncrementalProgressConfig>
   ) {
     this.config = {
       mode: config?.mode ?? DEFAULT_PROGRESS_MODE,
@@ -270,24 +270,20 @@ export class IncrementalProgressSender {
  * @param sender - The underlying sender for webhook calls
  * @param config - Optional configuration for incremental progress
  */
-/** Run an async callback safely — log errors if logger available, otherwise swallow. */
-function runSafe(logger: RequestLogger | undefined, event: string, fn: () => Promise<unknown>) {
-  if (logger) {
-    safeAsync(logger, event, fn);
-  } else {
-    fn().catch(() => {});
-  }
+/** Run an async callback safely — errors are logged via the structured logger. */
+function runSafe(logger: RequestLogger, event: string, fn: () => Promise<unknown>) {
+  safeAsync(logger, event, fn);
 }
 
 export function createWebhookCallbacks(
   sender: ProgressCallbackSender,
-  config?: Partial<IncrementalProgressConfig>,
-  logger?: RequestLogger
+  logger: RequestLogger,
+  config?: Partial<IncrementalProgressConfig>
 ): StreamCallbacks {
   const mode = config?.mode ?? DEFAULT_PROGRESS_MODE;
   const incrementalSender =
     mode === 'periodic' || mode === 'sentence'
-      ? new IncrementalProgressSender(sender, config, logger)
+      ? new IncrementalProgressSender(sender, logger, config)
       : null;
 
   // Track text already sent so iteration and complete callbacks only send deltas

@@ -220,14 +220,10 @@ export class UserSession {
       typeof body.progress_throttle_seconds === 'number' && body.progress_throttle_seconds > 0
         ? body.progress_throttle_seconds
         : DEFAULT_THROTTLE_SECONDS;
-    return createWebhookCallbacks(
-      sender,
-      {
-        mode: body.progress_mode ?? DEFAULT_PROGRESS_MODE,
-        throttleSeconds,
-      },
-      logger
-    );
+    return createWebhookCallbacks(sender, logger, {
+      mode: body.progress_mode ?? DEFAULT_PROGRESS_MODE,
+      throttleSeconds,
+    });
   }
 
   private async handleChat(request: Request): Promise<Response> {

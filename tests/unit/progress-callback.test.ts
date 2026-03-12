@@ -7,6 +7,9 @@ import {
   MIN_THROTTLE_SECONDS,
   ProgressCallbackSender,
 } from '../../src/services/progress/callback.js';
+import { createRequestLogger } from '../../src/utils/logger.js';
+
+const testLogger = createRequestLogger('test-request-id');
 
 const mockConfig = {
   url: 'https://example.com/webhook',
@@ -175,7 +178,7 @@ describe('createWebhookCallbacks onComplete forwards audio', () => {
 
   it('forwards voice_audio_base64 from ChatResponse', async () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const callbacks = createWebhookCallbacks(sender);
+    const callbacks = createWebhookCallbacks(sender, testLogger);
     const response = {
       responses: ['Hello'],
       response_language: 'en',
@@ -191,7 +194,7 @@ describe('createWebhookCallbacks onComplete forwards audio', () => {
 
   it('sends complete when only audio is present (no text delta)', async () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const callbacks = createWebhookCallbacks(sender);
+    const callbacks = createWebhookCallbacks(sender, testLogger);
 
     // Simulate iteration already sent all text
     callbacks.onProgress('Hello');
@@ -256,7 +259,7 @@ describe('createWebhookCallbacks', () => {
 
   it('creates StreamCallbacks that use the sender', () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const callbacks = createWebhookCallbacks(sender);
+    const callbacks = createWebhookCallbacks(sender, testLogger);
 
     expect(callbacks.onStatus).toBeDefined();
     expect(callbacks.onProgress).toBeDefined();
@@ -266,7 +269,7 @@ describe('createWebhookCallbacks', () => {
 
   it('onProgress accumulates text without sending', () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const callbacks = createWebhookCallbacks(sender);
+    const callbacks = createWebhookCallbacks(sender, testLogger);
 
     callbacks.onProgress('chunk1');
     callbacks.onProgress('chunk2');
@@ -281,7 +284,7 @@ describe('createWebhookCallbacks async operations', () => {
 
   it('onStatus sends status message', async () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const callbacks = createWebhookCallbacks(sender);
+    const callbacks = createWebhookCallbacks(sender, testLogger);
     callbacks.onStatus('Processing...');
     await vi.runAllTimersAsync();
     expect(fetch).toHaveBeenCalled();
@@ -289,7 +292,7 @@ describe('createWebhookCallbacks async operations', () => {
 
   it('onComplete sends the final response', async () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const callbacks = createWebhookCallbacks(sender);
+    const callbacks = createWebhookCallbacks(sender, testLogger);
     const response = {
       responses: ['Response 1', 'Response 2'],
       response_language: 'en',
@@ -307,7 +310,7 @@ describe('createWebhookCallbacks async operations', () => {
 
   it('onError sends error message', async () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const callbacks = createWebhookCallbacks(sender);
+    const callbacks = createWebhookCallbacks(sender, testLogger);
     callbacks.onError('Something failed');
     await vi.runAllTimersAsync();
     expect(fetch).toHaveBeenCalledWith(
@@ -360,13 +363,13 @@ describe('IncrementalProgressSender', () => {
 
   it('uses default mode and throttle when no config provided', () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const incremental = new IncrementalProgressSender(sender);
+    const incremental = new IncrementalProgressSender(sender, testLogger);
     expect(incremental.getMode()).toBe(DEFAULT_PROGRESS_MODE);
   });
 
   it('enforces minimum throttle seconds', () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const incremental = new IncrementalProgressSender(sender, {
+    const incremental = new IncrementalProgressSender(sender, testLogger, {
       mode: 'periodic',
       throttleSeconds: 0.5,
     });
@@ -376,7 +379,7 @@ describe('IncrementalProgressSender', () => {
 
   it('accumulates text in sender', () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const incremental = new IncrementalProgressSender(sender, { mode: 'complete' });
+    const incremental = new IncrementalProgressSender(sender, testLogger, { mode: 'complete' });
     incremental.accumulate('Hello ');
     incremental.accumulate('world');
     expect(incremental.getAccumulatedText()).toBe('Hello world');
@@ -392,7 +395,7 @@ describe('IncrementalProgressSender periodic mode', () => {
 
   it('sends accumulated text after throttle interval', async () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const incremental = new IncrementalProgressSender(sender, {
+    const incremental = new IncrementalProgressSender(sender, testLogger, {
       mode: 'periodic',
       throttleSeconds: 2,
     });
@@ -416,7 +419,7 @@ describe('IncrementalProgressSender periodic mode', () => {
 
   it('does not send duplicate content', async () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const incremental = new IncrementalProgressSender(sender, {
+    const incremental = new IncrementalProgressSender(sender, testLogger, {
       mode: 'periodic',
       throttleSeconds: 1,
     });
@@ -437,7 +440,7 @@ describe('IncrementalProgressSender periodic mode', () => {
 
   it('stops timer on complete', async () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const incremental = new IncrementalProgressSender(sender, {
+    const incremental = new IncrementalProgressSender(sender, testLogger, {
       mode: 'periodic',
       throttleSeconds: 1,
     });
@@ -459,7 +462,7 @@ describe('IncrementalProgressSender sentence mode - punctuation types', () => {
 
   it('sends after sentence boundary with period', async () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const incremental = new IncrementalProgressSender(sender, { mode: 'sentence' });
+    const incremental = new IncrementalProgressSender(sender, testLogger, { mode: 'sentence' });
 
     incremental.accumulate('Hello world');
     expect(fetch).not.toHaveBeenCalled();
@@ -477,7 +480,7 @@ describe('IncrementalProgressSender sentence mode - punctuation types', () => {
 
   it('sends after sentence boundary with exclamation', async () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const incremental = new IncrementalProgressSender(sender, { mode: 'sentence' });
+    const incremental = new IncrementalProgressSender(sender, testLogger, { mode: 'sentence' });
 
     incremental.accumulate('Hello world! ');
     await vi.runAllTimersAsync();
@@ -492,7 +495,7 @@ describe('IncrementalProgressSender sentence mode - punctuation types', () => {
 
   it('sends after sentence boundary with question mark', async () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const incremental = new IncrementalProgressSender(sender, { mode: 'sentence' });
+    const incremental = new IncrementalProgressSender(sender, testLogger, { mode: 'sentence' });
 
     incremental.accumulate('Is this working? ');
     await vi.runAllTimersAsync();
@@ -514,7 +517,7 @@ describe('IncrementalProgressSender sentence mode - edge cases', () => {
 
   it('does not send mid-sentence', () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const incremental = new IncrementalProgressSender(sender, { mode: 'sentence' });
+    const incremental = new IncrementalProgressSender(sender, testLogger, { mode: 'sentence' });
 
     incremental.accumulate('Hello world, this is a test');
     expect(fetch).not.toHaveBeenCalled();
@@ -522,7 +525,7 @@ describe('IncrementalProgressSender sentence mode - edge cases', () => {
 
   it('handles multiple sentences', async () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const incremental = new IncrementalProgressSender(sender, { mode: 'sentence' });
+    const incremental = new IncrementalProgressSender(sender, testLogger, { mode: 'sentence' });
 
     incremental.accumulate('First sentence. ');
     await vi.runAllTimersAsync();
@@ -535,7 +538,7 @@ describe('IncrementalProgressSender sentence mode - edge cases', () => {
 
   it('sends at end of string for sentence end', async () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const incremental = new IncrementalProgressSender(sender, { mode: 'sentence' });
+    const incremental = new IncrementalProgressSender(sender, testLogger, { mode: 'sentence' });
 
     incremental.accumulate('Done.');
     await vi.runAllTimersAsync();
@@ -557,13 +560,13 @@ describe('createWebhookCallbacks iteration mode', () => {
 
   it('defaults to iteration mode', () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const callbacks = createWebhookCallbacks(sender);
+    const callbacks = createWebhookCallbacks(sender, testLogger);
     expect(callbacks.onIterationComplete).toBeDefined();
   });
 
   it('iteration mode sends on iteration complete', async () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const callbacks = createWebhookCallbacks(sender, { mode: 'iteration' });
+    const callbacks = createWebhookCallbacks(sender, testLogger, { mode: 'iteration' });
 
     callbacks.onIterationComplete?.('Iteration response');
     await vi.runAllTimersAsync();
@@ -585,19 +588,19 @@ describe('createWebhookCallbacks mode callback availability', () => {
 
   it('complete mode does not have iteration callback', () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const callbacks = createWebhookCallbacks(sender, { mode: 'complete' });
+    const callbacks = createWebhookCallbacks(sender, testLogger, { mode: 'complete' });
     expect(callbacks.onIterationComplete).toBeUndefined();
   });
 
   it('periodic mode does not have iteration callback', () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const callbacks = createWebhookCallbacks(sender, { mode: 'periodic' });
+    const callbacks = createWebhookCallbacks(sender, testLogger, { mode: 'periodic' });
     expect(callbacks.onIterationComplete).toBeUndefined();
   });
 
   it('sentence mode does not have iteration callback', () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const callbacks = createWebhookCallbacks(sender, { mode: 'sentence' });
+    const callbacks = createWebhookCallbacks(sender, testLogger, { mode: 'sentence' });
     expect(callbacks.onIterationComplete).toBeUndefined();
   });
 });
@@ -610,7 +613,7 @@ describe('createWebhookCallbacks periodic and sentence modes', () => {
 
   it('periodic mode schedules sends', async () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const callbacks = createWebhookCallbacks(sender, {
+    const callbacks = createWebhookCallbacks(sender, testLogger, {
       mode: 'periodic',
       throttleSeconds: 1,
     });
@@ -631,7 +634,7 @@ describe('createWebhookCallbacks periodic and sentence modes', () => {
 
   it('sentence mode sends on sentence boundaries', async () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const callbacks = createWebhookCallbacks(sender, { mode: 'sentence' });
+    const callbacks = createWebhookCallbacks(sender, testLogger, { mode: 'sentence' });
 
     callbacks.onProgress('This is a sentence. ');
     await vi.runAllTimersAsync();
@@ -653,7 +656,7 @@ describe('createWebhookCallbacks complete mode and cleanup', () => {
 
   it('complete mode only sends on complete', async () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const callbacks = createWebhookCallbacks(sender, { mode: 'complete' });
+    const callbacks = createWebhookCallbacks(sender, testLogger, { mode: 'complete' });
 
     callbacks.onProgress('chunk1');
     callbacks.onProgress('chunk2');
@@ -678,7 +681,7 @@ describe('createWebhookCallbacks complete mode and cleanup', () => {
 
   it('cleans up timer on error', async () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    const callbacks = createWebhookCallbacks(sender, {
+    const callbacks = createWebhookCallbacks(sender, testLogger, {
       mode: 'periodic',
       throttleSeconds: 5,
     });
