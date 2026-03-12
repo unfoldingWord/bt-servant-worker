@@ -28,20 +28,23 @@ describe('ProgressCallbackSender.sendStatus', () => {
     const sender = new ProgressCallbackSender(mockConfig);
     await sender.sendStatus('Processing your request...');
 
-    expect(fetch).toHaveBeenCalledWith(mockConfig.url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Engine-Token': mockConfig.token,
-      },
-      body: JSON.stringify({
-        type: 'status',
-        message: 'Processing your request...',
-        user_id: mockConfig.user_id,
-        message_key: mockConfig.message_key,
-        timestamp: '2024-01-15T12:00:00.000Z',
-      }),
-    });
+    expect(fetch).toHaveBeenCalledWith(
+      mockConfig.url,
+      expect.objectContaining({
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Engine-Token': mockConfig.token,
+        },
+        body: JSON.stringify({
+          type: 'status',
+          message: 'Processing your request...',
+          user_id: mockConfig.user_id,
+          message_key: mockConfig.message_key,
+          timestamp: '2024-01-15T12:00:00.000Z',
+        }),
+      })
+    );
   });
 });
 
@@ -70,20 +73,23 @@ describe('ProgressCallbackSender.sendProgress', () => {
     sender.accumulateProgress('Accumulated text');
     await sender.sendProgress();
 
-    expect(fetch).toHaveBeenCalledWith(mockConfig.url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Engine-Token': mockConfig.token,
-      },
-      body: JSON.stringify({
-        type: 'progress',
-        text: 'Accumulated text',
-        user_id: mockConfig.user_id,
-        message_key: mockConfig.message_key,
-        timestamp: '2024-01-15T12:00:00.000Z',
-      }),
-    });
+    expect(fetch).toHaveBeenCalledWith(
+      mockConfig.url,
+      expect.objectContaining({
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Engine-Token': mockConfig.token,
+        },
+        body: JSON.stringify({
+          type: 'progress',
+          text: 'Accumulated text',
+          user_id: mockConfig.user_id,
+          message_key: mockConfig.message_key,
+          timestamp: '2024-01-15T12:00:00.000Z',
+        }),
+      })
+    );
   });
 
   it('does not send if no accumulated text', async () => {
@@ -100,20 +106,23 @@ describe('ProgressCallbackSender.sendComplete', () => {
     const sender = new ProgressCallbackSender(mockConfig);
     await sender.sendComplete('Final response text');
 
-    expect(fetch).toHaveBeenCalledWith(mockConfig.url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Engine-Token': mockConfig.token,
-      },
-      body: JSON.stringify({
-        type: 'complete',
-        text: 'Final response text',
-        user_id: mockConfig.user_id,
-        message_key: mockConfig.message_key,
-        timestamp: '2024-01-15T12:00:00.000Z',
-      }),
-    });
+    expect(fetch).toHaveBeenCalledWith(
+      mockConfig.url,
+      expect.objectContaining({
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Engine-Token': mockConfig.token,
+        },
+        body: JSON.stringify({
+          type: 'complete',
+          text: 'Final response text',
+          user_id: mockConfig.user_id,
+          message_key: mockConfig.message_key,
+          timestamp: '2024-01-15T12:00:00.000Z',
+        }),
+      })
+    );
   });
 });
 
@@ -124,21 +133,24 @@ describe('ProgressCallbackSender.sendComplete with audio', () => {
     const sender = new ProgressCallbackSender(mockConfig);
     await sender.sendComplete('Response text', 'base64audiodata');
 
-    expect(fetch).toHaveBeenCalledWith(mockConfig.url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Engine-Token': mockConfig.token,
-      },
-      body: JSON.stringify({
-        type: 'complete',
-        text: 'Response text',
-        voice_audio_base64: 'base64audiodata',
-        user_id: mockConfig.user_id,
-        message_key: mockConfig.message_key,
-        timestamp: '2024-01-15T12:00:00.000Z',
-      }),
-    });
+    expect(fetch).toHaveBeenCalledWith(
+      mockConfig.url,
+      expect.objectContaining({
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Engine-Token': mockConfig.token,
+        },
+        body: JSON.stringify({
+          type: 'complete',
+          text: 'Response text',
+          voice_audio_base64: 'base64audiodata',
+          user_id: mockConfig.user_id,
+          message_key: mockConfig.message_key,
+          timestamp: '2024-01-15T12:00:00.000Z',
+        }),
+      })
+    );
   });
 
   it('omits voice_audio_base64 when null', async () => {
@@ -211,20 +223,23 @@ describe('ProgressCallbackSender.sendError', () => {
     const sender = new ProgressCallbackSender(mockConfig);
     await sender.sendError('Something went wrong');
 
-    expect(fetch).toHaveBeenCalledWith(mockConfig.url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Engine-Token': mockConfig.token,
-      },
-      body: JSON.stringify({
-        type: 'error',
-        error: 'Something went wrong',
-        user_id: mockConfig.user_id,
-        message_key: mockConfig.message_key,
-        timestamp: '2024-01-15T12:00:00.000Z',
-      }),
-    });
+    expect(fetch).toHaveBeenCalledWith(
+      mockConfig.url,
+      expect.objectContaining({
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Engine-Token': mockConfig.token,
+        },
+        body: JSON.stringify({
+          type: 'error',
+          error: 'Something went wrong',
+          user_id: mockConfig.user_id,
+          message_key: mockConfig.message_key,
+          timestamp: '2024-01-15T12:00:00.000Z',
+        }),
+      })
+    );
   });
 });
 
@@ -311,20 +326,23 @@ describe('ProgressCallbackSender.sendProgressDirect', () => {
     const sender = new ProgressCallbackSender(mockConfig);
     await sender.sendProgressDirect('Direct text');
 
-    expect(fetch).toHaveBeenCalledWith(mockConfig.url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Engine-Token': mockConfig.token,
-      },
-      body: JSON.stringify({
-        type: 'progress',
-        text: 'Direct text',
-        user_id: mockConfig.user_id,
-        message_key: mockConfig.message_key,
-        timestamp: '2024-01-15T12:00:00.000Z',
-      }),
-    });
+    expect(fetch).toHaveBeenCalledWith(
+      mockConfig.url,
+      expect.objectContaining({
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Engine-Token': mockConfig.token,
+        },
+        body: JSON.stringify({
+          type: 'progress',
+          text: 'Direct text',
+          user_id: mockConfig.user_id,
+          message_key: mockConfig.message_key,
+          timestamp: '2024-01-15T12:00:00.000Z',
+        }),
+      })
+    );
   });
 
   it('does not send if text is empty', async () => {

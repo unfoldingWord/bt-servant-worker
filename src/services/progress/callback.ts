@@ -6,6 +6,7 @@
  */
 
 import { ChatResponse, ProgressMode, StreamCallbacks } from '../../types/engine.js';
+import { RequestLogger, safeAsync } from '../../utils/logger.js';
 
 export interface ProgressCallbackConfig {
   url: string;
@@ -29,8 +30,14 @@ interface CallbackPayload {
 
 export class ProgressCallbackSender {
   private accumulatedText = '';
+  private logger: RequestLogger | undefined;
 
-  constructor(private config: ProgressCallbackConfig) {}
+  constructor(
+    private config: ProgressCallbackConfig,
+    logger?: RequestLogger
+  ) {
+    this.logger = logger;
+  }
 
   async sendStatus(message: string): Promise<void> {
     await this.post({ type: 'status', message });
@@ -71,55 +78,68 @@ export class ProgressCallbackSender {
   private async post(
     payload: Omit<CallbackPayload, 'user_id' | 'message_key' | 'timestamp'>
   ): Promise<void> {
-    const fullPayload: CallbackPayload = {
+    const fullPayload = this.buildPayload(payload);
+    const ctx = { type: payload.type, user_id: this.config.user_id };
+    this.logOutgoing(payload, ctx);
+
+    try {
+      const response = await this.fetchWithTimeout(fullPayload);
+      this.logger?.log('webhook_response', { ...ctx, status: response.status });
+      if (!response.ok) {
+        this.logger?.warn('webhook_failure', {
+          url: this.config.url,
+          status: response.status,
+          ...ctx,
+        });
+      }
+    } catch (error) {
+      // Non-blocking: webhook failures shouldn't break main flow
+      const isTimeout = error instanceof Error && error.name === 'AbortError';
+      this.logger?.error('webhook_failure', error, {
+        url: this.config.url,
+        is_timeout: isTimeout,
+        ...ctx,
+      });
+    }
+  }
+
+  private buildPayload(
+    payload: Omit<CallbackPayload, 'user_id' | 'message_key' | 'timestamp'>
+  ): CallbackPayload {
+    return {
       ...payload,
       user_id: this.config.user_id,
       message_key: this.config.message_key,
       timestamp: new Date().toISOString(),
     };
+  }
 
-    const hasAudio = 'voice_audio_base64' in payload && !!payload.voice_audio_base64;
+  private logOutgoing(
+    payload: Omit<CallbackPayload, 'user_id' | 'message_key' | 'timestamp'>,
+    ctx: { type: string; user_id: string }
+  ): void {
     const textLen = 'text' in payload ? ((payload.text as string)?.length ?? 0) : 0;
-    console.warn(
-      JSON.stringify({
-        event: 'webhook_send',
-        type: payload.type,
-        has_text: textLen > 0,
-        text_length: textLen,
-        has_audio: hasAudio,
-        user_id: this.config.user_id,
-      })
-    );
+    const hasAudio = 'voice_audio_base64' in payload && !!payload.voice_audio_base64;
+    this.logger?.log('webhook_send', {
+      ...ctx,
+      has_text: textLen > 0,
+      text_length: textLen,
+      has_audio: hasAudio,
+    });
+  }
 
+  private async fetchWithTimeout(payload: CallbackPayload): Promise<Response> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10_000);
     try {
-      const response = await fetch(this.config.url, {
+      return await fetch(this.config.url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Engine-Token': this.config.token },
-        body: JSON.stringify(fullPayload),
+        body: JSON.stringify(payload),
+        signal: controller.signal,
       });
-      console.warn(
-        JSON.stringify({
-          event: 'webhook_response',
-          type: payload.type,
-          status: response.status,
-          user_id: this.config.user_id,
-        })
-      );
-
-      if (!response.ok) {
-        console.error('[webhook_failure]', {
-          url: this.config.url,
-          status: response.status,
-          user_id: this.config.user_id,
-        });
-      }
-    } catch (error) {
-      // Non-blocking: webhook failures shouldn't break main flow
-      console.error('[webhook_failure]', {
-        url: this.config.url,
-        error: error instanceof Error ? error.message : 'Unknown error',
-        user_id: this.config.user_id,
-      });
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 }
@@ -148,10 +168,12 @@ export class IncrementalProgressSender {
   private timerId: ReturnType<typeof setTimeout> | null = null;
   private isComplete = false;
   private config: IncrementalProgressConfig;
+  private logger: RequestLogger | undefined;
 
   constructor(
     private sender: ProgressCallbackSender,
-    config?: Partial<IncrementalProgressConfig>
+    config?: Partial<IncrementalProgressConfig>,
+    logger?: RequestLogger
   ) {
     this.config = {
       mode: config?.mode ?? DEFAULT_PROGRESS_MODE,
@@ -160,6 +182,7 @@ export class IncrementalProgressSender {
         MIN_THROTTLE_SECONDS
       ),
     };
+    this.logger = logger;
   }
 
   getMode(): ProgressMode {
@@ -183,7 +206,7 @@ export class IncrementalProgressSender {
     this.timerId = setTimeout(() => {
       this.timerId = null;
       if (!this.isComplete && this.accumulatedText !== this.lastSentText) {
-        void this.sendProgress(this.accumulatedText);
+        runSafe(this.logger, 'periodic_send_failed', () => this.sendProgress(this.accumulatedText));
         this.lastSentText = this.accumulatedText;
       }
       if (!this.isComplete) this.schedulePeriodicSend();
@@ -211,7 +234,7 @@ export class IncrementalProgressSender {
       const textToSend = this.accumulatedText.slice(0, endIndex);
 
       if (textToSend !== this.lastSentText) {
-        void this.sendProgress(textToSend);
+        runSafe(this.logger, 'sentence_send_failed', () => this.sendProgress(textToSend));
         this.lastSentText = textToSend;
       }
     }
@@ -247,14 +270,24 @@ export class IncrementalProgressSender {
  * @param sender - The underlying sender for webhook calls
  * @param config - Optional configuration for incremental progress
  */
+/** Run an async callback safely — log errors if logger available, otherwise swallow. */
+function runSafe(logger: RequestLogger | undefined, event: string, fn: () => Promise<unknown>) {
+  if (logger) {
+    safeAsync(logger, event, fn);
+  } else {
+    fn().catch(() => {});
+  }
+}
+
 export function createWebhookCallbacks(
   sender: ProgressCallbackSender,
-  config?: Partial<IncrementalProgressConfig>
+  config?: Partial<IncrementalProgressConfig>,
+  logger?: RequestLogger
 ): StreamCallbacks {
   const mode = config?.mode ?? DEFAULT_PROGRESS_MODE;
   const incrementalSender =
     mode === 'periodic' || mode === 'sentence'
-      ? new IncrementalProgressSender(sender, config)
+      ? new IncrementalProgressSender(sender, config, logger)
       : null;
 
   // Track text already sent so iteration and complete callbacks only send deltas
@@ -262,7 +295,7 @@ export function createWebhookCallbacks(
 
   const callbacks: StreamCallbacks = {
     onStatus: (message) => {
-      void sender.sendStatus(message);
+      runSafe(logger, 'webhook_status_failed', () => sender.sendStatus(message));
     },
     onProgress: (text) => {
       if (incrementalSender) {
@@ -276,12 +309,14 @@ export function createWebhookCallbacks(
       const fullText = response.responses.join('\n');
       const delta = fullText.slice(lastSentText.length);
       if (delta || response.voice_audio_base64) {
-        void sender.sendComplete(delta, response.voice_audio_base64);
+        runSafe(logger, 'webhook_complete_failed', () =>
+          sender.sendComplete(delta, response.voice_audio_base64)
+        );
       }
     },
     onError: (error) => {
       incrementalSender?.complete();
-      void sender.sendError(error);
+      runSafe(logger, 'webhook_error_failed', () => sender.sendError(error));
     },
   };
 
@@ -290,7 +325,7 @@ export function createWebhookCallbacks(
       const delta = text.slice(lastSentText.length);
       if (delta) {
         lastSentText = text;
-        void sender.sendProgressDirect(delta);
+        runSafe(logger, 'webhook_iteration_failed', () => sender.sendProgressDirect(delta));
       }
     };
   }

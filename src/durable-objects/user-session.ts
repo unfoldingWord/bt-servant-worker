@@ -62,7 +62,7 @@ import {
 } from '../types/prompt-overrides.js';
 import { transcribeAudio, synthesizeSpeech, AudioContext } from '../services/audio/index.js';
 import { AppError, AudioTranscriptionError, ValidationError } from '../utils/errors.js';
-import { createRequestLogger, RequestLogger } from '../utils/logger.js';
+import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
 import { applyTemplateVariables } from '../utils/template.js';
 import { createTimingContext, timePhase, TimingContext } from '../utils/timing.js';
 const HISTORY_KEY = 'history';
@@ -102,6 +102,7 @@ export class UserSession {
   private state: DurableObjectState;
   private env: Env;
   private app: Hono;
+  private requestLogger: RequestLogger | null = null;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -124,22 +125,24 @@ export class UserSession {
     this.app.delete('/memory', () => this.handleDeleteMemory());
   }
 
+  private getLogger(): RequestLogger {
+    return this.requestLogger ?? createRequestLogger(crypto.randomUUID());
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    const requestId = request.headers.get('X-Request-ID') ?? crypto.randomUUID();
+    this.requestLogger = createRequestLogger(requestId);
 
     // Only lock chat endpoints (not preferences/history reads)
     if (url.pathname === '/chat' || url.pathname === '/stream') {
       const acquired = await this.tryAcquireLock();
       if (!acquired) {
         const userId = url.searchParams.get('user_id') || 'unknown';
-        console.warn(
-          JSON.stringify({
-            event: 'CONCURRENT_REQUEST_REJECTED',
-            user_id: userId,
-            timestamp: Date.now(),
-            note: 'UserQueue should prevent this — kept as defense-in-depth',
-          })
-        );
+        this.getLogger().warn('concurrent_request_rejected', {
+          user_id: userId,
+          note: 'UserQueue should prevent this — kept as defense-in-depth',
+        });
         return new Response(
           JSON.stringify({
             error: 'Request in progress',
@@ -184,13 +187,9 @@ export class UserSession {
       }
       if (lock) {
         // Overwriting a stale lock - log this as it indicates a crash/timeout
-        console.warn(
-          JSON.stringify({
-            event: 'stale_lock_overwritten',
-            lock_age_ms: now - lock,
-            timestamp: now,
-          })
-        );
+        this.getLogger().warn('stale_lock_overwritten', {
+          lock_age_ms: now - lock,
+        });
       }
       await this.state.storage.put(PROCESSING_LOCK_KEY, now);
       return true;
@@ -202,23 +201,33 @@ export class UserSession {
   }
 
   /** Build webhook callbacks from request body fields, if present. */
-  private buildWebhookCallbacks(body: ChatRequest): StreamCallbacks | undefined {
+  private buildWebhookCallbacks(
+    body: ChatRequest,
+    logger: RequestLogger
+  ): StreamCallbacks | undefined {
     if (!body.progress_callback_url || !body.message_key) return undefined;
 
-    const sender = new ProgressCallbackSender({
-      url: body.progress_callback_url,
-      user_id: body.user_id,
-      message_key: body.message_key,
-      token: this.env.ENGINE_API_KEY,
-    });
+    const sender = new ProgressCallbackSender(
+      {
+        url: body.progress_callback_url,
+        user_id: body.user_id,
+        message_key: body.message_key,
+        token: this.env.ENGINE_API_KEY,
+      },
+      logger
+    );
     const throttleSeconds =
       typeof body.progress_throttle_seconds === 'number' && body.progress_throttle_seconds > 0
         ? body.progress_throttle_seconds
         : DEFAULT_THROTTLE_SECONDS;
-    return createWebhookCallbacks(sender, {
-      mode: body.progress_mode ?? DEFAULT_PROGRESS_MODE,
-      throttleSeconds,
-    });
+    return createWebhookCallbacks(
+      sender,
+      {
+        mode: body.progress_mode ?? DEFAULT_PROGRESS_MODE,
+        throttleSeconds,
+      },
+      logger
+    );
   }
 
   private async handleChat(request: Request): Promise<Response> {
@@ -235,7 +244,7 @@ export class UserSession {
       worker_request_id: workerRequestId,
     });
 
-    const callbacks = this.buildWebhookCallbacks(body);
+    const callbacks = this.buildWebhookCallbacks(body, logger);
     try {
       const response = await this.processChat(body, logger, timing, callbacks);
 
@@ -312,15 +321,7 @@ export class UserSession {
       workerRequestId,
       startTime,
     })
-      .catch(async (error) => {
-        const totalDuration = Date.now() - startTime;
-        logger.error('do_stream_error', error, { total_duration_ms: totalDuration });
-        await sendEvent({
-          type: 'error',
-          error: error instanceof Error ? error.message : 'Unknown error',
-        });
-        await writer.close();
-      })
+      .catch((error) => this.handleStreamCatchError(error, sendEvent, writer, logger, startTime))
       .finally(() => this.releaseLock());
 
     return new Response(readable, {
@@ -332,75 +333,109 @@ export class UserSession {
     });
   }
 
+  private async handleStreamCatchError(
+    error: unknown,
+    sendEvent: (event: SSEEvent) => Promise<void>,
+    writer: WritableStreamDefaultWriter,
+    logger: RequestLogger,
+    startTime: number
+  ): Promise<void> {
+    const totalDuration = Date.now() - startTime;
+    logger.error('do_stream_error', error, { total_duration_ms: totalDuration });
+    try {
+      await sendEvent({
+        type: 'error',
+        error: error instanceof Error ? error.message : 'Stream processing failed',
+      });
+    } catch (sendErr) {
+      logger.warn('stream_error_send_failed', {
+        error: sendErr instanceof Error ? sendErr.message : String(sendErr),
+      });
+    }
+    try {
+      await writer.close();
+    } catch (closeErr) {
+      logger.warn('stream_writer_close_failed', {
+        error: closeErr instanceof Error ? closeErr.message : String(closeErr),
+      });
+    }
+  }
+
   private async handleGetPreferences(): Promise<Response> {
-    const prefs = await this.getPreferences();
-    const apiPrefs: UserPreferencesAPI = {
-      response_language: prefs.response_language,
-    };
-    return Response.json(apiPrefs);
+    return withEndpointLogging(this.getLogger(), 'get_preferences', async () => {
+      const prefs = await this.getPreferences();
+      const apiPrefs: UserPreferencesAPI = {
+        response_language: prefs.response_language,
+      };
+      return Response.json(apiPrefs);
+    });
   }
 
   private async handleUpdatePreferences(request: Request): Promise<Response> {
-    const updates = (await request.json()) as UpdatePreferencesRequest;
+    return withEndpointLogging(this.getLogger(), 'update_preferences', async () => {
+      const updates = (await request.json()) as UpdatePreferencesRequest;
 
-    // Validate response_language format (ISO 639-1: 2 lowercase letters)
-    if (updates.response_language !== undefined) {
-      if (
-        typeof updates.response_language !== 'string' ||
-        !isValidLanguageCode(updates.response_language)
-      ) {
-        return Response.json(
-          {
-            error: 'Invalid response_language',
-            message:
-              'Must be a valid ISO 639-1 language code (2 lowercase letters, e.g., "en", "es", "fr")',
-          },
-          { status: 400 }
-        );
+      // Validate response_language format (ISO 639-1: 2 lowercase letters)
+      if (updates.response_language !== undefined) {
+        if (
+          typeof updates.response_language !== 'string' ||
+          !isValidLanguageCode(updates.response_language)
+        ) {
+          return Response.json(
+            {
+              error: 'Invalid response_language',
+              message:
+                'Must be a valid ISO 639-1 language code (2 lowercase letters, e.g., "en", "es", "fr")',
+            },
+            { status: 400 }
+          );
+        }
       }
-    }
 
-    const current = await this.getPreferences();
+      const current = await this.getPreferences();
 
-    const updated: UserPreferencesInternal = {
-      ...current,
-      ...(updates.response_language !== undefined && {
-        response_language: updates.response_language,
-      }),
-    };
+      const updated: UserPreferencesInternal = {
+        ...current,
+        ...(updates.response_language !== undefined && {
+          response_language: updates.response_language,
+        }),
+      };
 
-    await this.updatePreferences(updated);
+      await this.updatePreferences(updated);
 
-    const apiPrefs: UserPreferencesAPI = {
-      response_language: updated.response_language,
-    };
-    return Response.json(apiPrefs);
+      const apiPrefs: UserPreferencesAPI = {
+        response_language: updated.response_language,
+      };
+      return Response.json(apiPrefs);
+    });
   }
 
   private async handleGetHistory(url: URL): Promise<Response> {
-    const requestedLimit = parseInt(
-      url.searchParams.get('limit') ?? String(DEFAULT_ORG_CONFIG.max_history_storage),
-      10
-    );
-    const limit = Math.min(requestedLimit, DEFAULT_ORG_CONFIG.max_history_storage);
-    const offset = parseInt(url.searchParams.get('offset') ?? '0', 10);
-    const userId = url.searchParams.get('user_id') ?? '';
+    return withEndpointLogging(this.getLogger(), 'get_history', async () => {
+      const requestedLimit = parseInt(
+        url.searchParams.get('limit') ?? String(DEFAULT_ORG_CONFIG.max_history_storage),
+        10
+      );
+      const limit = Math.min(requestedLimit, DEFAULT_ORG_CONFIG.max_history_storage);
+      const offset = parseInt(url.searchParams.get('offset') ?? '0', 10);
+      const userId = url.searchParams.get('user_id') ?? '';
 
-    const allHistory = await this.getHistory();
-    const total = allHistory.length;
-    const entries = allHistory.slice(offset, offset + limit).map((e) => ({
-      ...e,
-      created_at: e.timestamp ? new Date(e.timestamp).toISOString() : null,
-    }));
+      const allHistory = await this.getHistory();
+      const total = allHistory.length;
+      const entries = allHistory.slice(offset, offset + limit).map((e) => ({
+        ...e,
+        created_at: e.timestamp ? new Date(e.timestamp).toISOString() : null,
+      }));
 
-    const response: ChatHistoryResponse = {
-      user_id: userId,
-      entries,
-      total_count: total,
-      limit,
-      offset,
-    };
-    return Response.json(response);
+      const response: ChatHistoryResponse = {
+        user_id: userId,
+        entries,
+        total_count: total,
+        limit,
+        offset,
+      };
+      return Response.json(response);
+    });
   }
 
   private async processStreamingChat(
@@ -676,82 +711,100 @@ export class UserSession {
   }
 
   private async handleGetPromptOverrides(): Promise<Response> {
-    try {
-      const overrides = await this.getPromptOverrides();
-      return Response.json(overrides);
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
-    }
+    return withEndpointLogging(this.getLogger(), 'get_prompt_overrides', async () => {
+      try {
+        const overrides = await this.getPromptOverrides();
+        return Response.json(overrides);
+      } catch (error) {
+        this.getLogger().error('get_prompt_overrides_error', error);
+        const msg = error instanceof Error ? error.message : String(error);
+        return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
+      }
+    });
   }
 
   private async handleUpdatePromptOverrides(request: Request): Promise<Response> {
-    const body = await request.json();
-    const error = validatePromptOverrides(body);
-    if (error) {
-      return Response.json({ error }, { status: 400 });
-    }
+    return withEndpointLogging(this.getLogger(), 'update_prompt_overrides', async () => {
+      const body = await request.json();
+      const error = validatePromptOverrides(body);
+      if (error) {
+        return Response.json({ error }, { status: 400 });
+      }
 
-    try {
-      const current = await this.getPromptOverrides();
-      const merged = mergePromptOverrides(current, body as PromptOverrides);
-      await this.updatePromptOverrides(merged);
-      return Response.json(merged);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
-    }
+      try {
+        const current = await this.getPromptOverrides();
+        const merged = mergePromptOverrides(current, body as PromptOverrides);
+        await this.updatePromptOverrides(merged);
+        return Response.json(merged);
+      } catch (err) {
+        this.getLogger().error('update_prompt_overrides_error', err);
+        const msg = err instanceof Error ? err.message : String(err);
+        return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
+      }
+    });
   }
 
   private async handleDeleteHistory(): Promise<Response> {
-    try {
-      await this.state.storage.delete(HISTORY_KEY);
-      return Response.json({ message: 'User history cleared' });
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
-    }
+    return withEndpointLogging(this.getLogger(), 'delete_history', async () => {
+      try {
+        await this.state.storage.delete(HISTORY_KEY);
+        return Response.json({ message: 'User history cleared' });
+      } catch (error) {
+        this.getLogger().error('delete_history_error', error);
+        const msg = error instanceof Error ? error.message : String(error);
+        return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
+      }
+    });
   }
 
   private async handleDeletePromptOverrides(): Promise<Response> {
-    try {
-      await this.state.storage.delete(PROMPT_OVERRIDES_KEY);
-      return Response.json({ message: 'User prompt overrides cleared' });
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
-    }
+    return withEndpointLogging(this.getLogger(), 'delete_prompt_overrides', async () => {
+      try {
+        await this.state.storage.delete(PROMPT_OVERRIDES_KEY);
+        return Response.json({ message: 'User prompt overrides cleared' });
+      } catch (error) {
+        this.getLogger().error('delete_prompt_overrides_error', error);
+        const msg = error instanceof Error ? error.message : String(error);
+        return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
+      }
+    });
   }
 
   private async handleGetMemory(): Promise<Response> {
-    try {
-      const logger = createRequestLogger(crypto.randomUUID());
-      const store = new JsonMemoryStore(this.state.storage, logger);
-      const { content, toc, entries } = await store.readAll();
-      return Response.json({ content, toc, entries });
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
-    }
+    return withEndpointLogging(this.getLogger(), 'get_memory', async () => {
+      try {
+        const store = new JsonMemoryStore(this.state.storage, this.getLogger());
+        const { content, toc, entries } = await store.readAll();
+        return Response.json({ content, toc, entries });
+      } catch (error) {
+        this.getLogger().error('get_memory_error', error);
+        const msg = error instanceof Error ? error.message : String(error);
+        return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
+      }
+    });
   }
 
   private async handleDeleteMemory(): Promise<Response> {
-    try {
-      const logger = createRequestLogger(crypto.randomUUID());
-      const store = new JsonMemoryStore(this.state.storage, logger);
-      await store.clear();
-      return Response.json({ message: 'User memory cleared' });
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
-    }
+    return withEndpointLogging(this.getLogger(), 'delete_memory', async () => {
+      try {
+        const store = new JsonMemoryStore(this.state.storage, this.getLogger());
+        await store.clear();
+        return Response.json({ message: 'User memory cleared' });
+      } catch (error) {
+        this.getLogger().error('delete_memory_error', error);
+        const msg = error instanceof Error ? error.message : String(error);
+        return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
+      }
+    });
   }
 
   // ─── Mode selection handlers ──────────────────────────────────────────────────
 
   private async handleGetMode(): Promise<Response> {
-    const mode = await this.getSelectedMode();
-    return Response.json({ mode: mode ?? null });
+    return withEndpointLogging(this.getLogger(), 'get_mode', async () => {
+      const mode = await this.getSelectedMode();
+      return Response.json({ mode: mode ?? null });
+    });
   }
 
   // NOTE: This handler validates name format but cannot verify that the mode exists in the org's
@@ -759,18 +812,22 @@ export class UserSession {
   // points: (1) the switch_mode tool checks availableModes before persisting, and (2) prompt
   // resolution gracefully ignores unknown modes (falls through to no mode).
   private async handleSetMode(request: Request): Promise<Response> {
-    const body = (await request.json()) as Record<string, unknown>;
-    const nameError = validateModeName(body.mode);
-    if (nameError) {
-      return Response.json({ error: nameError }, { status: 400 });
-    }
-    await this.state.storage.put(SELECTED_MODE_KEY, body.mode as string);
-    return Response.json({ mode: body.mode, message: 'User mode updated' });
+    return withEndpointLogging(this.getLogger(), 'set_mode', async () => {
+      const body = (await request.json()) as Record<string, unknown>;
+      const nameError = validateModeName(body.mode);
+      if (nameError) {
+        return Response.json({ error: nameError }, { status: 400 });
+      }
+      await this.state.storage.put(SELECTED_MODE_KEY, body.mode as string);
+      return Response.json({ mode: body.mode, message: 'User mode updated' });
+    });
   }
 
   private async handleDeleteMode(): Promise<Response> {
-    await this.state.storage.delete(SELECTED_MODE_KEY);
-    return Response.json({ mode: null, message: 'User mode cleared' });
+    return withEndpointLogging(this.getLogger(), 'delete_mode', async () => {
+      await this.state.storage.delete(SELECTED_MODE_KEY);
+      return Response.json({ mode: null, message: 'User mode cleared' });
+    });
   }
 
   /** Run orchestration and log duration */
