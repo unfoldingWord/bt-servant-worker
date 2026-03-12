@@ -727,9 +727,8 @@ export class UserSession {
     try {
       const logger = createRequestLogger(crypto.randomUUID());
       const store = new JsonMemoryStore(this.state.storage, logger);
-      const content = await store.read();
-      const toc = await store.getTableOfContents();
-      return Response.json({ content, toc });
+      const { content, toc, entries } = await store.readAll();
+      return Response.json({ content, toc, entries });
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);

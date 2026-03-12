@@ -14,6 +14,7 @@ import {
   MemoryEntry,
   MemoryStorage,
   MemoryTOC,
+  StructuredMemoryEntry,
 } from './types.js';
 import { byteLength } from './utils.js';
 
@@ -25,9 +26,22 @@ export interface WriteResult {
   capacityPercent: number;
 }
 
+/** Combined result from a single storage read */
+export interface MemoryReadAllResult {
+  content: string;
+  toc: MemoryTOC;
+  entries: Record<string, StructuredMemoryEntry>;
+}
+
 export interface UserMemoryStore {
   /** Read full memory or specific sections */
   read(sections?: string[]): Promise<string | Record<string, string>>;
+
+  /** Return all entries with metadata, pinned normalized to boolean */
+  readStructured(): Promise<Record<string, StructuredMemoryEntry>>;
+
+  /** Read content, TOC, and structured entries in a single storage call */
+  readAll(): Promise<MemoryReadAllResult>;
 
   /** Create/update sections (string) or delete them (null), with optional pin/unpin */
   writeSections(
@@ -127,6 +141,19 @@ export class JsonMemoryStore implements UserMemoryStore {
     });
 
     return result;
+  }
+
+  async readStructured(): Promise<Record<string, StructuredMemoryEntry>> {
+    const data = await this.getMemoryData();
+    return this.buildStructuredEntries(data.entries);
+  }
+
+  async readAll(): Promise<MemoryReadAllResult> {
+    const data = await this.getMemoryData();
+    const content = this.serializeEntries(data.entries);
+    const toc = this.buildTOC(data.entries);
+    const entries = this.buildStructuredEntries(data.entries);
+    return { content, toc, entries };
   }
 
   async writeSections(
@@ -230,28 +257,15 @@ export class JsonMemoryStore implements UserMemoryStore {
 
     if (entryNames.length === 0) {
       this.logger.log('memory_found_empty', {});
-      return { entries: [], totalSizeBytes: 0, maxSizeBytes: MAX_MEMORY_SIZE_BYTES };
+    } else {
+      this.logger.log('memory_toc_extracted', {
+        section_count: entryNames.length,
+        total_size_bytes: calculateTotalSize(data.entries),
+        sections: entryNames,
+      });
     }
 
-    const tocEntries = entryNames.map((name) => {
-      // eslint-disable-next-line security/detect-object-injection -- name from Object.keys
-      const entry = data.entries[name]!;
-      return {
-        name,
-        sizeBytes: byteLength(entry.content),
-        pinned: entry.pinned === true,
-      };
-    });
-
-    const totalSizeBytes = calculateTotalSize(data.entries);
-
-    this.logger.log('memory_toc_extracted', {
-      section_count: tocEntries.length,
-      total_size_bytes: totalSizeBytes,
-      sections: entryNames,
-    });
-
-    return { entries: tocEntries, totalSizeBytes, maxSizeBytes: MAX_MEMORY_SIZE_BYTES };
+    return this.buildTOC(data.entries);
   }
 
   async clear(): Promise<void> {
@@ -264,6 +278,50 @@ export class JsonMemoryStore implements UserMemoryStore {
   async getSizeBytes(): Promise<number> {
     const data = await this.getMemoryData();
     return calculateTotalSize(data.entries);
+  }
+
+  /** Build TOC from in-memory entries */
+  private buildTOC(entries: Record<string, MemoryEntry>): MemoryTOC {
+    const entryNames = Object.keys(entries);
+
+    if (entryNames.length === 0) {
+      return { entries: [], totalSizeBytes: 0, maxSizeBytes: MAX_MEMORY_SIZE_BYTES };
+    }
+
+    const tocEntries = entryNames.map((name) => {
+      // eslint-disable-next-line security/detect-object-injection -- name from Object.keys
+      const entry = entries[name]!;
+      return {
+        name,
+        sizeBytes: byteLength(entry.content),
+        pinned: entry.pinned === true,
+      };
+    });
+
+    return {
+      entries: tocEntries,
+      totalSizeBytes: calculateTotalSize(entries),
+      maxSizeBytes: MAX_MEMORY_SIZE_BYTES,
+    };
+  }
+
+  /** Build structured entries with normalized pinned boolean */
+  private buildStructuredEntries(
+    entries: Record<string, MemoryEntry>
+  ): Record<string, StructuredMemoryEntry> {
+    const result: Record<string, StructuredMemoryEntry> = {};
+
+    for (const [name, entry] of Object.entries(entries)) {
+      // eslint-disable-next-line security/detect-object-injection -- name from Object.entries
+      result[name] = {
+        content: entry.content,
+        updatedAt: entry.updatedAt,
+        createdAt: entry.createdAt,
+        pinned: entry.pinned === true,
+      };
+    }
+
+    return result;
   }
 
   /**
