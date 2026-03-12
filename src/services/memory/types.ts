@@ -23,6 +23,14 @@ export interface MemoryEntry {
   pinned?: boolean; // if true, never auto-evicted
 }
 
+/** Entry with normalized metadata, as returned by the admin API */
+export interface StructuredMemoryEntry {
+  content: string;
+  updatedAt: number;
+  createdAt: number;
+  pinned: boolean; // always present (normalized from optional)
+}
+
 /** What's stored in DO storage as a single JSON blob */
 export interface MemoryStorage {
   entries: Record<string, MemoryEntry>;

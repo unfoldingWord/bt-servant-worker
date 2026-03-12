@@ -500,6 +500,46 @@ describe('JsonMemoryStore - readStructured', () => {
   });
 });
 
+describe('JsonMemoryStore - readAll', () => {
+  it('returns content, toc, and entries from a single storage read', async () => {
+    const now = Date.now();
+    seedEntries(storage, {
+      Progress: { content: 'Phase 1 done', pinned: true, createdAt: now, updatedAt: now },
+      Preferences: { content: 'Language: es', createdAt: now, updatedAt: now },
+    });
+
+    const getSpy = vi.spyOn(storage, 'get');
+    const result = await store.readAll();
+
+    // Single storage read
+    expect(getSpy).toHaveBeenCalledTimes(1);
+
+    // content — serialized markdown
+    expect(result.content).toContain('## Progress');
+    expect(result.content).toContain('Phase 1 done');
+    expect(result.content).toContain('## Preferences');
+
+    // toc — table of contents
+    expect(result.toc.entries).toHaveLength(2);
+    expect(result.toc.entries.find((e) => e.name === 'Progress')?.pinned).toBe(true);
+    expect(result.toc.entries.find((e) => e.name === 'Preferences')?.pinned).toBe(false);
+    expect(result.toc.maxSizeBytes).toBe(131072);
+
+    // entries — structured with normalized pinned
+    expect(result.entries['Progress'].pinned).toBe(true);
+    expect(result.entries['Preferences'].pinned).toBe(false);
+    expect(result.entries['Preferences'].content).toBe('Language: es');
+  });
+
+  it('returns empty state when no memory exists', async () => {
+    const result = await store.readAll();
+
+    expect(result.content).toBe('');
+    expect(result.toc).toEqual({ entries: [], totalSizeBytes: 0, maxSizeBytes: 131072 });
+    expect(result.entries).toEqual({});
+  });
+});
+
 describe('JsonMemoryStore - clear and size', () => {
   it('removes all memory on clear', async () => {
     seedEntries(storage, { Data: { content: 'Content' } });
