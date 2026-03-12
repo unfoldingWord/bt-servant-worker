@@ -79,6 +79,140 @@ Merging without permission bypasses:
 4. **No Suppression**: NEVER suppress warnings, disable linting rules, or skip checks without explicitly asking the user first
 5. **No --no-verify**: NEVER use `--no-verify` or any flag to skip pre-commit hooks
 
+## CRITICAL: Never Silently Swallow Errors
+
+**NEVER write code that catches an error and does nothing with it.** This is non-negotiable.
+
+Silent error swallowing is one of the most destructive anti-patterns in software engineering. It creates systems that fail invisibly — users see broken behavior, operators see clean logs, and everyone wastes hours hunting ghosts. This project has been burned by this exact pattern and we will not tolerate it again.
+
+### The Philosophy
+
+Every error that occurs in this system is a **signal**. Signals must be observed. When you catch an error and discard it, you are actively destroying information that someone will need later to debug a production incident. You are trading a few lines of logging code for hours of future frustration.
+
+**The golden rule: If something can fail, the failure must be observable.**
+
+### What "Observable" Means
+
+An error is observable when ALL of the following are true:
+
+1. **It is logged** — using the structured request logger (`logger.error()` or `logger.warn()`), NOT `console.error()`. Console output is unreliable in production Workers.
+2. **It has context** — the log includes the request ID, user ID, operation name, and any relevant parameters. An error message alone is useless without knowing what triggered it.
+3. **It is correlated** — the log uses the same request logger as the rest of the request chain, not a new logger with a random UUID. Correlation is what makes debugging possible.
+
+### Banned Patterns
+
+These patterns are **strictly forbidden** in this codebase:
+
+```typescript
+// BANNED: Empty catch block
+try {
+  await doSomething();
+} catch {}
+
+// BANNED: Empty catch with a comment pretending it's fine
+try {
+  await doSomething();
+} catch {
+  // Client may have disconnected
+}
+
+// BANNED: Catch that only logs to console
+try {
+  await doSomething();
+} catch (error) {
+  console.error('something failed', error);
+}
+
+// BANNED: Fire-and-forget async call with void
+void someAsyncOperation();
+
+// BANNED: Catch that returns a fallback without logging
+try {
+  return await getData();
+} catch {
+  return defaultValue;
+}
+
+// BANNED: Creating a new logger with random UUID instead of using request context
+const logger = createRequestLogger(crypto.randomUUID()); // NO — use the real request logger
+```
+
+### Required Patterns
+
+Every catch block MUST follow one of these patterns:
+
+```typescript
+// PATTERN 1: Log and re-throw (let caller handle it)
+try {
+  await doSomething();
+} catch (error) {
+  logger.error('operation_failed', error, { context: 'relevant details' });
+  throw error;
+}
+
+// PATTERN 2: Log and return error response (at boundary)
+try {
+  await doSomething();
+} catch (error) {
+  logger.error('operation_failed', error, { context: 'relevant details' });
+  return createErrorResponse('Operation failed', 'INTERNAL_ERROR', error.message, 500);
+}
+
+// PATTERN 3: Log and degrade gracefully (only when degradation is the right call)
+try {
+  await sendOptionalNotification();
+} catch (error) {
+  logger.warn('notification_failed', { error: error.message, context: 'relevant details' });
+  // Explicitly continue — this is a non-critical side effect
+}
+```
+
+### Rules for Async Operations
+
+1. **Never use `void` to fire-and-forget an async operation** unless the error is handled inside the function itself with proper logging.
+2. If you must run something in the background, use `ctx.waitUntil()` and ensure the promise has internal error handling with logging.
+3. **Every `setTimeout`/`setInterval` callback** that calls async code must catch and log errors from that code.
+
+### Rules for Stream/Writer Operations
+
+SSE writers and stream pipes can fail when clients disconnect. This is expected, but it still MUST be logged:
+
+```typescript
+try {
+  await writer.write(data);
+} catch (error) {
+  logger.warn('stream_write_failed', { error: error.message, messageId });
+  // Client disconnected — this is expected but must be visible in logs
+}
+```
+
+"Expected" does not mean "invisible." A `warn`-level log for expected disconnections is the minimum. This lets operators distinguish "client disconnected" (normal) from "writer broke for unknown reasons" (bug).
+
+### Why This Matters
+
+When errors are swallowed:
+
+- Users see broken features and report vague bugs ("it just doesn't work")
+- Operators check logs and find nothing — leading to "works on my machine" dead ends
+- The AI assistant tells users "I'm having a technical issue" with zero diagnostic trail
+- Debugging becomes archaeology instead of engineering
+- Issues compound silently until something catastrophic happens
+
+When errors are logged:
+
+- Every failure has a trail
+- Operators can search logs by request ID and see exactly what happened
+- Patterns emerge (e.g., "memory writes fail every Tuesday at 3am")
+- Mean time to resolution drops from hours to minutes
+- The system earns trust because its behavior is explainable
+
+### Enforcement
+
+- **Code review** must reject any PR with silent catch blocks
+- **Pre-existing silent catches** are tech debt to be eliminated, not precedent to follow
+- When in doubt, **over-log rather than under-log** — verbose logs can be filtered; missing logs cannot be conjured
+- If you genuinely believe a catch block should not log (extraordinarily rare), you MUST add a comment explaining exactly why, and it must be approved in review
+
 ## Things to Remember Before Writing Any Code
 
 1. State how you will verify this change works (ex. tests, bash commands, browser checks, etc)
