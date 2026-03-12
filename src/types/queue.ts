@@ -40,6 +40,8 @@ export interface QueueEntry {
   _org_prompt_overrides?: PromptOverrides | undefined;
   /** Injected org modes from KV */
   _org_modes?: OrgModes | undefined;
+  /** Worker-level request ID for cross-DO correlation */
+  request_id?: string | undefined;
 }
 
 /**
