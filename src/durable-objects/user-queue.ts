@@ -33,6 +33,7 @@ import {
   StoredSSEEvent,
 } from '../types/queue.js';
 import { createRequestLogger, RequestLogger } from '../utils/logger.js';
+import { createTimingContext, timePhase } from '../utils/timing.js';
 
 // Defaults for configurable values (overridable via env vars)
 const DEFAULT_STORED_RESPONSE_TTL_MS = 5 * 60 * 1000; // 5 minutes
@@ -126,6 +127,7 @@ function parseEnqueueBody(body: Record<string, unknown>): QueueEntry | string {
     enqueued_at: Date.now(),
     delivery: body.delivery === 'callback' ? ('callback' as const) : ('sse' as const),
     retry_count: 0,
+    request_id: typeof body.request_id === 'string' ? body.request_id : undefined,
     ...extractOptionalFields(body),
     ...extractInjectedConfig(body),
   };
@@ -209,6 +211,7 @@ export class UserQueue {
         org: entry.org,
         retry_count: entry.retry_count,
         queue_wait_ms: startTime - entry.enqueued_at,
+        worker_request_id: entry.request_id,
       });
 
       try {
@@ -221,6 +224,7 @@ export class UserQueue {
           message_id: entry.message_id,
           user_id: entry.user_id,
           processing_ms: Date.now() - startTime,
+          worker_request_id: entry.request_id,
         });
       } catch (error) {
         logger.error('queue_processing_error', error, {
@@ -530,17 +534,23 @@ export class UserQueue {
   /** Forward to UserSession DO /chat with webhook callback. */
   private async processWithCallback(entry: QueueEntry, logger: RequestLogger): Promise<void> {
     const stub = this.getUserSessionStub(entry);
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (entry.request_id) headers['X-Request-ID'] = entry.request_id;
+
     const doRequest = new Request(`${DO_BASE_URL}/chat`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: buildSessionBody(entry, true),
     });
 
-    const response = await stub.fetch(doRequest);
+    const timing = createTimingContext();
+    const response = await timePhase(timing, 'session_fetch', () => stub.fetch(doRequest));
     logger.log('callback_response', {
       message_id: entry.message_id,
       user_id: entry.user_id,
       status: response.status,
+      session_fetch_ms: timing.phases['session_fetch'],
+      worker_request_id: entry.request_id,
     });
 
     if (!response.ok) {
@@ -585,9 +595,12 @@ export class UserQueue {
   /** Fetch SSE stream from UserSession DO. */
   private async fetchUserSessionStream(entry: QueueEntry): Promise<Response> {
     const stub = this.getUserSessionStub(entry);
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (entry.request_id) headers['X-Request-ID'] = entry.request_id;
+
     const doRequest = new Request(`${DO_BASE_URL}/stream`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: buildSessionBody(entry, false),
     });
 

@@ -64,6 +64,7 @@ import { transcribeAudio, synthesizeSpeech, AudioContext } from '../services/aud
 import { AppError, AudioTranscriptionError, ValidationError } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger } from '../utils/logger.js';
 import { applyTemplateVariables } from '../utils/template.js';
+import { createTimingContext, timePhase, TimingContext } from '../utils/timing.js';
 const HISTORY_KEY = 'history';
 const PREFERENCES_KEY = 'preferences';
 const PROMPT_OVERRIDES_KEY = 'prompt_overrides';
@@ -222,15 +223,21 @@ export class UserSession {
 
   private async handleChat(request: Request): Promise<Response> {
     const requestId = crypto.randomUUID();
+    const workerRequestId = request.headers.get('X-Request-ID') ?? undefined;
     const startTime = Date.now();
     const body = (await request.json()) as ChatRequest;
     const logger = createRequestLogger(requestId, body.user_id);
+    const timing = createTimingContext();
 
-    logger.log('do_chat_start', { client_id: body.client_id, message_type: body.message_type });
+    logger.log('do_chat_start', {
+      client_id: body.client_id,
+      message_type: body.message_type,
+      worker_request_id: workerRequestId,
+    });
 
     const callbacks = this.buildWebhookCallbacks(body);
     try {
-      const response = await this.processChat(body, logger, callbacks);
+      const response = await this.processChat(body, logger, timing, callbacks);
 
       // Send complete callback for webhook-based clients (e.g., WhatsApp gateway)
       await callbacks?.onComplete?.(response);
@@ -239,6 +246,11 @@ export class UserSession {
       logger.log('do_chat_complete', {
         response_count: response.responses.length,
         total_duration_ms: totalDuration,
+      });
+      logger.log('request_timing_summary', {
+        worker_request_id: workerRequestId,
+        total_ms: totalDuration,
+        phases: timing.phases,
       });
       logger.log('final_response', {
         responses: response.responses,
@@ -265,11 +277,17 @@ export class UserSession {
    */
   private async handleStreamingChatWithLock(request: Request): Promise<Response> {
     const requestId = crypto.randomUUID();
+    const workerRequestId = request.headers.get('X-Request-ID') ?? undefined;
     const startTime = Date.now();
     const body = (await request.json()) as ChatRequest;
     const logger = createRequestLogger(requestId, body.user_id);
+    const timing = createTimingContext();
 
-    logger.log('do_stream_start', { client_id: body.client_id, message_type: body.message_type });
+    logger.log('do_stream_start', {
+      client_id: body.client_id,
+      message_type: body.message_type,
+      worker_request_id: workerRequestId,
+    });
 
     const { readable, writable } = new TransformStream();
     const writer = writable.getWriter();
@@ -288,7 +306,12 @@ export class UserSession {
     };
 
     // Process streaming and release lock when done (success or error)
-    this.processStreamingChat(body, sendEvent, writer, logger, startTime)
+    this.processStreamingChat(body, sendEvent, writer, {
+      logger,
+      timing,
+      workerRequestId,
+      startTime,
+    })
       .catch(async (error) => {
         const totalDuration = Date.now() - startTime;
         logger.error('do_stream_error', error, { total_duration_ms: totalDuration });
@@ -384,9 +407,14 @@ export class UserSession {
     body: ChatRequest,
     sendEvent: (event: SSEEvent) => Promise<void>,
     writer: WritableStreamDefaultWriter<Uint8Array>,
-    logger: RequestLogger,
-    startTime: number
+    opts: {
+      logger: RequestLogger;
+      timing: TimingContext;
+      workerRequestId?: string | undefined;
+      startTime: number;
+    }
   ): Promise<void> {
+    const { logger, timing, workerRequestId, startTime } = opts;
     const callbacks: StreamCallbacks = {
       onStatus: async (message) => sendEvent({ type: 'status', message }),
       onProgress: async (text) => sendEvent({ type: 'progress', text }),
@@ -397,11 +425,16 @@ export class UserSession {
     };
 
     try {
-      const response = await this.processChat(body, logger, callbacks);
+      const response = await this.processChat(body, logger, timing, callbacks);
       const totalDuration = Date.now() - startTime;
       logger.log('do_stream_complete', {
         response_count: response.responses.length,
         total_duration_ms: totalDuration,
+      });
+      logger.log('request_timing_summary', {
+        worker_request_id: workerRequestId,
+        total_ms: totalDuration,
+        phases: timing.phases,
       });
       logger.log('final_response', {
         responses: response.responses,
@@ -605,50 +638,40 @@ export class UserSession {
   private async processChat(
     body: ChatRequest,
     logger: RequestLogger,
+    timing: TimingContext,
     callbacks?: StreamCallbacks
   ): Promise<ChatResponse> {
-    const messageText = await this.resolveMessageText(body, logger, callbacks);
-    const { preferences, history } = await this.loadUserContext(logger);
-    const orgConfig = body._org_config ?? {};
-    const catalog = await this.discoverMCPTools(body._mcp_servers ?? [], logger);
-    const {
-      resolved: resolvedPromptValues,
-      orgModes,
-      activeModeName,
-    } = await this.resolvePrompts(body, logger);
-    const { memoryStore, formattedTOC } = await this.loadMemoryContext(logger);
-    const modeContext = this.buildModeContext(orgModes, activeModeName);
-    const audioContext = this.buildAudioContext();
-    const responses = await this.runOrchestration(messageText, {
-      env: this.env,
-      catalog,
-      history,
-      preferences: {
-        response_language: preferences.response_language,
-        first_interaction: preferences.first_interaction,
-      },
-      orgConfig,
-      resolvedPromptValues,
-      memoryStore,
-      memoryTOC: formattedTOC || undefined,
-      modeContext,
-      audioContext,
-      clientId: body.client_id,
-      logger,
-      callbacks,
-    });
-    const voiceAudioBase64 = await this.maybeGenerateAudio(
-      body,
-      audioContext,
-      responses,
-      logger,
-      callbacks
+    const messageText = await timePhase(timing, 'resolve_message', () =>
+      this.resolveMessageText(body, logger, callbacks)
     );
-    await this.saveConversation(messageText, responses, preferences, orgConfig, logger);
+    const { preferences, history } = await timePhase(timing, 'load_user_context', () =>
+      this.loadUserContext(logger)
+    );
+    const catalog = await timePhase(timing, 'mcp_discovery', () =>
+      this.discoverMCPTools(body._mcp_servers ?? [], logger)
+    );
+    const { resolved, orgModes, activeModeName } = await timePhase(timing, 'resolve_prompts', () =>
+      this.resolvePrompts(body, logger)
+    );
+    const { memoryStore, formattedTOC } = await timePhase(timing, 'load_memory', () =>
+      this.loadMemoryContext(logger)
+    );
+    const audioContext = this.buildAudioContext();
+    // prettier-ignore
+    const orchOpts = this.buildOrchOpts(body, catalog, history, preferences, resolved, memoryStore, formattedTOC, orgModes, activeModeName, audioContext, logger, callbacks);
+    const responses = await timePhase(timing, 'orchestration', () =>
+      this.runOrchestration(messageText, orchOpts)
+    );
+    const voiceAudio = await timePhase(timing, 'audio_generation', () =>
+      this.maybeGenerateAudio(body, audioContext, responses, logger, callbacks)
+    );
+    await timePhase(timing, 'save_conversation', () =>
+      this.saveConversation(messageText, responses, preferences, body._org_config ?? {}, logger)
+    );
     return {
       responses,
       response_language: preferences.response_language,
-      voice_audio_base64: voiceAudioBase64,
+      voice_audio_base64: voiceAudio,
     };
   }
 
@@ -763,6 +786,41 @@ export class UserSession {
       duration_ms: Date.now() - startTime,
     });
     return responses;
+  }
+
+  // eslint-disable-next-line max-params -- opts builder, all params are necessary context
+  private buildOrchOpts(
+    body: ChatRequest,
+    catalog: ReturnType<typeof buildToolCatalog>,
+    history: ChatHistoryEntry[],
+    preferences: UserPreferencesInternal,
+    resolvedPromptValues: ReturnType<typeof resolvePromptOverrides>,
+    memoryStore: JsonMemoryStore,
+    formattedTOC: string | undefined,
+    orgModes: { modes: PromptMode[] },
+    activeModeName: string | undefined,
+    audioContext: AudioContext,
+    logger: RequestLogger,
+    callbacks?: StreamCallbacks
+  ): Parameters<typeof orchestrate>[1] {
+    return {
+      env: this.env,
+      catalog,
+      history,
+      orgConfig: body._org_config ?? {},
+      preferences: {
+        response_language: preferences.response_language,
+        first_interaction: preferences.first_interaction,
+      },
+      resolvedPromptValues,
+      memoryStore,
+      memoryTOC: formattedTOC || undefined,
+      modeContext: this.buildModeContext(orgModes, activeModeName),
+      audioContext,
+      clientId: body.client_id,
+      logger,
+      callbacks,
+    };
   }
 
   private buildAudioContext(): AudioContext {

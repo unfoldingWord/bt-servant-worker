@@ -28,6 +28,7 @@ import {
 import { DO_BASE_URL } from './config/constants.js';
 import { constantTimeCompare } from './utils/crypto.js';
 import { createRequestLogger } from './utils/logger.js';
+import { createTimingContext, timePhase } from './utils/timing.js';
 import {
   MAX_SERVERS_PER_ORG,
   validateServerConfig,
@@ -696,6 +697,7 @@ async function buildDOChatRequest(
     org: string;
     doPath: string;
     logger: ReturnType<typeof createRequestLogger>;
+    requestId?: string;
   }
 ): Promise<{ stub: DurableObjectStub; doRequest: Request }> {
   const { body, org, doPath, logger } = opts;
@@ -714,9 +716,14 @@ async function buildDOChatRequest(
   const doUrl = new URL(request.url);
   doUrl.pathname = doPath;
 
+  const headers = new Headers(request.headers);
+  if (opts.requestId) {
+    headers.set('X-Request-ID', opts.requestId);
+  }
+
   const doRequest = new Request(doUrl.toString(), {
     method: 'POST',
-    headers: request.headers,
+    headers,
     body: JSON.stringify({
       ...body,
       _mcp_servers: mcpServers,
@@ -737,6 +744,7 @@ async function buildDOChatRequest(
 async function handleChatRequest(request: Request, env: Env, doPath: string): Promise<Response> {
   const requestId = crypto.randomUUID();
   const logger = createRequestLogger(requestId);
+  const timing = createTimingContext();
 
   try {
     const body = (await request.clone().json()) as ChatRequest;
@@ -756,13 +764,19 @@ async function handleChatRequest(request: Request, env: Env, doPath: string): Pr
       path: doPath,
     });
 
-    const { stub, doRequest } = await buildDOChatRequest(request, env, {
-      body,
+    const { stub, doRequest } = await timePhase(timing, 'kv_and_routing', () =>
+      buildDOChatRequest(request, env, { body, org, doPath, logger, requestId })
+    );
+    const response = await timePhase(timing, 'do_fetch', () => stub.fetch(doRequest));
+
+    logger.log('request_timing_summary', {
+      user_id: body.user_id,
       org,
-      doPath,
-      logger,
+      total_ms: Date.now() - timing.start,
+      phases: timing.phases,
     });
-    return stub.fetch(doRequest);
+
+    return response;
   } catch (error) {
     logger.error('request_error', error);
     if (error instanceof SyntaxError) {
@@ -858,6 +872,7 @@ async function handleMessageEnqueue(request: Request, env: Env): Promise<Respons
         ...body,
         org,
         delivery,
+        request_id: requestId,
         _mcp_servers: mcpServers,
         _org_config: orgConfig,
         _org_prompt_overrides: promptOverrides,
