@@ -159,7 +159,7 @@ app.get('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
 
     return c.json({ org, servers });
   } catch (error) {
-    logAdminAction('list_mcp_servers_error', org, { error: String(error) });
+    logAdminAction('list_mcp_servers_error', org, { error: String(error) }, 'error');
     return c.json({ error: 'Failed to read MCP servers from storage' }, 500);
   }
 });
@@ -191,7 +191,7 @@ app.put('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
     });
     return c.json({ org, servers, message: 'MCP servers updated' });
   } catch (error) {
-    logAdminAction('replace_mcp_servers_error', org, { error: String(error) });
+    logAdminAction('replace_mcp_servers_error', org, { error: String(error) }, 'error');
     return c.json({ error: 'Failed to write MCP servers to storage' }, 500);
   }
 });
@@ -235,7 +235,7 @@ app.post('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
     });
     return c.json({ org, servers: existing, message: 'MCP server added' });
   } catch (error) {
-    logAdminAction('add_mcp_server_error', org, { error: String(error) });
+    logAdminAction('add_mcp_server_error', org, { error: String(error) }, 'error');
     return c.json({ error: 'Failed to update MCP servers in storage' }, 500);
   }
 });
@@ -260,7 +260,7 @@ app.delete('/api/v1/admin/orgs/:org/mcp-servers/:serverId', async (c) => {
     });
     return c.json({ org, servers: filtered, message: 'MCP server removed' });
   } catch (error) {
-    logAdminAction('remove_mcp_server_error', org, { error: String(error) });
+    logAdminAction('remove_mcp_server_error', org, { error: String(error) }, 'error');
     return c.json({ error: 'Failed to update MCP servers in storage' }, 500);
   }
 });
@@ -278,7 +278,7 @@ app.get('/api/v1/admin/orgs/:org/config', async (c) => {
   } catch (error) {
     // Return defaults with warning on read failure (matches chat flow behavior)
     const errorMsg = error instanceof Error ? error.message : String(error);
-    logAdminAction('get_org_config_error', org, { error: errorMsg });
+    logAdminAction('get_org_config_error', org, { error: errorMsg }, 'error');
     return c.json({
       org,
       config: DEFAULT_ORG_CONFIG,
@@ -323,7 +323,7 @@ app.put('/api/v1/admin/orgs/:org/config', async (c) => {
     return c.json({ org, config: withDefaults, message: 'Org config updated' });
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
-    logAdminAction('update_org_config_error', org, { error: errorMsg });
+    logAdminAction('update_org_config_error', org, { error: errorMsg }, 'error');
     return c.json({ error: 'Failed to update org config in storage' }, 500);
   }
 });
@@ -337,7 +337,7 @@ app.delete('/api/v1/admin/orgs/:org/config', async (c) => {
     return c.json({ org, config: DEFAULT_ORG_CONFIG, message: 'Org config reset to defaults' });
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
-    logAdminAction('reset_org_config_error', org, { error: errorMsg });
+    logAdminAction('reset_org_config_error', org, { error: errorMsg }, 'error');
     return c.json({ error: 'Failed to delete org config from storage' }, 500);
   }
 });
@@ -357,7 +357,7 @@ app.get('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
     return c.json({ org, overrides, resolved });
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
-    logAdminAction('get_prompt_overrides_error', org, { error: errorMsg });
+    logAdminAction('get_prompt_overrides_error', org, { error: errorMsg }, 'error');
     return c.json({ error: 'Failed to read prompt overrides from storage' }, 500);
   }
 });
@@ -384,7 +384,7 @@ app.put('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
     return c.json({ org, overrides: merged, resolved, message: 'Prompt overrides updated' });
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
-    logAdminAction('update_prompt_overrides_error', org, { error: errorMsg });
+    logAdminAction('update_prompt_overrides_error', org, { error: errorMsg }, 'error');
     return c.json({ error: 'Failed to update prompt overrides in storage' }, 500);
   }
 });
@@ -403,7 +403,7 @@ app.delete('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
     });
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
-    logAdminAction('reset_prompt_overrides_error', org, { error: errorMsg });
+    logAdminAction('reset_prompt_overrides_error', org, { error: errorMsg }, 'error');
     return c.json({ error: 'Failed to delete prompt overrides from storage' }, 500);
   }
 });
@@ -423,7 +423,7 @@ app.get('/api/v1/admin/orgs/:org/modes', async (c) => {
     return c.json({ org, ...orgModes });
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
-    logAdminAction('list_modes_error', org, { error: errorMsg });
+    logAdminAction('list_modes_error', org, { error: errorMsg }, 'error');
     return c.json({ error: 'Failed to read modes from storage' }, 500);
   }
 });
@@ -450,7 +450,7 @@ app.get('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
     return c.json({ org, mode });
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
-    logAdminAction('get_mode_error', org, { error: errorMsg });
+    logAdminAction('get_mode_error', org, { error: errorMsg }, 'error');
     return c.json({ error: 'Failed to read mode from storage' }, 500);
   }
 });
@@ -492,7 +492,7 @@ app.put('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
     return c.json({ org, mode: result.savedMode, message: 'Mode saved' });
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
-    logAdminAction('upsert_mode_error', org, { error: errorMsg });
+    logAdminAction('upsert_mode_error', org, { error: errorMsg }, 'error');
     return c.json({ error: 'Failed to save mode to storage' }, 500);
   }
 });
@@ -526,7 +526,7 @@ app.delete('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
     return c.json({ org, modes: orgModes.modes, message: 'Mode deleted' });
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
-    logAdminAction('delete_mode_error', org, { error: errorMsg });
+    logAdminAction('delete_mode_error', org, { error: errorMsg }, 'error');
     return c.json({ error: 'Failed to delete mode from storage' }, 500);
   }
 });
@@ -591,14 +591,14 @@ app.delete('/api/v1/admin/orgs/:org/users/:userId/history', async (c) => {
 
 export default app;
 
-/**
- * Log admin actions for audit trail.
- *
- * Uses console.error to ensure logs are captured in Cloudflare's logging
- * (console.log may be buffered/dropped in some scenarios).
- */
-function logAdminAction(action: string, org: string, details: Record<string, unknown> = {}): void {
-  console.error(
+/** Log admin actions for audit trail. */
+function logAdminAction(
+  action: string,
+  org: string,
+  details: Record<string, unknown> = {},
+  level: 'log' | 'error' = 'log'
+): void {
+  console[level](
     JSON.stringify({ event: 'admin_action', timestamp: Date.now(), action, org, ...details })
   );
 }
