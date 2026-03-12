@@ -788,6 +788,7 @@ export class UserSession {
     return responses;
   }
 
+  // TODO(review): Refactor to use an options object instead of positional params
   // eslint-disable-next-line max-params -- opts builder, all params are necessary context
   private buildOrchOpts(
     body: ChatRequest,

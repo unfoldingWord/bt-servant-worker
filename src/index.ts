@@ -778,7 +778,10 @@ async function handleChatRequest(request: Request, env: Env, doPath: string): Pr
 
     return response;
   } catch (error) {
-    logger.error('request_error', error);
+    logger.error('request_error', error, {
+      total_ms: Date.now() - timing.start,
+      phases: timing.phases,
+    });
     if (error instanceof SyntaxError) {
       return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
     }
