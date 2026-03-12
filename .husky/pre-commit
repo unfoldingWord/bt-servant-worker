@@ -1,5 +1,16 @@
 #!/usr/bin/env sh
 
+echo "Running secret scan..."
+if command -v gitleaks >/dev/null 2>&1; then
+  gitleaks git --staged --no-banner --exit-code 1
+elif [ -x "$HOME/.local/bin/gitleaks" ]; then
+  "$HOME/.local/bin/gitleaks" git --staged --no-banner --exit-code 1
+else
+  echo "WARNING: gitleaks not found — skipping local secret scan"
+  echo "  Install: https://github.com/gitleaks/gitleaks#installing"
+  echo "  CI will still run secret scanning as a mandatory gate."
+fi
+
 echo "Running dependency audit (production)..."
 pnpm run audit:prod
 
