@@ -32,6 +32,7 @@ import {
   StoredResponse,
   StoredSSEEvent,
 } from '../types/queue.js';
+import { chunkLargeEvents } from '../utils/audio-chunking.js';
 import { createRequestLogger, RequestLogger } from '../utils/logger.js';
 import { createTimingContext, timePhase } from '../utils/timing.js';
 
@@ -837,9 +838,11 @@ export class UserQueue {
     const meta = await this.state.storage.get<EventStoreMetadata>(metaKey);
     if (!meta) return;
 
+    const expandedEvents = chunkLargeEvents(events);
+
     const entries = new Map<string, StoredSSEEvent | EventStoreMetadata>();
     let idx = meta.event_count;
-    for (const event of events) {
+    for (const event of expandedEvents) {
       entries.set(`ev:${messageId}:${idx}`, event);
       idx++;
     }
