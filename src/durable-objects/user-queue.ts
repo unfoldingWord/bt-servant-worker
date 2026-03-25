@@ -590,6 +590,7 @@ export class UserQueue {
     const stub = this.getUserSessionStub(entry);
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (entry.request_id) headers['X-Request-ID'] = entry.request_id;
+    if (entry._worker_origin) headers['X-Worker-Origin'] = entry._worker_origin;
 
     const doRequest = new Request(`${DO_BASE_URL}/chat`, {
       method: 'POST',
@@ -651,6 +652,7 @@ export class UserQueue {
     const stub = this.getUserSessionStub(entry);
     const headers: Record<string, string> = { 'Content-Type': 'application/json' };
     if (entry.request_id) headers['X-Request-ID'] = entry.request_id;
+    if (entry._worker_origin) headers['X-Worker-Origin'] = entry._worker_origin;
 
     const doRequest = new Request(`${DO_BASE_URL}/stream`, {
       method: 'POST',

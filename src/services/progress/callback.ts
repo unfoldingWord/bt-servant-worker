@@ -125,7 +125,9 @@ export class ProgressCallbackSender {
     ctx: { type: string; user_id: string }
   ): void {
     const textLen = 'text' in payload ? ((payload.text as string)?.length ?? 0) : 0;
-    const hasAudio = 'voice_audio_base64' in payload && !!payload.voice_audio_base64;
+    const hasAudio =
+      ('voice_audio_url' in payload && !!payload.voice_audio_url) ||
+      ('voice_audio_base64' in payload && !!payload.voice_audio_base64);
     this.logger?.log('webhook_send', {
       ...ctx,
       has_text: textLen > 0,

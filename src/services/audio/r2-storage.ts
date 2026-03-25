@@ -17,7 +17,8 @@ export function generateAudioKey(org: string, userId: string): string {
 
 /** Build the public-facing URL path for an audio key. */
 export function audioKeyToUrl(audioKey: string, baseUrl: string): string {
-  return `${baseUrl}/api/v1/audio/${audioKey}`;
+  const base = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
+  return `${base}/api/v1/audio/${audioKey}`;
 }
 
 /** Upload raw audio bytes to R2. */

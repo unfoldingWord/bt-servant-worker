@@ -938,6 +938,7 @@ async function handleMessageEnqueue(request: Request, env: Env): Promise<Respons
         _org_config: orgConfig,
         _org_prompt_overrides: promptOverrides,
         _org_modes: orgModes,
+        _worker_origin: new URL(request.url).origin,
       }),
     });
 

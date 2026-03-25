@@ -84,12 +84,18 @@ export interface ChatHistoryEntry {
   voice_audio_key?: string | null;
 }
 
+/** History entry as returned by the API (includes computed fields). */
+export interface ChatHistoryResponseEntry extends ChatHistoryEntry {
+  /** URL to fetch the voice audio from R2, or null if no audio was generated */
+  voice_audio_url?: string | null;
+}
+
 /**
  * Chat history response for API
  */
 export interface ChatHistoryResponse {
   user_id: string;
-  entries: ChatHistoryEntry[];
+  entries: ChatHistoryResponseEntry[];
   total_count: number;
   limit: number;
   offset: number;

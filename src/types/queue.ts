@@ -42,6 +42,8 @@ export interface QueueEntry {
   _org_modes?: OrgModes | undefined;
   /** Worker-level request ID for cross-DO correlation */
   request_id?: string | undefined;
+  /** Worker origin URL for constructing public-facing audio URLs */
+  _worker_origin?: string | undefined;
 }
 
 /**

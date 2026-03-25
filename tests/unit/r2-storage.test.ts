@@ -20,8 +20,8 @@ describe('audioKeyToUrl', () => {
     expect(url).toBe('https://worker.example.com/api/v1/audio/audio/org/user/abc.mp3');
   });
 
-  it('works with trailing slash on base', () => {
-    const url = audioKeyToUrl('audio/org/user/abc.mp3', 'https://worker.example.com');
-    expect(url).toContain('/api/v1/audio/');
+  it('strips trailing slash from base to avoid double-slash', () => {
+    const url = audioKeyToUrl('audio/org/user/abc.mp3', 'https://worker.example.com/');
+    expect(url).toBe('https://worker.example.com/api/v1/audio/audio/org/user/abc.mp3');
   });
 });
