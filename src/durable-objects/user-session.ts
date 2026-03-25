@@ -60,7 +60,14 @@ import {
   validateModeName,
   validatePromptOverrides,
 } from '../types/prompt-overrides.js';
-import { transcribeAudio, synthesizeSpeech, AudioContext } from '../services/audio/index.js';
+import {
+  transcribeAudio,
+  synthesizeSpeech,
+  AudioContext,
+  generateAudioKey,
+  audioKeyToUrl,
+  uploadAudio,
+} from '../services/audio/index.js';
 import { AppError, AudioTranscriptionError, ValidationError } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
 import { applyTemplateVariables } from '../utils/template.js';
@@ -234,6 +241,7 @@ export class UserSession {
   private async handleChat(request: Request): Promise<Response> {
     const requestId = crypto.randomUUID();
     const workerRequestId = request.headers.get('X-Request-ID') ?? undefined;
+    const workerOrigin = request.headers.get('X-Worker-Origin') ?? new URL(request.url).origin;
     const startTime = Date.now();
     const body = (await request.json()) as ChatRequest;
     const logger = createRequestLogger(requestId, body.user_id);
@@ -247,7 +255,7 @@ export class UserSession {
 
     const callbacks = this.buildWebhookCallbacks(body, logger);
     try {
-      const response = await this.processChat(body, logger, timing, callbacks);
+      const response = await this.processChat(body, workerOrigin, logger, timing, callbacks);
 
       // Send complete callback for webhook-based clients (e.g., WhatsApp gateway)
       await callbacks?.onComplete?.(response);
@@ -288,24 +296,19 @@ export class UserSession {
   private async handleStreamingChatWithLock(request: Request): Promise<Response> {
     const requestId = crypto.randomUUID();
     const workerRequestId = request.headers.get('X-Request-ID') ?? undefined;
+    const workerOrigin = request.headers.get('X-Worker-Origin') ?? new URL(request.url).origin;
     const startTime = Date.now();
     const body = (await request.json()) as ChatRequest;
     const logger = createRequestLogger(requestId, body.user_id);
     const timing = createTimingContext();
 
-    logger.log('do_stream_start', {
-      client_id: body.client_id,
-      message_type: body.message_type,
-      worker_request_id: workerRequestId,
-    });
+    // prettier-ignore
+    logger.log('do_stream_start', { client_id: body.client_id, message_type: body.message_type, worker_request_id: workerRequestId });
 
     const { readable, writable } = new TransformStream();
     const writer = writable.getWriter();
     const encoder = new TextEncoder();
-
-    // Track time to first token
     let firstTokenTime: number | null = null;
-    // Track whether the client has disconnected so we stop writing
     let clientDisconnected = false;
 
     const sendEvent = async (event: SSEEvent): Promise<void> => {
@@ -332,6 +335,7 @@ export class UserSession {
       logger,
       timing,
       workerRequestId,
+      workerOrigin,
       startTime,
     })
       .catch((error) => this.handleStreamCatchError(error, sendEvent, writer, logger, startTime))
@@ -438,6 +442,7 @@ export class UserSession {
       const entries = allHistory.slice(offset, offset + limit).map((e) => ({
         ...e,
         created_at: e.timestamp ? new Date(e.timestamp).toISOString() : null,
+        voice_audio_url: e.voice_audio_key ? audioKeyToUrl(e.voice_audio_key, url.origin) : null,
       }));
 
       const response: ChatHistoryResponse = {
@@ -459,10 +464,11 @@ export class UserSession {
       logger: RequestLogger;
       timing: TimingContext;
       workerRequestId?: string | undefined;
+      workerOrigin: string;
       startTime: number;
     }
   ): Promise<void> {
-    const { logger, timing, workerRequestId, startTime } = opts;
+    const { logger, timing, workerRequestId, workerOrigin, startTime } = opts;
     const callbacks: StreamCallbacks = {
       onStatus: async (message) => sendEvent({ type: 'status', message }),
       onProgress: async (text) => sendEvent({ type: 'progress', text }),
@@ -473,7 +479,7 @@ export class UserSession {
     };
 
     try {
-      const response = await this.processChat(body, logger, timing, callbacks);
+      const response = await this.processChat(body, workerOrigin, logger, timing, callbacks);
       const totalDuration = Date.now() - startTime;
       logger.log('do_stream_complete', {
         response_count: response.responses.length,
@@ -582,8 +588,9 @@ export class UserSession {
     responses: string[],
     preferences: UserPreferencesInternal,
     orgConfig: OrgConfig,
-    logger: RequestLogger
+    opts: { logger: RequestLogger; audioKey?: string | null }
   ) {
+    const { logger, audioKey } = opts;
     const startTime = Date.now();
     const storageMax = orgConfig.max_history_storage ?? DEFAULT_ORG_CONFIG.max_history_storage;
     await this.addHistoryEntry(
@@ -591,6 +598,7 @@ export class UserSession {
         user_message: message,
         assistant_response: responses.join('\n'),
         timestamp: Date.now(),
+        ...(audioKey ? { voice_audio_key: audioKey } : {}),
       },
       storageMax
     );
@@ -666,10 +674,12 @@ export class UserSession {
     responses: string[],
     logger: RequestLogger,
     callbacks?: StreamCallbacks
-  ): Promise<string | null> {
+  ): Promise<{ audioKey: string } | null> {
     const ttsFlowStart = Date.now();
     const shouldGenerate = body.message_type === 'audio' || audioContext.audioRequested;
     const combinedText = responses.join('\n');
+    const org = body.org ?? this.env.DEFAULT_ORG;
+    const userId = body.user_id;
     logger.log('audio_flow_tts_decision', {
       message_type: body.message_type,
       audio_requested_by_tool: audioContext.audioRequested,
@@ -685,10 +695,10 @@ export class UserSession {
       });
       return null;
     }
-    const audio = await this.generateVoiceResponse(responses, logger, callbacks);
+    const audio = await this.generateVoiceResponse(org, userId, responses, logger, callbacks);
     logger.log('audio_flow_tts_result', {
       has_audio: audio !== null,
-      audio_base64_length: audio?.length ?? 0,
+      audio_key: audio?.audioKey ?? null,
       tts_flow_total_ms: Date.now() - ttsFlowStart,
     });
     return audio;
@@ -719,13 +729,15 @@ export class UserSession {
   }
 
   /**
-   * Generate TTS audio for a response. Non-fatal: returns null on failure.
+   * Generate TTS audio for a response, upload to R2. Non-fatal: returns null on failure.
    */
   private async generateVoiceResponse(
+    org: string,
+    userId: string,
     responses: string[],
     logger: RequestLogger,
     callbacks?: StreamCallbacks
-  ): Promise<string | null> {
+  ): Promise<{ audioKey: string } | null> {
     const genStart = Date.now();
     const combinedText = responses.join('\n');
     logger.log('audio_flow_generate_voice_start', {
@@ -738,14 +750,19 @@ export class UserSession {
     try {
       await callbacks?.onStatus?.('Generating audio response...');
       const synthesis = await synthesizeSpeech(this.env.OPENAI_API_KEY, combinedText, logger);
+
+      const audioKey = generateAudioKey(org, userId);
+      await uploadAudio(this.env.AUDIO_BUCKET, audioKey, synthesis.audio_bytes, logger);
+
       logger.log('audio_flow_generate_voice_complete', {
         input_chars: synthesis.input_chars,
         synthesis_ms: synthesis.duration_ms,
         generate_voice_total_ms: Date.now() - genStart,
-        audio_base64_length: synthesis.audio_base64.length,
+        audio_bytes: synthesis.audio_bytes.byteLength,
+        audio_key: audioKey,
         keepalives_sent: keepalive?.getCount() ?? 0,
       });
-      return synthesis.audio_base64;
+      return { audioKey };
     } catch (error) {
       logger.error('tts_generation_failed', error, {
         generate_voice_total_ms: Date.now() - genStart,
@@ -769,16 +786,13 @@ export class UserSession {
     return result;
   }
 
-  private async processChat(
+  /** Load all context needed for orchestration. */
+  private async loadChatContext(
     body: ChatRequest,
-    logger: RequestLogger,
-    timing: TimingContext,
+    ctx: { timing: TimingContext; logger: RequestLogger; startTime: number },
     callbacks?: StreamCallbacks
-  ): Promise<ChatResponse> {
-    const ctx = { timing, logger, startTime: Date.now() };
-    // prettier-ignore
-    logger.log('process_chat_start', { message_type: body.message_type, has_audio: !!body.audio_base64, has_callbacks: !!callbacks });
-
+  ) {
+    const { logger } = ctx;
     const messageText = await this.tracedPhase(ctx, 'resolve_message', () =>
       this.resolveMessageText(body, logger, callbacks)
     );
@@ -796,33 +810,64 @@ export class UserSession {
     const { memoryStore, formattedTOC } = await this.tracedPhase(ctx, 'load_memory', () =>
       this.loadMemoryContext(logger)
     );
+    return {
+      messageText,
+      preferences,
+      history,
+      catalog,
+      resolved,
+      orgModes,
+      activeModeName,
+      memoryStore,
+      formattedTOC,
+    };
+  }
 
+  private async processChat(
+    body: ChatRequest,
+    workerOrigin: string,
+    logger: RequestLogger,
+    timing: TimingContext,
+    callbacks?: StreamCallbacks
+  ): Promise<ChatResponse> {
+    const ctx = { timing, logger, startTime: Date.now() };
+    // prettier-ignore
+    logger.log('process_chat_start', { message_type: body.message_type, has_audio: !!body.audio_base64, has_callbacks: !!callbacks });
+
+    const loaded = await this.loadChatContext(body, ctx, callbacks);
     const audioContext = this.buildAudioContext();
     // prettier-ignore
-    const orchOpts = this.buildOrchOpts(body, catalog, history, preferences, resolved, memoryStore, formattedTOC, orgModes, activeModeName, audioContext, logger, callbacks);
+    const orchOpts = this.buildOrchOpts(body, loaded.catalog, loaded.history, loaded.preferences, loaded.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, loaded.activeModeName, audioContext, logger, callbacks);
 
     const responses = await this.tracedPhase(ctx, 'orchestration', () =>
-      this.runOrchestration(messageText, orchOpts)
+      this.runOrchestration(loaded.messageText, orchOpts)
     );
     const voiceAudio = await this.tracedPhase(ctx, 'audio_generation', () =>
       this.maybeGenerateAudio(body, audioContext, responses, logger, callbacks)
     );
+    const audioKey = voiceAudio?.audioKey ?? null;
 
     await this.tracedPhase(ctx, 'save_conversation', () =>
-      this.saveConversation(messageText, responses, preferences, body._org_config ?? {}, logger)
+      this.saveConversation(
+        loaded.messageText,
+        responses,
+        loaded.preferences,
+        body._org_config ?? {},
+        {
+          logger,
+          audioKey,
+        }
+      )
     );
 
-    logger.log('process_chat_complete', {
-      total_ms: Date.now() - ctx.startTime,
-      response_count: responses.length,
-      has_voice_audio: voiceAudio !== null,
-      voice_audio_base64_length: voiceAudio?.length ?? 0,
-      total_response_chars: responses.join('').length,
-    });
+    const voiceAudioUrl = audioKey ? audioKeyToUrl(audioKey, workerOrigin) : null;
+    // prettier-ignore
+    logger.log('process_chat_complete', { total_ms: Date.now() - ctx.startTime, response_count: responses.length, has_voice_audio: voiceAudioUrl !== null, voice_audio_key: audioKey, total_response_chars: responses.join('').length });
     return {
       responses,
-      response_language: preferences.response_language,
-      voice_audio_base64: voiceAudio,
+      response_language: loaded.preferences.response_language,
+      voice_audio_base64: null,
+      voice_audio_url: voiceAudioUrl,
     };
   }
 

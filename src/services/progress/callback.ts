@@ -26,6 +26,7 @@ interface CallbackPayload {
   text?: string;
   error?: string;
   voice_audio_base64?: string | null;
+  voice_audio_url?: string | null;
 }
 
 export class ProgressCallbackSender {
@@ -59,10 +60,15 @@ export class ProgressCallbackSender {
     }
   }
 
-  async sendComplete(text: string, voiceAudioBase64?: string | null): Promise<void> {
+  async sendComplete(
+    text: string,
+    voiceAudioUrl?: string | null,
+    voiceAudioBase64?: string | null
+  ): Promise<void> {
     await this.post({
       type: 'complete',
       ...(text ? { text } : {}),
+      ...(voiceAudioUrl ? { voice_audio_url: voiceAudioUrl } : {}),
       ...(voiceAudioBase64 ? { voice_audio_base64: voiceAudioBase64 } : {}),
     });
   }
@@ -119,7 +125,9 @@ export class ProgressCallbackSender {
     ctx: { type: string; user_id: string }
   ): void {
     const textLen = 'text' in payload ? ((payload.text as string)?.length ?? 0) : 0;
-    const hasAudio = 'voice_audio_base64' in payload && !!payload.voice_audio_base64;
+    const hasAudio =
+      ('voice_audio_url' in payload && !!payload.voice_audio_url) ||
+      ('voice_audio_base64' in payload && !!payload.voice_audio_base64);
     this.logger?.log('webhook_send', {
       ...ctx,
       has_text: textLen > 0,
@@ -304,9 +312,9 @@ export function createWebhookCallbacks(
       incrementalSender?.complete();
       const fullText = response.responses.join('\n');
       const delta = fullText.slice(lastSentText.length);
-      if (delta || response.voice_audio_base64) {
+      if (delta || response.voice_audio_url || response.voice_audio_base64) {
         runSafe(logger, 'webhook_complete_failed', () =>
-          sender.sendComplete(delta, response.voice_audio_base64)
+          sender.sendComplete(delta, response.voice_audio_url, response.voice_audio_base64)
         );
       }
     },

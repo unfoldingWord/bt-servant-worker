@@ -9,6 +9,7 @@ export interface TranscriptionResult {
 
 export interface SpeechSynthesisResult {
   audio_base64: string;
+  audio_bytes: Uint8Array;
   audio_format: 'mp3';
   duration_ms: number;
   input_chars: number;
