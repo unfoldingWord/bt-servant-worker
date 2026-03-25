@@ -50,27 +50,41 @@ export async function transcribeAudio(
 ): Promise<TranscriptionResult> {
   const startTime = Date.now();
   const decodedSize = validateAudioInput(audioBase64, audioFormat);
-  logger.log('stt_start', { format: audioFormat, size_bytes: decodedSize });
+  logger.log('stt_start', {
+    format: audioFormat,
+    size_bytes: decodedSize,
+    base64_length: audioBase64.length,
+    model: '@cf/openai/whisper-large-v3-turbo',
+  });
 
   try {
+    const aiCallStart = Date.now();
     // Whisper expects base64 string directly
     const result = await ai.run('@cf/openai/whisper-large-v3-turbo', {
       audio: audioBase64,
     });
+    const aiCallDuration = Date.now() - aiCallStart;
 
     const text = result.text?.trim() ?? '';
     const durationMs = Date.now() - startTime;
 
     logger.log('stt_complete', {
       text_length: text.length,
-      duration_ms: durationMs,
+      text_preview: text.slice(0, 100),
+      ai_call_ms: aiCallDuration,
+      total_ms: durationMs,
+      had_text: text.length > 0,
     });
 
     return { text, duration_ms: durationMs };
   } catch (error) {
+    const durationMs = Date.now() - startTime;
     if (error instanceof AudioTranscriptionError) throw error;
     const msg = error instanceof Error ? error.message : String(error);
-    logger.error('stt_error', error);
+    logger.error('stt_error', error, {
+      duration_ms: durationMs,
+      error_type: error instanceof Error ? error.constructor.name : typeof error,
+    });
     throw new AudioTranscriptionError(`Transcription failed: ${msg}`);
   }
 }

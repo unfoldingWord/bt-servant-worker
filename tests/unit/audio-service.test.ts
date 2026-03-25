@@ -194,7 +194,8 @@ describe('synthesizeSpeech - happy path', () => {
         input: 'Hello',
         response_format: 'mp3',
         instructions: expect.stringContaining('knowledgeable'),
-      })
+      }),
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
     );
   });
 

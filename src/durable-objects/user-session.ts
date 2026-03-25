@@ -609,36 +609,52 @@ export class UserSession {
     callbacks?: StreamCallbacks
   ): Promise<string> {
     if (body.message_type === 'audio') {
-      if (!body.audio_base64 || !body.audio_format) {
-        throw new ValidationError(
-          'audio_base64 and audio_format are required when message_type is audio'
-        );
-      }
-
-      await callbacks?.onStatus?.('Transcribing audio...');
-      const transcription = await transcribeAudio(
-        this.env.AI,
-        body.audio_base64,
-        body.audio_format,
-        logger
-      );
-
-      if (!transcription.text) {
-        throw new AudioTranscriptionError('Transcription returned empty text');
-      }
-
-      logger.log('audio_transcribed', {
-        original_format: body.audio_format,
-        transcribed_length: transcription.text.length,
-        transcription_ms: transcription.duration_ms,
-      });
-      return transcription.text;
+      return this.transcribeAudioMessage(body, logger, callbacks);
     }
-
     if (!body.message?.trim()) {
       throw new ValidationError('Message is required');
     }
     return body.message;
+  }
+
+  private async transcribeAudioMessage(
+    body: ChatRequest,
+    logger: RequestLogger,
+    callbacks?: StreamCallbacks
+  ): Promise<string> {
+    const sttFlowStart = Date.now();
+    logger.log('audio_flow_stt_begin', {
+      has_audio_base64: !!body.audio_base64,
+      audio_base64_length: body.audio_base64?.length ?? 0,
+      audio_format: body.audio_format,
+    });
+
+    if (!body.audio_base64 || !body.audio_format) {
+      throw new ValidationError(
+        'audio_base64 and audio_format are required when message_type is audio'
+      );
+    }
+
+    await callbacks?.onStatus?.('Transcribing audio...');
+    const transcription = await transcribeAudio(
+      this.env.AI,
+      body.audio_base64,
+      body.audio_format,
+      logger
+    );
+
+    if (!transcription.text) {
+      throw new AudioTranscriptionError('Transcription returned empty text');
+    }
+
+    logger.log('audio_flow_stt_complete', {
+      original_format: body.audio_format,
+      transcribed_length: transcription.text.length,
+      transcription_ms: transcription.duration_ms,
+      stt_flow_total_ms: Date.now() - sttFlowStart,
+      text_preview: transcription.text.slice(0, 200),
+    });
+    return transcription.text;
   }
 
   /**
@@ -651,17 +667,55 @@ export class UserSession {
     logger: RequestLogger,
     callbacks?: StreamCallbacks
   ): Promise<string | null> {
+    const ttsFlowStart = Date.now();
     const shouldGenerate = body.message_type === 'audio' || audioContext.audioRequested;
-    logger.log('audio_decision', {
+    const combinedText = responses.join('\n');
+    logger.log('audio_flow_tts_decision', {
       message_type: body.message_type,
       audio_requested_by_tool: audioContext.audioRequested,
       should_generate: shouldGenerate,
+      response_count: responses.length,
+      combined_text_chars: combinedText.length,
+      individual_response_lengths: responses.map((r) => r.length),
       has_responses: responses.length > 0,
     });
-    if (!shouldGenerate || responses.length === 0) return null;
+    if (!shouldGenerate || responses.length === 0) {
+      logger.log('audio_flow_tts_skipped', {
+        reason: !shouldGenerate ? 'not_requested' : 'no_responses',
+      });
+      return null;
+    }
     const audio = await this.generateVoiceResponse(responses, logger, callbacks);
-    logger.log('audio_generation_result', { has_audio: audio !== null });
+    logger.log('audio_flow_tts_result', {
+      has_audio: audio !== null,
+      audio_base64_length: audio?.length ?? 0,
+      tts_flow_total_ms: Date.now() - ttsFlowStart,
+    });
     return audio;
+  }
+
+  /** Start a keepalive interval that sends status updates and logs each tick. */
+  private startTtsKeepalive(
+    callbacks: StreamCallbacks,
+    genStart: number,
+    logger: RequestLogger
+  ): { interval: ReturnType<typeof setInterval>; getCount: () => number } {
+    let count = 0;
+    const interval = setInterval(() => {
+      count++;
+      logger.log('tts_keepalive_sent', {
+        keepalive_number: count,
+        elapsed_seconds: Math.round((Date.now() - genStart) / 1000),
+      });
+      Promise.resolve(callbacks.onStatus?.('Still generating audio...')).catch((error: unknown) => {
+        logger.warn('tts_keepalive_failed', {
+          error: error instanceof Error ? error.message : String(error),
+          keepalive_number: count,
+        });
+        clearInterval(interval);
+      });
+    }, 15_000);
+    return { interval, getCount: () => count };
   }
 
   /**
@@ -672,42 +726,47 @@ export class UserSession {
     logger: RequestLogger,
     callbacks?: StreamCallbacks
   ): Promise<string | null> {
+    const genStart = Date.now();
+    const combinedText = responses.join('\n');
+    logger.log('audio_flow_generate_voice_start', {
+      response_count: responses.length,
+      combined_text_chars: combinedText.length,
+      has_callbacks: !!callbacks,
+    });
+
+    const keepalive = callbacks ? this.startTtsKeepalive(callbacks, genStart, logger) : null;
     try {
       await callbacks?.onStatus?.('Generating audio response...');
-
-      // Send periodic keepalives during TTS so the client knows we're alive
-      let keepaliveInterval: ReturnType<typeof setInterval> | undefined;
-      if (callbacks) {
-        keepaliveInterval = setInterval(() => {
-          Promise.resolve(callbacks.onStatus?.('Still generating audio...')).catch(
-            (error: unknown) => {
-              logger.warn('tts_keepalive_failed', {
-                error: error instanceof Error ? error.message : String(error),
-              });
-              clearInterval(keepaliveInterval);
-            }
-          );
-        }, 15_000);
-      }
-
-      try {
-        const synthesis = await synthesizeSpeech(
-          this.env.OPENAI_API_KEY,
-          responses.join('\n'),
-          logger
-        );
-        logger.log('tts_generated', {
-          input_chars: synthesis.input_chars,
-          synthesis_ms: synthesis.duration_ms,
-        });
-        return synthesis.audio_base64;
-      } finally {
-        if (keepaliveInterval) clearInterval(keepaliveInterval);
-      }
+      const synthesis = await synthesizeSpeech(this.env.OPENAI_API_KEY, combinedText, logger);
+      logger.log('audio_flow_generate_voice_complete', {
+        input_chars: synthesis.input_chars,
+        synthesis_ms: synthesis.duration_ms,
+        generate_voice_total_ms: Date.now() - genStart,
+        audio_base64_length: synthesis.audio_base64.length,
+        keepalives_sent: keepalive?.getCount() ?? 0,
+      });
+      return synthesis.audio_base64;
     } catch (error) {
-      logger.error('tts_generation_failed', error);
+      logger.error('tts_generation_failed', error, {
+        generate_voice_total_ms: Date.now() - genStart,
+        combined_text_chars: combinedText.length,
+        keepalives_sent: keepalive?.getCount() ?? 0,
+      });
       return null;
+    } finally {
+      if (keepalive) clearInterval(keepalive.interval);
     }
+  }
+
+  /** Run a timed phase and log elapsed wall-clock time. */
+  private async tracedPhase<T>(
+    ctx: { timing: TimingContext; logger: RequestLogger; startTime: number },
+    phase: string,
+    fn: () => Promise<T>
+  ): Promise<T> {
+    const result = await timePhase(ctx.timing, phase, fn);
+    ctx.logger.log('process_chat_phase', { phase, elapsed_ms: Date.now() - ctx.startTime });
+    return result;
   }
 
   private async processChat(
@@ -716,33 +775,66 @@ export class UserSession {
     timing: TimingContext,
     callbacks?: StreamCallbacks
   ): Promise<ChatResponse> {
-    const messageText = await timePhase(timing, 'resolve_message', () =>
+    const ctx = { timing, logger, startTime: Date.now() };
+    logger.log('process_chat_start', {
+      message_type: body.message_type,
+      has_audio: !!body.audio_base64,
+      has_callbacks: !!callbacks,
+    });
+
+    const messageText = await this.tracedPhase(ctx, 'resolve_message', () =>
       this.resolveMessageText(body, logger, callbacks)
     );
-    const { preferences, history } = await timePhase(timing, 'load_user_context', () =>
+    const { preferences, history } = await this.tracedPhase(ctx, 'load_user_context', () =>
       this.loadUserContext(logger)
     );
-    const catalog = await timePhase(timing, 'mcp_discovery', () =>
+    const catalog = await this.tracedPhase(ctx, 'mcp_discovery', () =>
       this.discoverMCPTools(body._mcp_servers ?? [], logger)
     );
-    const { resolved, orgModes, activeModeName } = await timePhase(timing, 'resolve_prompts', () =>
-      this.resolvePrompts(body, logger)
+    const { resolved, orgModes, activeModeName } = await this.tracedPhase(
+      ctx,
+      'resolve_prompts',
+      () => this.resolvePrompts(body, logger)
     );
-    const { memoryStore, formattedTOC } = await timePhase(timing, 'load_memory', () =>
+    const { memoryStore, formattedTOC } = await this.tracedPhase(ctx, 'load_memory', () =>
       this.loadMemoryContext(logger)
     );
+
     const audioContext = this.buildAudioContext();
     // prettier-ignore
     const orchOpts = this.buildOrchOpts(body, catalog, history, preferences, resolved, memoryStore, formattedTOC, orgModes, activeModeName, audioContext, logger, callbacks);
-    const responses = await timePhase(timing, 'orchestration', () =>
+
+    const responses = await this.tracedPhase(ctx, 'orchestration', () =>
       this.runOrchestration(messageText, orchOpts)
     );
-    const voiceAudio = await timePhase(timing, 'audio_generation', () =>
+    logger.log('process_chat_phase', {
+      phase: 'orchestration_detail',
+      elapsed_ms: Date.now() - ctx.startTime,
+      response_count: responses.length,
+      total_response_chars: responses.join('').length,
+    });
+
+    const voiceAudio = await this.tracedPhase(ctx, 'audio_generation', () =>
       this.maybeGenerateAudio(body, audioContext, responses, logger, callbacks)
     );
-    await timePhase(timing, 'save_conversation', () =>
+    logger.log('process_chat_phase', {
+      phase: 'audio_generation_detail',
+      elapsed_ms: Date.now() - ctx.startTime,
+      has_voice_audio: voiceAudio !== null,
+      voice_audio_base64_length: voiceAudio?.length ?? 0,
+    });
+
+    await this.tracedPhase(ctx, 'save_conversation', () =>
       this.saveConversation(messageText, responses, preferences, body._org_config ?? {}, logger)
     );
+
+    logger.log('process_chat_complete', {
+      total_ms: Date.now() - ctx.startTime,
+      response_count: responses.length,
+      has_voice_audio: voiceAudio !== null,
+      voice_audio_base64_length: voiceAudio?.length ?? 0,
+      total_response_chars: responses.join('').length,
+    });
     return {
       responses,
       response_language: preferences.response_language,
