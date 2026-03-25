@@ -27,6 +27,7 @@ import {
 } from './types/prompt-overrides.js';
 import { DO_BASE_URL } from './config/constants.js';
 import { constantTimeCompare } from './utils/crypto.js';
+import { getAudio } from './services/audio/index.js';
 import { createRequestLogger } from './utils/logger.js';
 import { createTimingContext, timePhase } from './utils/timing.js';
 import {
@@ -102,6 +103,32 @@ app.get('/api/v1/orgs/:org/users/:userId/history', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
   return handleUserRequest(c.req.raw, c.env, org, userId, '/history');
+});
+
+// Audio serving endpoint — serves TTS audio from R2
+app.get('/api/v1/audio/*', async (c) => {
+  const audioKey = c.req.path.replace('/api/v1/audio/', '');
+  if (!audioKey || !audioKey.startsWith('audio/')) {
+    return c.json({ error: 'Invalid audio key' }, 400);
+  }
+
+  const logger = createRequestLogger(crypto.randomUUID());
+  try {
+    const object = await getAudio(c.env.AUDIO_BUCKET, audioKey, logger);
+    if (!object) {
+      return c.json({ error: 'Audio not found' }, 404);
+    }
+
+    const headers = new Headers();
+    headers.set('Content-Type', object.httpMetadata?.contentType ?? 'audio/mpeg');
+    headers.set('Content-Length', String(object.size));
+    headers.set('Cache-Control', 'private, max-age=86400');
+
+    return new Response(object.body, { headers });
+  } catch (error) {
+    logger.error('audio_get_error', error, { audio_key: audioKey });
+    return c.json({ error: 'Failed to retrieve audio' }, 500);
+  }
 });
 
 // Admin auth middleware - validates org-specific or super admin access
@@ -741,6 +768,8 @@ async function buildDOChatRequest(
   if (opts.requestId) {
     headers.set('X-Request-ID', opts.requestId);
   }
+  // Pass the real worker origin so the DO can build public-facing audio URLs
+  headers.set('X-Worker-Origin', new URL(request.url).origin);
 
   const doRequest = new Request(doUrl.toString(), {
     method: 'POST',

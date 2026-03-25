@@ -65,8 +65,11 @@ export interface ChatResponse {
   /** Language code for the response (e.g., 'en', 'es', 'fr') */
   response_language: string;
 
-  /** Base64-encoded audio response, or null if no audio was generated */
+  /** @deprecated Use voice_audio_url instead. Always null when R2 is enabled. */
   voice_audio_base64: string | null;
+
+  /** URL to fetch the audio from R2, or null if no audio was generated */
+  voice_audio_url?: string | null;
 }
 
 /**
@@ -77,6 +80,8 @@ export interface ChatHistoryEntry {
   assistant_response: string;
   timestamp: number;
   created_at?: string | null;
+  /** R2 object key for the voice audio associated with this entry */
+  voice_audio_key?: string | null;
 }
 
 /**

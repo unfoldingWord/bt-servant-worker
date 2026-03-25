@@ -34,6 +34,11 @@ id = "d7149c3d69f34cff87146557163f0a6c"
 binding = "PROMPT_OVERRIDES"
 id = "c1828624ab434f079776bddd171882d9"
 
+# R2 Object Storage (TTS audio) — local emulated bucket for tests
+[[r2_buckets]]
+binding = "AUDIO_BUCKET"
+bucket_name = "bt-servant-audio-test"
+
 # NOTE: [ai] binding intentionally omitted for tests
 # Unit tests mock env.AI directly; including it here forces
 # remote proxy mode which requires Cloudflare authentication

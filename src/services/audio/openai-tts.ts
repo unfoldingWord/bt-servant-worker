@@ -70,13 +70,18 @@ async function streamResponseBody(
   return result;
 }
 
+interface TtsResponseData {
+  audioBytes: Uint8Array;
+  audioBase64: string;
+}
+
 /** Stream the TTS response, convert to base64, and log each step. */
 async function readTtsResponse(
   response: Response,
   logger: RequestLogger,
   attempt: number,
   apiCallStart: number
-): Promise<string> {
+): Promise<TtsResponseData> {
   logger.log('tts_api_response_received', { attempt, api_call_ms: Date.now() - apiCallStart });
 
   const streamStart = Date.now();
@@ -88,24 +93,24 @@ async function readTtsResponse(
   });
 
   const encodeStart = Date.now();
-  const base64 = uint8ArrayToBase64(audioBytes);
+  const audioBase64 = uint8ArrayToBase64(audioBytes);
   logger.log('tts_base64_encode', {
     attempt,
-    base64_length: base64.length,
+    base64_length: audioBase64.length,
     encode_ms: Date.now() - encodeStart,
     total_api_to_encode_ms: Date.now() - apiCallStart,
   });
 
-  return base64;
+  return { audioBytes, audioBase64 };
 }
 
-/** Call the OpenAI TTS API with abort timeout and return a base64-encoded audio string. */
+/** Call the OpenAI TTS API with abort timeout and return audio bytes + base64. */
 async function callTtsApi(
   client: OpenAI,
   text: string,
   logger: RequestLogger,
   attempt: number
-): Promise<string> {
+): Promise<TtsResponseData> {
   const apiCallStart = Date.now();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), TTS_TIMEOUT_MS);
@@ -213,10 +218,11 @@ export async function synthesizeSpeech(
     });
 
     try {
-      const audioBase64 = await callTtsApi(client, truncatedText, logger, attempt);
+      const { audioBytes, audioBase64 } = await callTtsApi(client, truncatedText, logger, attempt);
       logger.log('tts_complete', {
         attempt,
-        output_size_bytes: audioBase64.length,
+        output_size_bytes: audioBytes.byteLength,
+        output_base64_length: audioBase64.length,
         attempt_ms: Date.now() - attemptStart,
         total_ms: Date.now() - startTime,
         input_chars: truncatedText.length,
@@ -225,6 +231,7 @@ export async function synthesizeSpeech(
       });
       return {
         audio_base64: audioBase64,
+        audio_bytes: audioBytes,
         audio_format: 'mp3',
         duration_ms: Date.now() - startTime,
         input_chars: text.length,
