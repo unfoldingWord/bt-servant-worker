@@ -9,7 +9,7 @@ import { StoredSSEEvent } from '../../src/types/queue.js';
 
 function makeCompleteEvent(audioBase64: string | null): StoredSSEEvent {
   return {
-    event: 'message',
+    event: 'data',
     data: JSON.stringify({
       type: 'complete',
       response: {
@@ -22,7 +22,7 @@ function makeCompleteEvent(audioBase64: string | null): StoredSSEEvent {
 
 function makeProgressEvent(): StoredSSEEvent {
   return {
-    event: 'message',
+    event: 'data',
     data: JSON.stringify({ type: 'progress', text: 'Thinking...' }),
   };
 }
@@ -46,6 +46,11 @@ describe('splitStringIntoChunks', () => {
   it('handles empty string', () => {
     const result = splitStringIntoChunks('', 3);
     expect(result).toEqual([]);
+  });
+
+  it('throws on zero or negative size', () => {
+    expect(() => splitStringIntoChunks('abc', 0)).toThrow('size must be positive');
+    expect(() => splitStringIntoChunks('abc', -1)).toThrow('size must be positive');
   });
 });
 
@@ -72,7 +77,7 @@ describe('maybeChunkCompleteEvent — passthrough', () => {
   });
 
   it('passes through events with unparseable data unchanged', () => {
-    const event: StoredSSEEvent = { event: 'message', data: 'not json' };
+    const event: StoredSSEEvent = { event: 'data', data: 'not json' };
     expect(maybeChunkCompleteEvent(event)).toEqual([event]);
   });
 });
@@ -94,7 +99,7 @@ describe('maybeChunkCompleteEvent — splitting', () => {
       expect(chunk.type).toBe('audio_chunk');
       expect(chunk.index).toBe(i);
       expect(chunk.total).toBe(3);
-      expect(result[i + 1].event).toBe('message');
+      expect(result[i + 1].event).toBe('data');
     }
   });
 
@@ -148,7 +153,7 @@ describe('chunkLargeEvents', () => {
 
   it('does not chunk large non-complete events', () => {
     const largeEvent: StoredSSEEvent = {
-      event: 'message',
+      event: 'data',
       data: JSON.stringify({ type: 'progress', text: 'x'.repeat(2_000_000) }),
     };
     expect(chunkLargeEvents([largeEvent])).toEqual([largeEvent]);

@@ -15,6 +15,7 @@ export const AUDIO_CHUNK_SIZE = 1_000_000;
  * Split a string into chunks of at most `size` characters.
  */
 export function splitStringIntoChunks(str: string, size: number): string[] {
+  if (size <= 0) throw new Error(`splitStringIntoChunks: size must be positive, got ${size}`);
   const chunks: string[] = [];
   for (let i = 0; i < str.length; i += size) {
     chunks.push(str.slice(i, i + size));
@@ -28,12 +29,14 @@ export function splitStringIntoChunks(str: string, size: number): string[] {
  * `audio_chunk` events. Otherwise return the event unchanged.
  */
 export function maybeChunkCompleteEvent(event: StoredSSEEvent): StoredSSEEvent[] {
-  if (event.event !== 'message') return [event];
+  if (event.event !== 'data') return [event];
 
   let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(event.data) as Record<string, unknown>;
   } catch {
+    // Non-JSON data fields are pass-through; this is not an error condition —
+    // it means the event doesn't contain a structured payload to inspect.
     return [event];
   }
 
@@ -58,7 +61,7 @@ export function maybeChunkCompleteEvent(event: StoredSSEEvent): StoredSSEEvent[]
   // Create audio chunk events
   const chunks = splitStringIntoChunks(audioBase64, AUDIO_CHUNK_SIZE);
   const chunkEvents: StoredSSEEvent[] = chunks.map((chunk, index) => ({
-    event: 'message',
+    event: 'data',
     data: JSON.stringify({
       type: 'audio_chunk',
       index,
