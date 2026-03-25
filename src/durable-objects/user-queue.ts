@@ -329,7 +329,7 @@ export class UserQueue {
     }
 
     logger.log('handle_stream_complete', { message_id: messageId, source: 'live_stream' });
-    return this.createLiveStream(messageId);
+    return this.createLiveStream(messageId, logger);
   }
 
   /** Return incremental events since cursor for poll-based streaming. */
@@ -554,15 +554,24 @@ export class UserQueue {
   }
 
   /** Create a live SSE stream for a message and register the writer. */
-  private async createLiveStream(messageId: string): Promise<Response> {
+  private async createLiveStream(messageId: string, logger: RequestLogger): Promise<Response> {
     const { readable, writable } = new TransformStream<Uint8Array>();
     const writer = writable.getWriter();
     this.streams.set(messageId, writer);
 
     const encoder = new TextEncoder();
-    await writer.write(
-      encoder.encode(`event: queued\ndata: ${JSON.stringify({ message_id: messageId })}\n\n`)
-    );
+    try {
+      await writer.write(
+        encoder.encode(`event: queued\ndata: ${JSON.stringify({ message_id: messageId })}\n\n`)
+      );
+    } catch (error) {
+      logger.warn('sse_client_disconnected', {
+        phase: 'initial_queued_event',
+        message_id: messageId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      this.streams.delete(messageId);
+    }
 
     // NOTE: No waiter.resolve() needed — waitForSSEClient uses polling on this.streams Map.
 

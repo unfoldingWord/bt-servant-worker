@@ -190,11 +190,26 @@ async function streamClaudeResponse(ctx: OrchestrationContext): Promise<Anthropi
     messages: ctx.messages,
     tools: ctx.tools,
   });
-  stream.on('text', (text) => ctx.callbacks?.onProgress(text));
+  stream.on('text', (text) => notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress(text)));
   stream.on('error', (error) => {
     ctx.logger.error('claude_stream_error', error);
   });
   return stream.finalMessage();
+}
+
+/** Invoke a callback safely — catches both sync throws and async rejections. */
+function notifyCallback(logger: RequestLogger, fn: () => unknown): void {
+  try {
+    Promise.resolve(fn()).catch((error: unknown) => {
+      logger.warn('callback_failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  } catch (error) {
+    logger.warn('callback_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 async function processIteration(ctx: OrchestrationContext, iteration: number): Promise<boolean> {
@@ -205,8 +220,8 @@ async function processIteration(ctx: OrchestrationContext, iteration: number): P
 
   // Add separator before subsequent iterations for streaming
   if (iteration > 0 && ctx.callbacks) {
-    ctx.callbacks.onProgress('\n');
-    ctx.callbacks.onStatus('Preparing your response...');
+    notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress('\n'));
+    notifyCallback(ctx.logger, () => ctx.callbacks?.onStatus('Preparing your response...'));
   }
 
   const startTime = Date.now();
@@ -228,7 +243,9 @@ async function processIteration(ctx: OrchestrationContext, iteration: number): P
     return true;
   }
 
-  ctx.callbacks?.onStatus(`Executing ${toolCalls.length} tool(s)...`);
+  notifyCallback(ctx.logger, () =>
+    ctx.callbacks?.onStatus(`Executing ${toolCalls.length} tool(s)...`)
+  );
 
   const toolResults = await executeToolCalls(toolCalls, ctx);
 
@@ -239,7 +256,7 @@ async function processIteration(ctx: OrchestrationContext, iteration: number): P
   ctx.messages.push({ role: 'user', content: toolResults });
 
   // Notify iteration complete for progress callbacks (only when tools were used)
-  ctx.callbacks?.onIterationComplete?.(ctx.responses.join('\n'));
+  notifyCallback(ctx.logger, () => ctx.callbacks?.onIterationComplete?.(ctx.responses.join('\n')));
 
   return false;
 }
@@ -448,7 +465,7 @@ export async function orchestrate(
   const config = parseEnvConfig(options.env, options.logger);
   const ctx = createOrchestrationContext(userMessage, options, config);
 
-  ctx.callbacks?.onStatus('Processing your request...');
+  notifyCallback(ctx.logger, () => ctx.callbacks?.onStatus('Processing your request...'));
 
   try {
     await runOrchestrationLoop(ctx, config.maxIterations);

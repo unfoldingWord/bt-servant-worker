@@ -305,14 +305,26 @@ export class UserSession {
 
     // Track time to first token
     let firstTokenTime: number | null = null;
+    // Track whether the client has disconnected so we stop writing
+    let clientDisconnected = false;
 
     const sendEvent = async (event: SSEEvent): Promise<void> => {
+      if (clientDisconnected) return;
       // Log time to first token on first progress event
       if (event.type === 'progress' && firstTokenTime === null) {
         firstTokenTime = Date.now() - startTime;
         logger.log('stream_first_token', { time_to_first_token_ms: firstTokenTime });
       }
-      await writer.write(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+      try {
+        await writer.write(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+      } catch (error) {
+        clientDisconnected = true;
+        logger.warn('sse_client_disconnected', {
+          phase: 'send_event',
+          event_type: event.type,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     };
 
     // Process streaming and release lock when done (success or error)
@@ -478,7 +490,14 @@ export class UserSession {
       });
       await sendEvent({ type: 'complete', response });
     } finally {
-      await writer.close();
+      try {
+        await writer.close();
+      } catch (error) {
+        logger.warn('stream_writer_close_failed', {
+          phase: 'processStreamingChat',
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     }
   }
 
