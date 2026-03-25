@@ -655,16 +655,36 @@ export class UserSession {
   ): Promise<string | null> {
     try {
       await callbacks?.onStatus?.('Generating audio response...');
-      const synthesis = await synthesizeSpeech(
-        this.env.OPENAI_API_KEY,
-        responses.join('\n'),
-        logger
-      );
-      logger.log('tts_generated', {
-        input_chars: synthesis.input_chars,
-        synthesis_ms: synthesis.duration_ms,
-      });
-      return synthesis.audio_base64;
+
+      // Send periodic keepalives during TTS so the client knows we're alive
+      let keepaliveInterval: ReturnType<typeof setInterval> | undefined;
+      if (callbacks) {
+        keepaliveInterval = setInterval(() => {
+          Promise.resolve(callbacks.onStatus?.('Still generating audio...')).catch(
+            (error: unknown) => {
+              logger.warn('tts_keepalive_failed', {
+                error: error instanceof Error ? error.message : String(error),
+              });
+              clearInterval(keepaliveInterval);
+            }
+          );
+        }, 15_000);
+      }
+
+      try {
+        const synthesis = await synthesizeSpeech(
+          this.env.OPENAI_API_KEY,
+          responses.join('\n'),
+          logger
+        );
+        logger.log('tts_generated', {
+          input_chars: synthesis.input_chars,
+          synthesis_ms: synthesis.duration_ms,
+        });
+        return synthesis.audio_base64;
+      } finally {
+        if (keepaliveInterval) clearInterval(keepaliveInterval);
+      }
     } catch (error) {
       logger.error('tts_generation_failed', error);
       return null;

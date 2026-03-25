@@ -206,6 +206,7 @@ async function processIteration(ctx: OrchestrationContext, iteration: number): P
   // Add separator before subsequent iterations for streaming
   if (iteration > 0 && ctx.callbacks) {
     ctx.callbacks.onProgress('\n');
+    ctx.callbacks.onStatus('Preparing your response...');
   }
 
   const startTime = Date.now();
