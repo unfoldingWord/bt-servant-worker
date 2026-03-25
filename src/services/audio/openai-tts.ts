@@ -25,9 +25,8 @@ Pronunciation: Careful and precise, ensuring proper enunciation of biblical name
 
 Features: Uses efficient pacing with brief pauses and gentle emphasis to highlight key points. Conveys reverence when reading Scripture and clarity when giving practical instructions. Avoids drawn-out pauses or overly slow delivery.`;
 
-/** Convert an ArrayBuffer to a base64 string. */
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
+/** Convert a Uint8Array to a base64 string. */
+function uint8ArrayToBase64(bytes: Uint8Array): string {
   let binary = '';
   for (const byte of bytes) {
     binary += String.fromCharCode(byte);
@@ -35,7 +34,43 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(binary);
 }
 
-/** Read the TTS response, convert to base64, and log each step. */
+/** Stream the TTS response body, collecting chunks incrementally. */
+async function streamResponseBody(
+  response: Response,
+  logger: RequestLogger,
+  attempt: number
+): Promise<Uint8Array> {
+  const body = response.body;
+  if (!body) throw new AudioSynthesisError('TTS response has no body');
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  let chunkCount = 0;
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    totalBytes += value.byteLength;
+    chunkCount++;
+    if (chunkCount % 10 === 0) {
+      logger.log('tts_stream_progress', { attempt, chunks: chunkCount, bytes: totalBytes });
+    }
+  }
+
+  logger.log('tts_stream_complete', { attempt, total_chunks: chunkCount, total_bytes: totalBytes });
+
+  const result = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return result;
+}
+
+/** Stream the TTS response, convert to base64, and log each step. */
 async function readTtsResponse(
   response: Response,
   logger: RequestLogger,
@@ -44,16 +79,16 @@ async function readTtsResponse(
 ): Promise<string> {
   logger.log('tts_api_response_received', { attempt, api_call_ms: Date.now() - apiCallStart });
 
-  const arrayBufferStart = Date.now();
-  const buffer = await response.arrayBuffer();
-  logger.log('tts_arraybuffer_read', {
+  const streamStart = Date.now();
+  const audioBytes = await streamResponseBody(response, logger, attempt);
+  logger.log('tts_stream_read', {
     attempt,
-    buffer_size_bytes: buffer.byteLength,
-    read_ms: Date.now() - arrayBufferStart,
+    buffer_size_bytes: audioBytes.byteLength,
+    read_ms: Date.now() - streamStart,
   });
 
   const encodeStart = Date.now();
-  const base64 = arrayBufferToBase64(buffer);
+  const base64 = uint8ArrayToBase64(audioBytes);
   logger.log('tts_base64_encode', {
     attempt,
     base64_length: base64.length,

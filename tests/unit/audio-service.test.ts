@@ -45,8 +45,14 @@ vi.mock('openai', () => {
 
 function mockSpeechResponse(audioContent = 'fake-audio-data') {
   const encoder = new TextEncoder();
-  const buffer = encoder.encode(audioContent).buffer;
-  return { arrayBuffer: () => Promise.resolve(buffer) };
+  const bytes = encoder.encode(audioContent);
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+  return { body: stream };
 }
 
 // ─── STT Tests ──────────────────────────────────────────────────────────────
