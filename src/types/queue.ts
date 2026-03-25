@@ -61,6 +61,20 @@ export interface StoredSSEEvent {
 }
 
 /**
+ * Payload shape for audio_chunk events produced by chunking large TTS audio.
+ *
+ * When a complete event's voice_audio_base64 exceeds the DO storage per-value
+ * limit, the audio is stripped and split into sequential audio_chunk events.
+ * Clients reassemble by concatenating the `data` fields in index order.
+ */
+export interface AudioChunkPayload {
+  type: 'audio_chunk';
+  index: number;
+  total: number;
+  data: string;
+}
+
+/**
  * Metadata for the chunked incremental event store.
  *
  * Events are stored in individual keys (`ev:{messageId}:{index}`) rather than
