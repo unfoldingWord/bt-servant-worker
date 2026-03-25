@@ -12,7 +12,7 @@ import { RequestLogger } from '../../utils/logger.js';
 /** Generate a unique R2 key for a TTS audio object. */
 export function generateAudioKey(org: string, userId: string): string {
   const id = crypto.randomUUID();
-  return `audio/${org}/${userId}/${id}.mp3`;
+  return `audio/${org}/${userId}/${id}.opus`;
 }
 
 /** Build the public-facing URL path for an audio key. */
@@ -30,7 +30,7 @@ export async function uploadAudio(
 ): Promise<void> {
   const start = Date.now();
   await bucket.put(key, audioBytes, {
-    httpMetadata: { contentType: 'audio/mpeg' },
+    httpMetadata: { contentType: 'audio/ogg' },
   });
   logger.log('r2_audio_uploaded', {
     key,

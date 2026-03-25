@@ -4,7 +4,7 @@ import { generateAudioKey, audioKeyToUrl } from '../../src/services/audio/r2-sto
 describe('generateAudioKey', () => {
   it('produces a key with the expected prefix and extension', () => {
     const key = generateAudioKey('myOrg', 'user-42');
-    expect(key).toMatch(/^audio\/myOrg\/user-42\/[0-9a-f-]+\.mp3$/);
+    expect(key).toMatch(/^audio\/myOrg\/user-42\/[0-9a-f-]+\.opus$/);
   });
 
   it('generates unique keys on successive calls', () => {
@@ -16,12 +16,12 @@ describe('generateAudioKey', () => {
 
 describe('audioKeyToUrl', () => {
   it('builds a full URL from key and base', () => {
-    const url = audioKeyToUrl('audio/org/user/abc.mp3', 'https://worker.example.com');
-    expect(url).toBe('https://worker.example.com/api/v1/audio/audio/org/user/abc.mp3');
+    const url = audioKeyToUrl('audio/org/user/abc.opus', 'https://worker.example.com');
+    expect(url).toBe('https://worker.example.com/api/v1/audio/audio/org/user/abc.opus');
   });
 
   it('strips trailing slash from base to avoid double-slash', () => {
-    const url = audioKeyToUrl('audio/org/user/abc.mp3', 'https://worker.example.com/');
-    expect(url).toBe('https://worker.example.com/api/v1/audio/audio/org/user/abc.mp3');
+    const url = audioKeyToUrl('audio/org/user/abc.opus', 'https://worker.example.com/');
+    expect(url).toBe('https://worker.example.com/api/v1/audio/audio/org/user/abc.opus');
   });
 });

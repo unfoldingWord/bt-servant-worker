@@ -128,7 +128,7 @@ app.get('/api/v1/audio/*', async (c) => {
     });
 
     const headers = new Headers();
-    headers.set('Content-Type', object.httpMetadata?.contentType ?? 'audio/mpeg');
+    headers.set('Content-Type', object.httpMetadata?.contentType ?? 'audio/ogg');
     headers.set('Content-Length', String(object.size));
     headers.set('Cache-Control', 'private, max-age=86400');
 

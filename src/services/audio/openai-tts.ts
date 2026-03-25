@@ -9,7 +9,7 @@ import { MAX_TTS_INPUT_CHARS, SpeechSynthesisResult } from './types.js';
 
 const TTS_MODEL = 'gpt-4o-mini-tts';
 const TTS_VOICE = 'ash';
-const TTS_FORMAT = 'mp3';
+const TTS_FORMAT = 'opus';
 /** Abort TTS calls that hang longer than 5 minutes. */
 const TTS_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -232,7 +232,7 @@ export async function synthesizeSpeech(
       return {
         audio_base64: audioBase64,
         audio_bytes: audioBytes,
-        audio_format: 'mp3',
+        audio_format: 'opus',
         duration_ms: Date.now() - startTime,
         input_chars: text.length,
       };

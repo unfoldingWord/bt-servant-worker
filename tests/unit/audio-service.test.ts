@@ -184,7 +184,7 @@ describe('synthesizeSpeech - happy path', () => {
     const result = await synthesizeSpeech('test-key', 'Hello', logger);
 
     expect(result.audio_base64).toBeTruthy();
-    expect(result.audio_format).toBe('mp3');
+    expect(result.audio_format).toBe('opus');
     expect(result.input_chars).toBe(5);
     expect(result.duration_ms).toBeGreaterThanOrEqual(0);
   });
@@ -198,7 +198,7 @@ describe('synthesizeSpeech - happy path', () => {
         model: 'gpt-4o-mini-tts',
         voice: 'ash',
         input: 'Hello',
-        response_format: 'mp3',
+        response_format: 'opus',
         instructions: expect.stringContaining('knowledgeable'),
       }),
       expect.objectContaining({ signal: expect.any(AbortSignal) })
