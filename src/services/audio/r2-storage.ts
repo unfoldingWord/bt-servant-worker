@@ -28,12 +28,14 @@ export async function uploadAudio(
   audioBytes: Uint8Array,
   logger: RequestLogger
 ): Promise<void> {
+  const start = Date.now();
   await bucket.put(key, audioBytes, {
     httpMetadata: { contentType: 'audio/mpeg' },
   });
   logger.log('r2_audio_uploaded', {
     key,
     size_bytes: audioBytes.byteLength,
+    upload_ms: Date.now() - start,
   });
 }
 
@@ -43,11 +45,12 @@ export async function getAudio(
   key: string,
   logger: RequestLogger
 ): Promise<R2ObjectBody | null> {
+  const start = Date.now();
   const object = await bucket.get(key);
   if (!object) {
-    logger.warn('r2_audio_not_found', { key });
+    logger.warn('r2_audio_not_found', { key, get_ms: Date.now() - start });
     return null;
   }
-  logger.log('r2_audio_retrieved', { key, size: object.size });
+  logger.log('r2_audio_retrieved', { key, size: object.size, get_ms: Date.now() - start });
   return object;
 }

@@ -129,6 +129,7 @@ function parseEnqueueBody(body: Record<string, unknown>): QueueEntry | string {
     delivery: body.delivery === 'callback' ? ('callback' as const) : ('sse' as const),
     retry_count: 0,
     request_id: typeof body.request_id === 'string' ? body.request_id : undefined,
+    _worker_origin: typeof body._worker_origin === 'string' ? body._worker_origin : undefined,
     ...extractOptionalFields(body),
     ...extractInjectedConfig(body),
   };

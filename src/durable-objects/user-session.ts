@@ -241,7 +241,7 @@ export class UserSession {
   private async handleChat(request: Request): Promise<Response> {
     const requestId = crypto.randomUUID();
     const workerRequestId = request.headers.get('X-Request-ID') ?? undefined;
-    const workerOrigin = request.headers.get('X-Worker-Origin') ?? new URL(request.url).origin;
+    const workerOrigin = request.headers.get('X-Worker-Origin') ?? '';
     const startTime = Date.now();
     const body = (await request.json()) as ChatRequest;
     const logger = createRequestLogger(requestId, body.user_id);
@@ -296,7 +296,7 @@ export class UserSession {
   private async handleStreamingChatWithLock(request: Request): Promise<Response> {
     const requestId = crypto.randomUUID();
     const workerRequestId = request.headers.get('X-Request-ID') ?? undefined;
-    const workerOrigin = request.headers.get('X-Worker-Origin') ?? new URL(request.url).origin;
+    const workerOrigin = request.headers.get('X-Worker-Origin') ?? '';
     const startTime = Date.now();
     const body = (await request.json()) as ChatRequest;
     const logger = createRequestLogger(requestId, body.user_id);
@@ -750,14 +750,17 @@ export class UserSession {
     try {
       await callbacks?.onStatus?.('Generating audio response...');
       const synthesis = await synthesizeSpeech(this.env.OPENAI_API_KEY, combinedText, logger);
+      const synthesisDoneAt = Date.now();
 
       const audioKey = generateAudioKey(org, userId);
       await uploadAudio(this.env.AUDIO_BUCKET, audioKey, synthesis.audio_bytes, logger);
+      const uploadDoneAt = Date.now();
 
       logger.log('audio_flow_generate_voice_complete', {
         input_chars: synthesis.input_chars,
         synthesis_ms: synthesis.duration_ms,
-        generate_voice_total_ms: Date.now() - genStart,
+        r2_upload_ms: uploadDoneAt - synthesisDoneAt,
+        generate_voice_total_ms: uploadDoneAt - genStart,
         audio_bytes: synthesis.audio_bytes.byteLength,
         audio_key: audioKey,
         keepalives_sent: keepalive?.getCount() ?? 0,

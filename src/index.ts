@@ -107,6 +107,7 @@ app.get('/api/v1/orgs/:org/users/:userId/history', async (c) => {
 
 // Audio serving endpoint — serves TTS audio from R2
 app.get('/api/v1/audio/*', async (c) => {
+  const start = Date.now();
   const audioKey = c.req.path.replace('/api/v1/audio/', '');
   if (!audioKey || !audioKey.startsWith('audio/')) {
     return c.json({ error: 'Invalid audio key' }, 400);
@@ -116,8 +117,15 @@ app.get('/api/v1/audio/*', async (c) => {
   try {
     const object = await getAudio(c.env.AUDIO_BUCKET, audioKey, logger);
     if (!object) {
+      logger.log('audio_serve_miss', { audio_key: audioKey, total_ms: Date.now() - start });
       return c.json({ error: 'Audio not found' }, 404);
     }
+
+    logger.log('audio_serve_hit', {
+      audio_key: audioKey,
+      size_bytes: object.size,
+      total_ms: Date.now() - start,
+    });
 
     const headers = new Headers();
     headers.set('Content-Type', object.httpMetadata?.contentType ?? 'audio/mpeg');
@@ -126,7 +134,7 @@ app.get('/api/v1/audio/*', async (c) => {
 
     return new Response(object.body, { headers });
   } catch (error) {
-    logger.error('audio_get_error', error, { audio_key: audioKey });
+    logger.error('audio_get_error', error, { audio_key: audioKey, total_ms: Date.now() - start });
     return c.json({ error: 'Failed to retrieve audio' }, 500);
   }
 });
