@@ -15,7 +15,7 @@ const TTS_TIMEOUT_MS = 5 * 60 * 1000;
 
 const VOICE_INSTRUCTIONS = `Personality/Affect: A knowledgeable and trustworthy guide, providing Scripture readings and translation support with calm confidence.
 
-Voice: Clear, steady, and professional, with a warm and approachable quality, at conversational speaking pace.
+Voice: Clear, steady, and professional, with a warm and approachable quality, at a brisk and efficient pace — slightly faster than normal conversation.
 
 Tone: Respectful and engaging, encouraging thoughtful reflection and supporting understanding without distraction.
 
@@ -23,7 +23,7 @@ Dialect: Neutral and standard, avoiding slang or overly casual phrasing; suitabl
 
 Pronunciation: Careful and precise, ensuring proper enunciation of biblical names and terms, while remaining natural and fluid.
 
-Features: Uses measured pacing, appropriate pauses, and gentle emphasis to highlight key points. Conveys reverence when reading Scripture and clarity when giving practical instructions.`;
+Features: Uses efficient pacing with brief pauses and gentle emphasis to highlight key points. Conveys reverence when reading Scripture and clarity when giving practical instructions. Avoids drawn-out pauses or overly slow delivery.`;
 
 /** Convert an ArrayBuffer to a base64 string. */
 function arrayBufferToBase64(buffer: ArrayBuffer): string {

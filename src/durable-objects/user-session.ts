@@ -776,11 +776,8 @@ export class UserSession {
     callbacks?: StreamCallbacks
   ): Promise<ChatResponse> {
     const ctx = { timing, logger, startTime: Date.now() };
-    logger.log('process_chat_start', {
-      message_type: body.message_type,
-      has_audio: !!body.audio_base64,
-      has_callbacks: !!callbacks,
-    });
+    // prettier-ignore
+    logger.log('process_chat_start', { message_type: body.message_type, has_audio: !!body.audio_base64, has_callbacks: !!callbacks });
 
     const messageText = await this.tracedPhase(ctx, 'resolve_message', () =>
       this.resolveMessageText(body, logger, callbacks)
@@ -807,22 +804,9 @@ export class UserSession {
     const responses = await this.tracedPhase(ctx, 'orchestration', () =>
       this.runOrchestration(messageText, orchOpts)
     );
-    logger.log('process_chat_phase', {
-      phase: 'orchestration_detail',
-      elapsed_ms: Date.now() - ctx.startTime,
-      response_count: responses.length,
-      total_response_chars: responses.join('').length,
-    });
-
     const voiceAudio = await this.tracedPhase(ctx, 'audio_generation', () =>
       this.maybeGenerateAudio(body, audioContext, responses, logger, callbacks)
     );
-    logger.log('process_chat_phase', {
-      phase: 'audio_generation_detail',
-      elapsed_ms: Date.now() - ctx.startTime,
-      has_voice_audio: voiceAudio !== null,
-      voice_audio_base64_length: voiceAudio?.length ?? 0,
-    });
 
     await this.tracedPhase(ctx, 'save_conversation', () =>
       this.saveConversation(messageText, responses, preferences, body._org_config ?? {}, logger)
