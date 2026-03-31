@@ -20,7 +20,6 @@
  * Transient failures are retried up to MAX_RETRIES times with re-enqueue.
  */
 
-import { DO_BASE_URL } from '../config/constants.js';
 import { Env } from '../config/types.js';
 import { ProgressMode } from '../types/engine.js';
 import {
@@ -586,21 +585,12 @@ export class UserQueue {
     });
   }
 
-  /** Forward to UserSession DO /chat with webhook callback. */
+  /** Forward to UserSession via the stateless Worker /chat endpoint. */
   private async processWithCallback(entry: QueueEntry, logger: RequestLogger): Promise<void> {
-    const stub = this.getUserSessionStub(entry);
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (entry.request_id) headers['X-Request-ID'] = entry.request_id;
-    if (entry._worker_origin) headers['X-Worker-Origin'] = entry._worker_origin;
-
-    const doRequest = new Request(`${DO_BASE_URL}/chat`, {
-      method: 'POST',
-      headers,
-      body: buildSessionBody(entry, true),
-    });
-
     const timing = createTimingContext();
-    const response = await timePhase(timing, 'session_fetch', () => stub.fetch(doRequest));
+    const response = await timePhase(timing, 'session_fetch', () =>
+      this.fetchViaWorker(entry, '/api/v1/chat')
+    );
     logger.log('callback_response', {
       message_id: entry.message_id,
       user_id: entry.user_id,
@@ -612,7 +602,7 @@ export class UserQueue {
     if (!response.ok) {
       const errorText = await response.text();
       throw new Error(
-        `UserSession returned ${response.status} for user=${entry.user_id} msg=${entry.message_id} org=${entry.org}: ${errorText}`
+        `Worker /chat returned ${response.status} for user=${entry.user_id} msg=${entry.message_id} org=${entry.org}: ${errorText}`
       );
     }
   }
@@ -648,27 +638,40 @@ export class UserQueue {
     await this.bufferIncrementally(response.body!, entry.message_id, writer, logger);
   }
 
-  /** Fetch SSE stream from UserSession DO. */
+  /** Fetch SSE stream via the stateless Worker /chat/stream endpoint. */
   private async fetchUserSessionStream(entry: QueueEntry): Promise<Response> {
-    const stub = this.getUserSessionStub(entry);
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (entry.request_id) headers['X-Request-ID'] = entry.request_id;
-    if (entry._worker_origin) headers['X-Worker-Origin'] = entry._worker_origin;
-
-    const doRequest = new Request(`${DO_BASE_URL}/stream`, {
-      method: 'POST',
-      headers,
-      body: buildSessionBody(entry, false),
-    });
-
-    const response = await stub.fetch(doRequest);
+    const response = await this.fetchViaWorker(entry, '/api/v1/chat/stream');
     if (!response.ok || !response.body) {
       const errorText = response.body ? await response.text() : 'No response body';
       throw new Error(
-        `UserSession stream returned ${response.status} for user=${entry.user_id} msg=${entry.message_id} org=${entry.org}: ${errorText}`
+        `Worker /chat/stream returned ${response.status} for user=${entry.user_id} msg=${entry.message_id} org=${entry.org}: ${errorText}`
       );
     }
     return response;
+  }
+
+  /**
+   * Route a request through the stateless Worker instead of calling
+   * UserSession DO directly. This breaks the DO-to-DO chain that causes
+   * Cloudflare to return 1003 on outbound fetch to api.anthropic.com.
+   */
+  private fetchViaWorker(entry: QueueEntry, path: string): Promise<Response> {
+    const origin = entry._worker_origin;
+    if (!origin) {
+      throw new Error(
+        `Cannot route via Worker: _worker_origin missing for msg=${entry.message_id}`
+      );
+    }
+
+    return globalThis.fetch(`${origin}${path}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.env.ENGINE_API_KEY}`,
+        ...(entry.request_id && { 'X-Request-ID': entry.request_id }),
+      },
+      body: buildSessionBody(entry, path === '/api/v1/chat'),
+    });
   }
 
   /**
@@ -852,12 +855,6 @@ export class UserQueue {
     meta.event_count = idx;
     entries.set(metaKey, meta);
     await this.state.storage.put(Object.fromEntries(entries));
-  }
-
-  /** Get a UserSession DO stub for the given queue entry. */
-  private getUserSessionStub(entry: QueueEntry): DurableObjectStub {
-    const doId = this.env.USER_SESSION.idFromName(`user:${entry.org}:${entry.user_id}`);
-    return this.env.USER_SESSION.get(doId);
   }
 
   // NOTE: waitForSSEClient removed. Durable Object alarm handlers cannot yield
