@@ -59,17 +59,42 @@ function createMockMessage(
   };
 }
 
-function createMockStream(textToEmit: string, finalMessage: Anthropic.Message) {
-  const emitText = (callback: (text: string) => void) => setTimeout(() => callback(textToEmit), 0);
-  const onHandler = vi.fn((event: string, callback: (text: string) => void) => {
-    if (event === 'text') emitText(callback);
-    return { on: vi.fn() };
+/** Build SSE text from a Message for streaming fetch mock. */
+function buildSSEBody(message: Anthropic.Message): string {
+  const lines: string[] = [];
+  lines.push(
+    `data: ${JSON.stringify({ type: 'message_start', message: { ...message, content: [] } })}\n`
+  );
+
+  message.content.forEach((block, index) => {
+    if (block.type === 'text') {
+      lines.push(
+        `data: ${JSON.stringify({ type: 'content_block_start', index, content_block: { type: 'text', text: '' } })}\n`
+      );
+      if (block.text) {
+        lines.push(
+          `data: ${JSON.stringify({ type: 'content_block_delta', index, delta: { type: 'text_delta', text: block.text } })}\n`
+        );
+      }
+      lines.push(`data: ${JSON.stringify({ type: 'content_block_stop', index })}\n`);
+    }
+    if (block.type === 'tool_use') {
+      lines.push(
+        `data: ${JSON.stringify({ type: 'content_block_start', index, content_block: { type: 'tool_use', id: block.id, name: block.name, input: {} } })}\n`
+      );
+      lines.push(
+        `data: ${JSON.stringify({ type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: JSON.stringify(block.input) } })}\n`
+      );
+      lines.push(`data: ${JSON.stringify({ type: 'content_block_stop', index })}\n`);
+    }
   });
-  const finalMessageFn = vi.fn(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    return finalMessage;
-  });
-  return { on: onHandler, finalMessage: finalMessageFn };
+
+  lines.push(
+    `data: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: message.stop_reason, stop_sequence: message.stop_sequence }, usage: message.usage })}\n`
+  );
+  lines.push(`data: ${JSON.stringify({ type: 'message_stop' })}\n`);
+
+  return lines.join('\n');
 }
 
 function setupMultiIterationMock() {
@@ -87,28 +112,31 @@ function setupMultiIterationMock() {
     { type: 'text', text: 'Here is the answer' },
   ]);
 
-  const mockStream = vi.fn().mockImplementation(() => {
+  (Anthropic as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({}));
+
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
     const isFirst = callCount === 0;
     callCount++;
-    return createMockStream(
-      isFirst ? 'Let me search for that' : 'Here is the answer',
-      isFirst ? firstMessage : secondMessage
-    );
+    return new Response(buildSSEBody(isFirst ? firstMessage : secondMessage), {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    });
   });
-
-  (Anthropic as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
-    messages: { stream: mockStream, create: vi.fn() },
-  }));
 }
 
 function setupSingleIterationMock() {
   const message = createMockMessage('msg_1', 'end_turn', [
     { type: 'text', text: 'Single response' },
   ]);
-  const mockStream = vi.fn().mockImplementation(() => createMockStream('Single response', message));
-  (Anthropic as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
-    messages: { stream: mockStream, create: vi.fn() },
-  }));
+
+  (Anthropic as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({}));
+
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+    return new Response(buildSSEBody(message), {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  });
 }
 
 describe('Orchestrator iteration separator - multi iteration', () => {
@@ -117,7 +145,7 @@ describe('Orchestrator iteration separator - multi iteration', () => {
   beforeEach(() => {
     progressChunks = [];
   });
-  afterEach(() => vi.clearAllMocks());
+  afterEach(() => vi.restoreAllMocks());
 
   it('uses single newline separator between iterations during streaming', async () => {
     setupMultiIterationMock();
@@ -140,7 +168,7 @@ describe('Orchestrator iteration separator - single iteration', () => {
   beforeEach(() => {
     progressChunks = [];
   });
-  afterEach(() => vi.clearAllMocks());
+  afterEach(() => vi.restoreAllMocks());
 
   it('does not add separator on first iteration', async () => {
     setupSingleIterationMock();
