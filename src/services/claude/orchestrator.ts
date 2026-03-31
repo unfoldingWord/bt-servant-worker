@@ -378,9 +378,18 @@ function resolveInputUrl(input: RequestInfo | URL): string {
  * Build a clean fetch that strips Cloudflare request context metadata.
  * Prevents 1003 errors when the Anthropic SDK makes outbound requests
  * from nested Durable Object chains (Worker → UserQueue DO → UserSession DO).
+ *
+ * Cloudflare Workers can inherit the inbound request's `cf` routing metadata
+ * on outbound fetch calls. In nested DO chains, this metadata comes from an
+ * internal DO-to-DO request rather than an external HTTP request, which can
+ * cause Cloudflare to misroute the outbound call to api.anthropic.com.
  */
 function createCleanFetch(): (input: RequestInfo | URL, init?: RequestInit) => Promise<Response> {
-  return async (input, init) => globalThis.fetch(resolveInputUrl(input), init);
+  return async (input, init) => {
+    const request = new Request(resolveInputUrl(input), init);
+    // Strip any inherited Cloudflare routing context
+    return globalThis.fetch(request, { cf: {} } as RequestInit);
+  };
 }
 
 function createOrchestrationContext(
