@@ -89,12 +89,7 @@ interface OrchestratorOptions {
   callbacks?: StreamCallbacks | undefined;
 }
 
-interface ToolUseBlock {
-  type: 'tool_use';
-  id: string;
-  name: string;
-  input: Record<string, unknown>;
-}
+type ToolUseBlock = Anthropic.Messages.ToolUseBlock;
 
 /**
  * Type guard for execute_code input with semantic validation.
