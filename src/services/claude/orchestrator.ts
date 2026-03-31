@@ -341,7 +341,10 @@ function applySSEEvent(
   }
 
   if (event.type === 'content_block_start') {
-    message.content.push({ ...event.content_block } as Anthropic.ContentBlock);
+    const block = { ...event.content_block };
+    // Initialize tool_use input as empty string so input_json_delta can accumulate
+    if (block.type === 'tool_use') (block as { input: unknown }).input = '';
+    message.content.push(block as Anthropic.ContentBlock);
   } else if (event.type === 'content_block_delta') {
     applyContentDelta(message, event, logger, callbacks);
   } else if (event.type === 'content_block_stop') {
