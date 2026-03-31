@@ -375,26 +375,25 @@ function resolveInputUrl(input: RequestInfo | URL): string {
 }
 
 /**
- * Build a diagnostic fetch wrapper for the Anthropic SDK.
- * Logs full request/response details and strips Cloudflare routing context.
+ * Build a fetch wrapper that strips SDK-specific headers that may trigger
+ * Cloudflare WAF/routing rules when requests originate from nested DO chains.
  */
 function createCleanFetch(
   logger: RequestLogger
 ): (input: RequestInfo | URL, init?: RequestInit) => Promise<Response> {
   return async (input, init) => {
     const url = resolveInputUrl(input);
-    const method = init?.method ?? 'GET';
 
-    // Log outbound request details
-    const headerEntries: Record<string, string> = {};
+    // Strip SDK-specific headers that may trigger CF edge blocking
     if (init?.headers) {
-      const h =
-        init.headers instanceof Headers ? init.headers : new Headers(init.headers as HeadersInit);
-      h.forEach((v, k) => {
-        headerEntries[k] = k.toLowerCase() === 'x-api-key' ? `${v.slice(0, 12)}...` : v;
-      });
+      const headers = new Headers(init.headers as HeadersInit);
+      for (const key of [...headers.keys()]) {
+        if (key.startsWith('x-stainless-') || key === 'user-agent') {
+          headers.delete(key);
+        }
+      }
+      init = { ...init, headers };
     }
-    logger.log('sdk_fetch_outbound', { url, method, headers: headerEntries });
 
     const start = Date.now();
     const response = await globalThis.fetch(url, init);
@@ -404,11 +403,8 @@ function createCleanFetch(
       url,
       status: response.status,
       elapsed_ms: elapsed,
-      content_type: response.headers.get('content-type'),
-      cf_ray: response.headers.get('cf-ray'),
     });
 
-    // If error, clone and log the body for diagnostics
     if (!response.ok) {
       const clone = response.clone();
       const body = await clone.text().catch(() => '(unreadable)');
