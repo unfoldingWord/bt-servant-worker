@@ -182,227 +182,19 @@ async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message>
   });
 }
 
-function isToolUseContentBlock(
-  block: Anthropic.ContentBlock | undefined
-): block is Anthropic.ToolUseBlock | Anthropic.ServerToolUseBlock {
-  return block?.type === 'tool_use' || block?.type === 'server_tool_use';
-}
-
-function getStreamContentBlock(message: Anthropic.Message, index: number): Anthropic.ContentBlock {
-  const block = message.content.at(index);
-  if (!block) {
-    throw new Error(`Claude stream delta referenced missing content block ${index}`);
-  }
-  return block;
-}
-
-function setStreamContentBlock(
-  message: Anthropic.Message,
-  index: number,
-  block: Anthropic.ContentBlock
-): void {
-  if (index === message.content.length) {
-    message.content.push(block);
-    return;
-  }
-  message.content.splice(index, 1, block);
-}
-
-function finalizeStreamToolInput(
-  message: Anthropic.Message,
-  index: number,
-  toolJsonBuffers: Map<number, string>
-): void {
-  const json = toolJsonBuffers.get(index);
-  if (!json) return;
-
-  const block = message.content.at(index);
-  if (!isToolUseContentBlock(block)) return;
-
-  try {
-    block.input = JSON.parse(json) as Record<string, unknown>;
-    toolJsonBuffers.delete(index);
-  } catch (error) {
-    throw new Error(
-      `Failed to parse Claude tool input for content block ${index}: ${
-        error instanceof Error ? error.message : String(error)
-      }`
-    );
-  }
-}
-
-function applyStreamUsage(message: Anthropic.Message, event: Anthropic.RawMessageDeltaEvent): void {
-  message.stop_reason = event.delta.stop_reason;
-  message.stop_sequence = event.delta.stop_sequence;
-  message.usage.output_tokens = event.usage.output_tokens;
-  if (event.usage.input_tokens != null) {
-    message.usage.input_tokens = event.usage.input_tokens;
-  }
-  if (event.usage.cache_creation_input_tokens != null) {
-    message.usage.cache_creation_input_tokens = event.usage.cache_creation_input_tokens;
-  }
-  if (event.usage.cache_read_input_tokens != null) {
-    message.usage.cache_read_input_tokens = event.usage.cache_read_input_tokens;
-  }
-  if (event.usage.server_tool_use != null) {
-    message.usage.server_tool_use = event.usage.server_tool_use;
-  }
-}
-
-function applyTextDelta(
-  block: Anthropic.ContentBlock,
-  text: string,
-  logger: RequestLogger,
-  callbacks?: StreamCallbacks
-): void {
-  if (block.type !== 'text') return;
-
-  block.text += text;
-  notifyCallback(logger, () => callbacks?.onProgress(text));
-}
-
-function applyInputJsonDelta(
-  block: Anthropic.ContentBlock,
-  index: number,
-  partialJson: string,
-  toolJsonBuffers: Map<number, string>
-): void {
-  if (!isToolUseContentBlock(block)) return;
-
-  toolJsonBuffers.set(index, (toolJsonBuffers.get(index) ?? '') + partialJson);
-}
-
-function applyNonTextDelta(
-  block: Anthropic.ContentBlock,
-  delta: Exclude<Anthropic.RawContentBlockDelta, Anthropic.TextDelta | Anthropic.InputJSONDelta>
-): void {
-  if (delta.type === 'citations_delta' && block.type === 'text') {
-    block.citations = [...(block.citations ?? []), delta.citation];
-    return;
-  }
-
-  if (delta.type === 'thinking_delta' && block.type === 'thinking') {
-    block.thinking += delta.thinking;
-    return;
-  }
-
-  if (delta.type === 'signature_delta' && block.type === 'thinking') {
-    block.signature = delta.signature;
-    return;
-  }
-}
-
-function applyContentBlockDelta(
-  message: Anthropic.Message,
-  event: Anthropic.RawContentBlockDeltaEvent,
-  toolJsonBuffers: Map<number, string>,
-  logger: RequestLogger,
-  callbacks?: StreamCallbacks
-): void {
-  const block = getStreamContentBlock(message, event.index);
-
-  if (event.delta.type === 'text_delta') {
-    applyTextDelta(block, event.delta.text, logger, callbacks);
-    return;
-  }
-
-  if (event.delta.type === 'input_json_delta') {
-    applyInputJsonDelta(block, event.index, event.delta.partial_json, toolJsonBuffers);
-    return;
-  }
-
-  applyNonTextDelta(block, event.delta);
-}
-
-function finalizeAllStreamToolInputs(
-  message: Anthropic.Message,
-  toolJsonBuffers: Map<number, string>
-): void {
-  for (const index of toolJsonBuffers.keys()) {
-    finalizeStreamToolInput(message, index, toolJsonBuffers);
-  }
-}
-
-function requireStreamMessage(
-  message: Anthropic.Message | undefined,
-  eventType: Anthropic.RawMessageStreamEvent['type']
-): Anthropic.Message {
-  if (message) return message;
-  throw new Error(`Unexpected Claude stream event before message_start: ${eventType}`);
-}
-
-function applyStreamEvent(
-  message: Anthropic.Message | undefined,
-  event: Anthropic.RawMessageStreamEvent,
-  toolJsonBuffers: Map<number, string>,
-  logger: RequestLogger,
-  callbacks?: StreamCallbacks
-): Anthropic.Message {
-  if (event.type === 'message_start') {
-    return event.message;
-  }
-
-  const currentMessage = requireStreamMessage(message, event.type);
-
-  if (event.type === 'message_delta') {
-    applyStreamUsage(currentMessage, event);
-    return currentMessage;
-  }
-
-  if (event.type === 'content_block_start') {
-    setStreamContentBlock(currentMessage, event.index, { ...event.content_block });
-    return currentMessage;
-  }
-
-  if (event.type === 'content_block_delta') {
-    applyContentBlockDelta(currentMessage, event, toolJsonBuffers, logger, callbacks);
-    return currentMessage;
-  }
-
-  if (event.type === 'content_block_stop') {
-    finalizeStreamToolInput(currentMessage, event.index, toolJsonBuffers);
-    return currentMessage;
-  }
-
-  finalizeAllStreamToolInputs(currentMessage, toolJsonBuffers);
-  return currentMessage;
-}
-
 async function streamClaudeResponse(ctx: OrchestrationContext): Promise<Anthropic.Message> {
-  const { response, data: stream } = await ctx.client.messages
-    .create(
-      {
-        model: ctx.model,
-        max_tokens: ctx.maxTokens,
-        system: ctx.systemPrompt,
-        messages: ctx.messages,
-        tools: ctx.tools,
-        stream: true,
-      },
-      {
-        // Avoid the SDK's helper-specific request path. This keeps SSE streaming
-        // but removes the extra wrapper/header that only the failing queue path hits.
-        headers: { 'X-Stainless-Helper-Method': null },
-      }
-    )
-    .withResponse();
-
-  ctx.logger.log('claude_stream_connected', {
-    request_id: response.headers.get('request-id') ?? undefined,
+  const stream = ctx.client.messages.stream({
+    model: ctx.model,
+    max_tokens: ctx.maxTokens,
+    system: ctx.systemPrompt,
+    messages: ctx.messages,
+    tools: ctx.tools,
   });
-
-  let message: Anthropic.Message | undefined;
-  const toolJsonBuffers = new Map<number, string>();
-
-  for await (const event of stream) {
-    message = applyStreamEvent(message, event, toolJsonBuffers, ctx.logger, ctx.callbacks);
-  }
-
-  if (!message) {
-    throw new Error('Claude stream ended before producing a message');
-  }
-
-  return message;
+  stream.on('text', (text) => notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress(text)));
+  stream.on('error', (error) => {
+    ctx.logger.error('claude_stream_error', error);
+  });
+  return stream.finalMessage();
 }
 
 /** Invoke a callback safely — catches both sync throws and async rejections. */
@@ -575,6 +367,22 @@ function parseEnvConfig(env: Env, logger: RequestLogger) {
   };
 }
 
+/** Extract a plain URL string from any fetch input type. */
+function resolveInputUrl(input: RequestInfo | URL): string {
+  if (typeof input === 'string') return input;
+  if (input instanceof URL) return input.toString();
+  return input.url;
+}
+
+/**
+ * Build a clean fetch that strips Cloudflare request context metadata.
+ * Prevents 1003 errors when the Anthropic SDK makes outbound requests
+ * from nested Durable Object chains (Worker → UserQueue DO → UserSession DO).
+ */
+function createCleanFetch(): (input: RequestInfo | URL, init?: RequestInit) => Promise<Response> {
+  return async (input, init) => globalThis.fetch(resolveInputUrl(input), init);
+}
+
 function createOrchestrationContext(
   userMessage: string,
   options: OrchestratorOptions,
@@ -587,7 +395,10 @@ function createOrchestrationContext(
   const llmMax = orgConfig?.max_history_llm ?? DEFAULT_ORG_CONFIG.max_history_llm;
 
   return {
-    client: new Anthropic({ apiKey: env.ANTHROPIC_API_KEY }),
+    client: new Anthropic({
+      apiKey: env.ANTHROPIC_API_KEY,
+      fetch: createCleanFetch(),
+    }),
     model: config.model,
     maxTokens: config.maxTokens,
     systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues, {

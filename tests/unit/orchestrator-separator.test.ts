@@ -59,73 +59,17 @@ function createMockMessage(
   };
 }
 
-function createMockStreamingResponse(events: Anthropic.RawMessageStreamEvent[]) {
-  return {
-    withResponse: vi.fn(async () => ({
-      response: new Response(null, {
-        headers: { 'request-id': 'req_test' },
-      }),
-      data: {
-        [Symbol.asyncIterator]: async function* () {
-          for (const event of events) {
-            yield event;
-          }
-        },
-      },
-    })),
-  };
-}
-
-function createStreamEvents(message: Anthropic.Message): Anthropic.RawMessageStreamEvent[] {
-  const events: Anthropic.RawMessageStreamEvent[] = [{ type: 'message_start', message }];
-
-  message.content.forEach((block, index) => {
-    if (block.type === 'text') {
-      events.push({
-        type: 'content_block_start',
-        index,
-        content_block: { ...block, text: '' },
-      });
-      if (block.text) {
-        events.push({
-          type: 'content_block_delta',
-          index,
-          delta: { type: 'text_delta', text: block.text },
-        });
-      }
-      events.push({ type: 'content_block_stop', index });
-      return;
-    }
-
-    if (block.type === 'tool_use') {
-      events.push({
-        type: 'content_block_start',
-        index,
-        content_block: { ...block, input: {} },
-      });
-      events.push({
-        type: 'content_block_delta',
-        index,
-        delta: {
-          type: 'input_json_delta',
-          partial_json: JSON.stringify(block.input),
-        },
-      });
-      events.push({ type: 'content_block_stop', index });
-    }
+function createMockStream(textToEmit: string, finalMessage: Anthropic.Message) {
+  const emitText = (callback: (text: string) => void) => setTimeout(() => callback(textToEmit), 0);
+  const onHandler = vi.fn((event: string, callback: (text: string) => void) => {
+    if (event === 'text') emitText(callback);
+    return { on: vi.fn() };
   });
-
-  events.push({
-    type: 'message_delta',
-    delta: {
-      stop_reason: message.stop_reason,
-      stop_sequence: message.stop_sequence,
-    },
-    usage: message.usage,
+  const finalMessageFn = vi.fn(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    return finalMessage;
   });
-  events.push({ type: 'message_stop' });
-
-  return events;
+  return { on: onHandler, finalMessage: finalMessageFn };
 }
 
 function setupMultiIterationMock() {
@@ -143,14 +87,17 @@ function setupMultiIterationMock() {
     { type: 'text', text: 'Here is the answer' },
   ]);
 
-  const mockCreate = vi.fn().mockImplementation(() => {
+  const mockStream = vi.fn().mockImplementation(() => {
     const isFirst = callCount === 0;
     callCount++;
-    return createMockStreamingResponse(createStreamEvents(isFirst ? firstMessage : secondMessage));
+    return createMockStream(
+      isFirst ? 'Let me search for that' : 'Here is the answer',
+      isFirst ? firstMessage : secondMessage
+    );
   });
 
   (Anthropic as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
-    messages: { create: mockCreate },
+    messages: { stream: mockStream, create: vi.fn() },
   }));
 }
 
@@ -158,12 +105,9 @@ function setupSingleIterationMock() {
   const message = createMockMessage('msg_1', 'end_turn', [
     { type: 'text', text: 'Single response' },
   ]);
+  const mockStream = vi.fn().mockImplementation(() => createMockStream('Single response', message));
   (Anthropic as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
-    messages: {
-      create: vi
-        .fn()
-        .mockImplementation(() => createMockStreamingResponse(createStreamEvents(message))),
-    },
+    messages: { stream: mockStream, create: vi.fn() },
   }));
 }
 
