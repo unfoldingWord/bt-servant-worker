@@ -375,20 +375,51 @@ function resolveInputUrl(input: RequestInfo | URL): string {
 }
 
 /**
- * Build a clean fetch that strips Cloudflare request context metadata.
- * Prevents 1003 errors when the Anthropic SDK makes outbound requests
- * from nested Durable Object chains (Worker → UserQueue DO → UserSession DO).
- *
- * Cloudflare Workers can inherit the inbound request's `cf` routing metadata
- * on outbound fetch calls. In nested DO chains, this metadata comes from an
- * internal DO-to-DO request rather than an external HTTP request, which can
- * cause Cloudflare to misroute the outbound call to api.anthropic.com.
+ * Build a diagnostic fetch wrapper for the Anthropic SDK.
+ * Logs full request/response details and strips Cloudflare routing context.
  */
-function createCleanFetch(): (input: RequestInfo | URL, init?: RequestInit) => Promise<Response> {
+function createCleanFetch(
+  logger: RequestLogger
+): (input: RequestInfo | URL, init?: RequestInit) => Promise<Response> {
   return async (input, init) => {
-    const request = new Request(resolveInputUrl(input), init);
-    // Strip any inherited Cloudflare routing context
-    return globalThis.fetch(request, { cf: {} } as RequestInit);
+    const url = resolveInputUrl(input);
+    const method = init?.method ?? 'GET';
+
+    // Log outbound request details
+    const headerEntries: Record<string, string> = {};
+    if (init?.headers) {
+      const h =
+        init.headers instanceof Headers ? init.headers : new Headers(init.headers as HeadersInit);
+      h.forEach((v, k) => {
+        headerEntries[k] = k.toLowerCase() === 'x-api-key' ? `${v.slice(0, 12)}...` : v;
+      });
+    }
+    logger.log('sdk_fetch_outbound', { url, method, headers: headerEntries });
+
+    const start = Date.now();
+    const response = await globalThis.fetch(url, init);
+    const elapsed = Date.now() - start;
+
+    logger.log('sdk_fetch_response', {
+      url,
+      status: response.status,
+      elapsed_ms: elapsed,
+      content_type: response.headers.get('content-type'),
+      cf_ray: response.headers.get('cf-ray'),
+    });
+
+    // If error, clone and log the body for diagnostics
+    if (!response.ok) {
+      const clone = response.clone();
+      const body = await clone.text().catch(() => '(unreadable)');
+      logger.error('sdk_fetch_error_body', new Error(`SDK fetch ${response.status}`), {
+        url,
+        status: response.status,
+        body: body.slice(0, 500),
+      });
+    }
+
+    return response;
   };
 }
 
@@ -406,7 +437,7 @@ function createOrchestrationContext(
   return {
     client: new Anthropic({
       apiKey: env.ANTHROPIC_API_KEY,
-      fetch: createCleanFetch(),
+      fetch: createCleanFetch(logger),
     }),
     model: config.model,
     maxTokens: config.maxTokens,
