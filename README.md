@@ -13,7 +13,7 @@ bt-servant-worker is deployed on Cloudflare's edge network and provides:
 - **Claude-powered chat** with multi-turn orchestration (up to 10 tool-use iterations per request)
 - **Dynamic MCP tool discovery** — discovers and calls MCP tools from configured servers
 - **Sandboxed code execution** via QuickJS compiled to WebAssembly
-- **Audio message support** — speech-to-text (STT) via Whisper and text-to-speech (TTS) via Deepgram Aura-2, powered by Cloudflare Workers AI
+- **Audio message support** — speech-to-text (STT) via Whisper (Workers AI) and text-to-speech (TTS) via OpenAI gpt-4o-mini-tts, with audio stored in R2
 - **Per-user state** — chat history, preferences, prompt overrides, and persistent memory via Durable Objects (SQLite-backed)
 - **Request serialization** — one request at a time per user, preventing race conditions
 - **Streaming support** — real-time SSE streaming and webhook progress callbacks
@@ -32,21 +32,22 @@ bt-servant-worker is deployed on Cloudflare's edge network and provides:
 │       │                                                         │
 │       ▼                                                         │
 │  ┌─────────────────────────────────────────────────────────┐    │
-│  │ Durable Object (per-user)                               │    │
+│  │ UserDO — Unified Durable Object (per-user)              │    │
 │  │ - Chat history, preferences, prompt overrides, memory   │    │
-│  │ - Request serialization via storage lock                │    │
+│  │ - Internal FIFO queue with alarm-based processing       │    │
+│  │ - Request serialization (one at a time per user)        │    │
 │  └──────────────┬──────────────────────────────────────────┘    │
 │                 │                                               │
 │    ┌────────────┴────────────────────────────┐                  │
 │    ▼                                         ▼                  │
-│  Workers AI (STT/TTS)            Claude Orchestrator            │
-│  ├─ Whisper (transcribe)         ├─ System prompt + tool catalog│
-│  └─ Deepgram Aura-2 (speak)     └─ Up to 10 iterations        │
-│                                         │                       │
-│                    ┌────────────┬────────┴───┬──────────┐       │
-│                    ▼            ▼            ▼          ▼       │
-│                execute_code  get_tool_   read_memory  update_   │
-│                (QuickJS)     definitions (DO store)   memory    │
+│  Workers AI (STT)                Claude Orchestrator            │
+│  └─ Whisper (transcribe)         ├─ System prompt + tool catalog│
+│                                  └─ Up to 10 iterations        │
+│  OpenAI TTS (gpt-4o-mini-tts)          │                       │
+│  └─ Audio stored in R2   ┌──────┬──────┴──┬──────────┐        │
+│                           ▼      ▼         ▼          ▼        │
+│                     execute_  get_tool_ read_memory update_    │
+│                     code      definitions (DO store) memory    │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -54,10 +55,7 @@ bt-servant-worker is deployed on Cloudflare's edge network and provides:
 
 **QuickJS Sandbox** — Replaces Node.js `isolated-vm` with QuickJS compiled to WebAssembly. Code runs in a completely isolated sandbox with no access to `fetch`, environment variables, or Worker APIs. Only explicitly injected MCP tool wrappers are available.
 
-**Durable Objects** — Two DO classes, both using SQLite-backed storage:
-
-- **UserSession** — per-user chat processing, history, preferences, memory, prompt overrides
-- **UserQueue** — alarm-based FIFO queue for async message processing with retry logic
+**Durable Objects** — A single unified `UserDO` class (SQLite-backed) that handles chat processing, history, preferences, memory, prompt overrides, and an internal FIFO queue with alarm-based processing. This flat architecture eliminates DO-to-DO chains that previously caused Cloudflare error 1003.
 
 **MCP Budget & Health Tracking** — Downstream API call budget tracking with circuit breaker pattern prevents runaway costs and blocks unhealthy servers.
 
@@ -77,15 +75,16 @@ bt-servant-worker is deployed on Cloudflare's edge network and provides:
 
 Prompt override text supports `{{version}}` as a template variable, replaced at runtime with the current worker version.
 
-**Audio Pipeline (Workers AI)** — When a user sends an audio message (`message_type: 'audio'`), the worker transcribes it using Whisper (`@cf/openai/whisper-large-v3-turbo`), processes the transcribed text through the normal Claude orchestration, then auto-generates a spoken response using Deepgram Aura-2 (`@cf/deepgram/aura-2-en`). TTS failure is non-fatal — the text response is always returned.
+**Audio Pipeline** — When a user sends an audio message (`message_type: 'audio'`), the worker transcribes it using Whisper (`@cf/openai/whisper-large-v3-turbo` via Workers AI), processes the transcribed text through the normal Claude orchestration, then auto-generates a spoken response using OpenAI's `gpt-4o-mini-tts`. TTS audio is stored in R2 and served via `/api/v1/audio/*`. TTS failure is non-fatal — the text response is always returned.
 
 | Constraint              | Value                                |
 | ----------------------- | ------------------------------------ |
 | Max audio input size    | 25 MB                                |
 | Supported audio formats | ogg, mp3, wav, webm, flac, m4a       |
 | Max TTS input           | 10,000 characters (truncated beyond) |
-| TTS output format       | MP3                                  |
-| TTS speaker             | luna                                 |
+| TTS output format       | OGG/Opus                             |
+| TTS model               | gpt-4o-mini-tts                      |
+| TTS voice               | ash                                  |
 
 ### Claude Built-in Tools
 
@@ -123,6 +122,12 @@ Authorization: Bearer <ENGINE_API_KEY or org-specific admin key>
 | `/api/v1/chat/queue/poll`    | GET    | Poll for queued message events        |
 | `/api/v1/chat/queue/stream`  | GET    | SSE stream for a queued message       |
 | `/api/v1/chat/queue/:userId` | GET    | Queue status (debug)                  |
+
+### Audio
+
+| Endpoint          | Method | Description                   |
+| ----------------- | ------ | ----------------------------- |
+| `/api/v1/audio/*` | GET    | Serve TTS audio files from R2 |
 
 ### User Endpoints
 
@@ -171,7 +176,8 @@ interface ChatRequest {
 interface ChatResponse {
   responses: string[];
   response_language: string;
-  voice_audio_base64: string | null; // base64 MP3 audio when input was audio, null otherwise
+  voice_audio_base64: string | null; // deprecated — always null (legacy compat)
+  voice_audio_url?: string | null; // URL to fetch TTS audio from R2 (e.g., /api/v1/audio/...)
 }
 ```
 
@@ -184,7 +190,7 @@ The queue system is for clients that can't hold open long connections (e.g., Wha
 Same body as `/api/v1/chat`. Returns `202 Accepted`:
 
 ```json
-{ "message_id": "uuid", "queue_position": 0 }
+{ "message_id": "uuid" }
 ```
 
 **Poll** — `GET /api/v1/chat/queue/poll?user_id=...&message_id=...&org=...&cursor=0`
@@ -321,9 +327,9 @@ These have sensible defaults and only need to be set to override:
 
 | Binding            | Type           | Purpose                                        |
 | ------------------ | -------------- | ---------------------------------------------- |
-| `AI`               | Workers AI     | STT (Whisper) and TTS (Deepgram Aura-2)        |
-| `USER_SESSION`     | Durable Object | Per-user chat processing, history, memory      |
-| `USER_QUEUE`       | Durable Object | Async message queue with alarm-based FIFO      |
+| `AI`               | Workers AI     | STT (Whisper)                                  |
+| `USER_DO`          | Durable Object | Per-user chat, history, memory, queue          |
+| `AUDIO_BUCKET`     | R2 Bucket      | TTS audio storage                              |
 | `ORG_ADMIN_KEYS`   | KV Namespace   | Per-org admin Bearer tokens                    |
 | `MCP_SERVERS`      | KV Namespace   | MCP server configurations per org              |
 | `ORG_CONFIG`       | KV Namespace   | Org-level configuration (history limits, etc.) |
@@ -340,9 +346,10 @@ bt-servant-worker/
 ├── src/
 │   ├── index.ts                         # Worker entry point + routes (Hono)
 │   ├── config/                          # Environment configuration types
-│   ├── durable-objects/                 # UserSession + UserQueue Durable Objects
+│   ├── durable-objects/                 # UserDO — unified per-user Durable Object
+│   ├── generated/                       # Auto-generated files (version.ts)
 │   ├── services/
-│   │   ├── audio/                      # STT/TTS via Workers AI (Whisper, Deepgram)
+│   │   ├── audio/                      # STT (Whisper), TTS (OpenAI), R2 storage
 │   │   ├── claude/                      # Orchestrator, system prompt, tools
 │   │   ├── code-execution/             # QuickJS sandbox
 │   │   ├── mcp/                        # MCP discovery, catalog, budget, health
