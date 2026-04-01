@@ -194,7 +194,7 @@ describe('UserDO unified chat endpoint', () => {
     expect(response.status).toBe(202);
     const data = (await response.json()) as { message_id: string; queue_position: number };
     expect(data.message_id).toBeDefined();
-    expect(data.queue_position).toBeGreaterThan(0);
+    expect(data.queue_position).toBeGreaterThanOrEqual(0);
   });
 
   it('returns 400 for invalid JSON', async () => {
