@@ -153,14 +153,73 @@ export class UserDO {
       return this.handleUnifiedChat(request);
     }
 
+    // TEMPORARY: Diagnostic endpoints for alarm fetch testing
+    if (url.pathname === '/diag/alarm-fetch') return this.handleDiagAlarmFetch();
+    if (url.pathname === '/diag/fetch-fetch') return this.handleDiagFetchFetch();
+
     // Non-chat endpoints don't need locking
     return this.app.fetch(request);
+  }
+
+  // ── TEMPORARY: Diagnostic endpoint for alarm fetch testing ─────────────────
+  // TODO: Remove after verifying alarm fetch behavior
+
+  private async handleDiagAlarmFetch(): Promise<Response> {
+    // Schedule an alarm that will make a raw fetch to Anthropic
+    await this.state.storage.put('_diag_alarm_fetch', true);
+    await this.state.storage.setAlarm(Date.now());
+    return Response.json({
+      status: 'alarm_scheduled',
+      message: 'Check logs for diag_alarm_fetch_result',
+    });
+  }
+
+  private async handleDiagFetchFetch(): Promise<Response> {
+    // Make the same fetch directly in the fetch handler for comparison
+    const result = await this.diagRawFetchAnthropicHealth();
+    return Response.json({ context: 'fetch_handler', ...result });
+  }
+
+  private async diagRawFetchAnthropicHealth(): Promise<Record<string, unknown>> {
+    const start = Date.now();
+    try {
+      const response = await globalThis.fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': 'not-a-real-key',
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 1,
+          messages: [{ role: 'user', content: 'hi' }],
+        }),
+      });
+      const body = await response.text();
+      return { status: response.status, elapsed_ms: Date.now() - start, body: body.slice(0, 200) };
+    } catch (error) {
+      return {
+        status: 'error',
+        elapsed_ms: Date.now() - start,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
   }
 
   // ── Alarm-based queue processing ──────────────────────────────────────────────
 
   async alarm(): Promise<void> {
     const logger = createRequestLogger(crypto.randomUUID());
+
+    // TEMPORARY: Diagnostic alarm fetch test
+    const diagFlag = await this.state.storage.get<boolean>('_diag_alarm_fetch');
+    if (diagFlag) {
+      await this.state.storage.delete('_diag_alarm_fetch');
+      const result = await this.diagRawFetchAnthropicHealth();
+      logger.log('diag_alarm_fetch_result', result);
+      return;
+    }
 
     try {
       const entry = await this.dequeueNext();

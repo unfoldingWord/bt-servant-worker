@@ -74,6 +74,18 @@ app.post('/api/v1/chat/queue', async (c) => {
   return handleChatRequest(c.req.raw, c.env);
 });
 
+// TEMPORARY: Diagnostic endpoints for alarm fetch testing
+app.get('/api/v1/diag/alarm-fetch', async (c) => {
+  const doId = c.env.USER_DO.idFromName('diag:alarm-test');
+  const stub = c.env.USER_DO.get(doId);
+  return stub.fetch(new Request('http://do-internal/diag/alarm-fetch'));
+});
+app.get('/api/v1/diag/fetch-fetch', async (c) => {
+  const doId = c.env.USER_DO.idFromName('diag:fetch-test');
+  const stub = c.env.USER_DO.get(doId);
+  return stub.fetch(new Request('http://do-internal/diag/fetch-fetch'));
+});
+
 // User endpoints with org scope (new paths)
 app.get('/api/v1/orgs/:org/users/:userId/preferences', async (c) => {
   const org = c.req.param('org');
