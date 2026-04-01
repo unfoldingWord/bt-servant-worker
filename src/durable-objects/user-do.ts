@@ -419,6 +419,13 @@ export class UserDO {
         callbacks
       );
       await sendEvent({ type: 'complete', response });
+    } catch (error) {
+      // Send error to SSE client BEFORE closing the writer — if we let this propagate
+      // to processQueueEntry's handleProcessingError, the writer is already closed.
+      const errorMessage = error instanceof Error ? error.message : 'Processing failed';
+      logger.error('sse_entry_processing_error', error, { message_id: entry.message_id });
+      await sendEvent({ type: 'error', error: errorMessage });
+      throw error; // Re-throw for retry logic in processQueueEntry
     } finally {
       clearInterval(keepaliveInterval);
       if (writer) {
