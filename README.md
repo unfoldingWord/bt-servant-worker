@@ -15,7 +15,8 @@ bt-servant-worker is deployed on Cloudflare's edge network and provides:
 - **Sandboxed code execution** via QuickJS compiled to WebAssembly
 - **Audio message support** — speech-to-text (STT) via Whisper (Workers AI) and text-to-speech (TTS) via OpenAI gpt-4o-mini-tts, with audio stored in R2
 - **Per-user state** — chat history, preferences, prompt overrides, and persistent memory via Durable Objects (SQLite-backed)
-- **Request serialization** — one request at a time per user, preventing race conditions
+- **Group & supergroup chat** — Telegram group/supergroup support with per-group DOs, thread-level isolation, speaker attribution, and shared group memory
+- **Request serialization** — one request at a time per user (or per group/thread), preventing race conditions
 - **Streaming support** — real-time SSE streaming and webhook progress callbacks
 - **Callback mode** — fire-and-forget with webhook progress callbacks for clients that can't hold long connections
 - **Dynamic prompt overrides** — org and user-level customization of Claude's system prompt
@@ -32,10 +33,11 @@ bt-servant-worker is deployed on Cloudflare's edge network and provides:
 │       │                                                         │
 │       ▼                                                         │
 │  ┌─────────────────────────────────────────────────────────┐    │
-│  │ UserDO — Unified Durable Object (per-user)              │    │
+│  │ UserDO — Unified Durable Object (per-conversation)      │    │
+│  │ - Routing: user:{org}:{uid} | group:{org}:{cid}[:tid]  │    │
 │  │ - Chat history, preferences, prompt overrides, memory   │    │
 │  │ - Internal FIFO queue with alarm-based processing       │    │
-│  │ - Request serialization (one at a time per user)        │    │
+│  │ - Request serialization (one at a time per DO)          │    │
 │  └──────────────┬──────────────────────────────────────────┘    │
 │                 │                                               │
 │    ┌────────────┴────────────────────────────┐                  │
@@ -55,7 +57,7 @@ bt-servant-worker is deployed on Cloudflare's edge network and provides:
 
 **QuickJS Sandbox** — Replaces Node.js `isolated-vm` with QuickJS compiled to WebAssembly. Code runs in a completely isolated sandbox with no access to `fetch`, environment variables, or Worker APIs. Only explicitly injected MCP tool wrappers are available.
 
-**Durable Objects** — A single unified `UserDO` class (SQLite-backed) that handles chat processing, history, preferences, memory, prompt overrides, and an internal FIFO queue with alarm-based processing. This flat architecture eliminates DO-to-DO chains that previously caused Cloudflare error 1003.
+**Durable Objects** — A single unified `UserDO` class (SQLite-backed) that handles chat processing, history, preferences, memory, prompt overrides, and an internal FIFO queue with alarm-based processing. The same DO class is used for private chats, group chats, and supergroup threads — polymorphic routing keys determine which DO instance handles each conversation. This flat architecture eliminates DO-to-DO chains that previously caused Cloudflare error 1003.
 
 **MCP Budget & Health Tracking** — Downstream API call budget tracking with circuit breaker pattern prevents runaway costs and blocks unhealthy servers.
 
@@ -135,18 +137,24 @@ Authorization: Bearer <ENGINE_API_KEY or org-specific admin key>
 
 All admin endpoints require Bearer token authentication (super admin or org-specific admin key).
 
-| Endpoint                                                 | Method       | Description                                         |
-| -------------------------------------------------------- | ------------ | --------------------------------------------------- |
-| `/api/v1/admin/orgs/:org/mcp-servers`                    | GET/PUT/POST | MCP server management (`?discover=true` for status) |
-| `/api/v1/admin/orgs/:org/mcp-servers/:serverId`          | DELETE       | Remove MCP server                                   |
-| `/api/v1/admin/orgs/:org/config`                         | GET/PUT/DEL  | Org config (history limits)                         |
-| `/api/v1/admin/orgs/:org/prompt-overrides`               | GET/PUT/DEL  | Org-level prompt overrides                          |
-| `/api/v1/admin/orgs/:org/modes`                          | GET          | List org modes                                      |
-| `/api/v1/admin/orgs/:org/modes/:modeName`                | GET/PUT/DEL  | Manage individual mode                              |
-| `/api/v1/admin/orgs/:org/users/:userId/mode`             | GET/PUT/DEL  | User's active mode                                  |
-| `/api/v1/admin/orgs/:org/users/:userId/prompt-overrides` | GET/PUT/DEL  | User-level prompt overrides                         |
-| `/api/v1/admin/orgs/:org/users/:userId/memory`           | GET/DEL      | User persistent memory                              |
-| `/api/v1/admin/orgs/:org/users/:userId/history`          | DEL          | Delete user history                                 |
+| Endpoint                                                               | Method       | Description                                         |
+| ---------------------------------------------------------------------- | ------------ | --------------------------------------------------- |
+| `/api/v1/admin/orgs/:org/mcp-servers`                                  | GET/PUT/POST | MCP server management (`?discover=true` for status) |
+| `/api/v1/admin/orgs/:org/mcp-servers/:serverId`                        | DELETE       | Remove MCP server                                   |
+| `/api/v1/admin/orgs/:org/config`                                       | GET/PUT/DEL  | Org config (history limits)                         |
+| `/api/v1/admin/orgs/:org/prompt-overrides`                             | GET/PUT/DEL  | Org-level prompt overrides                          |
+| `/api/v1/admin/orgs/:org/modes`                                        | GET          | List org modes                                      |
+| `/api/v1/admin/orgs/:org/modes/:modeName`                              | GET/PUT/DEL  | Manage individual mode                              |
+| `/api/v1/admin/orgs/:org/users/:userId/mode`                           | GET/PUT/DEL  | User's active mode                                  |
+| `/api/v1/admin/orgs/:org/users/:userId/prompt-overrides`               | GET/PUT/DEL  | User-level prompt overrides                         |
+| `/api/v1/admin/orgs/:org/users/:userId/memory`                         | GET/DEL      | User persistent memory                              |
+| `/api/v1/admin/orgs/:org/users/:userId/history`                        | DEL          | Delete user history                                 |
+| `/api/v1/admin/orgs/:org/groups/:chatId/preferences`                   | GET/PUT      | Group preferences (response_language)               |
+| `/api/v1/admin/orgs/:org/groups/:chatId/history`                       | GET/DEL      | Group chat history                                  |
+| `/api/v1/admin/orgs/:org/groups/:chatId/memory`                        | GET/DEL      | Group shared memory                                 |
+| `/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/preferences` | GET/PUT      | Thread preferences                                  |
+| `/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/history`     | GET/DEL      | Thread chat history                                 |
+| `/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/memory`      | GET/DEL      | Thread shared memory                                |
 
 ### Chat Request/Response
 
@@ -165,6 +173,13 @@ interface ChatRequest {
   progress_callback_url?: string; // webhook URL for progress updates
   progress_mode?: 'complete' | 'iteration' | 'periodic' | 'sentence';
   progress_throttle_seconds?: number;
+
+  // Group/supergroup chat fields (all optional — omit for private chats)
+  chat_type?: 'private' | 'group' | 'supergroup'; // defaults to 'private'
+  chat_id?: string; // group/supergroup chat ID (required when chat_type is 'group' or 'supergroup')
+  speaker?: string; // display name of the message sender (for group context)
+  thread_id?: string; // topic/thread ID within a supergroup
+  response_language_hint?: string; // ISO 639-1 code — overrides stored preference for this request
 }
 
 // Response
@@ -215,6 +230,8 @@ interface CallbackPayload {
   message?: string; // for 'status' type
   text?: string; // for 'progress' and 'complete' types
   error?: string; // for 'error' type
+  chat_id?: string; // present for group/supergroup chats — use to route response to correct chat
+  thread_id?: string; // present for supergroup threads — use to route response to correct thread
 }
 
 // Headers
@@ -253,7 +270,7 @@ All error responses follow a standard format:
 
 ## Request Serialization & Concurrency
 
-Chat requests are processed **one at a time per user** to ensure conversation history integrity. Concurrent requests receive `429 Too Many Requests` with a `Retry-After` header.
+Chat requests are processed **one at a time per conversation** (per user for private chats, per group, or per thread) to ensure history integrity. Concurrent requests to the same conversation receive `429 Too Many Requests` with a `Retry-After` header. Different users sending to the same group queue up FIFO within that group's DO.
 
 API consumers **must** implement retry logic for 429 responses. The lock has a 90-second stale threshold as a safety mechanism.
 
@@ -265,6 +282,103 @@ API consumers **must** implement retry logic for 429 responses. The lock has a 9
   "retry_after_ms": 5000
 }
 ```
+
+## Group & Supergroup Chat Support
+
+The worker supports Telegram-style group and supergroup chats alongside private (1:1) chats. All group fields are optional — omit them for private chats and behavior is identical to pre-v2.12.
+
+### Conversation Routing
+
+Each conversation maps to its own Durable Object instance via a routing key:
+
+| Chat Type         | Routing Key                         | DO Instance                   |
+| ----------------- | ----------------------------------- | ----------------------------- |
+| Private (default) | `user:{org}:{user_id}`              | One per user                  |
+| Group             | `group:{org}:{chat_id}`             | One per group chat            |
+| Supergroup thread | `group:{org}:{chat_id}:{thread_id}` | One per thread within a group |
+
+Each DO instance has its **own** history, memory, preferences, and queue — completely isolated from other conversations.
+
+### How It Works
+
+1. Gateway sends `POST /api/v1/chat` with `chat_type`, `chat_id`, and optionally `speaker` and `thread_id`
+2. Worker routes to the correct DO based on the routing key above
+3. Speaker name is saved in history entries and prefixed as `[Speaker Name]: message` in the LLM context
+4. Claude receives a "Group Chat Context" system prompt section that identifies the current speaker
+5. Response is returned via SSE or webhook callback (with `chat_id`/`thread_id` included in callback payloads for routing)
+
+### Example: Group Chat Request
+
+```json
+{
+  "client_id": "telegram",
+  "user_id": "alice-123",
+  "message_type": "text",
+  "message": "What is Genesis about?",
+  "chat_type": "group",
+  "chat_id": "-100123456789",
+  "speaker": "Alice"
+}
+```
+
+### Example: Supergroup Thread Request
+
+```json
+{
+  "client_id": "telegram",
+  "user_id": "bob-456",
+  "message_type": "text",
+  "message": "Tell me about Abraham",
+  "chat_type": "supergroup",
+  "chat_id": "-100123456789",
+  "thread_id": "42",
+  "speaker": "Bob",
+  "response_language_hint": "ru"
+}
+```
+
+### Design Decisions
+
+- **Thread-level isolation** — each supergroup thread gets its own DO (matches Telegram's thread UI)
+- **Speaker = display name only** — no `speaker_id`; Claude sees the name for addressing
+- **Shared memory per-conversation** — group memory benefits all participants (not per-user within a group)
+- **Group reset = entire group** — `DELETE .../groups/:chatId/history` clears all group history, no per-user filtering
+- **User prefs don't bleed into groups** — each group/thread DO stores its own `response_language` independently
+- **`response_language_hint`** — per-request language override (e.g., gateway detects user's language and passes it)
+- **Backward compatible** — all new fields are optional; existing clients (WhatsApp, web) send none of them
+
+### Speaker Attribution
+
+History entries include a `speaker` field. When building the LLM context, history messages are formatted as:
+
+```
+[Alice]: What is Genesis about?
+[Bob]: Tell me about Abraham
+```
+
+This gives Claude awareness of who said what. Speaker names are sanitized (brackets stripped, 64-char limit) to prevent prompt injection.
+
+### Admin Endpoints for Groups
+
+Group and thread admin endpoints mirror the user admin pattern:
+
+```bash
+# Group preferences
+GET/PUT /api/v1/admin/orgs/:org/groups/:chatId/preferences
+
+# Group history
+GET/DELETE /api/v1/admin/orgs/:org/groups/:chatId/history
+
+# Group memory
+GET/DELETE /api/v1/admin/orgs/:org/groups/:chatId/memory
+
+# Thread variants (same pattern, with thread_id)
+GET/PUT /api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/preferences
+GET/DELETE /api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/history
+GET/DELETE /api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/memory
+```
+
+Access control (who can reset a group) is the **gateway's** responsibility — the worker trusts authenticated requests.
 
 ## Environment Variables & Secrets
 
@@ -304,15 +418,15 @@ These have sensible defaults and only need to be set to override:
 
 ### Cloudflare Bindings
 
-| Binding            | Type           | Purpose                                        |
-| ------------------ | -------------- | ---------------------------------------------- |
-| `AI`               | Workers AI     | STT (Whisper)                                  |
-| `USER_DO`          | Durable Object | Per-user chat, history, memory, queue          |
-| `AUDIO_BUCKET`     | R2 Bucket      | TTS audio storage                              |
-| `ORG_ADMIN_KEYS`   | KV Namespace   | Per-org admin Bearer tokens                    |
-| `MCP_SERVERS`      | KV Namespace   | MCP server configurations per org              |
-| `ORG_CONFIG`       | KV Namespace   | Org-level configuration (history limits, etc.) |
-| `PROMPT_OVERRIDES` | KV Namespace   | Org-level prompt overrides and modes           |
+| Binding            | Type           | Purpose                                                                   |
+| ------------------ | -------------- | ------------------------------------------------------------------------- |
+| `AI`               | Workers AI     | STT (Whisper)                                                             |
+| `USER_DO`          | Durable Object | Per-conversation chat, history, memory, queue (private, group, or thread) |
+| `AUDIO_BUCKET`     | R2 Bucket      | TTS audio storage                                                         |
+| `ORG_ADMIN_KEYS`   | KV Namespace   | Per-org admin Bearer tokens                                               |
+| `MCP_SERVERS`      | KV Namespace   | MCP server configurations per org                                         |
+| `ORG_CONFIG`       | KV Namespace   | Org-level configuration (history limits, etc.)                            |
+| `PROMPT_OVERRIDES` | KV Namespace   | Org-level prompt overrides and modes                                      |
 
 ### Environments
 
@@ -443,6 +557,7 @@ These projects depend on bt-servant-worker's API:
 - **[bt-servant-web-client](../bt-servant-web-client)** — Next.js chat frontend (audio UI gated behind `AUDIO_ENABLED` flag)
 - **[bt-servant-admin-portal](../bt-servant-admin-portal)** — Admin dashboard for org config, MCP servers, prompt overrides, and user management
 - **[bt-servant-whatsapp-gateway](../bt-servant-whatsapp-gateway)** — WhatsApp Business API integration (audio messages forwarded as `message_type: 'audio'`)
+- **bt-servant-telegram-gateway** — Telegram Bot API integration (private, group, and supergroup chats with thread support)
 - **[baruch](../baruch)** — Cloudflare Worker companion service (self-administering via Claude tools)
 
 ## Related Projects
