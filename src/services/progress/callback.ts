@@ -13,6 +13,10 @@ export interface ProgressCallbackConfig {
   user_id: string;
   message_key: string;
   token: string;
+  /** Group/supergroup chat ID (present only for group chats). */
+  chat_id?: string;
+  /** Thread ID within a supergroup (present only for threaded chats). */
+  thread_id?: string;
 }
 
 type CallbackPayloadType = 'status' | 'progress' | 'complete' | 'error';
@@ -27,6 +31,10 @@ interface CallbackPayload {
   error?: string;
   voice_audio_base64?: string | null;
   voice_audio_url?: string | null;
+  /** Group/supergroup chat ID (present only for group chats). */
+  chat_id?: string;
+  /** Thread ID within a supergroup (present only for threaded chats). */
+  thread_id?: string;
 }
 
 export class ProgressCallbackSender {
@@ -117,6 +125,8 @@ export class ProgressCallbackSender {
       user_id: this.config.user_id,
       message_key: this.config.message_key,
       timestamp: new Date().toISOString(),
+      ...(this.config.chat_id ? { chat_id: this.config.chat_id } : {}),
+      ...(this.config.thread_id ? { thread_id: this.config.thread_id } : {}),
     };
   }
 

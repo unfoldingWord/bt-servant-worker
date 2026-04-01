@@ -14,9 +14,82 @@ export interface OrchestrationPreferences {
   first_interaction: boolean;
 }
 
+export interface GroupChatContext {
+  /** Whether this is a group or supergroup chat */
+  isGroupChat: boolean;
+  /** Display name of the current speaker */
+  currentSpeaker?: string;
+}
+
 interface SystemPromptOptions {
   memoryTOC?: string | undefined;
   clientId?: string | undefined;
+  groupContext?: GroupChatContext | undefined;
+}
+
+/** Max length for speaker names (prevents prompt bloat). */
+const MAX_SPEAKER_LENGTH = 64;
+
+/** Sanitize a speaker name: strip brackets, trim, and limit length. */
+export function sanitizeSpeaker(name: string): string {
+  return name.replace(/[[\]]/g, '').trim().slice(0, MAX_SPEAKER_LENGTH) || 'Unknown';
+}
+
+const AUDIO_GUIDANCE =
+  '## Audio Response (IMPORTANT)\n\n' +
+  'You have a `request_audio` tool. You MUST call it when any of these apply:\n' +
+  '- The user asks to "hear", "listen to", or "read aloud" something\n' +
+  '- The user says "I want to listen to..." or similar\n' +
+  '- The user explicitly requests audio, voice, or spoken output\n\n' +
+  'Call `request_audio` FIRST, before writing your text response. ' +
+  'Your text response will then be automatically converted to speech.';
+
+/** Build the client platform + client_instructions section. */
+function buildClientSection(clientId: string | undefined, clientInstructions: string): string {
+  const parts: string[] = [];
+  if (clientId) {
+    parts.push(`## Client Platform\nThe user is communicating via: ${clientId}`);
+  }
+  parts.push(clientInstructions);
+  return parts.join('\n\n');
+}
+
+/** Build the group chat context section, or null if not a group chat. */
+function buildGroupSection(groupContext: GroupChatContext | undefined): string | null {
+  if (!groupContext?.isGroupChat) return null;
+  const lines = [
+    '## Group Chat Context',
+    'You are in a group conversation. Messages come from different participants.',
+  ];
+  if (groupContext.currentSpeaker) {
+    const safe = sanitizeSpeaker(groupContext.currentSpeaker);
+    lines.push(`The current speaker is: ${safe}.`);
+    lines.push('Address the current speaker by name when responding.');
+  }
+  lines.push('Previous messages show [Speaker Name] attribution.');
+  return lines.join('\n');
+}
+
+/** Build conditional tail sections (preferences, history context, first interaction). */
+function buildConditionalSections(
+  preferences: OrchestrationPreferences,
+  history: ChatHistoryEntry[]
+): string[] {
+  const sections: string[] = [];
+  if (preferences.response_language !== 'en') {
+    sections.push(
+      `## User Preferences\n\nRespond in ${preferences.response_language} when possible.`
+    );
+  }
+  if (history.length > 0) {
+    sections.push(
+      '## Recent Conversation Context\nThe user has been in conversation. Consider this context when responding.'
+    );
+  }
+  if (preferences.first_interaction) {
+    sections.push("This is the user's first interaction. Briefly welcome them.");
+  }
+  return sections;
 }
 
 /**
@@ -24,7 +97,8 @@ interface SystemPromptOptions {
  *
  * Assembly order:
  *   [identity] → [methodology] → [tool_guidance] → [tool catalog] →
- *   [instructions] → [client_instructions] → [memory_instructions + TOC] →
+ *   [instructions] → [client_instructions] → [group context] →
+ *   [memory_instructions + TOC] → [audio guidance] →
  *   [user preferences] → [conversation context] → [first interaction] → [closing]
  */
 export function buildSystemPrompt(
@@ -34,72 +108,23 @@ export function buildSystemPrompt(
   resolvedPromptValues: Required<Record<PromptSlot, string>>,
   options?: SystemPromptOptions
 ): string {
-  const { memoryTOC, clientId } = options ?? {};
-  const sections: string[] = [];
+  const { memoryTOC, clientId, groupContext } = options ?? {};
+  const sections: string[] = [
+    resolvedPromptValues.identity,
+    resolvedPromptValues.methodology,
+    resolvedPromptValues.tool_guidance,
+    generateToolCatalog(catalog),
+    resolvedPromptValues.instructions,
+    buildClientSection(clientId, resolvedPromptValues.client_instructions),
+  ];
 
-  // Slot: identity
-  sections.push(resolvedPromptValues.identity);
+  const groupSection = buildGroupSection(groupContext);
+  if (groupSection) sections.push(groupSection);
 
-  // Slot: methodology
-  sections.push(resolvedPromptValues.methodology);
-
-  // Slot: tool_guidance
-  sections.push(resolvedPromptValues.tool_guidance);
-
-  // Tool catalog (always generated from MCP servers — NOT a slot)
-  const toolCatalog = generateToolCatalog(catalog);
-  sections.push(toolCatalog);
-
-  // Slot: instructions
-  sections.push(resolvedPromptValues.instructions);
-
-  // Slot: client_instructions — inject client platform context
-  const clientParts: string[] = [];
-  if (clientId) {
-    clientParts.push(`## Client Platform\nThe user is communicating via: ${clientId}`);
-  }
-  clientParts.push(resolvedPromptValues.client_instructions);
-  sections.push(clientParts.join('\n\n'));
-
-  // Slot: memory_instructions (always present so Claude knows tools exist)
   sections.push(resolvedPromptValues.memory_instructions);
-
-  // Append formatted TOC when memory is non-empty (separate section)
-  if (memoryTOC) {
-    sections.push(memoryTOC);
-  }
-
-  // Audio tool guidance (always present so Claude knows when to use request_audio)
-  sections.push(
-    '## Audio Response (IMPORTANT)\n\n' +
-      'You have a `request_audio` tool. You MUST call it when any of these apply:\n' +
-      '- The user asks to "hear", "listen to", or "read aloud" something\n' +
-      '- The user says "I want to listen to..." or similar\n' +
-      '- The user explicitly requests audio, voice, or spoken output\n\n' +
-      'Call `request_audio` FIRST, before writing your text response. ' +
-      'Your text response will then be automatically converted to speech.'
-  );
-
-  // Conditional: user preferences
-  if (preferences.response_language !== 'en') {
-    sections.push(
-      `## User Preferences\n\nRespond in ${preferences.response_language} when possible.`
-    );
-  }
-
-  // Conditional: conversation context
-  if (history.length > 0) {
-    sections.push(
-      '## Recent Conversation Context\nThe user has been in conversation. Consider this context when responding.'
-    );
-  }
-
-  // Conditional: first interaction
-  if (preferences.first_interaction) {
-    sections.push("This is the user's first interaction. Briefly welcome them.");
-  }
-
-  // Slot: closing
+  if (memoryTOC) sections.push(memoryTOC);
+  sections.push(AUDIO_GUIDANCE);
+  sections.push(...buildConditionalSections(preferences, history));
   sections.push(resolvedPromptValues.closing);
 
   return sections.join('\n\n');
@@ -121,7 +146,10 @@ export function historyToMessages(
   const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
 
   for (const entry of truncated) {
-    messages.push({ role: 'user', content: entry.user_message });
+    const userContent = entry.speaker
+      ? `[${sanitizeSpeaker(entry.speaker)}]: ${entry.user_message}`
+      : entry.user_message;
+    messages.push({ role: 'user', content: userContent });
     messages.push({ role: 'assistant', content: entry.assistant_response });
   }
 

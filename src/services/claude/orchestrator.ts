@@ -40,7 +40,12 @@ import {
   wouldExceedBudget,
 } from '../mcp/index.js';
 import { MAX_MEMORY_SIZE_BYTES, UserMemoryStore } from '../memory/index.js';
-import { buildSystemPrompt, historyToMessages } from './system-prompt.js';
+import {
+  buildSystemPrompt,
+  GroupChatContext,
+  historyToMessages,
+  sanitizeSpeaker,
+} from './system-prompt.js';
 import {
   buildAllTools,
   getToolDefinitions,
@@ -85,6 +90,7 @@ interface OrchestratorOptions {
   modeContext?: ModeContext | undefined;
   audioContext?: AudioContext | undefined;
   clientId?: string | undefined;
+  groupContext?: GroupChatContext | undefined;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
 }
@@ -545,11 +551,20 @@ function createOrchestrationContext(
     systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues, {
       memoryTOC: options.memoryTOC,
       clientId: options.clientId,
+      groupContext: options.groupContext,
     }),
     tools: buildAllTools(catalog, {
       hasModes: (options.modeContext?.availableModes.length ?? 0) > 0,
     }),
-    messages: [...historyToMessages(history, llmMax), { role: 'user', content: userMessage }],
+    messages: [
+      ...historyToMessages(history, llmMax),
+      {
+        role: 'user',
+        content: options.groupContext?.currentSpeaker
+          ? `[${sanitizeSpeaker(options.groupContext.currentSpeaker)}]: ${userMessage}`
+          : userMessage,
+      },
+    ],
     responses: [],
     codeExecTimeout: config.codeExecTimeout,
     maxMcpCalls: config.maxMcpCalls,
