@@ -17,7 +17,7 @@ bt-servant-worker is deployed on Cloudflare's edge network and provides:
 - **Per-user state** — chat history, preferences, prompt overrides, and persistent memory via Durable Objects (SQLite-backed)
 - **Request serialization** — one request at a time per user, preventing race conditions
 - **Streaming support** — real-time SSE streaming and webhook progress callbacks
-- **Queue system** — fire-and-forget enqueue with poll/stream retrieval for clients that can't hold long connections
+- **Callback mode** — fire-and-forget with webhook progress callbacks for clients that can't hold long connections
 - **Dynamic prompt overrides** — org and user-level customization of Claude's system prompt
 - **Modes** — named prompt override presets (e.g., "mast-methodology") assignable per-user
 - **User persistent memory** — schema-free markdown memory that persists across conversations
@@ -113,15 +113,12 @@ Authorization: Bearer <ENGINE_API_KEY or org-specific admin key>
 
 ### Chat
 
-| Endpoint                     | Method | Description                           |
-| ---------------------------- | ------ | ------------------------------------- |
-| `/health`                    | GET    | Health check                          |
-| `/api/v1/chat`               | POST   | Chat with Claude (synchronous)        |
-| `/api/v1/chat/stream`        | POST   | Chat with Claude (SSE streaming)      |
-| `/api/v1/chat/queue`         | POST   | Enqueue message — returns immediately |
-| `/api/v1/chat/queue/poll`    | GET    | Poll for queued message events        |
-| `/api/v1/chat/queue/stream`  | GET    | SSE stream for a queued message       |
-| `/api/v1/chat/queue/:userId` | GET    | Queue status (debug)                  |
+| Endpoint              | Method | Description                                            |
+| --------------------- | ------ | ------------------------------------------------------ |
+| `/health`             | GET    | Health check                                           |
+| `/api/v1/chat`        | POST   | Unified chat endpoint (SSE streaming or callback mode) |
+| `/api/v1/chat/stream` | POST   | Deprecated alias for `/api/v1/chat` (backward compat)  |
+| `/api/v1/chat/queue`  | POST   | Deprecated alias for `/api/v1/chat` (backward compat)  |
 
 ### Audio
 
@@ -181,37 +178,21 @@ interface ChatResponse {
 }
 ```
 
-### Queue Endpoints
+### Chat Modes
 
-The queue system is for clients that can't hold open long connections (e.g., WhatsApp gateway). Enqueue a message, then poll or stream for results.
+The unified `POST /api/v1/chat` endpoint supports two modes:
 
-**Enqueue** — `POST /api/v1/chat/queue`
+**SSE mode** (default) — The response is an SSE stream. Events are sent in real-time as Claude processes the request.
 
-Same body as `/api/v1/chat`. Returns `202 Accepted`:
+**Callback mode** — When `progress_callback_url` is provided, the endpoint returns `202 Accepted` immediately with a `message_id`, and sends progress updates to the callback URL. This is for clients that can't hold long connections (e.g., WhatsApp gateway).
 
 ```json
 { "message_id": "uuid" }
 ```
 
-**Poll** — `GET /api/v1/chat/queue/poll?user_id=...&message_id=...&org=...&cursor=0`
-
-Returns incremental events since `cursor`. Use the returned `cursor` for the next poll:
-
-```json
-{ "message_id": "uuid", "events": [...], "done": false, "cursor": 3 }
-```
-
-**Stream** — `GET /api/v1/chat/queue/stream?user_id=...&message_id=...&org=...`
-
-SSE stream that emits events as they occur: `queued`, `processing`, `done`.
-
-**Status** — `GET /api/v1/chat/queue/:userId?org=...`
-
-Debug endpoint returning queue depth and processing state.
-
 ### SSE Event Types
 
-For `/api/v1/chat/stream`:
+For `POST /api/v1/chat` (SSE mode):
 
 | Event         | Payload                                                  | Description               |
 | ------------- | -------------------------------------------------------- | ------------------------- |
