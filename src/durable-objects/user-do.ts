@@ -275,10 +275,10 @@ export class UserDO {
     });
 
     if (isCallbackMode) {
-      return Response.json({ message_id: messageId, queue_position: position }, { status: 202 });
+      return Response.json({ message_id: messageId }, { status: 202 });
     }
 
-    return this.createQueuedSSEStream(messageId, position, logger);
+    return this.createQueuedSSEStream(messageId, logger);
   }
 
   /** Process a callback-mode message immediately in the fetch handler. Returns 202. */
@@ -307,7 +307,7 @@ export class UserDO {
       logger.error('immediate_callback_unhandled', err, { message_id: messageId })
     );
 
-    return Response.json({ message_id: messageId, queue_position: 0 }, { status: 202 });
+    return Response.json({ message_id: messageId }, { status: 202 });
   }
 
   /** Process a chat message immediately in the fetch handler (not via alarm). */
@@ -362,11 +362,7 @@ export class UserDO {
   }
 
   /** Create an SSE stream for a queued message. Events flow when the alarm processes it. */
-  private createQueuedSSEStream(
-    messageId: string,
-    position: number,
-    logger: RequestLogger
-  ): Response {
+  private createQueuedSSEStream(messageId: string, logger: RequestLogger): Response {
     const { readable, writable } = new TransformStream<Uint8Array>();
     const writer = writable.getWriter();
     const encoder = new TextEncoder();
@@ -375,7 +371,10 @@ export class UserDO {
     this.queuedWriters.set(messageId, writer);
 
     // Send initial queued event
-    const queuedEvent: SSEEvent = { type: 'status', message: `Queued at position ${position}` };
+    const queuedEvent: SSEEvent = {
+      type: 'status',
+      message: 'Queued — processing will begin shortly',
+    };
     writer.write(encoder.encode(`data: ${JSON.stringify(queuedEvent)}\n\n`)).catch((error) => {
       logger.warn('sse_client_disconnected', {
         phase: 'initial_queued_event',
