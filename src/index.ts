@@ -78,7 +78,8 @@ app.post('/api/v1/chat/queue', async (c) => {
 app.get('/api/v1/diag/alarm-fetch', async (c) => {
   const doId = c.env.USER_DO.idFromName('diag:alarm-test');
   const stub = c.env.USER_DO.get(doId);
-  return stub.fetch(new Request('http://do-internal/diag/alarm-fetch'));
+  const url = new URL(c.req.url);
+  return stub.fetch(new Request(`http://do-internal/diag/alarm-fetch${url.search}`));
 });
 app.get('/api/v1/diag/fetch-fetch', async (c) => {
   const doId = c.env.USER_DO.idFromName('diag:fetch-test');

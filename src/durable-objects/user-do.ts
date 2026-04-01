@@ -154,7 +154,7 @@ export class UserDO {
     }
 
     // TEMPORARY: Diagnostic endpoints for alarm fetch testing
-    if (url.pathname === '/diag/alarm-fetch') return this.handleDiagAlarmFetch();
+    if (url.pathname === '/diag/alarm-fetch') return this.handleDiagAlarmFetch(url);
     if (url.pathname === '/diag/fetch-fetch') return this.handleDiagFetchFetch();
 
     // Non-chat endpoints don't need locking
@@ -164,13 +164,20 @@ export class UserDO {
   // ── TEMPORARY: Diagnostic endpoint for alarm fetch testing ─────────────────
   // TODO: Remove after verifying alarm fetch behavior
 
-  private async handleDiagAlarmFetch(): Promise<Response> {
-    // Schedule an alarm that will make a raw fetch to Anthropic
+  private async handleDiagAlarmFetch(url: URL): Promise<Response> {
+    // If ?result=true, return the stored result from a previous alarm test
+    if (url.searchParams.get('result') === 'true') {
+      const result = await this.state.storage.get<Record<string, unknown>>('_diag_alarm_result');
+      if (!result) return Response.json({ status: 'no_result_yet' });
+      await this.state.storage.delete('_diag_alarm_result');
+      return Response.json({ context: 'alarm_handler', ...result });
+    }
+    // Schedule an alarm that will make a raw fetch to Anthropic and store the result
     await this.state.storage.put('_diag_alarm_fetch', true);
     await this.state.storage.setAlarm(Date.now());
     return Response.json({
       status: 'alarm_scheduled',
-      message: 'Check logs for diag_alarm_fetch_result',
+      message: 'Call with ?result=true to get the result',
     });
   }
 
@@ -217,6 +224,7 @@ export class UserDO {
     if (diagFlag) {
       await this.state.storage.delete('_diag_alarm_fetch');
       const result = await this.diagRawFetchAnthropicHealth();
+      await this.state.storage.put('_diag_alarm_result', result);
       logger.log('diag_alarm_fetch_result', result);
       return;
     }
