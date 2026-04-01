@@ -27,6 +27,14 @@ interface SystemPromptOptions {
   groupContext?: GroupChatContext | undefined;
 }
 
+/** Max length for speaker names (prevents prompt bloat). */
+const MAX_SPEAKER_LENGTH = 64;
+
+/** Sanitize a speaker name: strip brackets, trim, and limit length. */
+export function sanitizeSpeaker(name: string): string {
+  return name.replace(/[[\]]/g, '').trim().slice(0, MAX_SPEAKER_LENGTH) || 'Unknown';
+}
+
 const AUDIO_GUIDANCE =
   '## Audio Response (IMPORTANT)\n\n' +
   'You have a `request_audio` tool. You MUST call it when any of these apply:\n' +
@@ -54,7 +62,8 @@ function buildGroupSection(groupContext: GroupChatContext | undefined): string |
     'You are in a group conversation. Messages come from different participants.',
   ];
   if (groupContext.currentSpeaker) {
-    lines.push(`The current speaker is: ${groupContext.currentSpeaker}.`);
+    const safe = sanitizeSpeaker(groupContext.currentSpeaker);
+    lines.push(`The current speaker is: ${safe}.`);
     lines.push('Address the current speaker by name when responding.');
   }
   lines.push('Previous messages show [Speaker Name] attribution.');
@@ -138,7 +147,7 @@ export function historyToMessages(
 
   for (const entry of truncated) {
     const userContent = entry.speaker
-      ? `[${entry.speaker}]: ${entry.user_message}`
+      ? `[${sanitizeSpeaker(entry.speaker)}]: ${entry.user_message}`
       : entry.user_message;
     messages.push({ role: 'user', content: userContent });
     messages.push({ role: 'assistant', content: entry.assistant_response });

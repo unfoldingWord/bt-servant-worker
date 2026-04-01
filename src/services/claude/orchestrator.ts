@@ -40,7 +40,12 @@ import {
   wouldExceedBudget,
 } from '../mcp/index.js';
 import { MAX_MEMORY_SIZE_BYTES, UserMemoryStore } from '../memory/index.js';
-import { buildSystemPrompt, historyToMessages } from './system-prompt.js';
+import {
+  buildSystemPrompt,
+  GroupChatContext,
+  historyToMessages,
+  sanitizeSpeaker,
+} from './system-prompt.js';
 import {
   buildAllTools,
   getToolDefinitions,
@@ -85,7 +90,7 @@ interface OrchestratorOptions {
   modeContext?: ModeContext | undefined;
   audioContext?: AudioContext | undefined;
   clientId?: string | undefined;
-  groupContext?: { isGroupChat: boolean; currentSpeaker?: string } | undefined;
+  groupContext?: GroupChatContext | undefined;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
 }
@@ -556,7 +561,7 @@ function createOrchestrationContext(
       {
         role: 'user',
         content: options.groupContext?.currentSpeaker
-          ? `[${options.groupContext.currentSpeaker}]: ${userMessage}`
+          ? `[${sanitizeSpeaker(options.groupContext.currentSpeaker)}]: ${userMessage}`
           : userMessage,
       },
     ],

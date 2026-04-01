@@ -628,159 +628,85 @@ app.delete('/api/v1/admin/orgs/:org/users/:userId/history', async (c) => {
   return handleUserRequest(c.req.raw, c.env, org, userId, '/history');
 });
 
+// ── Group/thread admin helpers ──────────────────────────────────────────────────
+
+/** Handle a group admin request with chatId validation. */
+function handleGroupRequest(
+  c: { req: { raw: Request; param: (k: string) => string }; env: Env },
+  doPath: string
+) {
+  const org = c.req.param('org');
+  const chatId = c.req.param('chatId');
+  const chatIdError = validateChatIdParam(chatId, 'chatId');
+  if (chatIdError) return Promise.resolve(Response.json({ error: chatIdError }, { status: 400 }));
+  return handleDORequest({
+    request: c.req.raw,
+    env: c.env,
+    org,
+    doKey: `group:${org}:${chatId}`,
+    doPath,
+  });
+}
+
+/** Handle a thread admin request with chatId + threadId validation. */
+function handleThreadRequest(
+  c: { req: { raw: Request; param: (k: string) => string }; env: Env },
+  doPath: string
+) {
+  const org = c.req.param('org');
+  const chatId = c.req.param('chatId');
+  const threadId = c.req.param('threadId');
+  const chatIdError = validateChatIdParam(chatId, 'chatId');
+  if (chatIdError) return Promise.resolve(Response.json({ error: chatIdError }, { status: 400 }));
+  const threadIdError = validateChatIdParam(threadId, 'threadId');
+  if (threadIdError)
+    return Promise.resolve(Response.json({ error: threadIdError }, { status: 400 }));
+  return handleDORequest({
+    request: c.req.raw,
+    env: c.env,
+    org,
+    doKey: `group:${org}:${chatId}:${threadId}`,
+    doPath,
+  });
+}
+
 // ── Group admin endpoints (routed to group DO) ─────────────────────────────────
 
-app.get('/api/v1/admin/orgs/:org/groups/:chatId/preferences', async (c) => {
-  const org = c.req.param('org');
-  const chatId = c.req.param('chatId');
-  return handleDORequest({
-    request: c.req.raw,
-    env: c.env,
-    org,
-    doKey: `group:${org}:${chatId}`,
-    doPath: '/preferences',
-  });
-});
-
-app.put('/api/v1/admin/orgs/:org/groups/:chatId/preferences', async (c) => {
-  const org = c.req.param('org');
-  const chatId = c.req.param('chatId');
-  return handleDORequest({
-    request: c.req.raw,
-    env: c.env,
-    org,
-    doKey: `group:${org}:${chatId}`,
-    doPath: '/preferences',
-  });
-});
-
-app.get('/api/v1/admin/orgs/:org/groups/:chatId/history', async (c) => {
-  const org = c.req.param('org');
-  const chatId = c.req.param('chatId');
-  return handleDORequest({
-    request: c.req.raw,
-    env: c.env,
-    org,
-    doKey: `group:${org}:${chatId}`,
-    doPath: '/history',
-  });
-});
-
-app.delete('/api/v1/admin/orgs/:org/groups/:chatId/history', async (c) => {
-  const org = c.req.param('org');
-  const chatId = c.req.param('chatId');
-  return handleDORequest({
-    request: c.req.raw,
-    env: c.env,
-    org,
-    doKey: `group:${org}:${chatId}`,
-    doPath: '/history',
-  });
-});
-
-app.get('/api/v1/admin/orgs/:org/groups/:chatId/memory', async (c) => {
-  const org = c.req.param('org');
-  const chatId = c.req.param('chatId');
-  return handleDORequest({
-    request: c.req.raw,
-    env: c.env,
-    org,
-    doKey: `group:${org}:${chatId}`,
-    doPath: '/memory',
-  });
-});
-
-app.delete('/api/v1/admin/orgs/:org/groups/:chatId/memory', async (c) => {
-  const org = c.req.param('org');
-  const chatId = c.req.param('chatId');
-  return handleDORequest({
-    request: c.req.raw,
-    env: c.env,
-    org,
-    doKey: `group:${org}:${chatId}`,
-    doPath: '/memory',
-  });
-});
+app.get('/api/v1/admin/orgs/:org/groups/:chatId/preferences', (c) =>
+  handleGroupRequest(c, '/preferences')
+);
+app.put('/api/v1/admin/orgs/:org/groups/:chatId/preferences', (c) =>
+  handleGroupRequest(c, '/preferences')
+);
+app.get('/api/v1/admin/orgs/:org/groups/:chatId/history', (c) => handleGroupRequest(c, '/history'));
+app.delete('/api/v1/admin/orgs/:org/groups/:chatId/history', (c) =>
+  handleGroupRequest(c, '/history')
+);
+app.get('/api/v1/admin/orgs/:org/groups/:chatId/memory', (c) => handleGroupRequest(c, '/memory'));
+app.delete('/api/v1/admin/orgs/:org/groups/:chatId/memory', (c) =>
+  handleGroupRequest(c, '/memory')
+);
 
 // ── Thread admin endpoints (routed to thread-specific DO) ───────────────────────
 
-app.get('/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/preferences', async (c) => {
-  const org = c.req.param('org');
-  const chatId = c.req.param('chatId');
-  const threadId = c.req.param('threadId');
-  return handleDORequest({
-    request: c.req.raw,
-    env: c.env,
-    org,
-    doKey: `group:${org}:${chatId}:${threadId}`,
-    doPath: '/preferences',
-  });
-});
-
-app.put('/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/preferences', async (c) => {
-  const org = c.req.param('org');
-  const chatId = c.req.param('chatId');
-  const threadId = c.req.param('threadId');
-  return handleDORequest({
-    request: c.req.raw,
-    env: c.env,
-    org,
-    doKey: `group:${org}:${chatId}:${threadId}`,
-    doPath: '/preferences',
-  });
-});
-
-app.get('/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/history', async (c) => {
-  const org = c.req.param('org');
-  const chatId = c.req.param('chatId');
-  const threadId = c.req.param('threadId');
-  return handleDORequest({
-    request: c.req.raw,
-    env: c.env,
-    org,
-    doKey: `group:${org}:${chatId}:${threadId}`,
-    doPath: '/history',
-  });
-});
-
-app.delete('/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/history', async (c) => {
-  const org = c.req.param('org');
-  const chatId = c.req.param('chatId');
-  const threadId = c.req.param('threadId');
-  return handleDORequest({
-    request: c.req.raw,
-    env: c.env,
-    org,
-    doKey: `group:${org}:${chatId}:${threadId}`,
-    doPath: '/history',
-  });
-});
-
-app.get('/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/memory', async (c) => {
-  const org = c.req.param('org');
-  const chatId = c.req.param('chatId');
-  const threadId = c.req.param('threadId');
-  return handleDORequest({
-    request: c.req.raw,
-    env: c.env,
-    org,
-    doKey: `group:${org}:${chatId}:${threadId}`,
-    doPath: '/memory',
-  });
-});
-
-app.delete('/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/memory', async (c) => {
-  const org = c.req.param('org');
-  const chatId = c.req.param('chatId');
-  const threadId = c.req.param('threadId');
-  return handleDORequest({
-    request: c.req.raw,
-    env: c.env,
-    org,
-    doKey: `group:${org}:${chatId}:${threadId}`,
-    doPath: '/memory',
-  });
-});
+app.get('/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/preferences', (c) =>
+  handleThreadRequest(c, '/preferences')
+);
+app.put('/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/preferences', (c) =>
+  handleThreadRequest(c, '/preferences')
+);
+app.get('/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/history', (c) =>
+  handleThreadRequest(c, '/history')
+);
+app.delete('/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/history', (c) =>
+  handleThreadRequest(c, '/history')
+);
+app.get('/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/memory', (c) =>
+  handleThreadRequest(c, '/memory')
+);
+app.delete('/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/memory', (c) =>
+  handleThreadRequest(c, '/memory')
+);
 
 export default app;
 
@@ -877,6 +803,20 @@ async function readAllOrgKV(env: Env, org: string, logger: ReturnType<typeof cre
 
 const VALID_CHAT_TYPES: ReadonlySet<string> = new Set(['private', 'group', 'supergroup']);
 
+/** Max length for chat_id and thread_id path parameters. */
+const MAX_CHAT_ID_LENGTH = 256;
+/** Pattern: alphanumeric, hyphens, underscores, dots, colons (Telegram IDs are typically numeric). */
+const CHAT_ID_PATTERN = /^[\w.:-]+$/;
+
+/** Validate a chat_id or thread_id path parameter. Returns an error string or null. */
+function validateChatIdParam(value: string, paramName: string): string | null {
+  if (!value) return `${paramName} is required`;
+  if (value.length > MAX_CHAT_ID_LENGTH)
+    return `${paramName} must be <= ${MAX_CHAT_ID_LENGTH} characters`;
+  if (!CHAT_ID_PATTERN.test(value)) return `${paramName} contains invalid characters`;
+  return null;
+}
+
 /**
  * Resolve the DO ID based on chat type and routing fields.
  *
@@ -951,11 +891,15 @@ async function buildDOChatRequest(
   return { stub, doRequest };
 }
 
-/**
- * Handle chat requests
- *
- * Routes to user-scoped DO (user:org:userId) and passes MCP config from KV.
- */
+/** Validate an optional ISO 639-1 language code. */
+function validateLanguageHint(hint: unknown): string | null {
+  if (hint === undefined) return null;
+  if (typeof hint !== 'string' || !/^[a-z]{2}$/.test(hint)) {
+    return 'response_language_hint must be a valid ISO 639-1 language code (2 lowercase letters)';
+  }
+  return null;
+}
+
 /** Validate chat request fields, returning an error string or null if valid. */
 function validateChatBody(body: ChatRequest): string | null {
   if (!body.user_id) return 'user_id is required';
@@ -963,7 +907,9 @@ function validateChatBody(body: ChatRequest): string | null {
   if (body.chat_type && !VALID_CHAT_TYPES.has(body.chat_type)) {
     return `Invalid chat_type: ${body.chat_type}. Must be one of: private, group, supergroup`;
   }
-  return null;
+  const isGroup = body.chat_type === 'group' || body.chat_type === 'supergroup';
+  if (isGroup && !body.chat_id) return 'chat_id is required for group/supergroup chats';
+  return validateLanguageHint(body.response_language_hint);
 }
 
 async function handleChatRequest(request: Request, env: Env): Promise<Response> {

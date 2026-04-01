@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { buildSystemPrompt, historyToMessages } from '../../src/services/claude/system-prompt.js';
+import {
+  buildSystemPrompt,
+  historyToMessages,
+  sanitizeSpeaker,
+} from '../../src/services/claude/system-prompt.js';
 import { DEFAULT_PROMPT_VALUES } from '../../src/types/prompt-overrides.js';
 import { buildToolCatalog } from '../../src/services/mcp/catalog.js';
 import { ChatHistoryEntry } from '../../src/types/engine.js';
@@ -89,14 +93,14 @@ describe('historyToMessages - speaker attribution', () => {
     const history: ChatHistoryEntry[] = [
       {
         user_message: 'Hello everyone',
-        assistant_response: 'Hi there!',
+        assistant_response: 'Hi!',
         timestamp: Date.now(),
         speaker: 'Alice',
       },
     ];
     const messages = historyToMessages(history);
     expect(messages[0]!.content).toBe('[Alice]: Hello everyone');
-    expect(messages[1]!.content).toBe('Hi there!');
+    expect(messages[1]!.content).toBe('Hi!');
   });
 
   it('does not prefix user messages when speaker is absent', () => {
@@ -109,40 +113,53 @@ describe('historyToMessages - speaker attribution', () => {
 
   it('handles mixed history with and without speakers', () => {
     const history: ChatHistoryEntry[] = [
+      { user_message: 'Private', assistant_response: 'Reply1', timestamp: Date.now() },
       {
-        user_message: 'Private message',
-        assistant_response: 'Private reply',
-        timestamp: Date.now(),
-      },
-      {
-        user_message: 'Group message',
-        assistant_response: 'Group reply',
+        user_message: 'Group',
+        assistant_response: 'Reply2',
         timestamp: Date.now(),
         speaker: 'Bob',
       },
     ];
     const messages = historyToMessages(history);
-    expect(messages[0]!.content).toBe('Private message');
-    expect(messages[2]!.content).toBe('[Bob]: Group message');
+    expect(messages[0]!.content).toBe('Private');
+    expect(messages[2]!.content).toBe('[Bob]: Group');
   });
 
   it('respects maxForLLM truncation with speaker entries', () => {
     const history: ChatHistoryEntry[] = [
-      {
-        user_message: 'Old message',
-        assistant_response: 'Old reply',
-        timestamp: 1,
-        speaker: 'Alice',
-      },
-      {
-        user_message: 'New message',
-        assistant_response: 'New reply',
-        timestamp: 2,
-        speaker: 'Bob',
-      },
+      { user_message: 'Old', assistant_response: 'OldR', timestamp: 1, speaker: 'Alice' },
+      { user_message: 'New', assistant_response: 'NewR', timestamp: 2, speaker: 'Bob' },
     ];
     const messages = historyToMessages(history, 1);
     expect(messages).toHaveLength(2);
-    expect(messages[0]!.content).toBe('[Bob]: New message');
+    expect(messages[0]!.content).toBe('[Bob]: New');
+  });
+});
+
+describe('sanitizeSpeaker', () => {
+  it('passes through normal names unchanged', () => {
+    expect(sanitizeSpeaker('Alice')).toBe('Alice');
+    expect(sanitizeSpeaker('Bob Smith')).toBe('Bob Smith');
+  });
+
+  it('strips square brackets', () => {
+    expect(sanitizeSpeaker('[Alice]')).toBe('Alice');
+    expect(sanitizeSpeaker('Al[i]ce')).toBe('Alice');
+  });
+
+  it('trims whitespace', () => {
+    expect(sanitizeSpeaker('  Alice  ')).toBe('Alice');
+  });
+
+  it('truncates to 64 characters', () => {
+    const long = 'A'.repeat(100);
+    expect(sanitizeSpeaker(long)).toBe('A'.repeat(64));
+  });
+
+  it('returns Unknown for empty or bracket-only names', () => {
+    expect(sanitizeSpeaker('')).toBe('Unknown');
+    expect(sanitizeSpeaker('[]')).toBe('Unknown');
+    expect(sanitizeSpeaker('   ')).toBe('Unknown');
   });
 });

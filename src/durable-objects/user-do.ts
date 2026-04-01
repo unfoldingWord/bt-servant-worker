@@ -15,7 +15,7 @@
 
 import { Hono } from 'hono';
 import { Env } from '../config/types.js';
-import { orchestrate } from '../services/claude/index.js';
+import { GroupChatContext, orchestrate } from '../services/claude/index.js';
 import { formatTOCForPrompt, JsonMemoryStore } from '../services/memory/index.js';
 import { buildToolCatalog, discoverAllTools } from '../services/mcp/index.js';
 import { MCPServerConfig } from '../services/mcp/types.js';
@@ -1143,7 +1143,7 @@ export class UserDO {
     audioContext: AudioContext,
     logger: RequestLogger,
     callbacks?: StreamCallbacks,
-    groupContext?: { isGroupChat: boolean; currentSpeaker?: string }
+    groupContext?: GroupChatContext
   ): Parameters<typeof orchestrate>[1] {
     return {
       env: this.env,
