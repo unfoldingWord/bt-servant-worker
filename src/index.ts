@@ -8,7 +8,7 @@
 import { Hono } from 'hono';
 import { Env } from './config/types.js';
 import { APP_VERSION } from './generated/version.js';
-import { UserQueue, UserSession } from './durable-objects/index.js';
+import { UserDO } from './durable-objects/index.js';
 import { discoverAllTools } from './services/mcp/index.js';
 import { MCPServerConfig } from './services/mcp/types.js';
 import { ChatRequest } from './types/engine.js';
@@ -25,7 +25,6 @@ import {
   validatePromptMode,
   validatePromptOverrides,
 } from './types/prompt-overrides.js';
-import { DO_BASE_URL } from './config/constants.js';
 import { constantTimeCompare } from './utils/crypto.js';
 import { getAudio } from './services/audio/index.js';
 import { createRequestLogger } from './utils/logger.js';
@@ -35,9 +34,9 @@ import {
   validateServerConfig,
   validateServerId,
 } from './utils/mcp-validation.js';
-import { resolveOrgFromBody, resolveOrgFromParams } from './utils/org.js';
+import { resolveOrgFromBody } from './utils/org.js';
 
-export { UserQueue, UserSession };
+export { UserDO };
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -60,30 +59,19 @@ app.use('/api/*', async (c, next) => {
   return next();
 });
 
-// Chat endpoints
+// Unified chat endpoint — routes all chat to UserDO
 app.post('/api/v1/chat', async (c) => {
-  return handleChatRequest(c.req.raw, c.env, '/chat');
+  return handleChatRequest(c.req.raw, c.env);
 });
 
+// Backward-compat alias: /chat/stream and /chat/queue route to the same handler.
+// Consumers should migrate to POST /api/v1/chat (SSE or callback mode).
 app.post('/api/v1/chat/stream', async (c) => {
-  return handleChatRequest(c.req.raw, c.env, '/stream');
+  return handleChatRequest(c.req.raw, c.env);
 });
 
-// Queue endpoints (UserQueue DO)
 app.post('/api/v1/chat/queue', async (c) => {
-  return handleMessageEnqueue(c.req.raw, c.env);
-});
-
-app.get('/api/v1/chat/queue/stream', async (c) => {
-  return handleQueueStream(c.req.raw, c.env);
-});
-
-app.get('/api/v1/chat/queue/poll', async (c) => {
-  return handleQueuePoll(c.req.raw, c.env);
-});
-
-app.get('/api/v1/chat/queue/:userId', async (c) => {
-  return handleQueueStatus(c.req.raw, c.env, c.req.param('userId'));
+  return handleChatRequest(c.req.raw, c.env);
 });
 
 // User endpoints with org scope (new paths)
@@ -751,17 +739,16 @@ async function buildDOChatRequest(
   opts: {
     body: ChatRequest;
     org: string;
-    doPath: string;
     logger: ReturnType<typeof createRequestLogger>;
     requestId?: string;
   }
 ): Promise<{ stub: DurableObjectStub; doRequest: Request }> {
-  const { body, org, doPath, logger } = opts;
+  const { body, org, logger } = opts;
 
   const [mcpServers, orgConfig, promptOverrides, orgModes] = await readAllOrgKV(env, org, logger);
 
-  const doId = env.USER_SESSION.idFromName(`user:${org}:${body.user_id}`);
-  const stub = env.USER_SESSION.get(doId);
+  const doId = env.USER_DO.idFromName(`user:${org}:${body.user_id}`);
+  const stub = env.USER_DO.get(doId);
 
   logger.log('do_routed', {
     do_id: doId.toString(),
@@ -770,7 +757,7 @@ async function buildDOChatRequest(
   });
 
   const doUrl = new URL(request.url);
-  doUrl.pathname = doPath;
+  doUrl.pathname = '/chat';
 
   const headers = new Headers(request.headers);
   if (opts.requestId) {
@@ -799,7 +786,7 @@ async function buildDOChatRequest(
  *
  * Routes to user-scoped DO (user:org:userId) and passes MCP config from KV.
  */
-async function handleChatRequest(request: Request, env: Env, doPath: string): Promise<Response> {
+async function handleChatRequest(request: Request, env: Env): Promise<Response> {
   const requestId = crypto.randomUUID();
   const logger = createRequestLogger(requestId);
   const timing = createTimingContext();
@@ -819,11 +806,10 @@ async function handleChatRequest(request: Request, env: Env, doPath: string): Pr
       user_id: body.user_id,
       client_id: body.client_id,
       org,
-      path: doPath,
     });
 
     const { stub, doRequest } = await timePhase(timing, 'kv_and_routing', () =>
-      buildDOChatRequest(request, env, { body, org, doPath, logger, requestId })
+      buildDOChatRequest(request, env, { body, org, logger, requestId })
     );
     const response = await timePhase(timing, 'do_fetch', () => stub.fetch(doRequest));
 
@@ -878,8 +864,8 @@ async function handleUserRequest(
   });
 
   // Route to user-scoped DO (same ID format as chat)
-  const doId = env.USER_SESSION.idFromName(`user:${org}:${userId}`);
-  const stub = env.USER_SESSION.get(doId);
+  const doId = env.USER_DO.idFromName(`user:${org}:${userId}`);
+  const stub = env.USER_DO.get(doId);
 
   // Build DO URL with query params for history
   const doUrl = new URL(request.url);
@@ -900,171 +886,5 @@ async function handleUserRequest(
     status: response.status,
     duration_ms: Date.now() - start,
   });
-  return response;
-}
-
-/**
- * Handle message enqueue (POST /api/v1/chat/queue)
- *
- * Validates user_id, fetches org config from KV, and routes to UserQueue DO.
- */
-async function handleMessageEnqueue(request: Request, env: Env): Promise<Response> {
-  const requestId = crypto.randomUUID();
-  const logger = createRequestLogger(requestId);
-  const start = Date.now();
-
-  try {
-    const body = (await request.clone().json()) as ChatRequest;
-
-    if (!body.user_id) {
-      return Response.json({ error: 'user_id is required' }, { status: 400 });
-    }
-
-    const org = resolveOrgFromBody(body, env.DEFAULT_ORG);
-    logger.log('message_enqueue_received', {
-      user_id: body.user_id,
-      org,
-    });
-
-    const [mcpServers, orgConfig, promptOverrides, orgModes] = await readAllOrgKV(env, org, logger);
-
-    // Determine delivery mode based on progress_callback_url
-    const delivery = body.progress_callback_url ? 'callback' : 'sse';
-
-    const doId = env.USER_QUEUE.idFromName(`queue:${org}:${body.user_id}`);
-    const stub = env.USER_QUEUE.get(doId);
-
-    const doRequest = new Request(`${DO_BASE_URL}/enqueue`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        ...body,
-        org,
-        delivery,
-        request_id: requestId,
-        _mcp_servers: mcpServers,
-        _org_config: orgConfig,
-        _org_prompt_overrides: promptOverrides,
-        _org_modes: orgModes,
-        _worker_origin: new URL(request.url).origin,
-      }),
-    });
-
-    const response = await stub.fetch(doRequest);
-    logger.log('message_enqueue_complete', {
-      user_id: body.user_id,
-      org,
-      status: response.status,
-      duration_ms: Date.now() - start,
-    });
-    return response;
-  } catch (error) {
-    logger.error('message_enqueue_error', error, { duration_ms: Date.now() - start });
-    if (error instanceof SyntaxError) {
-      return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
-    }
-    return Response.json({ error: 'Internal server error' }, { status: 500 });
-  }
-}
-
-/**
- * Handle queue stream (GET /api/v1/chat/queue/stream)
- *
- * Extracts user_id, message_id, org from query params and routes to UserQueue DO.
- */
-async function handleQueueStream(request: Request, env: Env): Promise<Response> {
-  const url = new URL(request.url);
-  const userId = url.searchParams.get('user_id');
-  const messageId = url.searchParams.get('message_id');
-  const org = resolveOrgFromParams(url.searchParams, env.DEFAULT_ORG);
-  const requestId = crypto.randomUUID();
-  const logger = createRequestLogger(requestId, userId ?? undefined);
-  const start = Date.now();
-
-  if (!userId) {
-    return Response.json({ error: 'user_id query parameter is required' }, { status: 400 });
-  }
-  if (!messageId) {
-    return Response.json({ error: 'message_id query parameter is required' }, { status: 400 });
-  }
-
-  logger.log('queue_stream_start', { message_id: messageId, org });
-
-  const doId = env.USER_QUEUE.idFromName(`queue:${org}:${userId}`);
-  const stub = env.USER_QUEUE.get(doId);
-
-  const doUrl = new URL(`${DO_BASE_URL}/stream`);
-  doUrl.searchParams.set('message_id', messageId);
-
-  const response = await stub.fetch(new Request(doUrl.toString()));
-  logger.log('queue_stream_complete', {
-    message_id: messageId,
-    status: response.status,
-    duration_ms: Date.now() - start,
-  });
-  return response;
-}
-
-/**
- * Handle poll for incremental events (GET /api/v1/chat/queue/poll)
- * Returns JSON with events since cursor, suitable for worker-to-worker fetch.
- */
-async function handleQueuePoll(request: Request, env: Env): Promise<Response> {
-  const url = new URL(request.url);
-  const userId = url.searchParams.get('user_id');
-  const messageId = url.searchParams.get('message_id');
-  const org = resolveOrgFromParams(url.searchParams, env.DEFAULT_ORG);
-  const cursor = url.searchParams.get('cursor') ?? '0';
-  const requestId = crypto.randomUUID();
-  const logger = createRequestLogger(requestId, userId ?? undefined);
-  const start = Date.now();
-
-  if (!userId) {
-    return Response.json({ error: 'user_id query parameter is required' }, { status: 400 });
-  }
-  if (!messageId) {
-    return Response.json({ error: 'message_id query parameter is required' }, { status: 400 });
-  }
-
-  logger.log('queue_poll_start', { message_id: messageId, org, cursor });
-
-  const doId = env.USER_QUEUE.idFromName(`queue:${org}:${userId}`);
-  const stub = env.USER_QUEUE.get(doId);
-
-  const doUrl = new URL(`${DO_BASE_URL}/poll`);
-  doUrl.searchParams.set('message_id', messageId);
-  doUrl.searchParams.set('cursor', cursor);
-
-  const response = await stub.fetch(new Request(doUrl.toString()));
-  logger.log('queue_poll_complete', {
-    message_id: messageId,
-    status: response.status,
-    duration_ms: Date.now() - start,
-  });
-  return response;
-}
-
-/**
- * Handle queue status (GET /api/v1/chat/queue/:userId)
- *
- * Debugging endpoint — returns queue length, processing flag, stored response count.
- */
-async function handleQueueStatus(request: Request, env: Env, userId: string): Promise<Response> {
-  const url = new URL(request.url);
-  const org = resolveOrgFromParams(url.searchParams, env.DEFAULT_ORG);
-  const logger = createRequestLogger(crypto.randomUUID(), userId);
-  const start = Date.now();
-
-  if (!userId) {
-    return Response.json({ error: 'userId is required in path' }, { status: 400 });
-  }
-
-  logger.log('queue_status_start', { org });
-
-  const doId = env.USER_QUEUE.idFromName(`queue:${org}:${userId}`);
-  const stub = env.USER_QUEUE.get(doId);
-
-  const response = await stub.fetch(new Request(`${DO_BASE_URL}/status`));
-  logger.log('queue_status_complete', { status: response.status, duration_ms: Date.now() - start });
   return response;
 }

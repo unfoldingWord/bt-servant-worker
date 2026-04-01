@@ -1,5 +1,5 @@
 /**
- * E2E tests for UserSession Durable Object
+ * E2E tests for UserDO (merged Durable Object)
  *
  * These tests run in the actual Cloudflare Workers runtime (via miniflare)
  * and test the real Durable Object implementation.
@@ -12,13 +12,12 @@
 import { env } from 'cloudflare:test';
 import { describe, it, expect, beforeEach } from 'vitest';
 
-describe('UserSession Durable Object', () => {
+describe('UserDO Durable Object', () => {
   let stub: DurableObjectStub;
 
   beforeEach(() => {
-    // Create a new Durable Object instance for each test
-    const id = env.USER_SESSION.newUniqueId();
-    stub = env.USER_SESSION.get(id);
+    const id = env.USER_DO.newUniqueId();
+    stub = env.USER_DO.get(id);
   });
 
   describe('GET /preferences', () => {
@@ -47,14 +46,12 @@ describe('UserSession Durable Object', () => {
     });
 
     it('persists preferences across requests', async () => {
-      // Update preference
       await stub.fetch('http://fake-host/preferences', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ response_language: 'fr' }),
       });
 
-      // Read it back
       const response = await stub.fetch('http://fake-host/preferences');
       const data = (await response.json()) as Record<string, unknown>;
 
@@ -156,321 +153,107 @@ describe('UserSession Durable Object', () => {
   });
 });
 
-describe('UserSession chat validation', () => {
+describe('UserDO unified chat endpoint', () => {
   let stub: DurableObjectStub;
 
   beforeEach(() => {
-    const id = env.USER_SESSION.newUniqueId();
-    stub = env.USER_SESSION.get(id);
+    const id = env.USER_DO.newUniqueId();
+    stub = env.USER_DO.get(id);
   });
 
-  describe('POST /chat', () => {
-    it('rejects empty message', async () => {
-      const response = await stub.fetch('http://fake-host/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          client_id: 'test-client',
-          user_id: 'test-user',
-          message: '',
-          message_type: 'text',
-        }),
-      });
-      const data = (await response.json()) as Record<string, unknown>;
-
-      expect(response.status).toBe(400);
-      expect(data.error).toBe('ValidationError');
-      expect(data.code).toBe('VALIDATION_ERROR');
-      expect(data.message).toBe('Message is required');
+  it('returns SSE stream for requests without callback URL', async () => {
+    const response = await stub.fetch('http://fake-host/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: 'test-client',
+        user_id: 'test-user',
+        message: 'hello',
+        message_type: 'text',
+      }),
     });
 
-    it('rejects whitespace-only message', async () => {
-      const response = await stub.fetch('http://fake-host/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          client_id: 'test-client',
-          user_id: 'test-user',
-          message: '   ',
-          message_type: 'text',
-        }),
-      });
-      const data = (await response.json()) as Record<string, unknown>;
+    // SSE mode returns event-stream
+    expect(response.headers.get('Content-Type')).toBe('text/event-stream');
+  });
 
-      expect(response.status).toBe(400);
-      expect(data.error).toBe('ValidationError');
-      expect(data.code).toBe('VALIDATION_ERROR');
-      expect(data.message).toBe('Message is required');
+  it('returns 202 for callback-mode requests', async () => {
+    const response = await stub.fetch('http://fake-host/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: 'test-client',
+        user_id: 'test-user',
+        message: 'hello',
+        message_type: 'text',
+        progress_callback_url: 'https://example.com/callback',
+        message_key: 'test-key',
+      }),
     });
+
+    expect(response.status).toBe(202);
+    const data = (await response.json()) as { message_id: string; queue_position: number };
+    expect(data.message_id).toBeDefined();
+    expect(data.queue_position).toBeGreaterThan(0);
+  });
+
+  it('returns 400 for invalid JSON', async () => {
+    const response = await stub.fetch('http://fake-host/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: 'not json',
+    });
+
+    expect(response.status).toBe(400);
+  });
+
+  it('non-chat endpoints still work without lock', async () => {
+    const prefsResponse = await stub.fetch('http://fake-host/preferences');
+    expect(prefsResponse.status).toBe(200);
+
+    const historyResponse = await stub.fetch('http://fake-host/history?user_id=test');
+    expect(historyResponse.status).toBe(200);
   });
 });
 
-describe('UserSession user-scoped DO isolation', () => {
+describe('UserDO user-scoped DO isolation', () => {
   it('different users have separate history', async () => {
-    // Create two user-scoped DOs (same format as the worker uses)
-    const aliceStub = env.USER_SESSION.get(env.USER_SESSION.idFromName('user:test-org:alice'));
-    const bobStub = env.USER_SESSION.get(env.USER_SESSION.idFromName('user:test-org:bob'));
+    const aliceStub = env.USER_DO.get(env.USER_DO.idFromName('user:test-org:alice'));
+    const bobStub = env.USER_DO.get(env.USER_DO.idFromName('user:test-org:bob'));
 
-    // Update Alice's preferences
     await aliceStub.fetch('http://fake-host/preferences', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ response_language: 'es' }),
     });
 
-    // Update Bob's preferences
     await bobStub.fetch('http://fake-host/preferences', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ response_language: 'fr' }),
     });
 
-    // Verify Alice still has Spanish
     const alicePrefs = await aliceStub.fetch('http://fake-host/preferences');
     const aliceData = (await alicePrefs.json()) as { response_language: string };
     expect(aliceData.response_language).toBe('es');
 
-    // Verify Bob has French
     const bobPrefs = await bobStub.fetch('http://fake-host/preferences');
     const bobData = (await bobPrefs.json()) as { response_language: string };
     expect(bobData.response_language).toBe('fr');
   });
 
   it('users in different orgs are isolated', async () => {
-    // Same user ID, different orgs
-    const org1Stub = env.USER_SESSION.get(env.USER_SESSION.idFromName('user:org1:alice'));
-    const org2Stub = env.USER_SESSION.get(env.USER_SESSION.idFromName('user:org2:alice'));
+    const org1Stub = env.USER_DO.get(env.USER_DO.idFromName('user:org1:alice'));
+    const org2Stub = env.USER_DO.get(env.USER_DO.idFromName('user:org2:alice'));
 
-    // Update org1 alice's preferences
     await org1Stub.fetch('http://fake-host/preferences', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ response_language: 'es' }),
     });
 
-    // Verify org2 alice still has default (English)
     const org2Prefs = await org2Stub.fetch('http://fake-host/preferences');
     const org2Data = (await org2Prefs.json()) as { response_language: string };
     expect(org2Data.response_language).toBe('en');
   });
-});
-
-describe('UserSession request serialization (429 lock)', () => {
-  let stub: DurableObjectStub;
-
-  beforeEach(() => {
-    const id = env.USER_SESSION.newUniqueId();
-    stub = env.USER_SESSION.get(id);
-  });
-
-  it('lock is released after request completes (even on validation error)', async () => {
-    // Send a request that fails validation - lock should still be released
-    const firstResponse = await stub.fetch('http://fake-host/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        client_id: 'test-client',
-        user_id: 'test-user',
-        message: '', // Empty message fails validation after lock acquired
-        message_type: 'text',
-      }),
-    });
-
-    expect(firstResponse.status).toBe(400);
-
-    // Verify lock was released - second request should succeed (not get 429)
-    const secondResponse = await stub.fetch('http://fake-host/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        client_id: 'test-client',
-        user_id: 'test-user',
-        message: '', // Will also fail validation
-        message_type: 'text',
-      }),
-    });
-
-    // Should get 400 (validation error), not 429 (lock held)
-    expect(secondResponse.status).toBe(400);
-  });
-
-  it('non-chat endpoints do not require lock', async () => {
-    // Preferences endpoint should work without lock
-    const prefsResponse = await stub.fetch('http://fake-host/preferences');
-    expect(prefsResponse.status).toBe(200);
-
-    // History endpoint should work without lock
-    const historyResponse = await stub.fetch('http://fake-host/history?user_id=test');
-    expect(historyResponse.status).toBe(200);
-  });
-
-  it('validation error response has consistent structure', async () => {
-    const response = await stub.fetch('http://fake-host/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        client_id: 'test-client',
-        user_id: 'test-user',
-        message: '',
-        message_type: 'text',
-      }),
-    });
-
-    expect(response.status).toBe(400);
-
-    const data = (await response.json()) as {
-      error: string;
-      code: string;
-      message: string;
-    };
-
-    // Verify consistent error response structure
-    expect(data.error).toBe('ValidationError');
-    expect(data.code).toBe('VALIDATION_ERROR');
-    expect(data.message).toBe('Message is required');
-  });
-
-  it('stream endpoint also requires lock', async () => {
-    // Stream endpoint should also go through lock mechanism
-    // A request to /stream should work (not 404)
-    const response = await stub.fetch('http://fake-host/stream', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        client_id: 'test-client',
-        user_id: 'test-user',
-        message: '', // Will fail validation
-        message_type: 'text',
-      }),
-    });
-
-    // Stream returns immediately with SSE headers, but validation error
-    // is sent through the stream. Check that we get the SSE response.
-    expect(response.headers.get('Content-Type')).toBe('text/event-stream');
-  });
-});
-
-/**
- * Real chat tests that call the Anthropic API.
- * These tests verify the full chat flow with Claude.
- *
- * Requirements:
- * - ANTHROPIC_API_KEY must be set in .dev.vars (local) or environment (CI)
- * - These tests cost money (API calls)
- * - These tests are slower (2-10+ seconds each)
- *
- * These tests check for the API key at runtime via the miniflare bindings.
- */
-describe('UserSession real chat (requires ANTHROPIC_API_KEY)', () => {
-  let stub: DurableObjectStub;
-
-  beforeEach(() => {
-    const id = env.USER_SESSION.newUniqueId();
-    stub = env.USER_SESSION.get(id);
-  });
-
-  // Check API key from miniflare bindings at runtime
-  const skipIfNoApiKey = () => {
-    // @ts-expect-error - ANTHROPIC_API_KEY is set via miniflare bindings
-    if (!env.ANTHROPIC_API_KEY) {
-      return true;
-    }
-    return false;
-  };
-
-  it('responds to a simple message with valid structure', async (ctx) => {
-    if (skipIfNoApiKey()) {
-      ctx.skip();
-      return;
-    }
-    const response = await stub.fetch('http://fake-host/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        client_id: 'e2e-test',
-        user_id: 'e2e-test-user',
-        message: 'Say "test successful" and nothing else.',
-        message_type: 'text',
-      }),
-    });
-
-    expect(response.status).toBe(200);
-
-    const data = (await response.json()) as {
-      responses: string[];
-      response_language: string;
-      voice_audio_base64: string | null;
-    };
-
-    // Verify response structure
-    expect(data).toHaveProperty('responses');
-    expect(data).toHaveProperty('response_language');
-    expect(data).toHaveProperty('voice_audio_base64');
-
-    // Verify responses is a non-empty array
-    expect(Array.isArray(data.responses)).toBe(true);
-    expect(data.responses.length).toBeGreaterThan(0);
-
-    // Verify response_language is a string
-    expect(typeof data.response_language).toBe('string');
-  }, 30000); // 30 second timeout for API call
-
-  it('saves chat to history after successful response', async (ctx) => {
-    if (skipIfNoApiKey()) {
-      ctx.skip();
-      return;
-    }
-    const testMessage = 'Reply with exactly: history test';
-
-    // Send a chat message
-    const chatResponse = await stub.fetch('http://fake-host/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        client_id: 'e2e-test',
-        user_id: 'e2e-history-user',
-        message: testMessage,
-        message_type: 'text',
-      }),
-    });
-
-    expect(chatResponse.status).toBe(200);
-
-    // Check history now has an entry
-    const historyResponse = await stub.fetch('http://fake-host/history?user_id=e2e-history-user');
-    const historyData = (await historyResponse.json()) as {
-      entries: Array<{ user_message: string; assistant_response: string }>;
-      total_count: number;
-    };
-
-    expect(historyData.total_count).toBe(1);
-    expect(historyData.entries.length).toBe(1);
-    expect(historyData.entries[0].user_message).toBe(testMessage);
-    expect(historyData.entries[0].assistant_response.length).toBeGreaterThan(0);
-  }, 30000); // 30 second timeout for API call
-
-  it('works without MCP servers configured', async (ctx) => {
-    if (skipIfNoApiKey()) {
-      ctx.skip();
-      return;
-    }
-    // This test verifies Claude responds even when no MCP tools are available
-    const response = await stub.fetch('http://fake-host/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        client_id: 'e2e-test',
-        user_id: 'e2e-no-mcp-user',
-        message: 'What is 2+2? Reply with just the number.',
-        message_type: 'text',
-      }),
-    });
-
-    expect(response.status).toBe(200);
-
-    const data = (await response.json()) as { responses: string[] };
-    expect(data.responses.length).toBeGreaterThan(0);
-    // Claude should be able to answer basic questions without tools
-    expect(data.responses.join(' ')).toMatch(/4/);
-  }, 30000); // 30 second timeout for API call
 });

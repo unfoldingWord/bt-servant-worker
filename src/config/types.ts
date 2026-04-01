@@ -26,8 +26,6 @@ export interface Env {
 
   // Queue configuration (optional - has defaults)
   MAX_QUEUE_DEPTH?: string;
-  QUEUE_STORED_RESPONSE_TTL_MS?: string;
-  QUEUE_SSE_CONNECT_TIMEOUT_MS?: string;
   QUEUE_MAX_RETRIES?: string;
 
   // Secrets (set via wrangler secret put)
@@ -48,8 +46,7 @@ export interface Env {
   AUDIO_BUCKET: R2Bucket;
 
   // Durable Object bindings
-  USER_SESSION: DurableObjectNamespace;
-  USER_QUEUE: DurableObjectNamespace;
+  USER_DO: DurableObjectNamespace;
 }
 
 /**

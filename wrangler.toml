@@ -41,12 +41,8 @@ bucket_name = "bt-servant-audio"
 
 # Durable Objects
 [[durable_objects.bindings]]
-name = "USER_SESSION"
-class_name = "UserSession"
-
-[[durable_objects.bindings]]
-name = "USER_QUEUE"
-class_name = "UserQueue"
+name = "USER_DO"
+class_name = "UserDO"
 
 [[migrations]]
 tag = "v1"
@@ -55,6 +51,11 @@ new_sqlite_classes = ["UserSession"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["UserQueue"]
+
+[[migrations]]
+tag = "v3"
+renamed_classes = [{from = "UserSession", to = "UserDO"}]
+deleted_classes = ["UserQueue"]
 
 # ──── Staging environment ────
 [env.staging]
@@ -91,9 +92,5 @@ binding = "AUDIO_BUCKET"
 bucket_name = "bt-servant-audio-staging"
 
 [[env.staging.durable_objects.bindings]]
-name = "USER_SESSION"
-class_name = "UserSession"
-
-[[env.staging.durable_objects.bindings]]
-name = "USER_QUEUE"
-class_name = "UserQueue"
+name = "USER_DO"
+class_name = "UserDO"
