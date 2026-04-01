@@ -218,22 +218,23 @@ export class UserDO {
     const messageId = crypto.randomUUID();
     const workerOrigin = request.headers.get('X-Worker-Origin') ?? '';
 
-    // Callback mode always enqueues (fire-and-forget)
-    if (isCallbackMode) {
-      return this.enqueueAndReturn(body, messageId, workerOrigin, logger);
-    }
-
-    // SSE mode: try to process immediately in the fetch handler if idle.
+    // Try to process immediately in the fetch handler if idle.
     // Outbound fetch to api.anthropic.com fails from DO alarm() contexts
-    // (Cloudflare 1003), so we process in the fetch handler when possible
-    // and only enqueue when another request is already being processed.
+    // (Cloudflare 1003), so we MUST process in the fetch handler.
     const lockAcquired = await this.tryAcquireLock();
     if (lockAcquired) {
-      logger.log('chat_immediate', { message_id: messageId, user_id: body.user_id });
+      logger.log('chat_immediate', {
+        message_id: messageId,
+        user_id: body.user_id,
+        mode: isCallbackMode ? 'callback' : 'sse',
+      });
+      if (isCallbackMode) {
+        return this.processImmediateCallback(body, workerOrigin, messageId, logger);
+      }
       return this.processImmediateSSE(body, workerOrigin, messageId, logger);
     }
 
-    // DO is busy — enqueue for alarm-based processing
+    // DO is busy — enqueue for processing when current request finishes
     return this.enqueueAndReturn(body, messageId, workerOrigin, logger);
   }
 
@@ -280,6 +281,35 @@ export class UserDO {
     return this.createQueuedSSEStream(messageId, position, logger);
   }
 
+  /** Process a callback-mode message immediately in the fetch handler. Returns 202. */
+  private processImmediateCallback(
+    body: ChatRequest,
+    workerOrigin: string,
+    messageId: string,
+    logger: RequestLogger
+  ): Response {
+    // Start processing in background — return 202 immediately
+    (async () => {
+      const timing = createTimingContext();
+      const callbacks = this.buildWebhookCallbacks(body, logger);
+      try {
+        const response = await this.processChat(body, workerOrigin, logger, timing, callbacks);
+        await callbacks?.onComplete?.(response);
+        logger.log('immediate_callback_complete', { message_id: messageId });
+      } catch (error) {
+        logger.error('immediate_callback_error', error, { message_id: messageId });
+        await callbacks?.onError?.(error instanceof Error ? error.message : 'Processing failed');
+      } finally {
+        await this.releaseLock();
+        await this.drainQueue(logger);
+      }
+    })().catch((err) =>
+      logger.error('immediate_callback_unhandled', err, { message_id: messageId })
+    );
+
+    return Response.json({ message_id: messageId, queue_position: 0 }, { status: 202 });
+  }
+
   /** Process a chat message immediately in the fetch handler (not via alarm). */
   private processImmediateSSE(
     body: ChatRequest,
@@ -318,6 +348,7 @@ export class UserDO {
           /* client disconnected */
         }
         await this.releaseLock();
+        await this.drainQueue(logger);
       }
     })().catch((err) => logger.error('immediate_sse_unhandled', err, { message_id: messageId }));
 
@@ -363,7 +394,22 @@ export class UserDO {
     });
   }
 
-  // ── Queue entry processing (called by alarm) ─────────────────────────────────
+  /**
+   * Drain queued entries after immediate processing completes.
+   * Runs in the fetch handler context (not alarm) to avoid Cloudflare 1003.
+   * Processes entries one at a time until the queue is empty.
+   */
+  private async drainQueue(logger: RequestLogger): Promise<void> {
+    for (;;) {
+      const entry = await this.dequeueNext();
+      if (!entry) return;
+
+      logger.log('drain_queue_entry', { message_id: entry.message_id });
+      await this.processQueueEntry(entry, logger);
+    }
+  }
+
+  // ── Queue entry processing (called by alarm or drainQueue) ────────────────────
 
   private async processQueueEntry(entry: InternalQueueEntry, logger: RequestLogger): Promise<void> {
     const startTime = Date.now();
