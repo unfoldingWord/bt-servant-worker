@@ -64,16 +64,6 @@ app.post('/api/v1/chat', async (c) => {
   return handleChatRequest(c.req.raw, c.env);
 });
 
-// Backward-compat alias: /chat/stream and /chat/queue route to the same handler.
-// Consumers should migrate to POST /api/v1/chat (SSE or callback mode).
-app.post('/api/v1/chat/stream', async (c) => {
-  return handleChatRequest(c.req.raw, c.env);
-});
-
-app.post('/api/v1/chat/queue', async (c) => {
-  return handleChatRequest(c.req.raw, c.env);
-});
-
 // User endpoints with org scope (new paths)
 app.get('/api/v1/orgs/:org/users/:userId/preferences', async (c) => {
   const org = c.req.param('org');

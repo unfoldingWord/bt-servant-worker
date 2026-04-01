@@ -113,12 +113,10 @@ Authorization: Bearer <ENGINE_API_KEY or org-specific admin key>
 
 ### Chat
 
-| Endpoint              | Method | Description                                            |
-| --------------------- | ------ | ------------------------------------------------------ |
-| `/health`             | GET    | Health check                                           |
-| `/api/v1/chat`        | POST   | Unified chat endpoint (SSE streaming or callback mode) |
-| `/api/v1/chat/stream` | POST   | Deprecated alias for `/api/v1/chat` (backward compat)  |
-| `/api/v1/chat/queue`  | POST   | Deprecated alias for `/api/v1/chat` (backward compat)  |
+| Endpoint       | Method | Description                                            |
+| -------------- | ------ | ------------------------------------------------------ |
+| `/health`      | GET    | Health check                                           |
+| `/api/v1/chat` | POST   | Unified chat endpoint (SSE streaming or callback mode) |
 
 ### Audio
 
