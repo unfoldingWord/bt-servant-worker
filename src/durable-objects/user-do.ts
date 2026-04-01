@@ -73,6 +73,7 @@ const QUEUE_KEY = 'queue';
 const QUEUE_PROCESSING_KEY = 'queue_processing';
 
 // ── Constants ──────────────────────────────────────────────────────────────────
+const LOCK_STALE_THRESHOLD_MS = 90_000; // 90 seconds
 const DEFAULT_MAX_QUEUE_DEPTH = 50;
 const DEFAULT_MAX_RETRIES = 3;
 const ENQUEUE_RATE_WINDOW_MS = 60_000; // 1 minute
@@ -217,6 +218,33 @@ export class UserDO {
     const messageId = crypto.randomUUID();
     const workerOrigin = request.headers.get('X-Worker-Origin') ?? '';
 
+    // Callback mode always enqueues (fire-and-forget)
+    if (isCallbackMode) {
+      return this.enqueueAndReturn(body, messageId, workerOrigin, logger);
+    }
+
+    // SSE mode: try to process immediately in the fetch handler if idle.
+    // Outbound fetch to api.anthropic.com fails from DO alarm() contexts
+    // (Cloudflare 1003), so we process in the fetch handler when possible
+    // and only enqueue when another request is already being processed.
+    const lockAcquired = await this.tryAcquireLock();
+    if (lockAcquired) {
+      logger.log('chat_immediate', { message_id: messageId, user_id: body.user_id });
+      return this.processImmediateSSE(body, workerOrigin, messageId, logger);
+    }
+
+    // DO is busy — enqueue for alarm-based processing
+    return this.enqueueAndReturn(body, messageId, workerOrigin, logger);
+  }
+
+  /** Enqueue a message and return 202 (callback) or SSE stream (SSE mode). */
+  private async enqueueAndReturn(
+    body: ChatRequest,
+    messageId: string,
+    workerOrigin: string,
+    logger: RequestLogger
+  ): Promise<Response> {
+    const isCallbackMode = !!body.progress_callback_url;
     const entry: InternalQueueEntry = {
       message_id: messageId,
       body: { ...body, _worker_origin: workerOrigin },
@@ -232,7 +260,7 @@ export class UserDO {
         {
           error: 'Queue full',
           code: 'QUEUE_DEPTH_EXCEEDED',
-          message: `Queue depth limit (${maxDepth}) exceeded. Please retry later.`,
+          message: `Queue depth limit (${maxDepth}) exceeded.`,
         },
         { status: 429, headers: { 'Retry-After': '5' } }
       );
@@ -249,8 +277,57 @@ export class UserDO {
       return Response.json({ message_id: messageId, queue_position: position }, { status: 202 });
     }
 
-    // SSE mode — hold the connection open
     return this.createQueuedSSEStream(messageId, position, logger);
+  }
+
+  /** Process a chat message immediately in the fetch handler (not via alarm). */
+  private processImmediateSSE(
+    body: ChatRequest,
+    workerOrigin: string,
+    messageId: string,
+    logger: RequestLogger
+  ): Response {
+    const { readable, writable } = new TransformStream<Uint8Array>();
+    const writer = writable.getWriter();
+    const { sendEvent, keepaliveInterval } = this.buildSSESender(writer, logger, Date.now());
+
+    const callbacks: StreamCallbacks = {
+      onStatus: async (message) => sendEvent({ type: 'status', message }),
+      onProgress: async (text) => sendEvent({ type: 'progress', text }),
+      onComplete: async (response) => sendEvent({ type: 'complete', response }),
+      onError: async (error) => sendEvent({ type: 'error', error }),
+      onToolUse: async (tool, input) => sendEvent({ type: 'tool_use', tool, input }),
+      onToolResult: async (tool, result) => sendEvent({ type: 'tool_result', tool, result }),
+    };
+
+    // Process in background — the Response is returned immediately with the SSE stream
+    (async () => {
+      try {
+        const timing = createTimingContext();
+        const response = await this.processChat(body, workerOrigin, logger, timing, callbacks);
+        await sendEvent({ type: 'complete', response });
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Processing failed';
+        logger.error('immediate_sse_error', error, { message_id: messageId });
+        await sendEvent({ type: 'error', error: errorMessage });
+      } finally {
+        clearInterval(keepaliveInterval);
+        try {
+          await writer.close();
+        } catch {
+          /* client disconnected */
+        }
+        await this.releaseLock();
+      }
+    })().catch((err) => logger.error('immediate_sse_unhandled', err, { message_id: messageId }));
+
+    return new Response(readable, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+      },
+    });
   }
 
   /** Create an SSE stream for a queued message. Events flow when the alarm processes it. */
@@ -575,6 +652,21 @@ export class UserDO {
   }
 
   // ── Lock management ───────────────────────────────────────────────────────────
+
+  private async tryAcquireLock(): Promise<boolean> {
+    return this.state.blockConcurrencyWhile(async () => {
+      const lock = await this.state.storage.get<number>(PROCESSING_LOCK_KEY);
+      const now = Date.now();
+      if (lock && now - lock < LOCK_STALE_THRESHOLD_MS) {
+        return false;
+      }
+      if (lock) {
+        this.getLogger().warn('stale_lock_overwritten', { lock_age_ms: now - lock });
+      }
+      await this.state.storage.put(PROCESSING_LOCK_KEY, now);
+      return true;
+    });
+  }
 
   private async releaseLock(): Promise<void> {
     await this.state.storage.delete(PROCESSING_LOCK_KEY);
