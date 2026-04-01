@@ -169,13 +169,6 @@ function extractTextResponses(content: Anthropic.ContentBlock[]): string[] {
   return texts;
 }
 
-/**
- * Call the Anthropic Messages API via the SDK.
- *
- * The SDK's HTTP layer works correctly when called from a single Durable Object
- * (depth 2: Worker → DO → Anthropic). The previous raw fetch bypass was needed
- * only when DO-to-DO nesting caused Cloudflare error 1003 at depth 3.
- */
 /** Build the base params for the Anthropic Messages API. */
 function buildMessageParams(ctx: OrchestrationContext) {
   return {
@@ -187,6 +180,13 @@ function buildMessageParams(ctx: OrchestrationContext) {
   };
 }
 
+/**
+ * Call the Anthropic Messages API via the SDK.
+ *
+ * The SDK's HTTP layer works correctly when called from a single Durable Object
+ * (depth 2: Worker → DO → Anthropic). The previous raw fetch bypass was needed
+ * only when DO-to-DO nesting caused Cloudflare error 1003 at depth 3.
+ */
 async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message> {
   if (ctx.callbacks) {
     return streamClaudeResponse(ctx);

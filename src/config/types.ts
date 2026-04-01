@@ -26,8 +26,6 @@ export interface Env {
 
   // Queue configuration (optional - has defaults)
   MAX_QUEUE_DEPTH?: string;
-  QUEUE_STORED_RESPONSE_TTL_MS?: string;
-  QUEUE_SSE_CONNECT_TIMEOUT_MS?: string;
   QUEUE_MAX_RETRIES?: string;
 
   // Secrets (set via wrangler secret put)

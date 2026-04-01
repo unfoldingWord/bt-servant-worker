@@ -179,14 +179,30 @@ export class UserDO {
       }
     }
 
-    await this.scheduleNextAlarm();
+    try {
+      await this.scheduleNextAlarm();
+    } catch (error) {
+      logger.error('alarm_schedule_next_failed', error);
+      try {
+        await this.state.storage.put(QUEUE_PROCESSING_KEY, false);
+      } catch (storageErr) {
+        logger.error('alarm_schedule_recovery_failed', storageErr);
+      }
+    }
   }
 
   // ── Unified chat handler ──────────────────────────────────────────────────────
 
   private async handleUnifiedChat(request: Request): Promise<Response> {
     const logger = this.getLogger();
-    const body = (await request.json()) as ChatRequest;
+
+    let body: ChatRequest;
+    try {
+      body = (await request.json()) as ChatRequest;
+    } catch (err) {
+      logger.warn('chat_invalid_json', { error: err instanceof Error ? err.message : String(err) });
+      return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
+    }
 
     // Rate limiting
     const rateLimited = this.checkRateLimit(
@@ -365,7 +381,10 @@ export class UserDO {
       }
       writer
         .write(encoder.encode(`data: ${JSON.stringify({ type: 'keepalive' })}\n\n`))
-        .catch(() => {
+        .catch((error: unknown) => {
+          logger.warn('sse_keepalive_write_failed', {
+            error: error instanceof Error ? error.message : String(error),
+          });
           state.clientDisconnected = true;
           clearInterval(keepaliveInterval);
         });
@@ -384,6 +403,7 @@ export class UserDO {
       const callbacks: StreamCallbacks = {
         onStatus: async (message) => sendEvent({ type: 'status', message }),
         onProgress: async (text) => sendEvent({ type: 'progress', text }),
+        // onComplete is sent explicitly after processChat returns (not by the orchestrator)
         onComplete: async (response) => sendEvent({ type: 'complete', response }),
         onError: async (error) => sendEvent({ type: 'error', error }),
         onToolUse: async (tool, input) => sendEvent({ type: 'tool_use', tool, input }),
