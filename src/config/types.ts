@@ -48,8 +48,7 @@ export interface Env {
   AUDIO_BUCKET: R2Bucket;
 
   // Durable Object bindings
-  USER_SESSION: DurableObjectNamespace;
-  USER_QUEUE: DurableObjectNamespace;
+  USER_DO: DurableObjectNamespace;
 }
 
 /**
