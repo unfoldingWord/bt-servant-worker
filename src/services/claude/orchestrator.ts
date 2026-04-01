@@ -311,6 +311,11 @@ function applyContentDelta(
 function finalizeToolInput(message: Anthropic.Message, index: number, logger: RequestLogger): void {
   const block = message.content[index];
   if (block?.type !== 'tool_use' || typeof block.input !== 'string') return;
+  // Empty string means no input_json_delta events arrived — tool has no input
+  if ((block.input as string).trim() === '') {
+    (block as { input: unknown }).input = {};
+    return;
+  }
   try {
     block.input = JSON.parse(block.input as string) as Record<string, unknown>;
   } catch (error) {
