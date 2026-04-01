@@ -85,6 +85,7 @@ interface OrchestratorOptions {
   modeContext?: ModeContext | undefined;
   audioContext?: AudioContext | undefined;
   clientId?: string | undefined;
+  groupContext?: { isGroupChat: boolean; currentSpeaker?: string } | undefined;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
 }
@@ -545,11 +546,20 @@ function createOrchestrationContext(
     systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues, {
       memoryTOC: options.memoryTOC,
       clientId: options.clientId,
+      groupContext: options.groupContext,
     }),
     tools: buildAllTools(catalog, {
       hasModes: (options.modeContext?.availableModes.length ?? 0) > 0,
     }),
-    messages: [...historyToMessages(history, llmMax), { role: 'user', content: userMessage }],
+    messages: [
+      ...historyToMessages(history, llmMax),
+      {
+        role: 'user',
+        content: options.groupContext?.currentSpeaker
+          ? `[${options.groupContext.currentSpeaker}]: ${userMessage}`
+          : userMessage,
+      },
+    ],
     responses: [],
     codeExecTimeout: config.codeExecTimeout,
     maxMcpCalls: config.maxMcpCalls,

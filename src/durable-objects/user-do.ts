@@ -731,6 +731,8 @@ export class UserDO {
         user_id: body.user_id,
         message_key: body.message_key,
         token: this.env.ENGINE_API_KEY,
+        ...(body.chat_id ? { chat_id: body.chat_id } : {}),
+        ...(body.thread_id ? { thread_id: body.thread_id } : {}),
       },
       logger
     );
@@ -755,12 +757,28 @@ export class UserDO {
   ): Promise<ChatResponse> {
     const ctx = { timing, logger, startTime: Date.now() };
     // prettier-ignore
-    logger.log('process_chat_start', { message_type: body.message_type, has_audio: !!body.audio_base64, has_callbacks: !!callbacks });
+    logger.log('process_chat_start', { message_type: body.message_type, has_audio: !!body.audio_base64, has_callbacks: !!callbacks, chat_type: body.chat_type ?? 'private' });
 
     const loaded = await this.loadChatContext(body, ctx, callbacks);
+
+    // Apply response_language_hint override for this request
+    const effectivePreferences = body.response_language_hint
+      ? { ...loaded.preferences, response_language: body.response_language_hint }
+      : loaded.preferences;
+
+    // Build group context for system prompt
+    const chatType = body.chat_type ?? 'private';
+    const isGroupChat = chatType === 'group' || chatType === 'supergroup';
+    const groupContext = isGroupChat
+      ? {
+          isGroupChat: true,
+          ...(body.speaker ? { currentSpeaker: body.speaker } : {}),
+        }
+      : undefined;
+
     const audioContext = this.buildAudioContext();
     // prettier-ignore
-    const orchOpts = this.buildOrchOpts(body, loaded.catalog, loaded.history, loaded.preferences, loaded.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, loaded.activeModeName, audioContext, logger, callbacks);
+    const orchOpts = this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, loaded.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, loaded.activeModeName, audioContext, logger, callbacks, groupContext);
 
     const responses = await this.tracedPhase(ctx, 'orchestration', () =>
       this.runOrchestration(loaded.messageText, orchOpts)
@@ -776,7 +794,7 @@ export class UserDO {
         responses,
         loaded.preferences,
         body._org_config ?? {},
-        { logger, audioKey }
+        { logger, audioKey, ...(body.speaker ? { speaker: body.speaker } : {}) }
       )
     );
 
@@ -785,7 +803,7 @@ export class UserDO {
     logger.log('process_chat_complete', { total_ms: Date.now() - ctx.startTime, response_count: responses.length, has_voice_audio: voiceAudioUrl !== null, voice_audio_key: audioKey, total_response_chars: responses.join('').length });
     return {
       responses,
-      response_language: loaded.preferences.response_language,
+      response_language: effectivePreferences.response_language,
       voice_audio_base64: null,
       voice_audio_url: voiceAudioUrl,
     };
@@ -957,9 +975,9 @@ export class UserDO {
     responses: string[],
     preferences: UserPreferencesInternal,
     orgConfig: OrgConfig,
-    opts: { logger: RequestLogger; audioKey?: string | null }
+    opts: { logger: RequestLogger; audioKey?: string | null; speaker?: string }
   ) {
-    const { logger, audioKey } = opts;
+    const { logger, audioKey, speaker } = opts;
     const startTime = Date.now();
     const storageMax = orgConfig.max_history_storage ?? DEFAULT_ORG_CONFIG.max_history_storage;
     await this.addHistoryEntry(
@@ -968,6 +986,7 @@ export class UserDO {
         assistant_response: responses.join('\n'),
         timestamp: Date.now(),
         ...(audioKey ? { voice_audio_key: audioKey } : {}),
+        ...(speaker ? { speaker } : {}),
       },
       storageMax
     );
@@ -1123,7 +1142,8 @@ export class UserDO {
     activeModeName: string | undefined,
     audioContext: AudioContext,
     logger: RequestLogger,
-    callbacks?: StreamCallbacks
+    callbacks?: StreamCallbacks,
+    groupContext?: { isGroupChat: boolean; currentSpeaker?: string }
   ): Parameters<typeof orchestrate>[1] {
     return {
       env: this.env,
@@ -1140,6 +1160,7 @@ export class UserDO {
       modeContext: this.buildModeContext(orgModes, activeModeName),
       audioContext,
       clientId: body.client_id,
+      groupContext,
       logger,
       callbacks,
     };

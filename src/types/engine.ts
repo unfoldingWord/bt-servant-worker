@@ -15,6 +15,9 @@ import { OrgModes, PromptOverrides } from './prompt-overrides.js';
  */
 export type ProgressMode = 'complete' | 'iteration' | 'periodic' | 'sentence';
 
+/** Chat type for routing. Defaults to 'private' when absent (backward compat). */
+export type ChatType = 'private' | 'group' | 'supergroup';
+
 export interface ChatRequest {
   client_id: string;
   user_id: string;
@@ -28,6 +31,21 @@ export interface ChatRequest {
   message_key?: string; // WhatsApp message identifier for correlation
   org?: string; // Organization for MCP server selection (defaults to DEFAULT_ORG)
   org_id?: string; // Alias for org (backward compat with whatsapp gateway)
+
+  /** Chat type. Defaults to 'private' when absent (backward compat). */
+  chat_type?: ChatType;
+
+  /** Group/supergroup chat ID. Required when chat_type is 'group' or 'supergroup'. */
+  chat_id?: string;
+
+  /** Display name of the person who sent the message (for group context). */
+  speaker?: string;
+
+  /** Telegram topic/thread ID within a supergroup. */
+  thread_id?: string;
+
+  /** Gateway-provided language hint. Overrides stored preference for this request. */
+  response_language_hint?: string;
 
   /** Internal: MCP servers injected by worker (not from client) */
   _mcp_servers?: MCPServerConfig[];
@@ -82,6 +100,8 @@ export interface ChatHistoryEntry {
   created_at?: string | null;
   /** R2 object key for the voice audio associated with this entry */
   voice_audio_key?: string | null;
+  /** Display name of the speaker (group chats only). */
+  speaker?: string;
 }
 
 /** History entry as returned by the API (includes computed fields). */
@@ -195,6 +215,10 @@ export interface ProgressCallback {
   message_key: string;
   text: string;
   timestamp: number;
+  /** Group/supergroup chat ID (present only for group chats). */
+  chat_id?: string;
+  /** Thread ID within a supergroup (present only for threaded chats). */
+  thread_id?: string;
 }
 
 /**
