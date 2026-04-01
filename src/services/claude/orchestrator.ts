@@ -134,8 +134,15 @@ function isGetToolDefinitionsInput(input: unknown): input is { tool_names: strin
   );
 }
 
+/** Anthropic API base URL */
+const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
+
+/** Anthropic API version header value */
+const ANTHROPIC_API_VERSION = '2023-06-01';
+
 interface OrchestrationContext {
   client: Anthropic;
+  apiKey: string;
   model: string;
   maxTokens: number;
   systemPrompt: string;
@@ -169,44 +176,179 @@ function extractTextResponses(content: Anthropic.ContentBlock[]): string[] {
   return texts;
 }
 
-/** Build the base params for the Anthropic Messages API. */
-function buildMessageParams(ctx: OrchestrationContext) {
-  return {
+/** Build the JSON request body for the Anthropic Messages API. */
+function buildMessageBody(ctx: OrchestrationContext, stream: boolean): string {
+  return JSON.stringify({
     model: ctx.model,
     max_tokens: ctx.maxTokens,
     system: ctx.systemPrompt,
     messages: ctx.messages,
     ...(ctx.tools.length > 0 ? { tools: ctx.tools } : {}),
-  };
+    stream,
+  });
 }
 
 /**
- * Call the Anthropic Messages API via the SDK.
+ * Call the Anthropic Messages API using raw fetch.
  *
- * The SDK's HTTP layer works correctly when called from a single Durable Object
- * (depth 2: Worker → DO → Anthropic). The previous raw fetch bypass was needed
- * only when DO-to-DO nesting caused Cloudflare error 1003 at depth 3.
+ * The Anthropic SDK's internal fetch triggers Cloudflare error 1003 when called
+ * from inside a Durable Object — even at depth 2 (Worker → DO → Anthropic).
+ * This appears to be a Cloudflare platform issue with SDK-managed fetch from DOs,
+ * not strictly a nesting problem. Raw globalThis.fetch works in all contexts.
  */
 async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message> {
   if (ctx.callbacks) {
     return streamClaudeResponse(ctx);
   }
 
-  return ctx.client.messages.create(buildMessageParams(ctx));
+  const response = await globalThis.fetch(ANTHROPIC_API_URL, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': ctx.apiKey,
+      'anthropic-version': ANTHROPIC_API_VERSION,
+    },
+    body: buildMessageBody(ctx, false),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => '(unreadable)');
+    throw new Anthropic.APIError(
+      response.status,
+      { message: errorText },
+      errorText,
+      response.headers
+    );
+  }
+
+  return (await response.json()) as Anthropic.Message;
 }
 
 async function streamClaudeResponse(ctx: OrchestrationContext): Promise<Anthropic.Message> {
-  const stream = ctx.client.messages.stream(buildMessageParams(ctx));
-
-  stream.on('text', (text) => {
-    notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress(text));
+  const response = await globalThis.fetch(ANTHROPIC_API_URL, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': ctx.apiKey,
+      'anthropic-version': ANTHROPIC_API_VERSION,
+    },
+    body: buildMessageBody(ctx, true),
   });
 
-  stream.on('error', (error) => {
-    ctx.logger.error('claude_stream_error', error);
-  });
+  if (!response.ok || !response.body) {
+    const errorText = await response.text().catch(() => '(unreadable)');
+    throw new Anthropic.APIError(
+      response.status,
+      { message: errorText },
+      errorText,
+      response.headers
+    );
+  }
 
-  return stream.finalMessage();
+  return parseSSEStream(response.body, ctx.logger, ctx.callbacks);
+}
+
+/** Parse an SSE stream from the Anthropic Messages API into a final Message. */
+async function parseSSEStream(
+  body: ReadableStream<Uint8Array>,
+  logger: RequestLogger,
+  callbacks?: StreamCallbacks
+): Promise<Anthropic.Message> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let message: Anthropic.Message | undefined;
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    const lines = buffer.split('\n');
+    buffer = lines.pop() ?? '';
+
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const data = line.slice(6).trim();
+      if (data === '[DONE]') continue;
+
+      let event: Anthropic.RawMessageStreamEvent;
+      try {
+        event = JSON.parse(data) as Anthropic.RawMessageStreamEvent;
+      } catch {
+        logger.warn('sse_parse_error', { data: data.slice(0, 200) });
+        continue;
+      }
+
+      message = applySSEEvent(message, event, logger, callbacks);
+    }
+  }
+
+  if (!message) {
+    throw new Error('Claude stream ended before producing a message');
+  }
+  return message;
+}
+
+function applyContentDelta(
+  message: Anthropic.Message,
+  event: Anthropic.RawContentBlockDeltaEvent,
+  logger: RequestLogger,
+  callbacks?: StreamCallbacks
+): void {
+  const block = message.content[event.index];
+  if (event.delta.type === 'text_delta' && block?.type === 'text') {
+    const text = event.delta.text;
+    block.text += text;
+    notifyCallback(logger, () => callbacks?.onProgress(text));
+  }
+  if (event.delta.type === 'input_json_delta' && block?.type === 'tool_use') {
+    const prev = typeof block.input === 'string' ? block.input : '';
+    (block as { input: string }).input = prev + event.delta.partial_json;
+  }
+}
+
+function finalizeToolInput(message: Anthropic.Message, index: number, logger: RequestLogger): void {
+  const block = message.content[index];
+  if (block?.type !== 'tool_use' || typeof block.input !== 'string') return;
+  try {
+    block.input = JSON.parse(block.input as string) as Record<string, unknown>;
+  } catch (error) {
+    logger.warn('tool_input_parse_error', {
+      index,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/** Apply a single SSE event to build up the final Message. */
+function applySSEEvent(
+  message: Anthropic.Message | undefined,
+  event: Anthropic.RawMessageStreamEvent,
+  logger: RequestLogger,
+  callbacks?: StreamCallbacks
+): Anthropic.Message {
+  if (event.type === 'message_start') return event.message;
+  if (!message) throw new Error(`Unexpected stream event before message_start: ${event.type}`);
+
+  if (event.type === 'message_delta') {
+    message.stop_reason = event.delta.stop_reason;
+    message.stop_sequence = event.delta.stop_sequence;
+    message.usage.output_tokens = event.usage.output_tokens;
+    return message;
+  }
+
+  if (event.type === 'content_block_start') {
+    const block = { ...event.content_block };
+    if (block.type === 'tool_use') (block as { input: unknown }).input = '';
+    message.content.push(block as Anthropic.ContentBlock);
+  } else if (event.type === 'content_block_delta') {
+    applyContentDelta(message, event, logger, callbacks);
+  } else if (event.type === 'content_block_stop') {
+    finalizeToolInput(message, event.index, logger);
+  }
+
+  return message;
 }
 
 /** Invoke a callback safely — catches both sync throws and async rejections. */
@@ -392,6 +534,7 @@ function createOrchestrationContext(
 
   return {
     client: new Anthropic({ apiKey: env.ANTHROPIC_API_KEY }),
+    apiKey: env.ANTHROPIC_API_KEY,
     model: config.model,
     maxTokens: config.maxTokens,
     systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues, {

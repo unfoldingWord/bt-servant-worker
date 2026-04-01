@@ -59,27 +59,42 @@ function createMockMessage(
   };
 }
 
-/** Create a mock MessageStream that emits text events and returns a final message. */
-function createMockStream(message: Anthropic.Message) {
-  const listeners: Record<string, ((...args: unknown[]) => void)[]> = {};
-  return {
-    on(event: string, handler: (...args: unknown[]) => void) {
-      if (!listeners[event]) listeners[event] = [];
-      listeners[event].push(handler);
-      return this;
-    },
-    async finalMessage() {
-      // Fire text events for any text content blocks
-      for (const block of message.content) {
-        if (block.type === 'text' && block.text) {
-          for (const handler of listeners['text'] ?? []) {
-            handler(block.text);
-          }
-        }
+/** Build SSE text from a Message for raw fetch mock. */
+function buildSSEBody(message: Anthropic.Message): string {
+  const lines: string[] = [];
+  lines.push(
+    `data: ${JSON.stringify({ type: 'message_start', message: { ...message, content: [] } })}\n`
+  );
+
+  message.content.forEach((block, index) => {
+    if (block.type === 'text') {
+      lines.push(
+        `data: ${JSON.stringify({ type: 'content_block_start', index, content_block: { type: 'text', text: '' } })}\n`
+      );
+      if (block.text) {
+        lines.push(
+          `data: ${JSON.stringify({ type: 'content_block_delta', index, delta: { type: 'text_delta', text: block.text } })}\n`
+        );
       }
-      return message;
-    },
-  };
+      lines.push(`data: ${JSON.stringify({ type: 'content_block_stop', index })}\n`);
+    }
+    if (block.type === 'tool_use') {
+      lines.push(
+        `data: ${JSON.stringify({ type: 'content_block_start', index, content_block: { type: 'tool_use', id: block.id, name: block.name, input: {} } })}\n`
+      );
+      lines.push(
+        `data: ${JSON.stringify({ type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: JSON.stringify(block.input) } })}\n`
+      );
+      lines.push(`data: ${JSON.stringify({ type: 'content_block_stop', index })}\n`);
+    }
+  });
+
+  lines.push(
+    `data: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: message.stop_reason, stop_sequence: message.stop_sequence }, usage: message.usage })}\n`
+  );
+  lines.push(`data: ${JSON.stringify({ type: 'message_stop' })}\n`);
+
+  return lines.join('\n');
 }
 
 function setupMultiIterationMock() {
@@ -97,15 +112,16 @@ function setupMultiIterationMock() {
     { type: 'text', text: 'Here is the answer' },
   ]);
 
-  (Anthropic as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
-    messages: {
-      stream: vi.fn(() => {
-        const isFirst = callCount === 0;
-        callCount++;
-        return createMockStream(isFirst ? firstMessage : secondMessage);
-      }),
-    },
-  }));
+  (Anthropic as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({}));
+
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+    const isFirst = callCount === 0;
+    callCount++;
+    return new Response(buildSSEBody(isFirst ? firstMessage : secondMessage), {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  });
 }
 
 function setupSingleIterationMock() {
@@ -113,11 +129,14 @@ function setupSingleIterationMock() {
     { type: 'text', text: 'Single response' },
   ]);
 
-  (Anthropic as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
-    messages: {
-      stream: vi.fn(() => createMockStream(message)),
-    },
-  }));
+  (Anthropic as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({}));
+
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+    return new Response(buildSSEBody(message), {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  });
 }
 
 describe('Orchestrator iteration separator - multi iteration', () => {
