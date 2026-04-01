@@ -17,8 +17,8 @@ describe('UserSession Durable Object', () => {
 
   beforeEach(() => {
     // Create a new Durable Object instance for each test
-    const id = env.USER_SESSION.newUniqueId();
-    stub = env.USER_SESSION.get(id);
+    const id = env.USER_DO.newUniqueId();
+    stub = env.USER_DO.get(id);
   });
 
   describe('GET /preferences', () => {
@@ -160,8 +160,8 @@ describe('UserSession chat validation', () => {
   let stub: DurableObjectStub;
 
   beforeEach(() => {
-    const id = env.USER_SESSION.newUniqueId();
-    stub = env.USER_SESSION.get(id);
+    const id = env.USER_DO.newUniqueId();
+    stub = env.USER_DO.get(id);
   });
 
   describe('POST /chat', () => {
@@ -208,8 +208,8 @@ describe('UserSession chat validation', () => {
 describe('UserSession user-scoped DO isolation', () => {
   it('different users have separate history', async () => {
     // Create two user-scoped DOs (same format as the worker uses)
-    const aliceStub = env.USER_SESSION.get(env.USER_SESSION.idFromName('user:test-org:alice'));
-    const bobStub = env.USER_SESSION.get(env.USER_SESSION.idFromName('user:test-org:bob'));
+    const aliceStub = env.USER_DO.get(env.USER_DO.idFromName('user:test-org:alice'));
+    const bobStub = env.USER_DO.get(env.USER_DO.idFromName('user:test-org:bob'));
 
     // Update Alice's preferences
     await aliceStub.fetch('http://fake-host/preferences', {
@@ -238,8 +238,8 @@ describe('UserSession user-scoped DO isolation', () => {
 
   it('users in different orgs are isolated', async () => {
     // Same user ID, different orgs
-    const org1Stub = env.USER_SESSION.get(env.USER_SESSION.idFromName('user:org1:alice'));
-    const org2Stub = env.USER_SESSION.get(env.USER_SESSION.idFromName('user:org2:alice'));
+    const org1Stub = env.USER_DO.get(env.USER_DO.idFromName('user:org1:alice'));
+    const org2Stub = env.USER_DO.get(env.USER_DO.idFromName('user:org2:alice'));
 
     // Update org1 alice's preferences
     await org1Stub.fetch('http://fake-host/preferences', {
@@ -259,8 +259,8 @@ describe('UserSession request serialization (429 lock)', () => {
   let stub: DurableObjectStub;
 
   beforeEach(() => {
-    const id = env.USER_SESSION.newUniqueId();
-    stub = env.USER_SESSION.get(id);
+    const id = env.USER_DO.newUniqueId();
+    stub = env.USER_DO.get(id);
   });
 
   it('lock is released after request completes (even on validation error)', async () => {
@@ -365,8 +365,8 @@ describe('UserSession real chat (requires ANTHROPIC_API_KEY)', () => {
   let stub: DurableObjectStub;
 
   beforeEach(() => {
-    const id = env.USER_SESSION.newUniqueId();
-    stub = env.USER_SESSION.get(id);
+    const id = env.USER_DO.newUniqueId();
+    stub = env.USER_DO.get(id);
   });
 
   // Check API key from miniflare bindings at runtime
