@@ -45,10 +45,12 @@ const AUDIO_GUIDANCE =
   'Call `request_audio` FIRST, before writing your text response. ' +
   'Your text response will then be automatically converted to speech.';
 
-const VOICE_RESPONSE_GUIDANCE =
-  '## Voice Response Mode (ACTIVE)\n\n' +
-  'The user sent a voice message and will hear your response as spoken audio. ' +
-  'Write your entire response for LISTENING, not reading:\n\n' +
+/**
+ * Core voice-friendly writing rules. Shared between the system prompt
+ * (voice-to-voice flow) and the request_audio tool result (text-to-audio flow).
+ */
+export const VOICE_WRITING_RULES =
+  'Write for LISTENING, not reading:\n' +
   '- Use natural, conversational language as if speaking to someone\n' +
   '- Do NOT use any markdown formatting — no bold, italic, headers, bullet lists, or code blocks\n' +
   '- Use verbal transitions ("First,", "Now,", "The key thing here is") instead of visual structure\n' +
@@ -58,6 +60,11 @@ const VOICE_RESPONSE_GUIDANCE =
   '- Summarize key points — oral learners benefit from brief repetition\n' +
   '- Keep your response concise — audio responses over two minutes feel long\n' +
   '- Do NOT narrate your actions (avoid "Let me look that up" or "I\'ll search for that") — just give the answer';
+
+const VOICE_RESPONSE_GUIDANCE =
+  '## Voice Response Mode (ACTIVE)\n\n' +
+  'The user sent a voice message and will hear your response as spoken audio. ' +
+  VOICE_WRITING_RULES;
 
 /** Build the client platform + client_instructions section. */
 function buildClientSection(clientId: string | undefined, clientInstructions: string): string {

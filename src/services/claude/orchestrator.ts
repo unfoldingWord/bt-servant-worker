@@ -45,6 +45,7 @@ import {
   GroupChatContext,
   historyToMessages,
   sanitizeSpeaker,
+  VOICE_WRITING_RULES,
 } from './system-prompt.js';
 import {
   buildAllTools,
@@ -792,7 +793,7 @@ function handleRequestAudio(ctx: OrchestrationContext): unknown {
   }
   ctx.audioContext.requestAudio();
   ctx.logger.log('request_audio_tool_called', { audioRequested: true });
-  return 'Audio response requested. Your text response will be converted to speech.';
+  return `Audio response requested. Your text response will be converted to speech. ${VOICE_WRITING_RULES}`;
 }
 
 function handleListModes(ctx: OrchestrationContext): unknown {
