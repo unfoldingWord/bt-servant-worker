@@ -154,19 +154,51 @@ function isClientError(error: unknown): boolean {
   );
 }
 
+/** Strip markdown formatting to produce clean text for TTS. */
+export function stripMarkdownForTts(text: string): string {
+  let result = text;
+  // Remove code blocks (must come before inline code)
+  result = result.replace(/```[\s\S]*?```/g, '');
+  // Remove headers: "## Title" → "Title"
+  result = result.replace(/^#{1,6}\s+/gm, '');
+  // Remove bold/italic markers: **text** → text, *text* → text
+  // Note: only strip asterisk-based markers; underscore-based markers are
+  // skipped to avoid corrupting snake_case identifiers like request_audio.
+  result = result.replace(/\*{1,3}(.+?)\*{1,3}/g, '$1');
+  // Remove inline code: `code` → code
+  result = result.replace(/`([^`]+)`/g, '$1');
+  // Remove image syntax: ![alt](url) → alt (must come before links)
+  result = result.replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1');
+  // Remove link syntax: [text](url) → text
+  result = result.replace(/\[([^\]]+)\]\([^)]+\)/g, '$1');
+  // Convert bullet/numbered list markers to plain text
+  result = result.replace(/^[\s]*[-*+]\s+/gm, '');
+  result = result.replace(/^[\s]*\d+\.\s+/gm, '');
+  // Remove blockquote markers: "> text" → "text"
+  result = result.replace(/^>\s?/gm, '');
+  // Remove horizontal rules
+  result = result.replace(/^[-*_]{3,}\s*$/gm, '');
+  // Collapse multiple blank lines into a single paragraph break
+  result = result.replace(/\n{3,}/g, '\n\n');
+  return result.trim();
+}
+
 /** Prepare input text, truncating if necessary, and log diagnostics. */
 function prepareInput(text: string, logger: RequestLogger) {
+  const cleaned = stripMarkdownForTts(text);
   const truncatedText =
-    text.length > MAX_TTS_INPUT_CHARS ? text.slice(0, MAX_TTS_INPUT_CHARS) : text;
+    cleaned.length > MAX_TTS_INPUT_CHARS ? cleaned.slice(0, MAX_TTS_INPUT_CHARS) : cleaned;
 
   logger.log('tts_start', {
-    input_chars: text.length,
-    truncated: text.length > MAX_TTS_INPUT_CHARS,
+    original_input_chars: text.length,
+    cleaned_input_chars: cleaned.length,
+    chars_stripped: text.length - cleaned.length,
+    truncated: cleaned.length > MAX_TTS_INPUT_CHARS,
     truncated_to_chars: truncatedText.length,
-    chars_dropped: text.length - truncatedText.length,
+    chars_dropped: cleaned.length - truncatedText.length,
     max_tts_input_chars: MAX_TTS_INPUT_CHARS,
-    text_preview_first_100: text.slice(0, 100),
-    text_preview_last_100: text.slice(-100),
+    text_preview_first_100: truncatedText.slice(0, 100),
+    text_preview_last_100: truncatedText.slice(-100),
   });
 
   return truncatedText;

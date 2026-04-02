@@ -91,6 +91,7 @@ interface OrchestratorOptions {
   audioContext?: AudioContext | undefined;
   clientId?: string | undefined;
   groupContext?: GroupChatContext | undefined;
+  isVoiceMessage?: boolean | undefined;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
 }
@@ -155,6 +156,8 @@ interface OrchestrationContext {
   tools: Anthropic.Tool[];
   messages: Anthropic.MessageParam[];
   responses: string[];
+  /** Index into responses[] where the most recent iteration's text begins. */
+  lastIterationStartIndex: number;
   codeExecTimeout: number;
   maxMcpCalls: number;
   maxMcpResponseSize: number;
@@ -166,6 +169,14 @@ interface OrchestrationContext {
   memoryStore: UserMemoryStore | undefined;
   modeContext: ModeContext | undefined;
   audioContext: AudioContext | undefined;
+}
+
+/** Result of an orchestration run. */
+export interface OrchestrationResult {
+  /** All text responses from all iterations (for display and history). */
+  responses: string[];
+  /** Index into responses[] where the final iteration's text begins. */
+  finalIterationStartIndex: number;
 }
 
 function extractToolCalls(content: Anthropic.ContentBlock[]): ToolUseBlock[] {
@@ -402,6 +413,7 @@ async function processIteration(ctx: OrchestrationContext, iteration: number): P
     duration_ms: duration,
   });
 
+  ctx.lastIterationStartIndex = ctx.responses.length;
   ctx.responses.push(...extractTextResponses(response.content));
 
   if (response.stop_reason === 'end_turn' || toolCalls.length === 0) {
@@ -552,6 +564,7 @@ function createOrchestrationContext(
       memoryTOC: options.memoryTOC,
       clientId: options.clientId,
       groupContext: options.groupContext,
+      isVoiceMessage: options.isVoiceMessage,
     }),
     tools: buildAllTools(catalog, {
       hasModes: (options.modeContext?.availableModes.length ?? 0) > 0,
@@ -566,6 +579,7 @@ function createOrchestrationContext(
       },
     ],
     responses: [],
+    lastIterationStartIndex: 0,
     codeExecTimeout: config.codeExecTimeout,
     maxMcpCalls: config.maxMcpCalls,
     maxMcpResponseSize: config.maxMcpResponseSize,
@@ -636,7 +650,7 @@ function handleOrchestrationError(error: unknown, logger: RequestLogger): never 
 export async function orchestrate(
   userMessage: string,
   options: OrchestratorOptions
-): Promise<string[]> {
+): Promise<OrchestrationResult> {
   const config = parseEnvConfig(options.env, options.logger);
   const ctx = createOrchestrationContext(userMessage, options, config);
 
@@ -648,7 +662,10 @@ export async function orchestrate(
     handleOrchestrationError(error, ctx.logger);
   }
 
-  return ctx.responses;
+  return {
+    responses: ctx.responses,
+    finalIterationStartIndex: ctx.lastIterationStartIndex,
+  };
 }
 
 async function executeToolCalls(

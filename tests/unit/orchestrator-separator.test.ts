@@ -160,6 +160,20 @@ describe('Orchestrator iteration separator - multi iteration', () => {
     expect(progressChunks.filter((c) => c === '\n').length).toBe(1);
     expect(progressChunks.filter((c) => c === '\n\n').length).toBe(0);
   });
+
+  it('sets finalIterationStartIndex to 1 for multi-iteration', async () => {
+    setupMultiIterationMock();
+    const result = await orchestrate('test message', {
+      env: createMockEnv(),
+      catalog: createMockCatalog(),
+      history: [],
+      preferences: { response_language: 'en', first_interaction: true },
+      logger: createMockLogger(),
+      callbacks: createMockCallbacks(progressChunks),
+    });
+    expect(result.finalIterationStartIndex).toBe(1);
+    expect(result.responses.slice(result.finalIterationStartIndex)).toEqual(['Here is the answer']);
+  });
 });
 
 describe('Orchestrator iteration separator - single iteration', () => {
@@ -181,5 +195,19 @@ describe('Orchestrator iteration separator - single iteration', () => {
       callbacks: createMockCallbacks(progressChunks),
     });
     expect(progressChunks.filter((c) => c === '\n').length).toBe(0);
+  });
+
+  it('sets finalIterationStartIndex to 0 for single-iteration', async () => {
+    setupSingleIterationMock();
+    const result = await orchestrate('test message', {
+      env: createMockEnv(),
+      catalog: createMockCatalog(),
+      history: [],
+      preferences: { response_language: 'en', first_interaction: true },
+      logger: createMockLogger(),
+      callbacks: createMockCallbacks(progressChunks),
+    });
+    expect(result.finalIterationStartIndex).toBe(0);
+    expect(result.responses).toEqual(['Single response']);
   });
 });
