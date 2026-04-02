@@ -291,7 +291,7 @@ describe('synthesizeSpeech - error handling', () => {
 
 // ─── Markdown Stripping Tests ───────────────────────────────────────────────
 
-describe('stripMarkdownForTts', () => {
+describe('stripMarkdownForTts - inline formatting', () => {
   it('removes headers', () => {
     expect(stripMarkdownForTts('## Hello World')).toBe('Hello World');
     expect(stripMarkdownForTts('# Title\nBody')).toBe('Title\nBody');
@@ -302,6 +302,11 @@ describe('stripMarkdownForTts', () => {
     expect(stripMarkdownForTts('This is **bold** text')).toBe('This is bold text');
     expect(stripMarkdownForTts('This is *italic* text')).toBe('This is italic text');
     expect(stripMarkdownForTts('This is ***bold italic***')).toBe('This is bold italic');
+  });
+
+  it('preserves snake_case identifiers', () => {
+    expect(stripMarkdownForTts('Use the request_audio tool')).toBe('Use the request_audio tool');
+    expect(stripMarkdownForTts('some_variable_name is set')).toBe('some_variable_name is set');
   });
 
   it('removes inline code backticks', () => {
@@ -319,7 +324,9 @@ describe('stripMarkdownForTts', () => {
   it('converts images to alt text', () => {
     expect(stripMarkdownForTts('![A photo](https://example.com/img.png)')).toBe('A photo');
   });
+});
 
+describe('stripMarkdownForTts - block formatting', () => {
   it('removes bullet list markers', () => {
     expect(stripMarkdownForTts('- Item one\n- Item two')).toBe('Item one\nItem two');
     expect(stripMarkdownForTts('* Item one\n* Item two')).toBe('Item one\nItem two');
@@ -327,6 +334,13 @@ describe('stripMarkdownForTts', () => {
 
   it('removes numbered list markers', () => {
     expect(stripMarkdownForTts('1. First\n2. Second')).toBe('First\nSecond');
+  });
+
+  it('removes blockquote markers', () => {
+    expect(stripMarkdownForTts('> In the beginning God created')).toBe(
+      'In the beginning God created'
+    );
+    expect(stripMarkdownForTts('> Line one\n> Line two')).toBe('Line one\nLine two');
   });
 
   it('removes horizontal rules', () => {

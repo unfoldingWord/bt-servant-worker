@@ -162,8 +162,9 @@ export function stripMarkdownForTts(text: string): string {
   // Remove headers: "## Title" → "Title"
   result = result.replace(/^#{1,6}\s+/gm, '');
   // Remove bold/italic markers: **text** → text, *text* → text
+  // Note: only strip asterisk-based markers; underscore-based markers are
+  // skipped to avoid corrupting snake_case identifiers like request_audio.
   result = result.replace(/\*{1,3}(.+?)\*{1,3}/g, '$1');
-  result = result.replace(/_{1,3}(.+?)_{1,3}/g, '$1');
   // Remove inline code: `code` → code
   result = result.replace(/`([^`]+)`/g, '$1');
   // Remove image syntax: ![alt](url) → alt (must come before links)
@@ -173,6 +174,8 @@ export function stripMarkdownForTts(text: string): string {
   // Convert bullet/numbered list markers to plain text
   result = result.replace(/^[\s]*[-*+]\s+/gm, '');
   result = result.replace(/^[\s]*\d+\.\s+/gm, '');
+  // Remove blockquote markers: "> text" → "text"
+  result = result.replace(/^>\s?/gm, '');
   // Remove horizontal rules
   result = result.replace(/^[-*_]{3,}\s*$/gm, '');
   // Collapse multiple blank lines into a single paragraph break

@@ -1023,7 +1023,7 @@ export class UserDO {
   ): Promise<{ audioKey: string } | null> {
     const ttsFlowStart = Date.now();
     const shouldGenerate = body.message_type === 'audio' || audioContext.audioRequested;
-    const combinedText = responses.join('\n');
+    const combinedText = responses.join('\n\n');
     const org = body.org ?? this.env.DEFAULT_ORG;
     const userId = body.user_id;
     logger.log('audio_flow_tts_decision', {
