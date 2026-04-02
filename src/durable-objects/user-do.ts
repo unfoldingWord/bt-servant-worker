@@ -15,7 +15,7 @@
 
 import { Hono } from 'hono';
 import { Env } from '../config/types.js';
-import { GroupChatContext, orchestrate } from '../services/claude/index.js';
+import { GroupChatContext, orchestrate, OrchestrationResult } from '../services/claude/index.js';
 import { formatTOCForPrompt, JsonMemoryStore } from '../services/memory/index.js';
 import { buildToolCatalog, discoverAllTools } from '../services/mcp/index.js';
 import { MCPServerConfig } from '../services/mcp/types.js';
@@ -780,11 +780,14 @@ export class UserDO {
     // prettier-ignore
     const orchOpts = this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, loaded.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, loaded.activeModeName, audioContext, logger, callbacks, groupContext);
 
-    const responses = await this.tracedPhase(ctx, 'orchestration', () =>
+    const orchResult = await this.tracedPhase(ctx, 'orchestration', () =>
       this.runOrchestration(loaded.messageText, orchOpts)
     );
+    const { responses } = orchResult;
+    const ttsResponses = this.extractTtsResponses(orchResult, logger);
+
     const voiceAudio = await this.tracedPhase(ctx, 'audio_generation', () =>
-      this.maybeGenerateAudio(body, audioContext, responses, logger, callbacks)
+      this.maybeGenerateAudio(body, audioContext, ttsResponses, logger, callbacks)
     );
     const audioKey = voiceAudio?.audioKey ?? null;
 
@@ -998,6 +1001,19 @@ export class UserDO {
 
   // ── Audio ─────────────────────────────────────────────────────────────────────
 
+  /** Extract only the final iteration's text for TTS (skip intermediate narration). */
+  private extractTtsResponses(orchResult: OrchestrationResult, logger: RequestLogger): string[] {
+    const { responses, finalIterationStartIndex } = orchResult;
+    const ttsResponses = responses.slice(finalIterationStartIndex);
+    logger.log('audio_flow_tts_filter', {
+      total_responses: responses.length,
+      final_iteration_start: finalIterationStartIndex,
+      tts_responses: ttsResponses.length,
+      filtered_out: responses.length - ttsResponses.length,
+    });
+    return ttsResponses;
+  }
+
   private async maybeGenerateAudio(
     body: ChatRequest,
     audioContext: AudioContext,
@@ -1065,7 +1081,7 @@ export class UserDO {
     callbacks?: StreamCallbacks
   ): Promise<{ audioKey: string } | null> {
     const genStart = Date.now();
-    const combinedText = responses.join('\n');
+    const combinedText = responses.join('\n\n');
     logger.log('audio_flow_generate_voice_start', {
       response_count: responses.length,
       combined_text_chars: combinedText.length,
@@ -1119,14 +1135,14 @@ export class UserDO {
   private async runOrchestration(
     messageText: string,
     options: Parameters<typeof orchestrate>[1]
-  ): Promise<string[]> {
+  ): Promise<OrchestrationResult> {
     const startTime = Date.now();
-    const responses = await orchestrate(messageText, options);
+    const result = await orchestrate(messageText, options);
     options.logger.log('phase_orchestration_complete', {
-      response_count: responses.length,
+      response_count: result.responses.length,
       duration_ms: Date.now() - startTime,
     });
-    return responses;
+    return result;
   }
 
   // eslint-disable-next-line max-params -- opts builder, all params are necessary context
@@ -1161,6 +1177,7 @@ export class UserDO {
       audioContext,
       clientId: body.client_id,
       groupContext,
+      isVoiceMessage: body.message_type === 'audio',
       logger,
       callbacks,
     };

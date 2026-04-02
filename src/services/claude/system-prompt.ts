@@ -25,6 +25,7 @@ interface SystemPromptOptions {
   memoryTOC?: string | undefined;
   clientId?: string | undefined;
   groupContext?: GroupChatContext | undefined;
+  isVoiceMessage?: boolean | undefined;
 }
 
 /** Max length for speaker names (prevents prompt bloat). */
@@ -43,6 +44,20 @@ const AUDIO_GUIDANCE =
   '- The user explicitly requests audio, voice, or spoken output\n\n' +
   'Call `request_audio` FIRST, before writing your text response. ' +
   'Your text response will then be automatically converted to speech.';
+
+const VOICE_RESPONSE_GUIDANCE =
+  '## Voice Response Mode (ACTIVE)\n\n' +
+  'The user sent a voice message and will hear your response as spoken audio. ' +
+  'Write your entire response for LISTENING, not reading:\n\n' +
+  '- Use natural, conversational language as if speaking to someone\n' +
+  '- Do NOT use any markdown formatting — no bold, italic, headers, bullet lists, or code blocks\n' +
+  '- Use verbal transitions ("First,", "Now,", "The key thing here is") instead of visual structure\n' +
+  '- Keep sentences short and clear — a listener cannot re-read a confusing sentence\n' +
+  '- Spell out abbreviations and reference notations that would sound awkward spoken aloud\n' +
+  '- For scripture references, say the full book name naturally ("Genesis chapter one, verse one") rather than shorthand\n' +
+  '- Summarize key points — oral learners benefit from brief repetition\n' +
+  '- Keep your response concise — audio responses over two minutes feel long\n' +
+  '- Do NOT narrate your actions (avoid "Let me look that up" or "I\'ll search for that") — just give the answer';
 
 /** Build the client platform + client_instructions section. */
 function buildClientSection(clientId: string | undefined, clientInstructions: string): string {
@@ -124,6 +139,9 @@ export function buildSystemPrompt(
   sections.push(resolvedPromptValues.memory_instructions);
   if (memoryTOC) sections.push(memoryTOC);
   sections.push(AUDIO_GUIDANCE);
+  if (options?.isVoiceMessage) {
+    sections.push(VOICE_RESPONSE_GUIDANCE);
+  }
   sections.push(...buildConditionalSections(preferences, history));
   sections.push(resolvedPromptValues.closing);
 

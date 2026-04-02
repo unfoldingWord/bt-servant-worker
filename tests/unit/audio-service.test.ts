@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { transcribeAudio } from '../../src/services/audio/cloudflare-stt.js';
-import { synthesizeSpeech } from '../../src/services/audio/openai-tts.js';
+import { stripMarkdownForTts, synthesizeSpeech } from '../../src/services/audio/openai-tts.js';
 import { AudioTranscriptionError, AudioSynthesisError } from '../../src/utils/errors.js';
 import {
   MAX_AUDIO_SIZE_BYTES,
@@ -286,5 +286,64 @@ describe('synthesizeSpeech - error handling', () => {
   it('preserves AudioSynthesisError thrown internally', async () => {
     mockSpeechCreate.mockRejectedValue(new AudioSynthesisError('Custom error'));
     await expect(synthesizeSpeech('test-key', 'Hello', logger)).rejects.toThrow('Custom error');
+  });
+});
+
+// ─── Markdown Stripping Tests ───────────────────────────────────────────────
+
+describe('stripMarkdownForTts', () => {
+  it('removes headers', () => {
+    expect(stripMarkdownForTts('## Hello World')).toBe('Hello World');
+    expect(stripMarkdownForTts('# Title\nBody')).toBe('Title\nBody');
+    expect(stripMarkdownForTts('### Deep header')).toBe('Deep header');
+  });
+
+  it('removes bold and italic markers', () => {
+    expect(stripMarkdownForTts('This is **bold** text')).toBe('This is bold text');
+    expect(stripMarkdownForTts('This is *italic* text')).toBe('This is italic text');
+    expect(stripMarkdownForTts('This is ***bold italic***')).toBe('This is bold italic');
+  });
+
+  it('removes inline code backticks', () => {
+    expect(stripMarkdownForTts('Use the `request_audio` tool')).toBe('Use the request_audio tool');
+  });
+
+  it('removes code blocks', () => {
+    expect(stripMarkdownForTts('Before\n```\ncode here\n```\nAfter')).toBe('Before\n\nAfter');
+  });
+
+  it('converts links to plain text', () => {
+    expect(stripMarkdownForTts('See [this page](https://example.com)')).toBe('See this page');
+  });
+
+  it('converts images to alt text', () => {
+    expect(stripMarkdownForTts('![A photo](https://example.com/img.png)')).toBe('A photo');
+  });
+
+  it('removes bullet list markers', () => {
+    expect(stripMarkdownForTts('- Item one\n- Item two')).toBe('Item one\nItem two');
+    expect(stripMarkdownForTts('* Item one\n* Item two')).toBe('Item one\nItem two');
+  });
+
+  it('removes numbered list markers', () => {
+    expect(stripMarkdownForTts('1. First\n2. Second')).toBe('First\nSecond');
+  });
+
+  it('removes horizontal rules', () => {
+    expect(stripMarkdownForTts('Above\n---\nBelow')).toBe('Above\n\nBelow');
+  });
+
+  it('collapses excessive blank lines', () => {
+    expect(stripMarkdownForTts('A\n\n\n\nB')).toBe('A\n\nB');
+  });
+
+  it('passes through plain text unchanged', () => {
+    expect(stripMarkdownForTts('Hello world, this is plain text.')).toBe(
+      'Hello world, this is plain text.'
+    );
+  });
+
+  it('handles empty string', () => {
+    expect(stripMarkdownForTts('')).toBe('');
   });
 });

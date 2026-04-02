@@ -238,6 +238,57 @@ describe('buildSystemPrompt - client platform with clientId', () => {
   });
 });
 
+describe('buildSystemPrompt - voice response mode', () => {
+  it('includes voice response guidance when isVoiceMessage is true', () => {
+    const prompt = buildSystemPrompt(
+      createEmptyCatalog(),
+      defaultPrefs,
+      [],
+      DEFAULT_PROMPT_VALUES,
+      {
+        isVoiceMessage: true,
+      }
+    );
+    expect(prompt).toContain('## Voice Response Mode (ACTIVE)');
+    expect(prompt).toContain('Write your entire response for LISTENING');
+  });
+
+  it('excludes voice response guidance when isVoiceMessage is false', () => {
+    const prompt = buildSystemPrompt(
+      createEmptyCatalog(),
+      defaultPrefs,
+      [],
+      DEFAULT_PROMPT_VALUES,
+      {
+        isVoiceMessage: false,
+      }
+    );
+    expect(prompt).not.toContain('## Voice Response Mode (ACTIVE)');
+  });
+
+  it('excludes voice response guidance when isVoiceMessage is undefined', () => {
+    const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
+    expect(prompt).not.toContain('## Voice Response Mode (ACTIVE)');
+  });
+
+  it('voice guidance appears after audio guidance and before closing', () => {
+    const prompt = buildSystemPrompt(
+      createEmptyCatalog(),
+      defaultPrefs,
+      [],
+      DEFAULT_PROMPT_VALUES,
+      {
+        isVoiceMessage: true,
+      }
+    );
+    const audioIdx = prompt.indexOf('## Audio Response (IMPORTANT)');
+    const voiceIdx = prompt.indexOf('## Voice Response Mode (ACTIVE)');
+    const closingIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.closing);
+    expect(audioIdx).toBeLessThan(voiceIdx);
+    expect(voiceIdx).toBeLessThan(closingIdx);
+  });
+});
+
 describe('buildSystemPrompt - client_instructions without clientId', () => {
   it('includes client_instructions without Client Platform header when clientId is omitted', () => {
     const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
