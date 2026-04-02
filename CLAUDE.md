@@ -242,27 +242,37 @@ bt-servant-worker is a Cloudflare Worker that integrates with bt-servant-engine.
 
 ## CRITICAL: Version Bumping
 
-**After every merge to main, you MUST bump the version.** This is non-negotiable.
+**Every PR MUST include a version bump.** This is non-negotiable.
 
 The version in `package.json` is the single source of truth. A `version` lifecycle hook in `package.json` runs `scripts/generate-version.mjs` to regenerate `src/generated/version.ts` and stage it automatically.
 
 ### Process
 
-1. After merging a PR to main, bump the version on main:
-   - **Patch** (`pnpm version patch`): bug fixes, documentation changes, minor tweaks
-   - **Minor** (`pnpm version minor`): new features, new endpoints, behavioral changes
-2. `pnpm version` automatically:
+1. Before the final push on a feature branch, bump the version:
+   - **Patch** (`pnpm version patch --no-git-tag-version`): bug fixes, documentation changes, minor tweaks
+   - **Minor** (`pnpm version minor --no-git-tag-version`): new features, new endpoints, behavioral changes
+2. `pnpm version --no-git-tag-version` automatically:
    - Updates `package.json`
-   - Regenerates `src/generated/version.ts`
-   - Stages both files
-   - Creates a git commit and tag
-3. Push the version commit and tag: `git push && git push --tags`
-4. The new version flows to the health endpoint and `{{version}}` template variables
+   - Regenerates `src/generated/version.ts` (via the `version` lifecycle hook)
+3. Commit the version bump files (`package.json` and `src/generated/version.ts`) as part of the PR
+4. After the PR is merged to main, tag the release on main:
+   - `git checkout main && git pull`
+   - `git tag v<version>` (e.g., `git tag v2.12.1`)
+   - `git push --tags`
+5. The new version flows to the health endpoint and `{{version}}` template variables
+
+### Why bump in the branch, not on main?
+
+- The version change is reviewed alongside the code
+- One merge = one atomic unit of work
+- No risk of forgetting the bump after merge
+- CI validates the version change
 
 ### Important
 
 - Do NOT manually edit `src/generated/version.ts` — it is auto-generated
-- Always bump version on main, not on feature branches
+- Use `--no-git-tag-version` on branches to avoid creating tags before merge
+- Tags are created on main after merge to point at the actual merged commit
 
 ## What to Do After a Push
 
