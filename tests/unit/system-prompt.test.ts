@@ -250,7 +250,7 @@ describe('buildSystemPrompt - voice response mode', () => {
       }
     );
     expect(prompt).toContain('## Voice Response Mode (ACTIVE)');
-    expect(prompt).toContain('Write your entire response for LISTENING');
+    expect(prompt).toContain('Write for LISTENING');
   });
 
   it('excludes voice response guidance when isVoiceMessage is false', () => {

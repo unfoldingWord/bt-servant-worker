@@ -45,6 +45,7 @@ import {
   GroupChatContext,
   historyToMessages,
   sanitizeSpeaker,
+  VOICE_WRITING_RULES,
 } from './system-prompt.js';
 import {
   buildAllTools,
@@ -792,14 +793,7 @@ function handleRequestAudio(ctx: OrchestrationContext): unknown {
   }
   ctx.audioContext.requestAudio();
   ctx.logger.log('request_audio_tool_called', { audioRequested: true });
-  return (
-    'Audio response requested. Your text response will be converted to speech. ' +
-    'Write your response for LISTENING, not reading: use natural conversational language, ' +
-    'no markdown formatting (no bold, headers, bullet lists, code blocks), ' +
-    'verbal transitions instead of visual structure, short clear sentences. ' +
-    'For scripture references, say the full book name naturally. ' +
-    'Do not narrate your actions — just give the answer.'
-  );
+  return `Audio response requested. Your text response will be converted to speech. ${VOICE_WRITING_RULES}`;
 }
 
 function handleListModes(ctx: OrchestrationContext): unknown {
