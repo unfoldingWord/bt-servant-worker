@@ -287,6 +287,17 @@ interface CallbackPayload {
 }
 ```
 
+#### Progress modes
+
+The `progress_mode` field on the request body controls which events the worker sends to your webhook. Errors always fire regardless of mode.
+
+| Mode        | Events delivered                                                      | Use case                                                                                                                   |
+| ----------- | --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `complete`  | **Only** the final `complete` event                                   | Clean "one request, one delivery" — Telegram gateways, anywhere intermediate updates would be noise in a user-facing chat. |
+| `iteration` | `status` + per-orchestration-iteration `progress` deltas + `complete` | Default. Good for gateways that surface a "typing" indicator and can display partial text.                                 |
+| `periodic`  | `status` + accumulated `progress` every N seconds + `complete`        | Rate-limited intermediate updates on a fixed cadence. `progress_throttle_seconds` controls N.                              |
+| `sentence`  | `status` + `progress` per complete sentence + `complete`              | Natural streaming where partial text only surfaces at sentence boundaries.                                                 |
+
 ### Error Codes
 
 All error responses follow a standard format:

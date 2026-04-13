@@ -708,6 +708,59 @@ describe('createWebhookCallbacks complete mode and cleanup', () => {
   });
 });
 
+describe('createWebhookCallbacks status event gating by mode', () => {
+  beforeEach(setupMocks);
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('complete mode suppresses status events (only complete fires)', async () => {
+    const sender = new ProgressCallbackSender(mockConfig);
+    const callbacks = createWebhookCallbacks(sender, testLogger, { mode: 'complete' });
+
+    // Simulate the orchestrator firing a status event at the start of processing.
+    callbacks.onStatus('Processing your request...');
+    await vi.runAllTimersAsync();
+
+    // Status must NOT have hit the webhook — it's noise when the caller asked
+    // for completion-only delivery.
+    expect(fetch).not.toHaveBeenCalled();
+
+    // The final completion should still land.
+    callbacks.onComplete({
+      responses: ['Final response'],
+      response_language: 'en',
+      voice_audio_base64: null,
+    });
+    await vi.runAllTimersAsync();
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledWith(
+      mockConfig.url,
+      expect.objectContaining({
+        body: expect.stringContaining('"type":"complete"'),
+      })
+    );
+  });
+
+  it('iteration mode still forwards status events', async () => {
+    const sender = new ProgressCallbackSender(mockConfig);
+    const callbacks = createWebhookCallbacks(sender, testLogger, { mode: 'iteration' });
+
+    callbacks.onStatus('Processing your request...');
+    await vi.runAllTimersAsync();
+
+    // Non-complete modes keep the status signal for clients that want it.
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledWith(
+      mockConfig.url,
+      expect.objectContaining({
+        body: expect.stringContaining('"type":"status"'),
+      })
+    );
+  });
+});
+
 describe('Progress mode constants', () => {
   it('exports correct default values', () => {
     expect(DEFAULT_PROGRESS_MODE).toBe('iteration');

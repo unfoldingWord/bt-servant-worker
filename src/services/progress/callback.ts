@@ -309,6 +309,11 @@ export function createWebhookCallbacks(
 
   const callbacks: StreamCallbacks = {
     onStatus: (message) => {
+      // In 'complete' mode the caller only wants the final completion event.
+      // The synchronous 202 response has already signaled "request received",
+      // so a status webhook POST would be noise. Matches the docs on
+      // ProgressMode.'complete' ("Legacy behavior - only send on completion").
+      if (mode === 'complete') return;
       runSafe(logger, 'webhook_status_failed', () => sender.sendStatus(message));
     },
     onProgress: (text) => {
