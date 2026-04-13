@@ -11,7 +11,7 @@ import { APP_VERSION } from './generated/version.js';
 import { UserDO } from './durable-objects/index.js';
 import { discoverAllTools } from './services/mcp/index.js';
 import { MCPServerConfig } from './services/mcp/types.js';
-import { ChatRequest, ChatType } from './types/engine.js';
+import { ChatRequest, ChatTransport, ChatType } from './types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig, validateOrgConfig } from './types/org-config.js';
 import {
   DEFAULT_PROMPT_VALUES,
@@ -36,6 +36,10 @@ import {
   validateServerId,
 } from './utils/mcp-validation.js';
 import { resolveOrgFromBody } from './utils/org.js';
+import { validateChatBody } from './utils/chat-validation.js';
+
+// Re-export so tests and consumers can import from './src/index.js'
+export { validateChatBody };
 
 export { UserDO };
 
@@ -60,9 +64,24 @@ app.use('/api/*', async (c, next) => {
   return next();
 });
 
-// Unified chat endpoint — routes all chat to UserDO
+// Chat endpoints — explicit transport per route.
+//
+// - POST /api/v1/chat           → legacy body-dispatch (SSE by default, callback
+//                                  if progress_callback_url is present). Will
+//                                  become final-only JSON in v2.14.0.
+// - POST /api/v1/chat/stream    → SSE streaming only.
+// - POST /api/v1/chat/callback  → 202 + webhook delivery; requires
+//                                  progress_callback_url and message_key.
 app.post('/api/v1/chat', async (c) => {
-  return handleChatRequest(c.req.raw, c.env);
+  return handleChatRequest(c.req.raw, c.env, 'legacy');
+});
+
+app.post('/api/v1/chat/stream', async (c) => {
+  return handleChatRequest(c.req.raw, c.env, 'stream');
+});
+
+app.post('/api/v1/chat/callback', async (c) => {
+  return handleChatRequest(c.req.raw, c.env, 'callback');
 });
 
 // User endpoints with org scope (new paths)
@@ -801,7 +820,17 @@ async function readAllOrgKV(env: Env, org: string, logger: ReturnType<typeof cre
   ]);
 }
 
-const VALID_CHAT_TYPES: ReadonlySet<string> = new Set(['private', 'group', 'supergroup']);
+/** DO internal pathname for each chat transport. */
+function doChatPathForTransport(transport: ChatTransport): string {
+  switch (transport) {
+    case 'legacy':
+      return '/chat';
+    case 'stream':
+      return '/chat/stream';
+    case 'callback':
+      return '/chat/callback';
+  }
+}
 
 /** Max length for chat_id and thread_id path parameters. */
 const MAX_CHAT_ID_LENGTH = 256;
@@ -849,11 +878,12 @@ async function buildDOChatRequest(
   opts: {
     body: ChatRequest;
     org: string;
+    transport: ChatTransport;
     logger: ReturnType<typeof createRequestLogger>;
     requestId?: string;
   }
 ): Promise<{ stub: DurableObjectStub; doRequest: Request }> {
-  const { body, org, logger } = opts;
+  const { body, org, transport, logger } = opts;
 
   const [mcpServers, orgConfig, promptOverrides, orgModes] = await readAllOrgKV(env, org, logger);
 
@@ -862,12 +892,13 @@ async function buildDOChatRequest(
 
   logger.log('do_routed', {
     do_id: doId.toString(),
+    transport,
     mcp_server_count: mcpServers.length,
     org_config: orgConfig,
   });
 
   const doUrl = new URL(request.url);
-  doUrl.pathname = '/chat';
+  doUrl.pathname = doChatPathForTransport(transport);
 
   const headers = new Headers(request.headers);
   if (opts.requestId) {
@@ -891,51 +922,41 @@ async function buildDOChatRequest(
   return { stub, doRequest };
 }
 
-/** Validate an optional ISO 639-1 language code. */
-function validateLanguageHint(hint: unknown): string | null {
-  if (hint === undefined) return null;
-  if (typeof hint !== 'string' || !/^[a-z]{2}$/.test(hint)) {
-    return 'response_language_hint must be a valid ISO 639-1 language code (2 lowercase letters)';
-  }
-  return null;
-}
-
-/** Validate chat request fields, returning an error string or null if valid. */
-function validateChatBody(body: ChatRequest): string | null {
-  if (!body.user_id) return 'user_id is required';
-  if (!body.client_id) return 'client_id is required';
-  if (body.chat_type && !VALID_CHAT_TYPES.has(body.chat_type)) {
-    return `Invalid chat_type: ${body.chat_type}. Must be one of: private, group, supergroup`;
-  }
-  const isGroup = body.chat_type === 'group' || body.chat_type === 'supergroup';
-  if (isGroup && !body.chat_id) return 'chat_id is required for group/supergroup chats';
-  return validateLanguageHint(body.response_language_hint);
-}
-
-async function handleChatRequest(request: Request, env: Env): Promise<Response> {
+async function handleChatRequest(
+  request: Request,
+  env: Env,
+  transport: ChatTransport
+): Promise<Response> {
   const requestId = crypto.randomUUID();
   const logger = createRequestLogger(requestId);
   const timing = createTimingContext();
 
   try {
     const body = (await request.clone().json()) as ChatRequest;
-    const validationError = validateChatBody(body);
+    const validationError = validateChatBody(body, transport);
     if (validationError) {
+      logger.warn('chat_validation_failed', {
+        transport,
+        error: validationError,
+        user_id: body.user_id,
+        client_id: body.client_id,
+      });
       return Response.json({ error: validationError }, { status: 400 });
     }
 
     const org = resolveOrgFromBody(body, env.DEFAULT_ORG);
     // prettier-ignore
-    logger.log('request_received', { user_id: body.user_id, client_id: body.client_id, org, chat_type: body.chat_type ?? 'private', chat_id: body.chat_id, thread_id: body.thread_id });
+    logger.log('request_received', { user_id: body.user_id, client_id: body.client_id, org, transport, chat_type: body.chat_type ?? 'private', chat_id: body.chat_id, thread_id: body.thread_id });
 
     const { stub, doRequest } = await timePhase(timing, 'kv_and_routing', () =>
-      buildDOChatRequest(request, env, { body, org, logger, requestId })
+      buildDOChatRequest(request, env, { body, org, transport, logger, requestId })
     );
     const response = await timePhase(timing, 'do_fetch', () => stub.fetch(doRequest));
 
     logger.log('request_timing_summary', {
       user_id: body.user_id,
       org,
+      transport,
       total_ms: Date.now() - timing.start,
       phases: timing.phases,
     });
@@ -943,6 +964,7 @@ async function handleChatRequest(request: Request, env: Env): Promise<Response> 
     return response;
   } catch (error) {
     logger.error('request_error', error, {
+      transport,
       total_ms: Date.now() - timing.start,
       phases: timing.phases,
     });
