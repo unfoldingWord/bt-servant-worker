@@ -119,8 +119,8 @@ Authorization: Bearer <ENGINE_API_KEY or org-specific admin key>
 | ----------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `/health`               | GET    | Health check                                                                                                                                                                              |
 | `/api/v1/chat`          | POST   | Legacy dispatch: SSE by default, webhook if `progress_callback_url` is present. **Will become final-only JSON in v2.14.0** — new consumers should use `/chat/stream` or `/chat/callback`. |
-| `/api/v1/chat/stream`   | POST   | SSE streaming. Rejects `progress_callback_url`.                                                                                                                                           |
-| `/api/v1/chat/callback` | POST   | 202 Accepted + webhook delivery. Requires `progress_callback_url` and `message_key`.                                                                                                      |
+| `/api/v1/chat/stream`   | POST   | SSE streaming. Rejects `progress_callback_url`, `progress_mode`, `progress_throttle_seconds`, and `message_key` with a 400.                                                               |
+| `/api/v1/chat/callback` | POST   | 202 Accepted + webhook delivery. Requires `progress_callback_url` and `message_key` in the body (400 if either is missing).                                                               |
 
 ### Audio
 
@@ -171,10 +171,10 @@ interface ChatRequest {
   audio_format?: string; // audio format: 'ogg' | 'mp3' | 'wav' | 'webm' | 'flac' | 'm4a'
   org?: string; // defaults to DEFAULT_ORG env var
   org_id?: string; // legacy alias for org (backward compat with whatsapp gateway)
-  message_key?: string; // correlation ID for webhook progress callbacks
-  progress_callback_url?: string; // webhook URL for progress updates
-  progress_mode?: 'complete' | 'iteration' | 'periodic' | 'sentence';
-  progress_throttle_seconds?: number;
+  message_key?: string; // correlation ID for webhook callbacks — REQUIRED on /chat/callback, REJECTED on /chat/stream
+  progress_callback_url?: string; // webhook URL — REQUIRED on /chat/callback, REJECTED on /chat/stream
+  progress_mode?: 'complete' | 'iteration' | 'periodic' | 'sentence'; // valid on /chat/callback only
+  progress_throttle_seconds?: number; // valid on /chat/callback only
 
   // Group/supergroup chat fields (all optional — omit for private chats)
   chat_type?: 'private' | 'group' | 'supergroup'; // defaults to 'private'
@@ -203,11 +203,51 @@ As of v2.13.0, transport mode is selected explicitly by the endpoint path rather
 | `/api/v1/chat/callback` | Webhook (async) | `202 Accepted` + `{ message_id }`; POST to `progress_callback_url` | WhatsApp gateway, any async consumer                                            |
 | `/api/v1/chat`          | Legacy dispatch | SSE by default; `202` if `progress_callback_url` is in the body    | Existing consumers; **slated for breaking change in v2.14.0** (final-only JSON) |
 
-The `/chat/callback` endpoint requires both `progress_callback_url` and `message_key` in the body. The `/chat/stream` endpoint rejects `progress_callback_url`, `progress_mode`, and `progress_throttle_seconds` (they are only valid on `/chat/callback`).
+The `/chat/callback` endpoint requires both `progress_callback_url` and `message_key` in the body. The `/chat/stream` endpoint rejects `progress_callback_url`, `progress_mode`, `progress_throttle_seconds`, and `message_key` (they are only valid on `/chat/callback`).
 
 ```json
 { "message_id": "uuid" }
 ```
+
+#### Usage examples
+
+**`/api/v1/chat/stream`** — SSE streaming (use `curl -N` to disable buffering):
+
+```bash
+curl -N -X POST https://api.btservant.ai/api/v1/chat/stream \
+  -H "Authorization: Bearer $ENGINE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "client_id": "my-client",
+    "user_id": "alice",
+    "message_type": "text",
+    "message": "Hello"
+  }'
+```
+
+Response is `text/event-stream` with `status`, `progress`, and `complete` frames ending in a final `complete` event.
+
+**`/api/v1/chat/callback`** — async webhook delivery:
+
+```bash
+curl -X POST https://api.btservant.ai/api/v1/chat/callback \
+  -H "Authorization: Bearer $ENGINE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "client_id": "my-client",
+    "user_id": "alice",
+    "message_type": "text",
+    "message": "Hello",
+    "progress_callback_url": "https://my-gateway.example.com/webhook",
+    "message_key": "msg-123"
+  }'
+```
+
+Immediate response: `202 Accepted` with `{"message_id": "uuid"}`. The worker then POSTs callback events (`status`, `progress`, `complete`, `error`) to the `progress_callback_url` asynchronously.
+
+**`/api/v1/chat`** — legacy dispatch (will become final-only JSON in v2.14.0):
+
+Current behavior: behaves like `/chat/stream` if `progress_callback_url` is absent, or like `/chat/callback` if it is present. New integrations should use the explicit endpoints.
 
 ### SSE Event Types
 
@@ -224,7 +264,7 @@ For `POST /api/v1/chat/stream` (and legacy `POST /api/v1/chat` in SSE mode):
 
 ### Webhook Progress Callbacks
 
-When `progress_callback_url` is provided, the worker sends POST requests with progress updates:
+When a request hits `POST /api/v1/chat/callback` (or the legacy `POST /api/v1/chat` with `progress_callback_url` in the body), the worker returns `202 Accepted` immediately and sends POST requests to the supplied `progress_callback_url` with progress updates:
 
 ```typescript
 // Payload
