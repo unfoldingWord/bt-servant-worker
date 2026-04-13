@@ -115,10 +115,12 @@ Authorization: Bearer <ENGINE_API_KEY or org-specific admin key>
 
 ### Chat
 
-| Endpoint       | Method | Description                                            |
-| -------------- | ------ | ------------------------------------------------------ |
-| `/health`      | GET    | Health check                                           |
-| `/api/v1/chat` | POST   | Unified chat endpoint (SSE streaming or callback mode) |
+| Endpoint                | Method | Description                                                                                                                                                                               |
+| ----------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/health`               | GET    | Health check                                                                                                                                                                              |
+| `/api/v1/chat`          | POST   | Legacy dispatch: SSE by default, webhook if `progress_callback_url` is present. **Will become final-only JSON in v2.14.0** — new consumers should use `/chat/stream` or `/chat/callback`. |
+| `/api/v1/chat/stream`   | POST   | SSE streaming. Rejects `progress_callback_url`.                                                                                                                                           |
+| `/api/v1/chat/callback` | POST   | 202 Accepted + webhook delivery. Requires `progress_callback_url` and `message_key`.                                                                                                      |
 
 ### Audio
 
@@ -191,13 +193,17 @@ interface ChatResponse {
 }
 ```
 
-### Chat Modes
+### Chat Transports
 
-The unified `POST /api/v1/chat` endpoint supports two modes:
+As of v2.13.0, transport mode is selected explicitly by the endpoint path rather than inferred from request fields. Each consumer should pick the endpoint that matches its delivery needs:
 
-**SSE mode** (default) — The response is an SSE stream. Events are sent in real-time as Claude processes the request.
+| Endpoint                | Transport       | Response                                                           | Use case                                                                        |
+| ----------------------- | --------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------- |
+| `/api/v1/chat/stream`   | SSE streaming   | `text/event-stream` with `status`/`progress`/`complete` events     | Web client / admin portal                                                       |
+| `/api/v1/chat/callback` | Webhook (async) | `202 Accepted` + `{ message_id }`; POST to `progress_callback_url` | WhatsApp gateway, any async consumer                                            |
+| `/api/v1/chat`          | Legacy dispatch | SSE by default; `202` if `progress_callback_url` is in the body    | Existing consumers; **slated for breaking change in v2.14.0** (final-only JSON) |
 
-**Callback mode** — When `progress_callback_url` is provided, the endpoint returns `202 Accepted` immediately with a `message_id`, and sends progress updates to the callback URL. This is for clients that can't hold long connections (e.g., WhatsApp gateway).
+The `/chat/callback` endpoint requires both `progress_callback_url` and `message_key` in the body. The `/chat/stream` endpoint rejects `progress_callback_url`, `progress_mode`, and `progress_throttle_seconds` (they are only valid on `/chat/callback`).
 
 ```json
 { "message_id": "uuid" }
@@ -205,7 +211,7 @@ The unified `POST /api/v1/chat` endpoint supports two modes:
 
 ### SSE Event Types
 
-For `POST /api/v1/chat` (SSE mode):
+For `POST /api/v1/chat/stream` (and legacy `POST /api/v1/chat` in SSE mode):
 
 | Event         | Payload                                                  | Description               |
 | ------------- | -------------------------------------------------------- | ------------------------- |

@@ -30,6 +30,7 @@ import {
   ChatHistoryResponse,
   ChatRequest,
   ChatResponse,
+  ChatTransport,
   SSEEvent,
   StreamCallbacks,
   UpdatePreferencesRequest,
@@ -148,9 +149,21 @@ export class UserDO {
     const requestId = request.headers.get('X-Request-ID') ?? crypto.randomUUID();
     this.requestLogger = createRequestLogger(requestId);
 
-    // Unified chat endpoint — replaces separate /chat, /stream, and /enqueue
+    // Chat endpoints — one route per explicit transport.
+    //   /chat           → legacy body-dispatch (SSE by default, callback if
+    //                     progress_callback_url is present). Will become
+    //                     final-only JSON in v2.14.0.
+    //   /chat/stream    → always SSE.
+    //   /chat/callback  → always webhook; worker has already validated that
+    //                     progress_callback_url and message_key are present.
     if (url.pathname === '/chat') {
-      return this.handleUnifiedChat(request);
+      return this.handleUnifiedChat(request, 'legacy');
+    }
+    if (url.pathname === '/chat/stream') {
+      return this.handleUnifiedChat(request, 'stream');
+    }
+    if (url.pathname === '/chat/callback') {
+      return this.handleUnifiedChat(request, 'callback');
     }
 
     // Non-chat endpoints don't need locking
@@ -194,14 +207,17 @@ export class UserDO {
 
   // ── Unified chat handler ──────────────────────────────────────────────────────
 
-  private async handleUnifiedChat(request: Request): Promise<Response> {
+  private async handleUnifiedChat(request: Request, transport: ChatTransport): Promise<Response> {
     const logger = this.getLogger();
 
     let body: ChatRequest;
     try {
       body = (await request.json()) as ChatRequest;
     } catch (err) {
-      logger.warn('chat_invalid_json', { error: err instanceof Error ? err.message : String(err) });
+      logger.warn('chat_invalid_json', {
+        transport,
+        error: err instanceof Error ? err.message : String(err),
+      });
       return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
     }
 
@@ -214,7 +230,14 @@ export class UserDO {
     );
     if (rateLimited) return rateLimited;
 
-    const isCallbackMode = !!body.progress_callback_url;
+    // Resolve the effective delivery mode for this request:
+    //   - stream   → always SSE
+    //   - callback → always webhook
+    //   - legacy   → pick based on body.progress_callback_url presence
+    // The effective delivery is what matters for queue semantics and for
+    // which background runner we invoke.
+    const isCallbackDelivery =
+      transport === 'callback' || (transport === 'legacy' && !!body.progress_callback_url);
     const messageId = crypto.randomUUID();
     const workerOrigin = request.headers.get('X-Worker-Origin') ?? '';
 
@@ -226,26 +249,27 @@ export class UserDO {
       logger.log('chat_immediate', {
         message_id: messageId,
         user_id: body.user_id,
-        mode: isCallbackMode ? 'callback' : 'sse',
+        transport,
+        delivery: isCallbackDelivery ? 'callback' : 'sse',
       });
-      if (isCallbackMode) {
+      if (isCallbackDelivery) {
         return this.processImmediateCallback(body, workerOrigin, messageId, logger);
       }
       return this.processImmediateSSE(body, workerOrigin, messageId, logger);
     }
 
     // DO is busy — enqueue for processing when current request finishes
-    return this.enqueueAndReturn(body, messageId, workerOrigin, logger);
+    return this.enqueueAndReturn(body, messageId, workerOrigin, isCallbackDelivery, logger);
   }
 
-  /** Enqueue a message and return 202 (callback) or SSE stream (SSE mode). */
+  /** Enqueue a message and return 202 (callback) or SSE stream (SSE delivery). */
   private async enqueueAndReturn(
     body: ChatRequest,
     messageId: string,
     workerOrigin: string,
+    isCallbackDelivery: boolean,
     logger: RequestLogger
   ): Promise<Response> {
-    const isCallbackMode = !!body.progress_callback_url;
     const entry: InternalQueueEntry = {
       message_id: messageId,
       body: { ...body, _worker_origin: workerOrigin },
@@ -269,12 +293,12 @@ export class UserDO {
 
     logger.log('chat_enqueued', {
       message_id: messageId,
-      delivery: isCallbackMode ? 'callback' : 'sse',
+      delivery: isCallbackDelivery ? 'callback' : 'sse',
       queue_position: position,
       user_id: body.user_id,
     });
 
-    if (isCallbackMode) {
+    if (isCallbackDelivery) {
       return Response.json({ message_id: messageId }, { status: 202 });
     }
 
