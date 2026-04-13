@@ -59,6 +59,12 @@ describe('validateChatBody — stream transport', () => {
     const result = validateChatBody({ ...baseBody, progress_throttle_seconds: 5 }, 'stream');
     expect(result).toContain('progress_throttle_seconds');
   });
+
+  it('rejects message_key', () => {
+    const result = validateChatBody({ ...baseBody, message_key: 'm1' }, 'stream');
+    expect(result).toContain('message_key');
+    expect(result).toContain('/api/v1/chat/callback');
+  });
 });
 
 describe('validateChatBody — callback transport', () => {
@@ -87,6 +93,46 @@ describe('validateChatBody — callback transport', () => {
         'callback'
       )
     ).toBe('message_key is required on /api/v1/chat/callback');
+  });
+
+  it('rejects missing both progress_callback_url and message_key (URL error first)', () => {
+    expect(validateChatBody(baseBody, 'callback')).toBe(
+      'progress_callback_url is required on /api/v1/chat/callback'
+    );
+  });
+});
+
+describe('validateChatBody — legacy transport (body-dispatch)', () => {
+  it('accepts a body WITH progress_callback_url (legacy callback mode)', () => {
+    expect(
+      validateChatBody(
+        {
+          ...baseBody,
+          progress_callback_url: 'https://example.com/hook',
+          message_key: 'm1',
+        },
+        'legacy'
+      )
+    ).toBeNull();
+  });
+
+  it('accepts a body WITHOUT progress_callback_url (legacy SSE mode)', () => {
+    expect(validateChatBody(baseBody, 'legacy')).toBeNull();
+  });
+
+  it('accepts progress_mode and progress_throttle_seconds on legacy', () => {
+    expect(
+      validateChatBody(
+        {
+          ...baseBody,
+          progress_callback_url: 'https://example.com/hook',
+          message_key: 'm1',
+          progress_mode: 'iteration',
+          progress_throttle_seconds: 5,
+        },
+        'legacy'
+      )
+    ).toBeNull();
   });
 });
 

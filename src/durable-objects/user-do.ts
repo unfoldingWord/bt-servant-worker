@@ -62,6 +62,7 @@ import { AudioTranscriptionError, ValidationError } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
 import { applyTemplateVariables } from '../utils/template.js';
 import { createTimingContext, timePhase, TimingContext } from '../utils/timing.js';
+import { validateChatBody } from '../utils/chat-validation.js';
 import { InternalQueueEntry } from '../types/queue.js';
 
 // ── Storage keys ───────────────────────────────────────────────────────────────
@@ -207,9 +208,25 @@ export class UserDO {
 
   // ── Unified chat handler ──────────────────────────────────────────────────────
 
-  private async handleUnifiedChat(request: Request, transport: ChatTransport): Promise<Response> {
-    const logger = this.getLogger();
-
+  /**
+   * Parse and re-validate the request body for a chat endpoint.
+   *
+   * Returns `{ body }` on success, or `{ error: Response }` on failure.
+   *
+   * The DO re-runs the worker's transport validation rules as
+   * defense-in-depth. The worker already validated this request, but
+   * re-checking here guarantees the transport → body invariant is
+   * enforced at the same place we rely on it for queue dispatch
+   * (processQueueEntry reads body.progress_callback_url to decide
+   * callback vs SSE). If a future refactor breaks worker-side
+   * validation, this fails loudly instead of silently dropping the
+   * user's response in the queued path.
+   */
+  private async parseChatBody(
+    request: Request,
+    transport: ChatTransport,
+    logger: RequestLogger
+  ): Promise<{ body: ChatRequest; error?: never } | { body?: never; error: Response }> {
     let body: ChatRequest;
     try {
       body = (await request.json()) as ChatRequest;
@@ -218,8 +235,28 @@ export class UserDO {
         transport,
         error: err instanceof Error ? err.message : String(err),
       });
-      return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
+      return { error: Response.json({ error: 'Invalid JSON body' }, { status: 400 }) };
     }
+
+    const validationError = validateChatBody(body, transport);
+    if (validationError) {
+      logger.warn('chat_validation_failed_in_do', {
+        transport,
+        error: validationError,
+        user_id: body.user_id,
+      });
+      return { error: Response.json({ error: validationError }, { status: 400 }) };
+    }
+
+    return { body };
+  }
+
+  private async handleUnifiedChat(request: Request, transport: ChatTransport): Promise<Response> {
+    const logger = this.getLogger();
+
+    const parsed = await this.parseChatBody(request, transport, logger);
+    if (parsed.error) return parsed.error;
+    const { body } = parsed;
 
     // Rate limiting
     const rateLimited = this.checkRateLimit(
@@ -235,7 +272,11 @@ export class UserDO {
     //   - callback → always webhook
     //   - legacy   → pick based on body.progress_callback_url presence
     // The effective delivery is what matters for queue semantics and for
-    // which background runner we invoke.
+    // which background runner we invoke. This is safe because the
+    // validation above guarantees stream bodies never have
+    // progress_callback_url and callback bodies always do, so
+    // body.progress_callback_url is a faithful proxy for delivery on
+    // the queued path (processQueueEntry reads the same field).
     const isCallbackDelivery =
       transport === 'callback' || (transport === 'legacy' && !!body.progress_callback_url);
     const messageId = crypto.randomUUID();
