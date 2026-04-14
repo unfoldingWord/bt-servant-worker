@@ -69,10 +69,11 @@ app.use('/api/*', async (c, next) => {
 // - POST /api/v1/chat           → synchronous, final-only JSON response.
 //                                  Rejects progress_callback_url, progress_mode,
 //                                  progress_throttle_seconds, and message_key.
-//                                  Returns 503 Retry-After when the user's DO
-//                                  is busy processing another request — the
-//                                  final transport cannot hold an HTTP
-//                                  connection open while the queue drains.
+//                                  Returns 429 CONCURRENT_REQUEST_REJECTED with
+//                                  Retry-After when the user's DO is busy
+//                                  processing another request — the final
+//                                  transport cannot hold an HTTP connection
+//                                  open while the queue drains.
 // - POST /api/v1/chat/stream    → SSE streaming only.
 // - POST /api/v1/chat/callback  → 202 + webhook delivery; requires
 //                                  progress_callback_url and message_key.

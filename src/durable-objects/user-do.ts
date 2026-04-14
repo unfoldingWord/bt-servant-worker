@@ -307,7 +307,7 @@ export class UserDO {
           message: 'Another request for this user is currently being processed. Please retry.',
           retry_after_ms: 5000,
         },
-        { status: 503, headers: { 'Retry-After': '5' } }
+        { status: 429, headers: { 'Retry-After': '5' } }
       );
     }
 

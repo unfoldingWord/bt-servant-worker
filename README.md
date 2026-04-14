@@ -115,12 +115,12 @@ Authorization: Bearer <ENGINE_API_KEY or org-specific admin key>
 
 ### Chat
 
-| Endpoint                | Method | Description                                                                                                                                                                                                                                                                                |
-| ----------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `/health`               | GET    | Health check                                                                                                                                                                                                                                                                               |
-| `/api/v1/chat`          | POST   | **Synchronous final-only JSON response.** Blocks until the orchestrator finishes, then returns one `ChatResponse` body. Rejects `progress_callback_url`, `progress_mode`, `progress_throttle_seconds`, and `message_key` with a 400. Returns `503 Retry-After` when the user's DO is busy. |
-| `/api/v1/chat/stream`   | POST   | SSE streaming. Rejects `progress_callback_url`, `progress_mode`, `progress_throttle_seconds`, and `message_key` with a 400.                                                                                                                                                                |
-| `/api/v1/chat/callback` | POST   | 202 Accepted + webhook delivery. Requires `progress_callback_url` and `message_key` in the body (400 if either is missing).                                                                                                                                                                |
+| Endpoint                | Method | Description                                                                                                                                                                                                                                                                                                                      |
+| ----------------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/health`               | GET    | Health check                                                                                                                                                                                                                                                                                                                     |
+| `/api/v1/chat`          | POST   | **Synchronous final-only JSON response.** Blocks until the orchestrator finishes, then returns one `ChatResponse` body. Rejects `progress_callback_url`, `progress_mode`, `progress_throttle_seconds`, and `message_key` with a 400. Returns `429 CONCURRENT_REQUEST_REJECTED` with `Retry-After: 5` when the user's DO is busy. |
+| `/api/v1/chat/stream`   | POST   | SSE streaming. Rejects `progress_callback_url`, `progress_mode`, `progress_throttle_seconds`, and `message_key` with a 400.                                                                                                                                                                                                      |
+| `/api/v1/chat/callback` | POST   | 202 Accepted + webhook delivery. Requires `progress_callback_url` and `message_key` in the body (400 if either is missing).                                                                                                                                                                                                      |
 
 ### Audio
 
@@ -207,7 +207,7 @@ The `/chat/callback` endpoint requires both `progress_callback_url` and `message
 
 #### Concurrency note for `/api/v1/chat`
 
-Because `/api/v1/chat` holds the HTTP connection open for the duration of the orchestration, it cannot queue. If the user's Durable Object is already processing another request, `/api/v1/chat` returns `503 CONCURRENT_REQUEST_REJECTED` with a `Retry-After: 5` header. Clients must implement retry logic. The SSE and callback transports both queue cleanly and do not have this limitation.
+Because `/api/v1/chat` holds the HTTP connection open for the duration of the orchestration, it cannot queue. If the user's Durable Object is already processing another request, `/api/v1/chat` returns `429 CONCURRENT_REQUEST_REJECTED` with a `Retry-After: 5` header. Clients must implement retry logic. The SSE and callback transports both queue cleanly and do not have this limitation.
 
 ```json
 { "message_id": "uuid" }
@@ -241,7 +241,7 @@ Blocks until the orchestrator finishes and returns a JSON body:
 }
 ```
 
-If the user's DO is already processing another request, returns `503` with `{"code": "CONCURRENT_REQUEST_REJECTED", ...}` and a `Retry-After: 5` header. Retry the request.
+If the user's DO is already processing another request, returns `429` with `{"code": "CONCURRENT_REQUEST_REJECTED", ...}` and a `Retry-After: 5` header. Retry the request.
 
 **`/api/v1/chat/stream`** — SSE streaming (use `curl -N` to disable buffering):
 
