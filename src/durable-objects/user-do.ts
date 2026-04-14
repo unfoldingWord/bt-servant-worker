@@ -151,14 +151,14 @@ export class UserDO {
     this.requestLogger = createRequestLogger(requestId);
 
     // Chat endpoints — one route per explicit transport.
-    //   /chat           → legacy body-dispatch (SSE by default, callback if
-    //                     progress_callback_url is present). Will become
-    //                     final-only JSON in v2.14.0.
+    //   /chat/final     → synchronous final-only JSON. Worker has already
+    //                     validated that none of the callback-flavored
+    //                     fields are present.
     //   /chat/stream    → always SSE.
     //   /chat/callback  → always webhook; worker has already validated that
     //                     progress_callback_url and message_key are present.
-    if (url.pathname === '/chat') {
-      return this.handleUnifiedChat(request, 'legacy');
+    if (url.pathname === '/chat/final') {
+      return this.handleUnifiedChat(request, 'final');
     }
     if (url.pathname === '/chat/stream') {
       return this.handleUnifiedChat(request, 'stream');
@@ -267,18 +267,6 @@ export class UserDO {
     );
     if (rateLimited) return rateLimited;
 
-    // Resolve the effective delivery mode for this request:
-    //   - stream   → always SSE
-    //   - callback → always webhook
-    //   - legacy   → pick based on body.progress_callback_url presence
-    // The effective delivery is what matters for queue semantics and for
-    // which background runner we invoke. This is safe because the
-    // validation above guarantees stream bodies never have
-    // progress_callback_url and callback bodies always do, so
-    // body.progress_callback_url is a faithful proxy for delivery on
-    // the queued path (processQueueEntry reads the same field).
-    const isCallbackDelivery =
-      transport === 'callback' || (transport === 'legacy' && !!body.progress_callback_url);
     const messageId = crypto.randomUUID();
     const workerOrigin = request.headers.get('X-Worker-Origin') ?? '';
 
@@ -291,16 +279,39 @@ export class UserDO {
         message_id: messageId,
         user_id: body.user_id,
         transport,
-        delivery: isCallbackDelivery ? 'callback' : 'sse',
       });
-      if (isCallbackDelivery) {
+      if (transport === 'final') {
+        return this.processImmediateFinal(body, workerOrigin, messageId, logger);
+      }
+      if (transport === 'callback') {
         return this.processImmediateCallback(body, workerOrigin, messageId, logger);
       }
       return this.processImmediateSSE(body, workerOrigin, messageId, logger);
     }
 
-    // DO is busy — enqueue for processing when current request finishes
-    return this.enqueueAndReturn(body, messageId, workerOrigin, isCallbackDelivery, logger);
+    // DO is busy. The final transport cannot queue because we have no
+    // way to hold an HTTP connection open while the alarm drains the
+    // backlog — tell the caller to retry so they can re-serialize on
+    // their side. Stream and callback transports can queue cleanly
+    // (SSE holds the writer; callback returns 202 now, fires the
+    // webhook later).
+    if (transport === 'final') {
+      logger.log('chat_busy_final_reject', {
+        message_id: messageId,
+        user_id: body.user_id,
+      });
+      return Response.json(
+        {
+          error: 'Request in progress',
+          code: 'CONCURRENT_REQUEST_REJECTED',
+          message: 'Another request for this user is currently being processed. Please retry.',
+          retry_after_ms: 5000,
+        },
+        { status: 503, headers: { 'Retry-After': '5' } }
+      );
+    }
+
+    return this.enqueueAndReturn(body, messageId, workerOrigin, transport === 'callback', logger);
   }
 
   /** Enqueue a message and return 202 (callback) or SSE stream (SSE delivery). */
@@ -344,6 +355,69 @@ export class UserDO {
     }
 
     return this.createQueuedSSEStream(messageId, logger);
+  }
+
+  /**
+   * Process a final-mode message synchronously in the fetch handler and
+   * return a JSON response.
+   *
+   * Unlike SSE and callback, this path cannot return early and let the
+   * orchestrator run in the background — the caller is waiting on the
+   * HTTP response, so we must await processChat and serialize the
+   * ChatResponse before returning.
+   *
+   * Lock release and queue drain are fired as background work *after*
+   * processChat resolves but *before* we return the Response. Drain
+   * must not be awaited here: if SSE/callback requests were queued
+   * while this final request was running, awaiting drainQueue would
+   * make the /api/v1/chat caller wait for those backlogged
+   * orchestrations to complete before getting their JSON body,
+   * which blows the final-only latency contract. Fire-and-forget
+   * matches the pattern used by processImmediateSSE and
+   * processImmediateCallback, which launch processChat + release +
+   * drain inside a background closure and return immediately.
+   */
+  private async processImmediateFinal(
+    body: ChatRequest,
+    workerOrigin: string,
+    messageId: string,
+    logger: RequestLogger
+  ): Promise<Response> {
+    const timing = createTimingContext();
+    let response: Response;
+    try {
+      const chatResponse = await this.processChat(body, workerOrigin, logger, timing);
+      logger.log('immediate_final_complete', { message_id: messageId });
+      response = Response.json({ message_id: messageId, ...chatResponse });
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        logger.warn('immediate_final_validation_failed', {
+          message_id: messageId,
+          error: error.message,
+        });
+        response = createErrorResponse('Validation failed', 'VALIDATION_ERROR', error.message, 400);
+      } else {
+        const message = error instanceof Error ? error.message : 'Processing failed';
+        logger.error('immediate_final_error', error, { message_id: messageId });
+        response = createErrorResponse('Processing failed', 'INTERNAL_ERROR', message, 500);
+      }
+    }
+
+    // Release the lock and drain the queue in the background so this
+    // caller does not wait for any SSE/callback backlog that accumulated
+    // while processChat was running.
+    (async () => {
+      try {
+        await this.releaseLock();
+        await this.drainQueue(logger);
+      } catch (drainErr) {
+        logger.error('immediate_final_drain_failed', drainErr, { message_id: messageId });
+      }
+    })().catch((err) =>
+      logger.error('immediate_final_drain_unhandled', err, { message_id: messageId })
+    );
+
+    return response;
   }
 
   /** Process a callback-mode message immediately in the fetch handler. Returns 202. */

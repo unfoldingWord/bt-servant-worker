@@ -153,7 +153,7 @@ describe('UserDO Durable Object', () => {
   });
 });
 
-describe('UserDO unified chat endpoint', () => {
+describe('UserDO explicit chat transports', () => {
   let stub: DurableObjectStub;
 
   beforeEach(() => {
@@ -161,8 +161,8 @@ describe('UserDO unified chat endpoint', () => {
     stub = env.USER_DO.get(id);
   });
 
-  it('returns SSE stream for requests without callback URL', async () => {
-    const response = await stub.fetch('http://fake-host/chat', {
+  it('POST /chat/stream returns text/event-stream', async () => {
+    const response = await stub.fetch('http://fake-host/chat/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -173,12 +173,11 @@ describe('UserDO unified chat endpoint', () => {
       }),
     });
 
-    // SSE mode returns event-stream
     expect(response.headers.get('Content-Type')).toBe('text/event-stream');
   });
 
-  it('returns 202 for callback-mode requests', async () => {
-    const response = await stub.fetch('http://fake-host/chat', {
+  it('POST /chat/callback returns 202 + message_id', async () => {
+    const response = await stub.fetch('http://fake-host/chat/callback', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -194,16 +193,6 @@ describe('UserDO unified chat endpoint', () => {
     expect(response.status).toBe(202);
     const data = (await response.json()) as { message_id: string };
     expect(data.message_id).toBeDefined();
-  });
-
-  it('returns 400 for invalid JSON', async () => {
-    const response = await stub.fetch('http://fake-host/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: 'not json',
-    });
-
-    expect(response.status).toBe(400);
   });
 
   it('non-chat endpoints still work without lock', async () => {

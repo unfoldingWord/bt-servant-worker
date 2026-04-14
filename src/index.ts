@@ -66,14 +66,18 @@ app.use('/api/*', async (c, next) => {
 
 // Chat endpoints — explicit transport per route.
 //
-// - POST /api/v1/chat           → legacy body-dispatch (SSE by default, callback
-//                                  if progress_callback_url is present). Will
-//                                  become final-only JSON in v2.14.0.
+// - POST /api/v1/chat           → synchronous, final-only JSON response.
+//                                  Rejects progress_callback_url, progress_mode,
+//                                  progress_throttle_seconds, and message_key.
+//                                  Returns 503 Retry-After when the user's DO
+//                                  is busy processing another request — the
+//                                  final transport cannot hold an HTTP
+//                                  connection open while the queue drains.
 // - POST /api/v1/chat/stream    → SSE streaming only.
 // - POST /api/v1/chat/callback  → 202 + webhook delivery; requires
 //                                  progress_callback_url and message_key.
 app.post('/api/v1/chat', async (c) => {
-  return handleChatRequest(c.req.raw, c.env, 'legacy');
+  return handleChatRequest(c.req.raw, c.env, 'final');
 });
 
 app.post('/api/v1/chat/stream', async (c) => {
@@ -823,8 +827,8 @@ async function readAllOrgKV(env: Env, org: string, logger: ReturnType<typeof cre
 /** DO internal pathname for each chat transport. */
 function doChatPathForTransport(transport: ChatTransport): string {
   switch (transport) {
-    case 'legacy':
-      return '/chat';
+    case 'final':
+      return '/chat/final';
     case 'stream':
       return '/chat/stream';
     case 'callback':

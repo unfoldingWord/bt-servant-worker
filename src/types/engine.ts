@@ -21,14 +21,14 @@ export type ChatType = 'private' | 'group' | 'supergroup';
 /**
  * Chat transport selected by the worker route.
  *
- * - 'legacy'   → POST /api/v1/chat. Dispatches to SSE or callback based on
- *                the presence of body.progress_callback_url. Will be removed
- *                in v2.14.0 when /chat becomes final-only.
+ * - 'final'    → POST /api/v1/chat. Synchronous final-only JSON response.
+ *                Rejects progress_callback_url, progress_mode,
+ *                progress_throttle_seconds, and message_key with a 400.
  * - 'stream'   → POST /api/v1/chat/stream. Always SSE.
  * - 'callback' → POST /api/v1/chat/callback. Always webhook callback; requires
  *                body.progress_callback_url and body.message_key.
  */
-export type ChatTransport = 'legacy' | 'stream' | 'callback';
+export type ChatTransport = 'final' | 'stream' | 'callback';
 
 export interface ChatRequest {
   client_id: string;

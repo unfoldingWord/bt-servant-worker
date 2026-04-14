@@ -22,41 +22,51 @@ function validateLanguageHint(hint: unknown): string | null {
 }
 
 /**
- * Per-transport field-presence rules.
+ * Reject callback-flavored fields on transports that don't accept them.
  *
- * The stream-side rejections use `!== undefined` (not truthy checks) so
- * that an explicit `null` or empty string is still rejected — any
- * *presence* of a callback-flavored field on /chat/stream is an error.
- * The callback-side checks use truthy (`!`) because empty strings are
- * not usable as a URL or correlation key and should be rejected the
- * same way as a missing field.
+ * Uses `!== undefined` (not truthy checks) so that an explicit `null` or
+ * empty string is still rejected — any *presence* of a callback-flavored
+ * field on /chat or /chat/stream is an error. Both endpoints deliver a
+ * self-contained response (JSON or SSE) and have no use for a callback
+ * URL, correlation key, or progress-mode tuning.
  */
+function forbidCallbackFields(body: ChatRequest, endpoint: string): string | null {
+  if (body.progress_callback_url !== undefined) {
+    return `progress_callback_url is not valid on ${endpoint} — use /api/v1/chat/callback`;
+  }
+  if (body.progress_mode !== undefined) {
+    return `progress_mode is not valid on ${endpoint} — use /api/v1/chat/callback`;
+  }
+  if (body.progress_throttle_seconds !== undefined) {
+    return `progress_throttle_seconds is not valid on ${endpoint} — use /api/v1/chat/callback`;
+  }
+  if (body.message_key !== undefined) {
+    return `message_key is not valid on ${endpoint} — use /api/v1/chat/callback`;
+  }
+  return null;
+}
+
+/**
+ * Require the two fields that /chat/callback cannot operate without.
+ *
+ * Uses truthy (`!`) because empty strings are not usable as a URL or
+ * correlation key and should be rejected the same way as a missing field.
+ */
+function requireCallbackFields(body: ChatRequest): string | null {
+  if (!body.progress_callback_url) {
+    return 'progress_callback_url is required on /api/v1/chat/callback';
+  }
+  if (!body.message_key) {
+    return 'message_key is required on /api/v1/chat/callback';
+  }
+  return null;
+}
+
+/** Per-transport field-presence rules. */
 function validateTransportFields(body: ChatRequest, transport: ChatTransport): string | null {
-  if (transport === 'stream') {
-    if (body.progress_callback_url !== undefined) {
-      return 'progress_callback_url is not valid on /api/v1/chat/stream — use /api/v1/chat/callback';
-    }
-    if (body.progress_mode !== undefined) {
-      return 'progress_mode is not valid on /api/v1/chat/stream — use /api/v1/chat/callback';
-    }
-    if (body.progress_throttle_seconds !== undefined) {
-      return 'progress_throttle_seconds is not valid on /api/v1/chat/stream — use /api/v1/chat/callback';
-    }
-    if (body.message_key !== undefined) {
-      return 'message_key is not valid on /api/v1/chat/stream — use /api/v1/chat/callback';
-    }
-    return null;
-  }
-  if (transport === 'callback') {
-    if (!body.progress_callback_url) {
-      return 'progress_callback_url is required on /api/v1/chat/callback';
-    }
-    if (!body.message_key) {
-      return 'message_key is required on /api/v1/chat/callback';
-    }
-    return null;
-  }
-  // 'legacy' transport keeps current implicit-dispatch behavior — no rules.
+  if (transport === 'final') return forbidCallbackFields(body, '/api/v1/chat');
+  if (transport === 'stream') return forbidCallbackFields(body, '/api/v1/chat/stream');
+  if (transport === 'callback') return requireCallbackFields(body);
   return null;
 }
 
