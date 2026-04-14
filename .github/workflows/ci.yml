@@ -28,8 +28,8 @@ jobs:
       - name: Audit production dependencies
         run: pnpm audit --prod
 
-      - name: Audit all dependencies (informational)
-        run: pnpm audit || true
+      - name: Audit all dependencies (fail on high/critical)
+        run: pnpm audit --audit-level=high
 
   lint:
     name: Lint
