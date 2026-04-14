@@ -364,8 +364,18 @@ export class UserDO {
    * Unlike SSE and callback, this path cannot return early and let the
    * orchestrator run in the background — the caller is waiting on the
    * HTTP response, so we must await processChat and serialize the
-   * ChatResponse before returning. Lock release and queue drain happen
-   * in the finally block so they always run, even on error.
+   * ChatResponse before returning.
+   *
+   * Lock release and queue drain are fired as background work *after*
+   * processChat resolves but *before* we return the Response. Drain
+   * must not be awaited here: if SSE/callback requests were queued
+   * while this final request was running, awaiting drainQueue would
+   * make the /api/v1/chat caller wait for those backlogged
+   * orchestrations to complete before getting their JSON body,
+   * which blows the final-only latency contract. Fire-and-forget
+   * matches the pattern used by processImmediateSSE and
+   * processImmediateCallback, which launch processChat + release +
+   * drain inside a background closure and return immediately.
    */
   private async processImmediateFinal(
     body: ChatRequest,
@@ -374,18 +384,40 @@ export class UserDO {
     logger: RequestLogger
   ): Promise<Response> {
     const timing = createTimingContext();
+    let response: Response;
     try {
-      const response = await this.processChat(body, workerOrigin, logger, timing);
+      const chatResponse = await this.processChat(body, workerOrigin, logger, timing);
       logger.log('immediate_final_complete', { message_id: messageId });
-      return Response.json({ message_id: messageId, ...response });
+      response = Response.json({ message_id: messageId, ...chatResponse });
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Processing failed';
-      logger.error('immediate_final_error', error, { message_id: messageId });
-      return createErrorResponse('Processing failed', 'INTERNAL_ERROR', message, 500);
-    } finally {
-      await this.releaseLock();
-      await this.drainQueue(logger);
+      if (error instanceof ValidationError) {
+        logger.warn('immediate_final_validation_failed', {
+          message_id: messageId,
+          error: error.message,
+        });
+        response = createErrorResponse('Validation failed', 'VALIDATION_ERROR', error.message, 400);
+      } else {
+        const message = error instanceof Error ? error.message : 'Processing failed';
+        logger.error('immediate_final_error', error, { message_id: messageId });
+        response = createErrorResponse('Processing failed', 'INTERNAL_ERROR', message, 500);
+      }
     }
+
+    // Release the lock and drain the queue in the background so this
+    // caller does not wait for any SSE/callback backlog that accumulated
+    // while processChat was running.
+    (async () => {
+      try {
+        await this.releaseLock();
+        await this.drainQueue(logger);
+      } catch (drainErr) {
+        logger.error('immediate_final_drain_failed', drainErr, { message_id: messageId });
+      }
+    })().catch((err) =>
+      logger.error('immediate_final_drain_unhandled', err, { message_id: messageId })
+    );
+
+    return response;
   }
 
   /** Process a callback-mode message immediately in the fetch handler. Returns 202. */
