@@ -67,6 +67,7 @@ def send_chat_request(
     worker_key: str,
     message_type: str,
     user_id: str = "test-voice-flow",
+    client_id: str = "test-voice-flow",
     message: str | None = None,
     audio_b64: str | None = None,
     audio_format: str | None = None,
@@ -74,11 +75,11 @@ def send_chat_request(
     lang_hint: str | None = None,
 ) -> dict:
     """Send a chat request to bt-servant-worker and parse the SSE response."""
-    url = f"{worker_url.rstrip('/')}/api/v1/chat"
+    url = f"{worker_url.rstrip('/')}/api/v1/chat/stream"
 
     body: dict = {
         "user_id": user_id,
-        "client_id": "test-voice-flow",
+        "client_id": client_id,
         "message_type": message_type,
     }
     if message_type == "audio":
@@ -157,7 +158,14 @@ def download_audio(url: str, api_key: str, output_path: Path) -> None:
     print(f"[DOWNLOAD] Saved {size_kb:.1f} KB to {output_path}")
 
 
-def show_results(result: dict, worker_key: str, mode: str, lang: str | None, output: str | None):
+def show_results(
+    result: dict,
+    worker_key: str,
+    mode: str,
+    lang: str | None,
+    output: str | None,
+    client_id: str = "test-voice-flow",
+):
     """Display results and download audio if available."""
     print("\n=== Results ===\n")
     responses = result.get("responses", [])
@@ -165,6 +173,7 @@ def show_results(result: dict, worker_key: str, mode: str, lang: str | None, out
     resp_lang = result.get("response_language", "?")
 
     print(f"Mode: {mode}")
+    print(f"Client ID: {client_id}")
     print(f"Response language: {resp_lang}")
     print(f"Response count: {len(responses)}")
     print(f"Has audio: {'yes' if voice_url else 'no'}")
@@ -177,7 +186,10 @@ def show_results(result: dict, worker_key: str, mode: str, lang: str | None, out
 
         timestamp = int(time.time())
         lang_suffix = f"_{lang}" if lang else ""
-        output_path = Path(output or f"voice_response_{mode}_{timestamp}{lang_suffix}.opus")
+        safe_client = client_id.replace("/", "_").replace(" ", "_")
+        output_path = Path(
+            output or f"voice_response_{mode}_{safe_client}_{timestamp}{lang_suffix}.opus"
+        )
 
         print(f"\n=== Download audio response ===\n")
         download_audio(voice_url, worker_key, output_path)
@@ -209,11 +221,12 @@ def cmd_voice(args):
         audio_b64=audio_b64,
         audio_format=audio_format,
         user_id=args.user_id,
+        client_id=args.client_id,
         org=args.org,
         lang_hint=args.lang,
     )
 
-    show_results(result, args.worker_key, "voice", args.lang, args.output)
+    show_results(result, args.worker_key, "voice", args.lang, args.output, args.client_id)
 
 
 def cmd_text(args):
@@ -225,11 +238,12 @@ def cmd_text(args):
         message_type="text",
         message=args.text,
         user_id=args.user_id,
+        client_id=args.client_id,
         org=args.org,
         lang_hint=args.lang,
     )
 
-    show_results(result, args.worker_key, "text", args.lang, args.output)
+    show_results(result, args.worker_key, "text", args.lang, args.output, args.client_id)
 
 
 def main():
@@ -246,6 +260,11 @@ def main():
     shared.add_argument("--text", required=True, help="Text content (spoken for voice, sent as-is for text)")
     shared.add_argument("--lang", default=None, help="Response language hint (e.g., es, fr, pt)")
     shared.add_argument("--user-id", default="test-voice-flow", help="User ID for the request")
+    shared.add_argument(
+        "--client-id",
+        default="test-voice-flow",
+        help="Client ID to send in the request body (e.g., whatsapp, web, test-voice-flow)",
+    )
     shared.add_argument("--org", default=None, help="Organization override")
     shared.add_argument("--output", default=None, help="Output file path (default: auto-generated)")
 

@@ -61,10 +61,26 @@ export const VOICE_WRITING_RULES =
   '- Keep your response concise — audio responses over two minutes feel long\n' +
   '- Do NOT narrate your actions (avoid "Let me look that up" or "I\'ll search for that") — just give the answer';
 
+/**
+ * Planning-scope rules for voice mode. Prevents Claude from cascading into
+ * follow-up tool calls to enrich a voice answer beyond what the user literally
+ * asked for. Targets planning (how many tools to call), not tone — the sibling
+ * VOICE_WRITING_RULES covers tone. Only injected when isVoiceMessage=true; text
+ * mode responses are unchanged.
+ */
+const VOICE_PLANNING_RULES =
+  'Plan for a spoken answer:\n' +
+  '- Answer what was asked, nothing more. Use the minimum tool calls needed to answer the literal question.\n' +
+  '- Do NOT cascade into follow-up tool calls to enrich the answer. Example: if the user asks for a LIST of items, give the list — do not then fetch per-item details for each one. If the user wants details, they will ask.\n' +
+  '- Multiple tool calls ARE fine when they are required to answer the literal question (e.g., fetching two translations to compare them). The rule is: no enrichment beyond what was asked.\n' +
+  '- A brief answer that ends with "Would you like me to go deeper on any of these?" is better than a comprehensive answer that blows past the original question.';
+
 const VOICE_RESPONSE_GUIDANCE =
   '## Voice Response Mode (ACTIVE)\n\n' +
-  'The user sent a voice message and will hear your response as spoken audio. ' +
-  VOICE_WRITING_RULES;
+  'The user sent a voice message and will hear your response as spoken audio.\n\n' +
+  VOICE_WRITING_RULES +
+  '\n\n' +
+  VOICE_PLANNING_RULES;
 
 /** Build the client platform + client_instructions section. */
 function buildClientSection(clientId: string | undefined, clientInstructions: string): string {
