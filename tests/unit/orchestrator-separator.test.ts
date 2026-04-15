@@ -112,7 +112,11 @@ function setupMultiIterationMock() {
     { type: 'text', text: 'Here is the answer' },
   ]);
 
-  (Anthropic as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({}));
+  (Anthropic as unknown as ReturnType<typeof vi.fn>).mockImplementation(function MockAnthropic(
+    this: object
+  ) {
+    return this;
+  } as unknown as () => object);
 
   vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
     const isFirst = callCount === 0;
@@ -129,7 +133,11 @@ function setupSingleIterationMock() {
     { type: 'text', text: 'Single response' },
   ]);
 
-  (Anthropic as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({}));
+  (Anthropic as unknown as ReturnType<typeof vi.fn>).mockImplementation(function MockAnthropic(
+    this: object
+  ) {
+    return this;
+  } as unknown as () => object);
 
   vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
     return new Response(buildSSEBody(message), {

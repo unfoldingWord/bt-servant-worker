@@ -1,4 +1,5 @@
-import { defineWorkersConfig } from '@cloudflare/vitest-pool-workers/config';
+import { cloudflareTest } from '@cloudflare/vitest-pool-workers';
+import { defineConfig } from 'vitest/config';
 import { readFileSync, existsSync } from 'fs';
 import { platform } from 'os';
 
@@ -36,30 +37,30 @@ function getAnthropicKey(): string {
 
 const anthropicKey = getAnthropicKey();
 
-export default defineWorkersConfig({
+export default defineConfig({
+  plugins: [
+    cloudflareTest({
+      wrangler: { configPath: './wrangler.test.toml' },
+      miniflare: {
+        bindings: {
+          ENVIRONMENT: 'test',
+          MAX_ORCHESTRATION_ITERATIONS: '10',
+          CODE_EXEC_TIMEOUT_MS: '30000',
+          DEFAULT_ORG: 'unfoldingWord',
+          // Pass API keys for real chat tests
+          ENGINE_API_KEY: 'test-api-key',
+          ANTHROPIC_API_KEY: anthropicKey,
+        },
+        kvNamespaces: ['ORG_ADMIN_KEYS', 'MCP_SERVERS', 'ORG_CONFIG', 'PROMPT_OVERRIDES'],
+        r2Buckets: ['AUDIO_BUCKET'],
+      },
+      // Disable isolated storage to avoid issues with multi-request DO tests
+      // See: https://developers.cloudflare.com/workers/testing/vitest-integration/known-issues/#isolated-storage
+      isolatedStorage: false,
+    }),
+  ],
   test: {
     globals: true,
-    poolOptions: {
-      workers: {
-        wrangler: { configPath: './wrangler.test.toml' },
-        miniflare: {
-          bindings: {
-            ENVIRONMENT: 'test',
-            MAX_ORCHESTRATION_ITERATIONS: '10',
-            CODE_EXEC_TIMEOUT_MS: '30000',
-            DEFAULT_ORG: 'unfoldingWord',
-            // Pass API keys for real chat tests
-            ENGINE_API_KEY: 'test-api-key',
-            ANTHROPIC_API_KEY: anthropicKey,
-          },
-          kvNamespaces: ['ORG_ADMIN_KEYS', 'MCP_SERVERS', 'ORG_CONFIG', 'PROMPT_OVERRIDES'],
-          r2Buckets: ['AUDIO_BUCKET'],
-        },
-        // Disable isolated storage to avoid issues with multi-request DO tests
-        // See: https://developers.cloudflare.com/workers/testing/vitest-integration/known-issues/#isolated-storage
-        isolatedStorage: false,
-      },
-    },
     include: ['tests/**/*.test.ts'],
     exclude: isWindows ? ['tests/e2e/**'] : [],
     // Increase timeout for real API calls

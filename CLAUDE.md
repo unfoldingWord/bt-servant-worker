@@ -240,6 +240,24 @@ bt-servant-worker is a Cloudflare Worker that integrates with bt-servant-engine.
 - `pnpm architecture` - Check for circular dependencies
 - `wrangler deploy` - **DO NOT USE DIRECTLY** - Deployments go through CI/CD
 
+## CRITICAL: Dependency Audit Policy
+
+CI gates every PR on `pnpm audit` in two layers — neither layer may be weakened:
+
+1. **Production tree** (`pnpm audit --prod`) — hard fail on **any** severity. Nothing vulnerable reaches the Cloudflare Worker runtime.
+2. **Full tree** (`pnpm audit --audit-level=high`) — hard fail on **high or critical** in dev deps. Moderate dev-only advisories are allowed through to keep the noise floor livable, but high/critical dev advisories must be fixed.
+
+The full-tree gate exists because dev deps run on the CI build host with access to `CLOUDFLARE_API_TOKEN`, `ANTHROPIC_API_KEY`, and the ability to rewrite the deploy artifact. A compromised transitive dev dep is a supply-chain attack surface even though the code never ships to Workers.
+
+**Do not** weaken either gate with `|| true`, `--audit-level=critical`, or any other escape hatch. If the audit flags something you cannot fix, the correct responses are:
+
+1. `pnpm update` to pick up patched transitive versions
+2. Add a targeted entry to `pnpm.overrides` in `package.json` (existing pattern: `hono`, `undici`, `vite`, etc.)
+3. Bump the direct dep that pins the vulnerable transitive version
+4. If none of the above work, open an issue documenting the blocker — **do not** silently re-enable the `|| true` bypass
+
+Dependabot (`.github/dependabot.yml`) runs weekly and groups minor/patch bumps into two PRs (dev vs prod) to handle routine hygiene. If Dependabot is down or lagging, manual `pnpm update` is the fallback.
+
 ## CRITICAL: Version Bumping
 
 **Every PR MUST include a version bump.** This is non-negotiable.
