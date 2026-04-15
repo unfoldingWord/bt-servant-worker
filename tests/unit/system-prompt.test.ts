@@ -289,6 +289,36 @@ describe('buildSystemPrompt - voice response mode', () => {
   });
 });
 
+describe('buildSystemPrompt - voice planning rules', () => {
+  it('includes voice planning rules when isVoiceMessage is true', () => {
+    const prompt = buildSystemPrompt(
+      createEmptyCatalog(),
+      defaultPrefs,
+      [],
+      DEFAULT_PROMPT_VALUES,
+      {
+        isVoiceMessage: true,
+      }
+    );
+    expect(prompt).toContain('Plan for a spoken answer');
+    expect(prompt).toContain('Do NOT cascade into follow-up tool calls');
+  });
+
+  it('excludes voice planning rules when isVoiceMessage is false', () => {
+    const prompt = buildSystemPrompt(
+      createEmptyCatalog(),
+      defaultPrefs,
+      [],
+      DEFAULT_PROMPT_VALUES,
+      {
+        isVoiceMessage: false,
+      }
+    );
+    expect(prompt).not.toContain('Plan for a spoken answer');
+    expect(prompt).not.toContain('Do NOT cascade into follow-up tool calls');
+  });
+});
+
 describe('buildSystemPrompt - client_instructions without clientId', () => {
   it('includes client_instructions without Client Platform header when clientId is omitted', () => {
     const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
