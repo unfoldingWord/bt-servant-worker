@@ -20,7 +20,8 @@
     "format:check": "prettier --check .",
     "check": "tsc --noEmit",
     "architecture": "depcruise --config .dependency-cruiser.js src",
-    "audit:prod": "pnpm audit --prod",
+    "audit:prod": "node scripts/audit-prod.mjs",
+    "audit:all": "node scripts/audit-prod.mjs --include-dev --audit-level=high",
     "prepare": "husky"
   },
   "dependencies": {
@@ -36,6 +37,7 @@
     "@cloudflare/workers-types": "^4.20260414.1",
     "@eslint/js": "^9.39.4",
     "@types/node": "^22.19.17",
+    "@types/semver": "^7.7.1",
     "dependency-cruiser": "^16.10.4",
     "eslint": "^9.39.4",
     "eslint-config-prettier": "^9.1.2",
@@ -44,6 +46,7 @@
     "husky": "^9.1.7",
     "lint-staged": "^15.5.2",
     "prettier": "^3.8.2",
+    "semver": "^7.7.4",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.58.2",
     "vite": "^6.4.2",
