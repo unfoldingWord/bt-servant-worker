@@ -26,10 +26,10 @@ jobs:
         run: pnpm install
 
       - name: Audit production dependencies
-        run: pnpm audit --prod
+        run: pnpm run audit:prod
 
       - name: Audit all dependencies (fail on high/critical)
-        run: pnpm audit --audit-level=high
+        run: pnpm run audit:all
 
   lint:
     name: Lint
