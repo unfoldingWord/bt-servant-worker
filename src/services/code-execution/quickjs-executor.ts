@@ -207,7 +207,7 @@ function logMcpCall(
 ): void {
   logger.log('mcp_call_executed', {
     tool_name: toolName,
-    args,
+    arg_count: args.length,
     call_number: mcpCounter.count,
     limit: mcpCounter.limit,
   });

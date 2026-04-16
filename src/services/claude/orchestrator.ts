@@ -142,6 +142,33 @@ function isGetToolDefinitionsInput(input: unknown): input is { tool_names: strin
   );
 }
 
+/**
+ * Redact sensitive tool inputs for logging.
+ * execute_code: code is already logged separately in quickjs-executor; log length only here.
+ * update_memory: section contents may contain user data; log section names and action only.
+ * All other tools: log input as-is (MCP tool args are redacted in discovery.ts).
+ */
+function redactToolInput(toolName: string, input: Record<string, unknown>): unknown {
+  if (toolName === 'execute_code') {
+    const code = input.code;
+    return { code_length: typeof code === 'string' ? code.length : 0 };
+  }
+  if (toolName === 'update_memory') {
+    const sections = input.sections;
+    if (typeof sections === 'object' && sections !== null) {
+      const keys = Object.keys(sections as Record<string, unknown>);
+      const actions = keys.map((k) => {
+        const v = (sections as Record<string, unknown>)[k];
+        return { section: k, action: v === null ? 'delete' : 'upsert' };
+      });
+      return { sections: actions, pin: input.pin, unpin: input.unpin };
+    }
+    return { sections: '[redacted]' };
+  }
+  // get_tool_definitions and other internal tools are safe to log as-is
+  return input;
+}
+
 /** Anthropic API base URL */
 const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
 
@@ -683,7 +710,7 @@ async function executeSingleTool(
   ctx.logger.log('tool_execution_start', {
     tool_name: toolCall.name,
     tool_id: toolCall.id,
-    input: toolCall.input,
+    input: redactToolInput(toolCall.name, toolCall.input),
   });
   ctx.callbacks?.onToolUse?.(toolCall.name, toolCall.input);
 
@@ -858,7 +885,7 @@ function logToolSuccess(
   ctx.logger.log('tool_execution_complete', {
     tool_name: toolCall.name,
     tool_id: toolCall.id,
-    input: toolCall.input,
+    input: redactToolInput(toolCall.name, toolCall.input),
     duration_ms: Date.now() - startTime,
     success: true,
   });
@@ -874,7 +901,7 @@ function handleToolError(
   ctx.logger.error('tool_execution_error', error, {
     tool_name: toolCall.name,
     tool_id: toolCall.id,
-    input: toolCall.input,
+    input: redactToolInput(toolCall.name, toolCall.input),
     duration_ms: Date.now() - startTime,
   });
   ctx.callbacks?.onToolResult?.(toolCall.name, { error: errorMessage });
