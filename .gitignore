@@ -5,3 +5,5 @@ dist
 .DS_Store
 .dev.vars
 .claude/
+.agents/
+skills-lock.json
