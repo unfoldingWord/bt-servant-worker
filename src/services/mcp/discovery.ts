@@ -287,15 +287,14 @@ function buildToolCallSendOptions(options?: CallMCPToolOptions): SendOptions {
 
 function logToolCallSuccess(
   logger: RequestLogger,
-  serverId: string,
-  toolName: string,
-  responseTimeMs: number,
+  call: { serverId: string; toolName: string; args: unknown; responseTimeMs: number },
   metadata: MCPResponseMetadata | undefined
 ): void {
   logger.log('mcp_tool_call_complete', {
-    server_id: serverId,
-    tool_name: toolName,
-    duration_ms: responseTimeMs,
+    server_id: call.serverId,
+    tool_name: call.toolName,
+    args: call.args,
+    duration_ms: call.responseTimeMs,
     has_metadata: !!metadata,
     downstream_calls: metadata?.downstream_api_calls,
     cache_status: metadata?.cache_status,
@@ -320,7 +319,7 @@ export async function callMCPTool(
   options?: CallMCPToolOptions
 ): Promise<MCPToolCallResult> {
   const startTime = Date.now();
-  logger.log('mcp_tool_call_start', { server_id: server.id, tool_name: toolName });
+  logger.log('mcp_tool_call_start', { server_id: server.id, tool_name: toolName, args });
 
   try {
     const sendOptions = buildToolCallSendOptions(options);
@@ -334,7 +333,7 @@ export async function callMCPTool(
     const responseTimeMs = Date.now() - startTime;
     const metadata = result._meta;
 
-    logToolCallSuccess(logger, server.id, toolName, responseTimeMs, metadata);
+    logToolCallSuccess(logger, { serverId: server.id, toolName, args, responseTimeMs }, metadata);
     if (options?.healthTracker) {
       recordSuccess(options.healthTracker, server.id, responseTimeMs);
     }
@@ -345,6 +344,7 @@ export async function callMCPTool(
     logger.error('mcp_tool_call_error', error, {
       server_id: server.id,
       tool_name: toolName,
+      args,
       duration_ms: responseTimeMs,
     });
     if (options?.healthTracker) {
