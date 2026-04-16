@@ -10,7 +10,7 @@
 
 import { getQuickJSWASMModule, QuickJSContext } from '@cf-wasm/quickjs/workerd';
 import { CodeExecutionError, MCPCallLimitError, TimeoutError } from '../../utils/errors.js';
-import { RequestLogger } from '../../utils/logger.js';
+import { RequestLogger, summarizeArgs } from '../../utils/logger.js';
 import { CodeExecutionOptions, CodeExecutionResult, ConsoleLog, HostFunction } from './types.js';
 
 /**
@@ -207,7 +207,7 @@ function logMcpCall(
 ): void {
   logger.log('mcp_call_executed', {
     tool_name: toolName,
-    args,
+    args: summarizeArgs(Object.fromEntries(args.map((a, i) => [String(i), a]))),
     call_number: mcpCounter.count,
     limit: mcpCounter.limit,
   });

@@ -25,7 +25,7 @@
  */
 
 import { MCPError, MCPResponseTooLargeError } from '../../utils/errors.js';
-import { RequestLogger } from '../../utils/logger.js';
+import { redactArgsForError, RequestLogger, summarizeArgs } from '../../utils/logger.js';
 import { HealthTracker, recordFailure, recordSuccess } from './health.js';
 import {
   MCPResponseMetadata,
@@ -322,7 +322,7 @@ export async function callMCPTool(
   logger.log('mcp_tool_call_start', {
     server_id: server.id,
     tool_name: toolName,
-    args: args,
+    args: summarizeArgs(args),
   });
 
   try {
@@ -339,7 +339,7 @@ export async function callMCPTool(
 
     logToolCallSuccess(
       logger,
-      { serverId: server.id, toolName, args: args, responseTimeMs },
+      { serverId: server.id, toolName, args: summarizeArgs(args), responseTimeMs },
       metadata
     );
     if (options?.healthTracker) {
@@ -352,7 +352,7 @@ export async function callMCPTool(
     logger.error('mcp_tool_call_error', error, {
       server_id: server.id,
       tool_name: toolName,
-      args: args,
+      args: redactArgsForError(args),
       duration_ms: responseTimeMs,
     });
     if (options?.healthTracker) {
