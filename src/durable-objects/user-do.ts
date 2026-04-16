@@ -942,7 +942,7 @@ export class UserDO {
 
     const voiceAudioUrl = audioKey ? audioKeyToUrl(audioKey, workerOrigin) : null;
     // prettier-ignore
-    logger.log('process_chat_complete', { total_ms: Date.now() - ctx.startTime, response_count: responses.length, has_voice_audio: voiceAudioUrl !== null, voice_audio_key: audioKey, total_response_chars: responses.join('').length, response: responses.join('\n') });
+    logger.log('process_chat_complete', { total_ms: Date.now() - ctx.startTime, response_count: responses.length, has_voice_audio: voiceAudioUrl !== null, voice_audio_key: audioKey, total_response_chars: responses.join('').length });
     return {
       responses,
       response_language: effectivePreferences.response_language,

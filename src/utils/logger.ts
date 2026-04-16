@@ -87,7 +87,7 @@ export type RequestLogger = ReturnType<typeof createRequestLogger>;
 //   - Error logs: raw values with sensitive-key masking + string truncation
 
 const SENSITIVE_KEY_PATTERN =
-  /^(token|authorization|apikey|api_key|secret|password|cookie|session|credential|auth)$/i;
+  /token|secret|password|cookie|session|credential|auth|api.?key|private.?key/i;
 const MAX_ERROR_STRING_LENGTH = 1000;
 const ERROR_STRING_HEAD = 500;
 const ERROR_STRING_TAIL = 200;
