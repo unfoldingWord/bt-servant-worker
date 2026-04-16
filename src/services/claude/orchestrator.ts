@@ -20,7 +20,7 @@ import {
   MCPError,
   ValidationError,
 } from '../../utils/errors.js';
-import { RequestLogger } from '../../utils/logger.js';
+import { redactToolInputForError, RequestLogger, summarizeToolInput } from '../../utils/logger.js';
 import { createMCPHostFunctions, executeCode } from '../code-execution/index.js';
 import {
   callMCPTool,
@@ -683,6 +683,7 @@ async function executeSingleTool(
   ctx.logger.log('tool_execution_start', {
     tool_name: toolCall.name,
     tool_id: toolCall.id,
+    input: summarizeToolInput(toolCall.name, toolCall.input),
   });
   ctx.callbacks?.onToolUse?.(toolCall.name, toolCall.input);
 
@@ -857,6 +858,7 @@ function logToolSuccess(
   ctx.logger.log('tool_execution_complete', {
     tool_name: toolCall.name,
     tool_id: toolCall.id,
+    input: summarizeToolInput(toolCall.name, toolCall.input),
     duration_ms: Date.now() - startTime,
     success: true,
   });
@@ -872,6 +874,7 @@ function handleToolError(
   ctx.logger.error('tool_execution_error', error, {
     tool_name: toolCall.name,
     tool_id: toolCall.id,
+    input: redactToolInputForError(toolCall.input),
     duration_ms: Date.now() - startTime,
   });
   ctx.callbacks?.onToolResult?.(toolCall.name, { error: errorMessage });

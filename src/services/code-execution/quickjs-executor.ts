@@ -10,7 +10,7 @@
 
 import { getQuickJSWASMModule, QuickJSContext } from '@cf-wasm/quickjs/workerd';
 import { CodeExecutionError, MCPCallLimitError, TimeoutError } from '../../utils/errors.js';
-import { RequestLogger } from '../../utils/logger.js';
+import { RequestLogger, summarizeArgs } from '../../utils/logger.js';
 import { CodeExecutionOptions, CodeExecutionResult, ConsoleLog, HostFunction } from './types.js';
 
 /**
@@ -199,9 +199,15 @@ function rejectPendingCall(vm: QuickJSContext, callId: number, error: unknown): 
  * Log MCP call execution and warn when approaching the limit.
  * Call numbers are 1-indexed for human readability (call_number: 1 = first call).
  */
-function logMcpCall(logger: RequestLogger, mcpCounter: MCPCallCounter, toolName: string): void {
+function logMcpCall(
+  logger: RequestLogger,
+  mcpCounter: MCPCallCounter,
+  toolName: string,
+  args: unknown[]
+): void {
   logger.log('mcp_call_executed', {
     tool_name: toolName,
+    args: summarizeArgs(Object.fromEntries(args.map((a, i) => [String(i), a]))),
     call_number: mcpCounter.count,
     limit: mcpCounter.limit,
   });
@@ -225,7 +231,7 @@ async function executePendingCall(
   logger: RequestLogger
 ): Promise<void> {
   mcpCounter.count++;
-  logMcpCall(logger, mcpCounter, call.fn.name);
+  logMcpCall(logger, mcpCounter, call.fn.name, call.args);
   try {
     const result = await call.fn.fn(...call.args);
     resolvePendingCall(vm, call.id, result);
