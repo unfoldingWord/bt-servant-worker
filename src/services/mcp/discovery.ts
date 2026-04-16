@@ -187,32 +187,6 @@ async function sendJsonRpcRequest<T>(
   }
 }
 
-/**
- * Describe a single value's type and size for logging without exposing content.
- */
-function describeValue(value: unknown): string {
-  if (value === null || value === undefined) return 'null';
-  if (typeof value === 'string') return `string(${value.length})`;
-  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-  if (Array.isArray(value)) return `array(${value.length})`;
-  return `object(${Object.keys(value as Record<string, unknown>).length} keys)`;
-}
-
-/**
- * Summarize MCP tool args for logging without exposing raw values.
- * Logs argument keys and value types/lengths so we can debug parameter
- * shape issues without persisting user data into centralized logs.
- */
-function summarizeArgs(args: unknown): unknown {
-  if (args === null || args === undefined) return args;
-  if (typeof args !== 'object') return { type: typeof args };
-  const summary: Record<string, string> = {};
-  for (const [key, value] of Object.entries(args as Record<string, unknown>)) {
-    summary[key] = describeValue(value);
-  }
-  return summary;
-}
-
 function filterTools(tools: MCPToolDefinition[], allowedTools?: string[]): MCPToolDefinition[] {
   if (!allowedTools || allowedTools.length === 0) {
     return tools;
@@ -348,7 +322,7 @@ export async function callMCPTool(
   logger.log('mcp_tool_call_start', {
     server_id: server.id,
     tool_name: toolName,
-    args: summarizeArgs(args),
+    args: args,
   });
 
   try {
@@ -365,7 +339,7 @@ export async function callMCPTool(
 
     logToolCallSuccess(
       logger,
-      { serverId: server.id, toolName, args: summarizeArgs(args), responseTimeMs },
+      { serverId: server.id, toolName, args: args, responseTimeMs },
       metadata
     );
     if (options?.healthTracker) {
@@ -378,7 +352,7 @@ export async function callMCPTool(
     logger.error('mcp_tool_call_error', error, {
       server_id: server.id,
       tool_name: toolName,
-      args: summarizeArgs(args),
+      args: args,
       duration_ms: responseTimeMs,
     });
     if (options?.healthTracker) {
