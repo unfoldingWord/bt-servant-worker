@@ -285,15 +285,25 @@ function buildToolCallSendOptions(options?: CallMCPToolOptions): SendOptions {
   return sendOptions;
 }
 
+function truncateResult(result: unknown, maxLen: number = 2000): unknown {
+  if (typeof result === 'string') {
+    if (result.length <= maxLen) return result;
+    return result.slice(0, maxLen) + ` [truncated, ${result.length} chars total]`;
+  }
+  return result;
+}
+
 function logToolCallSuccess(
   logger: RequestLogger,
   call: { serverId: string; toolName: string; args: unknown; responseTimeMs: number },
-  metadata: MCPResponseMetadata | undefined
+  metadata: MCPResponseMetadata | undefined,
+  result: unknown
 ): void {
   logger.log('mcp_tool_call_complete', {
     server_id: call.serverId,
     tool_name: call.toolName,
     args: call.args,
+    result: truncateResult(result),
     duration_ms: call.responseTimeMs,
     has_metadata: !!metadata,
     downstream_calls: metadata?.downstream_api_calls,
@@ -336,17 +346,19 @@ export async function callMCPTool(
 
     const responseTimeMs = Date.now() - startTime;
     const metadata = result._meta;
+    const extractedResult = extractToolResult(result);
 
     logToolCallSuccess(
       logger,
       { serverId: server.id, toolName, args: summarizeArgs(args), responseTimeMs },
-      metadata
+      metadata,
+      extractedResult
     );
     if (options?.healthTracker) {
       recordSuccess(options.healthTracker, server.id, responseTimeMs);
     }
 
-    return { result: extractToolResult(result), metadata, responseTimeMs };
+    return { result: extractedResult, metadata, responseTimeMs };
   } catch (error) {
     const responseTimeMs = Date.now() - startTime;
     logger.error('mcp_tool_call_error', error, {
