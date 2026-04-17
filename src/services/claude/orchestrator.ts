@@ -766,17 +766,57 @@ async function handleReadMemory(input: unknown, ctx: OrchestrationContext): Prom
   return { sections: result, total_size_bytes: totalSize, capacityPercent };
 }
 
+/**
+ * Recover from a known model-drift pattern: sometimes the model calls
+ * update_memory with `sections` as a JSON-stringified object instead of an
+ * object literal. When we detect that, parse the string and swap it in so the
+ * strict validator can apply all other invariants. Emit a warn log so drift
+ * stays observable; if the string is unparseable, throw a targeted
+ * ValidationError (more useful to the retrying model than the generic one).
+ *
+ * Exported for unit testing. Takes only the logger so tests don't need to
+ * construct a full OrchestrationContext.
+ */
+export function coerceStringifiedSections(input: unknown, logger: RequestLogger): unknown {
+  if (
+    typeof input !== 'object' ||
+    input === null ||
+    !('sections' in input) ||
+    typeof (input as { sections: unknown }).sections !== 'string'
+  ) {
+    return input;
+  }
+  const rawSections = (input as { sections: string }).sections;
+  try {
+    const parsed: unknown = JSON.parse(rawSections);
+    logger.warn('update_memory_sections_coerced_from_string', {
+      reason: 'model sent sections as JSON string; auto-parsed before validation',
+      raw_length: rawSections.length,
+    });
+    return { ...(input as object), sections: parsed };
+  } catch (parseError) {
+    logger.log('update_memory_sections_coerce_parse_failed', {
+      error: parseError instanceof Error ? parseError.message : 'unknown',
+      raw_length: rawSections.length,
+    });
+    throw new ValidationError(
+      'Invalid input for update_memory: `sections` must be a JSON object, not a JSON string. Pass the object directly; do not call JSON.stringify on it.'
+    );
+  }
+}
+
 async function handleUpdateMemory(input: unknown, ctx: OrchestrationContext): Promise<unknown> {
   if (!ctx.memoryStore) {
     return { error: 'Memory is not available for this session.' };
   }
-  if (!isUpdateMemoryInput(input)) {
+  const coerced = coerceStringifiedSections(input, ctx.logger);
+  if (!isUpdateMemoryInput(coerced)) {
     throw new ValidationError(
       `Invalid input for update_memory: expected { sections: Record<string, string|null>, pin?: string[], unpin?: string[] }, got ${truncateInput(input)}`
     );
   }
   const startTime = Date.now();
-  const result = await ctx.memoryStore.writeSections(input.sections, input.pin, input.unpin);
+  const result = await ctx.memoryStore.writeSections(coerced.sections, coerced.pin, coerced.unpin);
 
   ctx.logger.log('memory_tool_dispatch', {
     tool_name: 'update_memory',

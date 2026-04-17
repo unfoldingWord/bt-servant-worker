@@ -101,7 +101,7 @@ export function buildReadMemoryTool(): Anthropic.Tool {
 export function buildUpdateMemoryTool(): Anthropic.Tool {
   return {
     name: 'update_memory',
-    description: `Create, update, or delete sections in the user's persistent memory. Pass an object where keys are section names and values are either markdown content (to create/update) or null (to delete). Multiple sections can be updated in a single call. The sections object must contain at least one entry. Use pin/unpin arrays to control which entries are protected from automatic eviction.`,
+    description: `Create, update, or delete sections in the user's persistent memory. Pass an object where keys are section names and values are either markdown content (to create/update) or null (to delete). Multiple sections can be updated in a single call. The sections object must contain at least one entry. Use pin/unpin arrays to control which entries are protected from automatic eviction. Pass \`sections\` as an object directly in the tool input; do not JSON.stringify it.`,
     input_schema: {
       type: 'object',
       properties: {
