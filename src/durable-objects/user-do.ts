@@ -1051,12 +1051,13 @@ export class UserDO {
     let modeOverrides: PromptOverrides = {};
     if (activeModeName) {
       const mode = orgModes.modes.find((m) => m.name === activeModeName);
-      if (mode) {
+      if (mode && mode.published === true) {
         modeOverrides = mode.overrides;
       } else {
         logger.warn('mode_not_found', {
           active_mode: activeModeName,
-          available_modes: orgModes.modes.map((m) => m.name),
+          available_modes: orgModes.modes.filter((m) => m.published === true).map((m) => m.name),
+          reason: mode ? 'unpublished' : 'missing',
         });
       }
     }
@@ -1337,7 +1338,7 @@ export class UserDO {
     activeModeName: string | undefined
   ): ModeContext {
     return {
-      availableModes: orgModes.modes,
+      availableModes: orgModes.modes.filter((m) => m.published === true),
       activeModeName,
       setSelectedMode: async (name: string | null) => {
         if (name === null) {

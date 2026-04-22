@@ -419,6 +419,36 @@ describe('validatePromptMode', () => {
   });
 });
 
+describe('validatePromptMode - published field', () => {
+  it('accepts published: true', () => {
+    expect(validatePromptMode({ published: true, overrides: {} })).toBeNull();
+  });
+
+  it('accepts published: false', () => {
+    expect(validatePromptMode({ published: false, overrides: {} })).toBeNull();
+  });
+
+  it('accepts missing published field (treated as draft)', () => {
+    expect(validatePromptMode({ overrides: {} })).toBeNull();
+  });
+
+  it('accepts published: undefined', () => {
+    expect(validatePromptMode({ published: undefined, overrides: {} })).toBeNull();
+  });
+
+  it('rejects non-boolean published value', () => {
+    expect(validatePromptMode({ published: 'yes', overrides: {} })).toContain(
+      'published must be a boolean'
+    );
+    expect(validatePromptMode({ published: 1, overrides: {} })).toContain(
+      'published must be a boolean'
+    );
+    expect(validatePromptMode({ published: null, overrides: {} })).toContain(
+      'published must be a boolean'
+    );
+  });
+});
+
 describe('validatePromptMode - name field', () => {
   it('accepts valid name when provided', () => {
     expect(validatePromptMode({ name: 'fia-mode', overrides: {} })).toBeNull();
