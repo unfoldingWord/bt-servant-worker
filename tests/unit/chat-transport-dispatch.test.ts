@@ -11,6 +11,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { validateChatBody } from '../../src/index.js';
+import { isAdminClient } from '../../src/utils/chat-validation.js';
 import type { ChatRequest } from '../../src/types/engine.js';
 
 const baseBody: ChatRequest = {
@@ -31,6 +32,36 @@ describe('validateChatBody — shared rules', () => {
     const { client_id: _omit, ...body } = baseBody;
     void _omit;
     expect(validateChatBody(body as ChatRequest, 'final')).toBe('client_id is required');
+  });
+
+  it('rejects is_admin in the body (admin origin is derived from client_id)', () => {
+    const body = { ...baseBody, is_admin: true } as unknown as ChatRequest;
+    expect(validateChatBody(body, 'final')).toBe(
+      'is_admin is not a valid field; admin origin is derived from client_id'
+    );
+  });
+
+  it('rejects is_admin: false the same way (any presence of the field)', () => {
+    const body = { ...baseBody, is_admin: false } as unknown as ChatRequest;
+    expect(validateChatBody(body, 'final')).toBe(
+      'is_admin is not a valid field; admin origin is derived from client_id'
+    );
+  });
+});
+
+describe('isAdminClient', () => {
+  it('treats "admin-portal" as admin', () => {
+    expect(isAdminClient('admin-portal')).toBe(true);
+  });
+
+  it('treats other client_ids as non-admin', () => {
+    expect(isAdminClient('whatsapp-gateway')).toBe(false);
+    expect(isAdminClient('web-client')).toBe(false);
+    expect(isAdminClient('')).toBe(false);
+  });
+
+  it('treats undefined as non-admin', () => {
+    expect(isAdminClient(undefined)).toBe(false);
   });
 });
 

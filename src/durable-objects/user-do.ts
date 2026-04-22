@@ -63,7 +63,7 @@ import { AudioTranscriptionError, ValidationError } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
 import { applyTemplateVariables } from '../utils/template.js';
 import { createTimingContext, timePhase, TimingContext } from '../utils/timing.js';
-import { validateChatBody } from '../utils/chat-validation.js';
+import { isAdminClient, validateChatBody } from '../utils/chat-validation.js';
 import { InternalQueueEntry } from '../types/queue.js';
 
 // ── Storage keys ───────────────────────────────────────────────────────────────
@@ -1044,6 +1044,7 @@ export class UserDO {
   }
 
   private async resolvePrompts(body: ChatRequest, logger: RequestLogger) {
+    const isAdmin = isAdminClient(body.client_id);
     const orgOverrides = body._org_prompt_overrides ?? {};
     const orgModes = body._org_modes ?? { modes: [] };
     const userSelectedMode = await this.getSelectedMode();
@@ -1053,14 +1054,19 @@ export class UserDO {
     // tool doesn't surface a mode that has been unpublished or deleted as
     // "active." The persisted selection in storage is left untouched in case the
     // mode is republished later — we only mask in-memory for this request.
+    // Admin-origin requests skip the published filter so authors can test drafts
+    // from the portal's test chat pane.
     const { effectiveModeName, modeOverrides, reason } = resolveEffectiveMode(
       orgModes,
-      requestedModeName
+      requestedModeName,
+      { includeUnpublished: isAdmin }
     );
     if (reason === 'missing' || reason === 'unpublished') {
       logger.warn('mode_not_found', {
         active_mode: requestedModeName,
-        available_modes: orgModes.modes.filter((m) => m.published === true).map((m) => m.name),
+        available_modes: isAdmin
+          ? orgModes.modes.map((m) => m.name)
+          : orgModes.modes.filter((m) => m.published === true).map((m) => m.name),
         reason,
       });
     }
@@ -1083,7 +1089,7 @@ export class UserDO {
         overridden_slots: overriddenSlots,
       });
     }
-    return { resolved, orgModes, activeModeName: effectiveModeName };
+    return { resolved, orgModes, activeModeName: effectiveModeName, isAdmin };
   }
 
   private async loadMemoryContext(logger: RequestLogger) {
@@ -1316,7 +1322,7 @@ export class UserDO {
       resolvedPromptValues,
       memoryStore,
       memoryTOC: formattedTOC || undefined,
-      modeContext: this.buildModeContext(orgModes, activeModeName),
+      modeContext: this.buildModeContext(orgModes, activeModeName, isAdminClient(body.client_id)),
       audioContext,
       clientId: body.client_id,
       groupContext,
@@ -1338,10 +1344,11 @@ export class UserDO {
 
   private buildModeContext(
     orgModes: { modes: PromptMode[] },
-    activeModeName: string | undefined
+    activeModeName: string | undefined,
+    isAdmin: boolean
   ): ModeContext {
     return {
-      availableModes: orgModes.modes.filter((m) => m.published === true),
+      availableModes: isAdmin ? orgModes.modes : orgModes.modes.filter((m) => m.published === true),
       activeModeName,
       setSelectedMode: async (name: string | null) => {
         if (name === null) {
