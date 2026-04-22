@@ -293,10 +293,15 @@ export function resolveActiveModeName(userSelectedMode: string | undefined): str
  * unpublished, so downstream tools (`list_modes`) never surface a draft as
  * "active." `modeOverrides` is the mode's overrides when applicable, otherwise
  * empty. `reason` distinguishes missing vs unpublished for log correlation.
+ *
+ * Admin-origin requests pass `options.includeUnpublished = true` so authors can
+ * test drafts from the portal's test chat pane. For those requests a matched
+ * draft returns `reason: 'ok'` — end-user requests keep the default filter.
  */
 export function resolveEffectiveMode(
   orgModes: OrgModes,
-  requestedModeName: string | undefined
+  requestedModeName: string | undefined,
+  options?: { includeUnpublished?: boolean }
 ): {
   effectiveModeName: string | undefined;
   modeOverrides: PromptOverrides;
@@ -309,7 +314,7 @@ export function resolveEffectiveMode(
   if (!mode) {
     return { effectiveModeName: undefined, modeOverrides: {}, reason: 'missing' };
   }
-  if (mode.published !== true) {
+  if (mode.published !== true && options?.includeUnpublished !== true) {
     return { effectiveModeName: undefined, modeOverrides: {}, reason: 'unpublished' };
   }
   return { effectiveModeName: requestedModeName, modeOverrides: mode.overrides, reason: 'ok' };

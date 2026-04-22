@@ -70,15 +70,24 @@ function validateTransportFields(body: ChatRequest, transport: ChatTransport): s
   return null;
 }
 
-/** Validate chat request fields, returning an error string or null if valid. */
-export function validateChatBody(body: ChatRequest, transport: ChatTransport): string | null {
+function validateCoreFields(body: ChatRequest): string | null {
   if (!body.user_id) return 'user_id is required';
   if (!body.client_id) return 'client_id is required';
+  if (body.is_admin !== undefined && typeof body.is_admin !== 'boolean') {
+    return 'is_admin must be a boolean when provided';
+  }
   if (body.chat_type && !VALID_CHAT_TYPES.has(body.chat_type)) {
     return `Invalid chat_type: ${body.chat_type}. Must be one of: private, group, supergroup`;
   }
   const isGroup = body.chat_type === 'group' || body.chat_type === 'supergroup';
   if (isGroup && !body.chat_id) return 'chat_id is required for group/supergroup chats';
+  return null;
+}
+
+/** Validate chat request fields, returning an error string or null if valid. */
+export function validateChatBody(body: ChatRequest, transport: ChatTransport): string | null {
+  const coreError = validateCoreFields(body);
+  if (coreError) return coreError;
 
   const transportError = validateTransportFields(body, transport);
   if (transportError) return transportError;

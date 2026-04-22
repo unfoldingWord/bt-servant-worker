@@ -32,6 +32,19 @@ describe('validateChatBody — shared rules', () => {
     void _omit;
     expect(validateChatBody(body as ChatRequest, 'final')).toBe('client_id is required');
   });
+
+  it('accepts is_admin: true', () => {
+    expect(validateChatBody({ ...baseBody, is_admin: true }, 'final')).toBeNull();
+  });
+
+  it('accepts is_admin: false', () => {
+    expect(validateChatBody({ ...baseBody, is_admin: false }, 'final')).toBeNull();
+  });
+
+  it('rejects non-boolean is_admin', () => {
+    const body = { ...baseBody, is_admin: 'yes' as unknown as boolean };
+    expect(validateChatBody(body, 'final')).toBe('is_admin must be a boolean when provided');
+  });
 });
 
 describe('validateChatBody — final transport', () => {

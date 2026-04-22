@@ -516,3 +516,39 @@ describe('resolveEffectiveMode', () => {
     expect(r.reason).toBe('none-requested');
   });
 });
+
+describe('resolveEffectiveMode - includeUnpublished (admin-origin)', () => {
+  const orgModes = {
+    modes: [
+      { name: 'pub', published: true, overrides: { identity: 'Pub identity' } },
+      { name: 'draft', published: false, overrides: { identity: 'Draft identity' } },
+      { name: 'legacy', overrides: { identity: 'Legacy identity' } },
+    ],
+  };
+
+  it('returns a draft as ok when includeUnpublished is true', () => {
+    const r = resolveEffectiveMode(orgModes, 'draft', { includeUnpublished: true });
+    expect(r.effectiveModeName).toBe('draft');
+    expect(r.modeOverrides.identity).toBe('Draft identity');
+    expect(r.reason).toBe('ok');
+  });
+
+  it('returns a legacy (no published field) mode as ok when includeUnpublished is true', () => {
+    const r = resolveEffectiveMode(orgModes, 'legacy', { includeUnpublished: true });
+    expect(r.effectiveModeName).toBe('legacy');
+    expect(r.modeOverrides.identity).toBe('Legacy identity');
+    expect(r.reason).toBe('ok');
+  });
+
+  it('still returns missing for a non-existent mode even with includeUnpublished', () => {
+    const r = resolveEffectiveMode(orgModes, 'deleted', { includeUnpublished: true });
+    expect(r.effectiveModeName).toBeUndefined();
+    expect(r.modeOverrides).toEqual({});
+    expect(r.reason).toBe('missing');
+  });
+
+  it('default (no options) still masks drafts as unpublished for end-user requests', () => {
+    const r = resolveEffectiveMode(orgModes, 'draft');
+    expect(r.reason).toBe('unpublished');
+  });
+});
