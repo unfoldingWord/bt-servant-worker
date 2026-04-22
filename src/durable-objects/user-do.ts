@@ -63,7 +63,7 @@ import { AudioTranscriptionError, ValidationError } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
 import { applyTemplateVariables } from '../utils/template.js';
 import { createTimingContext, timePhase, TimingContext } from '../utils/timing.js';
-import { validateChatBody } from '../utils/chat-validation.js';
+import { isAdminClient, validateChatBody } from '../utils/chat-validation.js';
 import { InternalQueueEntry } from '../types/queue.js';
 
 // ── Storage keys ───────────────────────────────────────────────────────────────
@@ -1044,7 +1044,7 @@ export class UserDO {
   }
 
   private async resolvePrompts(body: ChatRequest, logger: RequestLogger) {
-    const isAdmin = body.is_admin === true;
+    const isAdmin = isAdminClient(body.client_id);
     const orgOverrides = body._org_prompt_overrides ?? {};
     const orgModes = body._org_modes ?? { modes: [] };
     const userSelectedMode = await this.getSelectedMode();
@@ -1322,7 +1322,7 @@ export class UserDO {
       resolvedPromptValues,
       memoryStore,
       memoryTOC: formattedTOC || undefined,
-      modeContext: this.buildModeContext(orgModes, activeModeName, body.is_admin === true),
+      modeContext: this.buildModeContext(orgModes, activeModeName, isAdminClient(body.client_id)),
       audioContext,
       clientId: body.client_id,
       groupContext,

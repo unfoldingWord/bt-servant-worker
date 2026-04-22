@@ -59,16 +59,6 @@ export interface ChatRequest {
   /** Gateway-provided language hint. Overrides stored preference for this request. */
   response_language_hint?: string;
 
-  /**
-   * Set to true by the admin portal BFF (bt-servant-admin-portal worker/baruch.ts)
-   * when the chat originates from an authenticated admin session. Bypasses the
-   * published-mode filter so authors can test draft modes from the portal's
-   * built-in test chat pane. Trusted at face value: the portal BFF is the only
-   * expected caller to set this, and it's populated from the portal's
-   * server-side session.
-   */
-  is_admin?: boolean;
-
   /** Internal: MCP servers injected by worker (not from client) */
   _mcp_servers?: MCPServerConfig[];
 
