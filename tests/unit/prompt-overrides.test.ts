@@ -10,6 +10,7 @@ import {
   validateModeName,
   validatePromptMode,
   resolveActiveModeName,
+  resolveEffectiveMode,
   MAX_MODE_NAME_LENGTH,
   MAX_MODE_LABEL_LENGTH,
   MAX_MODE_DESCRIPTION_LENGTH,
@@ -468,5 +469,50 @@ describe('resolveActiveModeName', () => {
 
   it('returns undefined when no user selection', () => {
     expect(resolveActiveModeName(undefined)).toBeUndefined();
+  });
+});
+
+describe('resolveEffectiveMode', () => {
+  const orgModes = {
+    modes: [
+      { name: 'pub', published: true, overrides: { identity: 'Pub identity' } },
+      { name: 'draft', published: false, overrides: { identity: 'Draft identity' } },
+      { name: 'legacy', overrides: { identity: 'Legacy identity' } },
+    ],
+  };
+
+  it('returns the requested mode when published', () => {
+    const r = resolveEffectiveMode(orgModes, 'pub');
+    expect(r.effectiveModeName).toBe('pub');
+    expect(r.modeOverrides.identity).toBe('Pub identity');
+    expect(r.reason).toBe('ok');
+  });
+
+  it('masks effectiveModeName when the requested mode is unpublished (published: false)', () => {
+    const r = resolveEffectiveMode(orgModes, 'draft');
+    expect(r.effectiveModeName).toBeUndefined();
+    expect(r.modeOverrides).toEqual({});
+    expect(r.reason).toBe('unpublished');
+  });
+
+  it('treats a mode with no published field as unpublished (legacy/missing field)', () => {
+    const r = resolveEffectiveMode(orgModes, 'legacy');
+    expect(r.effectiveModeName).toBeUndefined();
+    expect(r.modeOverrides).toEqual({});
+    expect(r.reason).toBe('unpublished');
+  });
+
+  it('masks effectiveModeName when the requested mode no longer exists', () => {
+    const r = resolveEffectiveMode(orgModes, 'deleted');
+    expect(r.effectiveModeName).toBeUndefined();
+    expect(r.modeOverrides).toEqual({});
+    expect(r.reason).toBe('missing');
+  });
+
+  it('returns none-requested when no mode was requested', () => {
+    const r = resolveEffectiveMode(orgModes, undefined);
+    expect(r.effectiveModeName).toBeUndefined();
+    expect(r.modeOverrides).toEqual({});
+    expect(r.reason).toBe('none-requested');
   });
 });

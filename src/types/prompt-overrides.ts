@@ -287,6 +287,35 @@ export function resolveActiveModeName(userSelectedMode: string | undefined): str
 }
 
 /**
+ * Resolve the effective mode for a request given a (possibly stale) selection.
+ *
+ * `effectiveModeName` is `undefined` whenever the requested mode is missing or
+ * unpublished, so downstream tools (`list_modes`) never surface a draft as
+ * "active." `modeOverrides` is the mode's overrides when applicable, otherwise
+ * empty. `reason` distinguishes missing vs unpublished for log correlation.
+ */
+export function resolveEffectiveMode(
+  orgModes: OrgModes,
+  requestedModeName: string | undefined
+): {
+  effectiveModeName: string | undefined;
+  modeOverrides: PromptOverrides;
+  reason: 'ok' | 'none-requested' | 'missing' | 'unpublished';
+} {
+  if (!requestedModeName) {
+    return { effectiveModeName: undefined, modeOverrides: {}, reason: 'none-requested' };
+  }
+  const mode = orgModes.modes.find((m) => m.name === requestedModeName);
+  if (!mode) {
+    return { effectiveModeName: undefined, modeOverrides: {}, reason: 'missing' };
+  }
+  if (mode.published !== true) {
+    return { effectiveModeName: undefined, modeOverrides: {}, reason: 'unpublished' };
+  }
+  return { effectiveModeName: requestedModeName, modeOverrides: mode.overrides, reason: 'ok' };
+}
+
+/**
  * Type-safe merge of prompt override updates into an existing overrides object.
  * - null values delete the slot (revert to inherited behavior)
  * - string values set the slot (after stripping control characters)
