@@ -45,16 +45,16 @@ The ONLY exception is if the user explicitly asks you to deploy directly for eme
 
 **NEVER merge a PR without explicit user approval.** This is non-negotiable.
 
-**NEVER ask to merge or offer to merge a PR until the code reviewer has been run and all issues it reports are resolved.** Running CI alone is NOT sufficient — the code reviewer must also pass.
+**NEVER ask to merge or offer to merge a PR until Codex code review has been run and all issues it reports are resolved.** Running CI alone is NOT sufficient — Codex review must also pass.
 
-After pushing changes to a PR:
+Codex review is human-triggered, not something Claude can run. After pushing changes to a PR:
 
 1. Wait for CI to pass
-2. Run the code reviewer on the PR
-3. Fix ALL issues reported by the reviewer (Critical, High, Medium, and Low)
-4. Push fixes and re-run the code reviewer
-5. Repeat steps 3-4 until the reviewer reports no remaining issues
-6. Report the clean review results to the user
+2. Tell the user: **"Ready for codex code review."** Then stop and wait — do not proceed.
+3. The user runs Codex review and pastes the findings back
+4. Fix ALL issues reported (Critical, High, Medium, and Low)
+5. Push fixes and tell the user **"Ready for codex code review."** again
+6. Repeat steps 3-5 until Codex reports no remaining issues
 7. **ASK the user** if they want to merge
 8. Only merge if the user explicitly says yes
 
