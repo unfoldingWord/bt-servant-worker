@@ -88,3 +88,47 @@ describe('upsertMode - scalar field preservation', () => {
     if (result.ok) expect(result.savedMode.label).toBe('New');
   });
 });
+
+describe('upsertMode - published flag preservation', () => {
+  it('preserves existing published: true when caller omits the field', () => {
+    const orgModes = makeOrgModes({ name: 't', published: true, overrides: {} });
+    const result = upsertMode(orgModes, { name: 't', overrides: { identity: 'X' } }, 'o');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.savedMode.published).toBe(true);
+  });
+
+  it('preserves existing published: false when caller omits the field', () => {
+    const orgModes = makeOrgModes({ name: 't', published: false, overrides: {} });
+    const result = upsertMode(orgModes, { name: 't', overrides: { identity: 'X' } }, 'o');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.savedMode.published).toBe(false);
+  });
+
+  it('updates published when caller provides it (publish action)', () => {
+    const orgModes = makeOrgModes({ name: 't', published: false, overrides: {} });
+    const result = upsertMode(orgModes, { name: 't', published: true, overrides: {} }, 'o');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.savedMode.published).toBe(true);
+  });
+
+  it('updates published when caller provides it (unpublish action)', () => {
+    const orgModes = makeOrgModes({ name: 't', published: true, overrides: {} });
+    const result = upsertMode(orgModes, { name: 't', published: false, overrides: {} }, 'o');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.savedMode.published).toBe(false);
+  });
+
+  it('persists published on a brand-new mode', () => {
+    const orgModes = makeOrgModes();
+    const result = upsertMode(orgModes, { name: 'new', published: true, overrides: {} }, 'o');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.savedMode.published).toBe(true);
+  });
+
+  it('omits published key on new mode when not supplied (defaults to draft)', () => {
+    const orgModes = makeOrgModes();
+    const result = upsertMode(orgModes, { name: 'new', overrides: {} }, 'o');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.savedMode.published).toBeUndefined();
+  });
+});

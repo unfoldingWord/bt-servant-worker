@@ -66,6 +66,12 @@ export interface PromptMode {
   label?: string;
   /** Description of what this mode does */
   description?: string;
+  /**
+   * Whether this mode is visible to end users via list_modes/switch_mode.
+   * `true` => user-visible. Anything else (`false`, `undefined`, missing) => draft.
+   * Admin endpoints always return all modes regardless of this flag.
+   */
+  published?: boolean;
   /** The prompt overrides for this mode — same 7 slots */
   overrides: PromptOverrides;
 }
@@ -216,6 +222,20 @@ export function validateModeName(name: unknown): string | null {
   return null;
 }
 
+/** Narrow `unknown` to a plain object (not array, not null). */
+function asPlainObject(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+/** Validate an optional boolean field. `undefined` / missing are accepted. */
+function validateOptionalBoolean(obj: Record<string, unknown>, field: string): string | null {
+  const value = obj[field]; // eslint-disable-line security/detect-object-injection -- field is hardcoded
+  if (value === undefined) return null;
+  if (typeof value !== 'boolean') return `Mode ${field} must be a boolean`;
+  return null;
+}
+
 /** Validate an optional string field with a max length. */
 function validateOptionalString(
   obj: Record<string, unknown>,
@@ -236,23 +256,15 @@ function validateOptionalString(
  * Returns an error message if invalid, null if valid.
  */
 export function validatePromptMode(mode: unknown): string | null {
-  if (typeof mode !== 'object' || mode === null || Array.isArray(mode)) {
-    return 'Mode must be a JSON object';
-  }
+  const obj = asPlainObject(mode);
+  if (!obj) return 'Mode must be a JSON object';
 
-  const obj = mode as Record<string, unknown>;
-
-  // name is required and must pass mode name validation
-  if ('name' in obj) {
-    const nameError = validateModeName(obj.name);
-    if (nameError) return nameError;
-  }
-
-  const labelError = validateOptionalString(obj, 'label', MAX_MODE_LABEL_LENGTH);
-  if (labelError) return labelError;
-
-  const descError = validateOptionalString(obj, 'description', MAX_MODE_DESCRIPTION_LENGTH);
-  if (descError) return descError;
+  const scalarError =
+    ('name' in obj ? validateModeName(obj.name) : null) ??
+    validateOptionalString(obj, 'label', MAX_MODE_LABEL_LENGTH) ??
+    validateOptionalString(obj, 'description', MAX_MODE_DESCRIPTION_LENGTH) ??
+    validateOptionalBoolean(obj, 'published');
+  if (scalarError) return scalarError;
 
   if (!('overrides' in obj)) {
     return 'Mode must include an "overrides" object';
@@ -272,6 +284,35 @@ export function validatePromptMode(mode: unknown): string | null {
  */
 export function resolveActiveModeName(userSelectedMode: string | undefined): string | undefined {
   return userSelectedMode;
+}
+
+/**
+ * Resolve the effective mode for a request given a (possibly stale) selection.
+ *
+ * `effectiveModeName` is `undefined` whenever the requested mode is missing or
+ * unpublished, so downstream tools (`list_modes`) never surface a draft as
+ * "active." `modeOverrides` is the mode's overrides when applicable, otherwise
+ * empty. `reason` distinguishes missing vs unpublished for log correlation.
+ */
+export function resolveEffectiveMode(
+  orgModes: OrgModes,
+  requestedModeName: string | undefined
+): {
+  effectiveModeName: string | undefined;
+  modeOverrides: PromptOverrides;
+  reason: 'ok' | 'none-requested' | 'missing' | 'unpublished';
+} {
+  if (!requestedModeName) {
+    return { effectiveModeName: undefined, modeOverrides: {}, reason: 'none-requested' };
+  }
+  const mode = orgModes.modes.find((m) => m.name === requestedModeName);
+  if (!mode) {
+    return { effectiveModeName: undefined, modeOverrides: {}, reason: 'missing' };
+  }
+  if (mode.published !== true) {
+    return { effectiveModeName: undefined, modeOverrides: {}, reason: 'unpublished' };
+  }
+  return { effectiveModeName: requestedModeName, modeOverrides: mode.overrides, reason: 'ok' };
 }
 
 /**

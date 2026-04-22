@@ -550,6 +550,7 @@ app.put('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
       mode_name: modeName,
       mode_count: orgModes.modes.length,
       saved_overrides: result.savedMode.overrides,
+      published: result.savedMode.published === true,
     });
     return c.json({ org, mode: result.savedMode, message: 'Mode saved' });
   } catch (error) {
@@ -736,6 +737,10 @@ export default app;
 
 /** Merge an incoming mode with an existing one, combining overrides and optional fields. */
 function mergeExistingMode(existing: PromptMode, incoming: PromptMode): PromptMode {
+  // published is rebuilt explicitly: incoming wins if present (publish/unpublish action),
+  // otherwise existing carries through. Without this, a PUT that omits `published`
+  // would silently strip the flag from a previously-published mode.
+  const publishedResolved = incoming.published ?? existing.published;
   return {
     name: incoming.name,
     overrides: mergePromptOverrides(existing.overrides, incoming.overrides),
@@ -743,6 +748,7 @@ function mergeExistingMode(existing: PromptMode, incoming: PromptMode): PromptMo
     ...((incoming.description ?? existing.description)
       ? { description: incoming.description ?? existing.description }
       : {}),
+    ...(publishedResolved !== undefined ? { published: publishedResolved } : {}),
   };
 }
 

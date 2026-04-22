@@ -46,6 +46,7 @@ import {
   PromptMode,
   PromptOverrides,
   resolveActiveModeName,
+  resolveEffectiveMode,
   resolvePromptOverrides,
   validateModeName,
   validatePromptOverrides,
@@ -1046,19 +1047,22 @@ export class UserDO {
     const orgOverrides = body._org_prompt_overrides ?? {};
     const orgModes = body._org_modes ?? { modes: [] };
     const userSelectedMode = await this.getSelectedMode();
-    const activeModeName = resolveActiveModeName(userSelectedMode);
+    const requestedModeName = resolveActiveModeName(userSelectedMode);
 
-    let modeOverrides: PromptOverrides = {};
-    if (activeModeName) {
-      const mode = orgModes.modes.find((m) => m.name === activeModeName);
-      if (mode) {
-        modeOverrides = mode.overrides;
-      } else {
-        logger.warn('mode_not_found', {
-          active_mode: activeModeName,
-          available_modes: orgModes.modes.map((m) => m.name),
-        });
-      }
+    // effectiveModeName masks a stale selection so the orchestrator's list_modes
+    // tool doesn't surface a mode that has been unpublished or deleted as
+    // "active." The persisted selection in storage is left untouched in case the
+    // mode is republished later — we only mask in-memory for this request.
+    const { effectiveModeName, modeOverrides, reason } = resolveEffectiveMode(
+      orgModes,
+      requestedModeName
+    );
+    if (reason === 'missing' || reason === 'unpublished') {
+      logger.warn('mode_not_found', {
+        active_mode: requestedModeName,
+        available_modes: orgModes.modes.filter((m) => m.published === true).map((m) => m.name),
+        reason,
+      });
     }
 
     const userOverrides = await this.getPromptOverrides();
@@ -1074,12 +1078,12 @@ export class UserDO {
       logger.log('prompt_overrides_applied', {
         org_overrides: Object.keys(orgOverrides).length,
         mode_overrides: Object.keys(modeOverrides).length,
-        active_mode: activeModeName ?? null,
+        active_mode: effectiveModeName ?? null,
         user_overrides: Object.keys(userOverrides).length,
         overridden_slots: overriddenSlots,
       });
     }
-    return { resolved, orgModes, activeModeName };
+    return { resolved, orgModes, activeModeName: effectiveModeName };
   }
 
   private async loadMemoryContext(logger: RequestLogger) {
@@ -1337,7 +1341,7 @@ export class UserDO {
     activeModeName: string | undefined
   ): ModeContext {
     return {
-      availableModes: orgModes.modes,
+      availableModes: orgModes.modes.filter((m) => m.published === true),
       activeModeName,
       setSelectedMode: async (name: string | null) => {
         if (name === null) {
