@@ -45,20 +45,20 @@ The ONLY exception is if the user explicitly asks you to deploy directly for eme
 
 **NEVER merge a PR without explicit user approval.** This is non-negotiable.
 
-**NEVER ask to merge or offer to merge a PR until the `claude-code-review` subagent has been run and all issues it reports are resolved.** Running CI alone is NOT sufficient — the code review agent must also pass.
+**NEVER ask to merge or offer to merge a PR until the code reviewer has been run and all issues it reports are resolved.** Running CI alone is NOT sufficient — the code reviewer must also pass.
 
 After pushing changes to a PR:
 
 1. Wait for CI to pass
-2. Run the `claude-code-review` subagent on the PR
-3. Fix ALL issues reported by the review agent (Critical, High, Medium, and Low)
-4. Push fixes and re-run the `claude-code-review` subagent
-5. Repeat steps 3-4 until the review agent reports no remaining issues
+2. Run the code reviewer on the PR
+3. Fix ALL issues reported by the reviewer (Critical, High, Medium, and Low)
+4. Push fixes and re-run the code reviewer
+5. Repeat steps 3-4 until the reviewer reports no remaining issues
 6. Report the clean review results to the user
 7. **ASK the user** if they want to merge
 8. Only merge if the user explicitly says yes
 
-Do NOT skip or shortcut the review loop. Every push with fixes must be re-reviewed by the `claude-code-review` subagent until it passes clean.
+Do NOT skip or shortcut the review loop. Every push with fixes must be re-reviewed until it passes clean.
 
 Merging without permission bypasses:
 
