@@ -19,7 +19,7 @@ export const PROMPT_OVERRIDE_SLOTS = [
 export type PromptSlot = (typeof PROMPT_OVERRIDE_SLOTS)[number];
 
 /** Max characters per slot */
-export const MAX_OVERRIDE_LENGTH = 4000;
+export const MAX_OVERRIDE_LENGTH = 8000;
 
 /**
  * Prompt overrides — each slot is optional.
