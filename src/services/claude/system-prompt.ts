@@ -82,6 +82,25 @@ const VOICE_RESPONSE_GUIDANCE =
   '\n\n' +
   VOICE_PLANNING_RULES;
 
+// Non-overridable rendering contract. Downstream clients (web, WhatsApp) parse
+// Claude's output for media URLs and render them natively — this rule set is
+// the wire format between the worker and those clients. Do not move this into
+// a prompt-override slot: an org accidentally clobbering it breaks inline
+// media rendering across every conversation for that org.
+const MEDIA_FORMATTING_RULES =
+  '## Media URL formatting (REQUIRED)\n\n' +
+  'When referencing a URL returned by a tool, use EXACTLY these formats:\n\n' +
+  '- **Image URLs** ending in `.jpg`, `.jpeg`, `.png`, `.webp`, or `.gif` → use markdown image syntax: `![descriptive alt text](url)`. ' +
+  'NEVER use link syntax `[text](url)` for an image URL. NEVER emit a bare image URL.\n' +
+  '- **Video URLs** ending in `.mp4`, `.webm`, `.mov`, `.m4v`, or `.ogv` → use markdown link syntax: `[descriptive label](url)`. ' +
+  'NEVER wrap a video URL with `!` (never `![…](url.mp4)`). NEVER emit a bare video URL.\n\n' +
+  '## Never invent URLs\n\n' +
+  "You may ONLY reference media URLs that were explicitly present in a tool's return value.\n" +
+  '- If a tool result has an empty or missing field for a media item (e.g., `Video:` with no URL), DO NOT emit a reference for that item. ' +
+  'Skip it or say "no video available for this passage."\n' +
+  '- NEVER construct a URL by pattern-matching from another field (e.g., do not derive a video URL from a photo URL by swapping path segments like `photos/…` → `videos/…`).\n' +
+  '- Copy URLs verbatim from tool output.';
+
 /** Build the client platform + client_instructions section. */
 function buildClientSection(clientId: string | undefined, clientInstructions: string): string {
   const parts: string[] = [];
@@ -136,8 +155,9 @@ function buildConditionalSections(
  * Assembly order:
  *   [identity] → [methodology] → [tool_guidance] → [tool catalog] →
  *   [instructions] → [client_instructions] → [group context] →
- *   [memory_instructions + TOC] → [audio guidance] →
- *   [user preferences] → [conversation context] → [first interaction] → [closing]
+ *   [memory_instructions + TOC] → [audio guidance] → [voice guidance] →
+ *   [user preferences] → [conversation context] → [first interaction] →
+ *   [media formatting rules (non-overridable)] → [closing]
  */
 export function buildSystemPrompt(
   catalog: ToolCatalog,
@@ -166,6 +186,7 @@ export function buildSystemPrompt(
     sections.push(VOICE_RESPONSE_GUIDANCE);
   }
   sections.push(...buildConditionalSections(preferences, history));
+  sections.push(MEDIA_FORMATTING_RULES);
   sections.push(resolvedPromptValues.closing);
 
   return sections.join('\n\n');

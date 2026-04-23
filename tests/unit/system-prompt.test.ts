@@ -343,3 +343,47 @@ describe('buildSystemPrompt - client_instructions without clientId', () => {
     expect(clientIdx).toBeLessThan(memoryIdx);
   });
 });
+
+describe('buildSystemPrompt - media formatting rules (non-overridable)', () => {
+  it('includes the media URL formatting contract heading and patterns', () => {
+    const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
+    expect(prompt).toContain('## Media URL formatting (REQUIRED)');
+    expect(prompt).toContain('![descriptive alt text](url)');
+    expect(prompt).toContain('[descriptive label](url)');
+    expect(prompt).toContain('.jpg');
+    expect(prompt).toContain('.mp4');
+  });
+
+  it('includes the "never invent URLs" guardrail with verbatim/empty guidance', () => {
+    const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
+    expect(prompt).toContain('## Never invent URLs');
+    expect(prompt).toContain('verbatim');
+    expect(prompt).toContain('empty');
+  });
+
+  it('rules survive when every overridable slot is replaced (non-overridable)', () => {
+    const custom = {
+      identity: 'X_IDENTITY',
+      methodology: 'X_METHODOLOGY',
+      tool_guidance: 'X_TOOL_GUIDANCE',
+      instructions: 'X_INSTRUCTIONS',
+      client_instructions: 'X_CLIENT_INSTRUCTIONS',
+      memory_instructions: 'X_MEMORY',
+      closing: 'X_CLOSING',
+    };
+    const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], custom);
+    expect(prompt).toContain('## Media URL formatting (REQUIRED)');
+    expect(prompt).toContain('## Never invent URLs');
+  });
+
+  it('media rules appear after memory + audio guidance and before closing', () => {
+    const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
+    const memoryIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.memory_instructions);
+    const audioIdx = prompt.indexOf('## Audio Response (IMPORTANT)');
+    const mediaIdx = prompt.indexOf('## Media URL formatting (REQUIRED)');
+    const closingIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.closing);
+    expect(memoryIdx).toBeLessThan(mediaIdx);
+    expect(audioIdx).toBeLessThan(mediaIdx);
+    expect(mediaIdx).toBeLessThan(closingIdx);
+  });
+});
