@@ -104,7 +104,15 @@ const MEDIA_FORMATTING_RULES =
   '- If a tool result has an empty or missing field for a media item (e.g., `Video:` with no URL), DO NOT emit a reference for that item. ' +
   'Skip it or say "no video available for this passage."\n' +
   '- NEVER construct a URL by pattern-matching from another field (e.g., do not derive a video URL from a photo URL by swapping path segments like `photos/…` → `videos/…`).\n' +
-  '- Copy URLs verbatim from tool output.';
+  '- Copy URLs verbatim from tool output.\n\n' +
+  '## One media item per response\n\n' +
+  "When sharing multiple media items (images or videos), emit each one as its own response, with the relevant context or caption as that response's prose.\n" +
+  '- DO NOT combine multiple `![alt](url)` or `[label](url)` items into a single response.\n' +
+  '- A single image accompanied by prose context in the same response is fine; the constraint is on multi-item responses, not on prose-plus-one-media.\n\n' +
+  '## No pre-labeled markdown images\n\n' +
+  "The markdown alt text IS the image's label — downstream clients render it as the caption.\n" +
+  '- Write `![Mount Tabor Map](url)`, NOT `Mount Tabor Map:\\n![Mount Tabor Map](url)`.\n' +
+  '- Pre-labeling in prose creates duplicate captions on the rendered message.';
 
 /** Build the client platform + client_instructions section. */
 function buildClientSection(clientId: string | undefined, clientInstructions: string): string {

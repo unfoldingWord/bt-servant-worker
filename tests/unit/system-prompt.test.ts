@@ -361,6 +361,20 @@ describe('buildSystemPrompt - media formatting rules (non-overridable)', () => {
     expect(prompt).toContain('empty');
   });
 
+  it('includes the "one media item per response" rule', () => {
+    const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
+    expect(prompt).toContain('## One media item per response');
+    expect(prompt).toContain('emit each one as its own response');
+    expect(prompt).toContain('DO NOT combine multiple');
+  });
+
+  it('includes the "no pre-labeled markdown images" rule', () => {
+    const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
+    expect(prompt).toContain('## No pre-labeled markdown images');
+    expect(prompt).toContain("alt text IS the image's label");
+    expect(prompt).toContain('duplicate captions');
+  });
+
   it('rules survive when every overridable slot is replaced (non-overridable)', () => {
     const custom = {
       identity: 'X_IDENTITY',
@@ -374,6 +388,8 @@ describe('buildSystemPrompt - media formatting rules (non-overridable)', () => {
     const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], custom);
     expect(prompt).toContain('## Media URL formatting (REQUIRED)');
     expect(prompt).toContain('## Never invent URLs');
+    expect(prompt).toContain('## One media item per response');
+    expect(prompt).toContain('## No pre-labeled markdown images');
   });
 });
 
@@ -399,6 +415,8 @@ describe('buildSystemPrompt - media formatting rules placement & voice mode', ()
     );
     expect(prompt).not.toContain('## Media URL formatting (REQUIRED)');
     expect(prompt).not.toContain('## Never invent URLs');
+    expect(prompt).not.toContain('## One media item per response');
+    expect(prompt).not.toContain('## No pre-labeled markdown images');
     // Voice guidance should still be present.
     expect(prompt).toContain('## Voice Response Mode (ACTIVE)');
   });
