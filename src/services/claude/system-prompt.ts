@@ -87,6 +87,11 @@ const VOICE_RESPONSE_GUIDANCE =
 // the wire format between the worker and those clients. Do not move this into
 // a prompt-override slot: an org accidentally clobbering it breaks inline
 // media rendering across every conversation for that org.
+//
+// Not injected in voice mode: VOICE_WRITING_RULES forbids markdown, and the
+// TTS path strips markdown before synthesis — so emitting media URLs in
+// markdown shapes there would either contradict the voice guidance or lose
+// the URL entirely when it reaches the user as audio.
 const MEDIA_FORMATTING_RULES =
   '## Media URL formatting (REQUIRED)\n\n' +
   'When referencing a URL returned by a tool, use EXACTLY these formats:\n\n' +
@@ -157,7 +162,7 @@ function buildConditionalSections(
  *   [instructions] → [client_instructions] → [group context] →
  *   [memory_instructions + TOC] → [audio guidance] → [voice guidance] →
  *   [user preferences] → [conversation context] → [first interaction] →
- *   [media formatting rules (non-overridable)] → [closing]
+ *   [media formatting rules (non-overridable, text mode only)] → [closing]
  */
 export function buildSystemPrompt(
   catalog: ToolCatalog,
@@ -186,7 +191,9 @@ export function buildSystemPrompt(
     sections.push(VOICE_RESPONSE_GUIDANCE);
   }
   sections.push(...buildConditionalSections(preferences, history));
-  sections.push(MEDIA_FORMATTING_RULES);
+  if (!options?.isVoiceMessage) {
+    sections.push(MEDIA_FORMATTING_RULES);
+  }
   sections.push(resolvedPromptValues.closing);
 
   return sections.join('\n\n');

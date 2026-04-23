@@ -375,7 +375,9 @@ describe('buildSystemPrompt - media formatting rules (non-overridable)', () => {
     expect(prompt).toContain('## Media URL formatting (REQUIRED)');
     expect(prompt).toContain('## Never invent URLs');
   });
+});
 
+describe('buildSystemPrompt - media formatting rules placement & voice mode', () => {
   it('media rules appear after memory + audio guidance and before closing', () => {
     const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
     const memoryIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.memory_instructions);
@@ -385,5 +387,19 @@ describe('buildSystemPrompt - media formatting rules (non-overridable)', () => {
     expect(memoryIdx).toBeLessThan(mediaIdx);
     expect(audioIdx).toBeLessThan(mediaIdx);
     expect(mediaIdx).toBeLessThan(closingIdx);
+  });
+
+  it('media rules are excluded in voice mode (conflicts with no-markdown voice rule)', () => {
+    const prompt = buildSystemPrompt(
+      createEmptyCatalog(),
+      defaultPrefs,
+      [],
+      DEFAULT_PROMPT_VALUES,
+      { isVoiceMessage: true }
+    );
+    expect(prompt).not.toContain('## Media URL formatting (REQUIRED)');
+    expect(prompt).not.toContain('## Never invent URLs');
+    // Voice guidance should still be present.
+    expect(prompt).toContain('## Voice Response Mode (ACTIVE)');
   });
 });
