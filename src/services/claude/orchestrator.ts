@@ -298,6 +298,9 @@ async function parseSSEStream(
         continue;
       }
 
+      // Anthropic keepalive; spec allows it between any events. No-op everywhere.
+      if ((event as { type?: string }).type === 'ping') continue;
+
       message = applySSEEvent(message, event, logger, callbacks);
     }
   }
