@@ -6,4 +6,6 @@ dist
 .dev.vars
 .claude/
 .agents/
+.codex
+/AGENTS.md
 skills-lock.json
