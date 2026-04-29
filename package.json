@@ -25,11 +25,11 @@
     "prepare": "husky"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.71.2",
+    "@anthropic-ai/sdk": "^0.91.1",
     "@cf-wasm/quickjs": "^0.2.4",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "hono": "^4.12.14",
-    "openai": "^6.34.0",
+    "hono": "^4.12.15",
+    "openai": "^6.35.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {
