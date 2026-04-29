@@ -26,6 +26,7 @@ import {
   ProgressCallbackSender,
 } from '../services/progress/index.js';
 import {
+  Attachment,
   ChatHistoryEntry,
   ChatHistoryResponse,
   ChatRequest,
@@ -922,13 +923,19 @@ export class UserDO {
     );
     const audioKey = voiceAudio?.audioKey ?? null;
 
+    const persistedAttachments = attachmentsContext.list();
     await this.tracedPhase(ctx, 'save_conversation', () =>
       this.saveConversation(
         loaded.messageText,
         responses,
         loaded.preferences,
         body._org_config ?? {},
-        { logger, audioKey, ...(body.speaker ? { speaker: body.speaker } : {}) }
+        {
+          logger,
+          audioKey,
+          ...(body.speaker ? { speaker: body.speaker } : {}),
+          ...(persistedAttachments.length > 0 ? { attachments: persistedAttachments } : {}),
+        }
       )
     );
 
@@ -1118,9 +1125,14 @@ export class UserDO {
     responses: string[],
     preferences: UserPreferencesInternal,
     orgConfig: OrgConfig,
-    opts: { logger: RequestLogger; audioKey?: string | null; speaker?: string }
+    opts: {
+      logger: RequestLogger;
+      audioKey?: string | null;
+      speaker?: string;
+      attachments?: Attachment[];
+    }
   ) {
-    const { logger, audioKey, speaker } = opts;
+    const { logger, audioKey, speaker, attachments } = opts;
     const startTime = Date.now();
     const storageMax = orgConfig.max_history_storage ?? DEFAULT_ORG_CONFIG.max_history_storage;
     await this.addHistoryEntry(
@@ -1130,13 +1142,18 @@ export class UserDO {
         timestamp: Date.now(),
         ...(audioKey ? { voice_audio_key: audioKey } : {}),
         ...(speaker ? { speaker } : {}),
+        ...(attachments && attachments.length > 0 ? { attachments } : {}),
       },
       storageMax
     );
     if (preferences.first_interaction) {
       await this.updatePreferences({ ...preferences, first_interaction: false });
     }
-    logger.log('phase_save_complete', { duration_ms: Date.now() - startTime, storageMax });
+    logger.log('phase_save_complete', {
+      duration_ms: Date.now() - startTime,
+      storageMax,
+      attachment_count: attachments?.length ?? 0,
+    });
   }
 
   // ── Audio ─────────────────────────────────────────────────────────────────────

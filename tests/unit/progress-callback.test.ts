@@ -176,6 +176,88 @@ describe('ProgressCallbackSender.sendComplete with audio', () => {
   });
 });
 
+describe('ProgressCallbackSender.sendComplete with attachments', () => {
+  beforeEach(setupMocks);
+
+  it('includes attachments[] when provided', async () => {
+    const sender = new ProgressCallbackSender(mockConfig);
+    const attachments = [
+      {
+        type: 'pdf' as const,
+        url: 'https://w.example.com/public/ptxprint/pdfs/uw/u/job1.pdf',
+        filename: 'JHN-paperback-a5.pdf',
+        size_bytes: 1234,
+        mime_type: 'application/pdf' as const,
+      },
+    ];
+    await sender.sendComplete('Response text', null, null, attachments);
+    const body = JSON.parse((fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].body as string);
+    expect(body.attachments).toEqual(attachments);
+  });
+
+  it('omits attachments when empty array', async () => {
+    const sender = new ProgressCallbackSender(mockConfig);
+    await sender.sendComplete('Response text', null, null, []);
+    const body = JSON.parse((fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].body as string);
+    expect(body).not.toHaveProperty('attachments');
+  });
+
+  it('omits attachments when not passed', async () => {
+    const sender = new ProgressCallbackSender(mockConfig);
+    await sender.sendComplete('Response text');
+    const body = JSON.parse((fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].body as string);
+    expect(body).not.toHaveProperty('attachments');
+  });
+});
+
+const SAMPLE_ATTACHMENT = {
+  type: 'pdf' as const,
+  url: 'https://w.example.com/public/ptxprint/pdfs/uw/u/jobABC.pdf',
+  filename: 'JHN-paperback-a5.pdf',
+  size_bytes: 9999,
+  mime_type: 'application/pdf' as const,
+};
+
+describe('createWebhookCallbacks onComplete forwards attachments', () => {
+  beforeEach(setupMocks);
+
+  it('forwards attachments[] from ChatResponse', async () => {
+    const sender = new ProgressCallbackSender(mockConfig);
+    const callbacks = createWebhookCallbacks(sender, testLogger);
+    callbacks.onComplete({
+      responses: ['Here is your PDF.'],
+      response_language: 'en',
+      voice_audio_base64: null,
+      attachments: [SAMPLE_ATTACHMENT],
+    });
+    await vi.runAllTimersAsync();
+    const body = JSON.parse((fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].body as string);
+    expect(body.type).toBe('complete');
+    expect(body.attachments).toEqual([SAMPLE_ATTACHMENT]);
+  });
+
+  it('sends complete when only attachments are present (no text delta, no audio)', async () => {
+    const sender = new ProgressCallbackSender(mockConfig);
+    const callbacks = createWebhookCallbacks(sender, testLogger);
+    callbacks.onProgress('Here is your PDF.');
+    callbacks.onIterationComplete?.('Here is your PDF.');
+    callbacks.onComplete({
+      responses: ['Here is your PDF.'],
+      response_language: 'en',
+      voice_audio_base64: null,
+      attachments: [SAMPLE_ATTACHMENT],
+    });
+    await vi.runAllTimersAsync();
+    const completeCalls = (fetch as ReturnType<typeof vi.fn>).mock.calls.filter(
+      (call: unknown[]) => {
+        const body = JSON.parse((call as [string, { body: string }])[1].body);
+        return body.type === 'complete';
+      }
+    );
+    expect(completeCalls.length).toBe(1);
+  });
+});
+
 describe('createWebhookCallbacks onComplete forwards audio', () => {
   beforeEach(setupMocks);
 

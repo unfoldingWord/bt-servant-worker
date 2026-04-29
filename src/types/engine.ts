@@ -137,6 +137,13 @@ export interface ChatHistoryEntry {
   voice_audio_key?: string | null;
   /** Display name of the speaker (group chats only). */
   speaker?: string;
+  /**
+   * Tool-produced artifacts persisted alongside the assistant response.
+   * Stored as the same shape exposed on ChatResponse.attachments so /history
+   * can replay artifacts without reconstruction. Origin lives inside the URL
+   * — these are content-addressed and bound to our R2 bucket.
+   */
+  attachments?: Attachment[];
 }
 
 /** History entry as returned by the API (includes computed fields). */
