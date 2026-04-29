@@ -923,7 +923,6 @@ export class UserDO {
     );
     const audioKey = voiceAudio?.audioKey ?? null;
 
-    const persistedAttachments = attachmentsContext.list();
     await this.tracedPhase(ctx, 'save_conversation', () =>
       this.saveConversation(
         loaded.messageText,
@@ -933,8 +932,8 @@ export class UserDO {
         {
           logger,
           audioKey,
-          ...(body.speaker ? { speaker: body.speaker } : {}),
-          ...(persistedAttachments.length > 0 ? { attachments: persistedAttachments } : {}),
+          speaker: body.speaker,
+          attachments: attachmentsContext.list(),
         }
       )
     );
@@ -1128,13 +1127,14 @@ export class UserDO {
     opts: {
       logger: RequestLogger;
       audioKey?: string | null;
-      speaker?: string;
+      speaker?: string | undefined;
       attachments?: Attachment[];
     }
   ) {
     const { logger, audioKey, speaker, attachments } = opts;
     const startTime = Date.now();
     const storageMax = orgConfig.max_history_storage ?? DEFAULT_ORG_CONFIG.max_history_storage;
+    const hasAttachments = !!attachments && attachments.length > 0;
     await this.addHistoryEntry(
       {
         user_message: message,
@@ -1142,7 +1142,7 @@ export class UserDO {
         timestamp: Date.now(),
         ...(audioKey ? { voice_audio_key: audioKey } : {}),
         ...(speaker ? { speaker } : {}),
-        ...(attachments && attachments.length > 0 ? { attachments } : {}),
+        ...(hasAttachments ? { attachments } : {}),
       },
       storageMax
     );
