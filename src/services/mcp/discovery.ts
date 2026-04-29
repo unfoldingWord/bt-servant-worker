@@ -26,11 +26,14 @@
 
 import { MCPError, MCPResponseTooLargeError } from '../../utils/errors.js';
 import { redactArgsForError, RequestLogger, summarizeArgs } from '../../utils/logger.js';
-import { HealthTracker, recordFailure, recordSuccess } from './health.js';
+import { recordFailure, recordSuccess } from './health.js';
+import { callMCPToolViaSdk, discoverServerToolsViaSdk } from './streamable-http-client.js';
 import {
+  CallMCPToolOptions,
   MCPResponseMetadata,
   MCPServerConfig,
   MCPServerManifest,
+  MCPToolCallResult,
   MCPToolDefinition,
 } from './types.js';
 
@@ -196,14 +199,26 @@ function filterTools(tools: MCPToolDefinition[], allowedTools?: string[]): MCPTo
 }
 
 /**
- * Discover tools from a single MCP server using JSON-RPC 2.0
+ * Discover tools from a single MCP server.
+ *
+ * Dispatches by `server.transport`. Default (`'json-rpc'`, also when omitted)
+ * uses the hand-rolled stateless JSON-RPC client below; `'streamable-http'`
+ * delegates to the SDK adapter, which handles the session handshake and
+ * SSE-framed responses ptxprint-mcp and similar servers require.
  */
 export async function discoverServerTools(
   server: MCPServerConfig,
   logger: RequestLogger
 ): Promise<MCPServerManifest> {
+  if (server.transport === 'streamable-http') {
+    return discoverServerToolsViaSdk(server, logger);
+  }
   const startTime = Date.now();
-  logger.log('mcp_discovery_start', { server_id: server.id, server_url: server.url });
+  logger.log('mcp_discovery_start', {
+    server_id: server.id,
+    server_url: server.url,
+    transport: 'json-rpc',
+  });
 
   try {
     const result = await sendJsonRpcRequest<ToolsListResult>(server, 'tools/list');
@@ -260,22 +275,9 @@ function extractTextContent(content: Array<{ type: string; text?: string }>): st
   return textContent?.text ?? JSON.stringify(content);
 }
 
-/**
- * Options for MCP tool calls
- */
-export interface CallMCPToolOptions {
-  healthTracker?: HealthTracker;
-  maxResponseSizeBytes?: number;
-}
-
-/**
- * Result of an MCP tool call with optional metadata
- */
-export interface MCPToolCallResult {
-  result: unknown;
-  metadata: MCPResponseMetadata | undefined;
-  responseTimeMs: number;
-}
+// CallMCPToolOptions and MCPToolCallResult moved to ./types.ts to break a
+// circular import between discovery.ts and streamable-http-client.ts.
+export type { CallMCPToolOptions, MCPToolCallResult } from './types.js';
 
 function buildToolCallSendOptions(options?: CallMCPToolOptions): SendOptions {
   const sendOptions: SendOptions = { timeoutMs: TOOL_CALL_TIMEOUT_MS };
@@ -318,19 +320,17 @@ function extractToolResult(result: ToolCallResult): unknown {
   return result;
 }
 
-/**
- * Call an MCP tool on a specific server using JSON-RPC 2.0
- */
-export async function callMCPTool(
+async function callMCPToolViaJsonRpc(
   server: MCPServerConfig,
   toolName: string,
   args: unknown,
   logger: RequestLogger,
-  options?: CallMCPToolOptions
+  options: CallMCPToolOptions | undefined
 ): Promise<MCPToolCallResult> {
   const startTime = Date.now();
   logger.log('mcp_tool_call_start', {
     server_id: server.id,
+    transport: 'json-rpc',
     tool_name: toolName,
     args: summarizeArgs(args),
   });
@@ -343,11 +343,9 @@ export async function callMCPTool(
       { name: toolName, arguments: args },
       sendOptions
     );
-
     const responseTimeMs = Date.now() - startTime;
     const metadata = result._meta;
     const extractedResult = extractToolResult(result);
-
     logToolCallSuccess(
       logger,
       { serverId: server.id, toolName, args: summarizeArgs(args), responseTimeMs },
@@ -357,7 +355,6 @@ export async function callMCPTool(
     if (options?.healthTracker) {
       recordSuccess(options.healthTracker, server.id, responseTimeMs);
     }
-
     return { result: extractedResult, metadata, responseTimeMs };
   } catch (error) {
     const responseTimeMs = Date.now() - startTime;
@@ -372,4 +369,24 @@ export async function callMCPTool(
     }
     throw error;
   }
+}
+
+/**
+ * Call an MCP tool on a specific server.
+ *
+ * Dispatches by `server.transport`. Default (`'json-rpc'`, also when omitted)
+ * stays on the hand-rolled stateless JSON-RPC path; `'streamable-http'`
+ * delegates to the SDK adapter for sessions + SSE responses.
+ */
+export async function callMCPTool(
+  server: MCPServerConfig,
+  toolName: string,
+  args: unknown,
+  logger: RequestLogger,
+  options?: CallMCPToolOptions
+): Promise<MCPToolCallResult> {
+  if (server.transport === 'streamable-http') {
+    return callMCPToolViaSdk(server, toolName, args, logger, options);
+  }
+  return callMCPToolViaJsonRpc(server, toolName, args, logger, options);
 }
