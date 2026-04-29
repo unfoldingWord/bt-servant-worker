@@ -72,6 +72,22 @@ export interface ChatRequest {
   _org_modes?: OrgModes;
 }
 
+/**
+ * A binary artifact produced by a tool and surfaced to the consumer alongside
+ * the text response. Currently only PDFs (from the ptxprint integration); the
+ * type is open-ended so other artifact kinds can be added without a breaking
+ * change to consumers.
+ */
+export interface PdfAttachment {
+  type: 'pdf';
+  url: string;
+  filename: string;
+  size_bytes?: number;
+  mime_type: 'application/pdf';
+}
+
+export type Attachment = PdfAttachment;
+
 export interface ChatResponse {
   /**
    * Array of response text segments from the assistant.
@@ -100,6 +116,13 @@ export interface ChatResponse {
 
   /** URL to fetch the audio from R2, or null if no audio was generated */
   voice_audio_url?: string | null;
+
+  /**
+   * Tool-produced artifacts (e.g., generated PDFs). Empty / omitted when no
+   * artifact-producing tool ran. Consumers that don't understand the type
+   * should ignore the field — never present a raw URL string in chat.
+   */
+  attachments?: Attachment[];
 }
 
 /**

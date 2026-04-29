@@ -39,6 +39,11 @@ id = "c1828624ab434f079776bddd171882d9"
 binding = "AUDIO_BUCKET"
 bucket_name = "bt-servant-audio-test"
 
+# R2 Object Storage (ptxprint USFM + PDFs) — local emulated bucket for tests
+[[r2_buckets]]
+binding = "PTXPRINT_BUCKET"
+bucket_name = "bt-servant-ptxprint-test"
+
 # NOTE: [ai] binding intentionally omitted for tests
 # Unit tests mock env.AI directly; including it here forces
 # remote proxy mode which requires Cloudflare authentication

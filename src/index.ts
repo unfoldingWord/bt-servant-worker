@@ -48,6 +48,21 @@ const app = new Hono<{ Bindings: Env }>();
 // Health check - no auth required
 app.get('/health', (c) => c.json({ status: 'healthy', version: APP_VERSION }));
 
+// Public ptxprint artifact serving — no auth required.
+//
+// Why public: ptxprint-mcp's container at klappy.workers.dev fetches our USFM
+// source URLs during typesetting. It cannot satisfy our /api/* ENGINE_API_KEY
+// auth, so a public endpoint is required. PDFs are also served here so that
+// downstream consumers (Meta WhatsApp document fetcher, web client iframe)
+// can load them without auth.
+//
+// Privacy: keys are content-addressed (sha256-based) for USFM and job-id-based
+// (sha256 of canonicalized payload) for PDFs. Path is unguessable; the lack
+// of auth is comparable to a private signed URL.
+//
+// Bucket: PTXPRINT_BUCKET (defined in wrangler.toml).
+app.get('/public/ptxprint/*', async (c) => servePublicPtxprintObject(c.req.path, c.env));
+
 // Auth middleware for all /api routes
 app.use('/api/*', async (c, next) => {
   const authHeader = c.req.header('Authorization');
@@ -1035,6 +1050,48 @@ async function handleDORequest(params: DORequestParams): Promise<Response> {
     duration_ms: Date.now() - start,
   });
   return response;
+}
+
+const ALLOWED_PUBLIC_PTXPRINT_PREFIXES = ['usfm/', 'pdfs/', 'fonts/'];
+
+function isAllowedPublicPtxprintKey(key: string): boolean {
+  return ALLOWED_PUBLIC_PTXPRINT_PREFIXES.some((p) => key.startsWith(p));
+}
+
+async function servePublicPtxprintObject(path: string, env: Env): Promise<Response> {
+  const start = Date.now();
+  const key = path.replace('/public/ptxprint/', '');
+  const logger = createRequestLogger(crypto.randomUUID());
+  if (!key) {
+    logger.warn('public_ptxprint_invalid_key', { path });
+    return Response.json({ error: 'Invalid key' }, { status: 400 });
+  }
+  if (!isAllowedPublicPtxprintKey(key)) {
+    logger.warn('public_ptxprint_disallowed_prefix', { key });
+    return Response.json({ error: 'Key not in an allowed prefix' }, { status: 400 });
+  }
+  let object: R2ObjectBody | null;
+  try {
+    object = await env.PTXPRINT_BUCKET.get(key);
+  } catch (error) {
+    logger.error('public_ptxprint_r2_get_error', error, { key, total_ms: Date.now() - start });
+    return Response.json({ error: 'Failed to retrieve object' }, { status: 500 });
+  }
+  if (!object) {
+    logger.log('public_ptxprint_miss', { key, total_ms: Date.now() - start });
+    return Response.json({ error: 'Not found' }, { status: 404 });
+  }
+  logger.log('public_ptxprint_hit', {
+    key,
+    size_bytes: object.size,
+    content_type: object.httpMetadata?.contentType ?? null,
+    total_ms: Date.now() - start,
+  });
+  const headers = new Headers();
+  headers.set('Content-Type', object.httpMetadata?.contentType ?? 'application/octet-stream');
+  headers.set('Content-Length', String(object.size));
+  headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+  return new Response(object.body, { headers });
 }
 
 /** Convenience wrapper for user-scoped DO requests. */

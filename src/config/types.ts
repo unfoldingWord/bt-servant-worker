@@ -44,6 +44,7 @@ export interface Env {
 
   // R2 Object Storage
   AUDIO_BUCKET: R2Bucket;
+  PTXPRINT_BUCKET: R2Bucket;
 
   // Durable Object bindings
   USER_DO: DurableObjectNamespace;

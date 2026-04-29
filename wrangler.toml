@@ -39,6 +39,15 @@ binding = "AI"
 binding = "AUDIO_BUCKET"
 bucket_name = "bt-servant-audio"
 
+# R2 Object Storage (ptxprint USFM sources + generated PDFs)
+# Served publicly via /public/ptxprint/* — keys are content-addressed (sha256)
+# so the path is unguessable even though the route is unauthenticated.
+# The container at ptxprint-mcp.klappy.workers.dev fetches USFM URLs from
+# this bucket during typesetting, which is why auth is not enforced.
+[[r2_buckets]]
+binding = "PTXPRINT_BUCKET"
+bucket_name = "bt-servant-ptxprint"
+
 # Durable Objects
 [[durable_objects.bindings]]
 name = "USER_DO"
@@ -90,6 +99,10 @@ binding = "AI"
 [[env.staging.r2_buckets]]
 binding = "AUDIO_BUCKET"
 bucket_name = "bt-servant-audio-staging"
+
+[[env.staging.r2_buckets]]
+binding = "PTXPRINT_BUCKET"
+bucket_name = "bt-servant-ptxprint-staging"
 
 [[env.staging.durable_objects.bindings]]
 name = "USER_DO"

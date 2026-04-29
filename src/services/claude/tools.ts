@@ -148,6 +148,80 @@ export function buildRequestAudioTool(): Anthropic.Tool {
 }
 
 /**
+ * Build generate_scripture_pdf tool definition.
+ *
+ * Macro-tool that orchestrates the whole ptxprint pipeline. Prefer this for
+ * standard scripture PDF requests; drop to the raw catalog tools
+ * (submit_typeset / get_job_status / cancel_job) only when the user wants
+ * something the macro doesn't support — autofill mode, multi-book payloads,
+ * custom configs, illustration figures, etc. The macro returns
+ * `{ status: "succeeded", pdf_url, ... }` on the happy path; an attachment
+ * is auto-attached to the chat response so the URL renders natively, not as
+ * a raw link.
+ */
+export function buildGenerateScripturePdfTool(): Anthropic.Tool {
+  return {
+    name: 'generate_scripture_pdf',
+    description:
+      'Generate a print-ready PDF of a single book from a Door43 open translation. Returns a PDF attachment that renders inline in chat clients. Use this for standard "make me a PDF of John in ULT"-style requests; for advanced cases (custom layout, multiple books, fonts, figures) use the raw submit_typeset tool from ptxprint-mcp.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        translation: {
+          type: 'string',
+          enum: ['en_ult', 'en_ust', 'en_t4t', 'en_ueb'],
+          description:
+            'Door43 translation id. v1 supports en_ult (Literal), en_ust (Simplified), en_t4t (Translation for Translators), en_ueb (Unlocked English Bible).',
+        },
+        book: {
+          type: 'string',
+          description:
+            '3-letter Paratext book code, e.g. "JHN" for John, "GEN" for Genesis. Single book only in v1.',
+        },
+        preset: {
+          type: 'string',
+          enum: ['paperback-a5', 'letter-2col', 'large-print-a4'],
+          description:
+            'Layout preset. Defaults to paperback-a5 if omitted. paperback-a5 = A5 single-column, letter-2col = US Letter two-column, large-print-a4 = A4 14pt accessibility.',
+        },
+      },
+      required: ['translation', 'book'],
+    },
+  };
+}
+
+/**
+ * Build prepare_usfm_source tool definition.
+ *
+ * Helper that exposes our USFM resolver so Claude can hand-build payloads
+ * for the raw `submit_typeset` MCP tool. Required because submit_typeset
+ * needs sha256 on every source entry, which Claude cannot compute in
+ * conversation without falling back to execute_code.
+ */
+export function buildPrepareUsfmSourceTool(): Anthropic.Tool {
+  return {
+    name: 'prepare_usfm_source',
+    description:
+      "Resolve a (translation, book) pair to a `sources[]` entry suitable for ptxprint-mcp's `submit_typeset` payload. Returns { book, filename, url, sha256 } — drop straight into the sources array. Use this before calling submit_typeset directly when generate_scripture_pdf does not fit your needs.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        translation: {
+          type: 'string',
+          enum: ['en_ult', 'en_ust', 'en_t4t', 'en_ueb'],
+          description: 'Door43 translation id (same set as generate_scripture_pdf).',
+        },
+        book: {
+          type: 'string',
+          description: '3-letter Paratext book code, e.g. "JHN".',
+        },
+      },
+      required: ['translation', 'book'],
+    },
+  };
+}
+
+/**
  * Build list_modes tool definition
  */
 export function buildListModesTool(): Anthropic.Tool {
@@ -208,6 +282,8 @@ export function buildAllTools(
     buildReadMemoryTool(),
     buildUpdateMemoryTool(),
     buildRequestAudioTool(), // Always available — TTS is a platform capability, not org-gated
+    buildGenerateScripturePdfTool(), // Always available — short-circuits to error if ptxprint-mcp not registered for the org
+    buildPrepareUsfmSourceTool(),
   ];
 
   if (opts?.hasModes) {
@@ -228,7 +304,9 @@ export function isBuiltInTool(toolName: string): boolean {
     toolName === 'update_memory' ||
     toolName === 'request_audio' ||
     toolName === 'list_modes' ||
-    toolName === 'switch_mode'
+    toolName === 'switch_mode' ||
+    toolName === 'generate_scripture_pdf' ||
+    toolName === 'prepare_usfm_source'
   );
 }
 
