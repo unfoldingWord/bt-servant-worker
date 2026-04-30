@@ -21,6 +21,11 @@ export interface ProgressCallbackConfig {
 
 type CallbackPayloadType = 'status' | 'progress' | 'complete' | 'error';
 
+/**
+ * Internal payload shape sent over the wire. Must stay in sync with the
+ * exported `ProgressCallback` contract in `src/types/engine.ts` — that's
+ * the public type consumers (whatsapp gateway, etc.) model against.
+ */
 interface CallbackPayload {
   type: CallbackPayloadType;
   user_id: string;

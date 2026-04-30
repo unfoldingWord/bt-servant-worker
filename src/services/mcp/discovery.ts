@@ -30,6 +30,7 @@ import { recordFailure, recordSuccess } from './health.js';
 import { callMCPToolViaSdk, discoverServerToolsViaSdk } from './streamable-http-client.js';
 import {
   CallMCPToolOptions,
+  DEFAULT_MAX_RESPONSE_SIZE_BYTES,
   MCPResponseMetadata,
   MCPServerConfig,
   MCPServerManifest,
@@ -39,7 +40,6 @@ import {
 
 const DISCOVERY_TIMEOUT_MS = 10000;
 const TOOL_CALL_TIMEOUT_MS = 30000;
-const DEFAULT_MAX_RESPONSE_SIZE_BYTES = 1048576; // 1MB
 
 /** JSON-RPC 2.0 request structure */
 interface JsonRpcRequest {

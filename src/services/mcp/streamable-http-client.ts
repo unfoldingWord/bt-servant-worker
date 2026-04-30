@@ -20,10 +20,11 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
-import { MCPError } from '../../utils/errors.js';
+import { MCPError, MCPResponseTooLargeError } from '../../utils/errors.js';
 import { redactArgsForError, RequestLogger, summarizeArgs } from '../../utils/logger.js';
 import {
   CallMCPToolOptions,
+  DEFAULT_MAX_RESPONSE_SIZE_BYTES,
   MCPResponseMetadata,
   MCPServerConfig,
   MCPServerManifest,
@@ -149,6 +150,32 @@ function ensureNoToolError(toolName: string, raw: SdkToolCallContent, serverId: 
   }
 }
 
+/**
+ * Enforce the same max-response-size guardrail the JSON-RPC path applies.
+ * Parity with `readResponseWithSizeLimit` in `discovery.ts` — a misbehaving
+ * streamable-HTTP server should not be able to bypass the byte cap by virtue
+ * of its transport choice.
+ *
+ * Limitation: the SDK has already buffered the full response by the time we
+ * see the parsed content (we cannot stream-cancel mid-read), so this check is
+ * post-parse rather than during-stream. Same observable behavior for callers
+ * — the request fails with `MCPResponseTooLargeError` when the byte cap is
+ * exceeded — but the worker pays the memory cost briefly. For ptxprint-mcp's
+ * ~hundreds-of-bytes JSON envelopes this is fine; revisit if/when we add a
+ * streamable-HTTP server that returns large blobs (e.g. raw PDF bytes).
+ */
+export function enforceResponseSizeLimit(
+  extracted: unknown,
+  maxResponseSizeBytes: number,
+  serverId: string
+): void {
+  const text = typeof extracted === 'string' ? extracted : JSON.stringify(extracted);
+  const size = new TextEncoder().encode(text).byteLength;
+  if (size > maxResponseSizeBytes) {
+    throw new MCPResponseTooLargeError(size, maxResponseSizeBytes, serverId);
+  }
+}
+
 function logToolSuccess(
   logger: RequestLogger,
   ctx: { serverId: string; toolName: string; args: unknown; responseTimeMs: number },
@@ -222,6 +249,11 @@ export async function callMCPToolViaSdk(
     ensureNoToolError(toolName, raw, server.id);
     const metadata = raw._meta;
     const extracted = extractResult(raw);
+    enforceResponseSizeLimit(
+      extracted,
+      options?.maxResponseSizeBytes ?? DEFAULT_MAX_RESPONSE_SIZE_BYTES,
+      server.id
+    );
     logToolSuccess(logger, { serverId: server.id, toolName, args, responseTimeMs }, metadata);
     if (options?.healthTracker) {
       recordSuccess(options.healthTracker, server.id, responseTimeMs);

@@ -113,6 +113,13 @@ export interface MCPToolCallResult {
 }
 
 /**
+ * Default max bytes accepted for an MCP tool/list or tool/call response.
+ * Enforced by both transports (json-rpc and streamable-http) so a misbehaving
+ * server cannot blow up worker memory with an unbounded payload.
+ */
+export const DEFAULT_MAX_RESPONSE_SIZE_BYTES = 1_048_576; // 1MB
+
+/**
  * No default MCP servers - each org must explicitly configure their servers.
  * This ensures orgs intentionally set up their MCP infrastructure.
  */

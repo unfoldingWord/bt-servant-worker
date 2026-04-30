@@ -250,13 +250,33 @@ export interface StreamCallbacks {
 }
 
 /**
- * Progress callback payload (sent to progress_callback_url)
+ * Progress callback payload (sent to progress_callback_url).
+ *
+ * Public contract for callback consumers (whatsapp gateway, future
+ * integrations). Must stay in sync with the actual payload assembled in
+ * `src/services/progress/callback.ts` (`CallbackPayload`). When you change
+ * one, change the other.
  */
+export type ProgressCallbackType = 'status' | 'progress' | 'complete' | 'error';
+
 export interface ProgressCallback {
+  type: ProgressCallbackType;
   user_id: string;
   message_key: string;
-  text: string;
-  timestamp: number;
+  /** ISO-8601 timestamp string (e.g. "2026-04-30T14:00:00.000Z"). */
+  timestamp: string;
+  /** Status updates (e.g. "Working on it…") — present on `type: "status"`. */
+  message?: string;
+  /** Accumulated/delta text — present on `progress` and `complete` events. */
+  text?: string;
+  /** Error description — present on `type: "error"`. */
+  error?: string;
+  /** Voice audio (base64-encoded) — present on `complete` when TTS is on. */
+  voice_audio_base64?: string | null;
+  /** Voice audio (URL form, preferred for large payloads) — present on `complete` when TTS is on. */
+  voice_audio_url?: string | null;
+  /** Tool-produced artifacts (e.g. generated PDFs) — present on `complete` when tools registered them. */
+  attachments?: Attachment[];
   /** Group/supergroup chat ID (present only for group chats). */
   chat_id?: string;
   /** Thread ID within a supergroup (present only for threaded chats). */
