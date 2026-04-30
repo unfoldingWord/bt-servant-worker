@@ -157,16 +157,20 @@ describe('handleGenerateScripturePdf — happy path (cached)', () => {
       translation: 'bsb',
       book: 'JHN',
     });
-    expect((result as { pdf_url: string }).pdf_url).toMatch(
-      /^https:\/\/w\.example\.com\/public\/ptxprint\/pdfs\//
-    );
+    // PDF URL is INTENTIONALLY not returned to Claude — see InternalSuccessResult docstring.
+    // The attachment carries the URL; sending it back as text caused duplicate
+    // "[Title](url.pdf) + actual PDF" deliveries to the user (req d21eda5a, 2026-04-30).
+    expect(result).not.toHaveProperty('pdf_url');
+    expect(result).toMatchObject({ attached: true });
+    expect((result as { note: string }).note).toMatch(/do NOT include any URL/i);
     // submit_typeset called, get_job_status NOT called (cached short-circuit).
     expect(callMCPToolMock).toHaveBeenCalledTimes(1);
     expect(callMCPToolMock.mock.calls[0]?.[1]).toBe('submit_typeset');
-    // Attachment registered.
+    // Attachment registered with the public URL.
     const attachments = ctx.attachmentsContext!.list();
     expect(attachments).toHaveLength(1);
     expect(attachments[0]?.type).toBe('pdf');
+    expect(attachments[0]?.url).toMatch(/^https:\/\/w\.example\.com\/public\/ptxprint\/pdfs\//);
   });
 });
 

@@ -176,17 +176,30 @@ export async function handlePrepareUsfmSource(
 
 // ---------- handleGenerateScripturePdf ----------
 
+/**
+ * Returned to Claude as the tool result on success.
+ *
+ * IMPORTANT: do NOT include `pdf_url` here. The PDF is already mirrored
+ * into our R2 and registered as an attachment via attachmentsContext —
+ * the gateway will deliver it to the user as a file. If we also hand the
+ * URL back to Claude, MEDIA_FORMATTING_RULES tells Claude to render any
+ * tool-returned URL as a markdown link, and the user ends up with BOTH
+ * `[Title](url.pdf)` text AND the actual PDF attachment (observed
+ * 2026-04-30, request d21eda5a). The `attached` sentinel + `note` give
+ * Claude exactly enough to write a one-line confirmation without
+ * inventing a link.
+ */
 interface InternalSuccessResult {
   status: 'succeeded';
   job_id: string;
   cached: boolean;
-  pdf_url: string;
-  pdf_size_bytes: number;
   preset: PresetId;
   translation: string;
   book: string;
   filename: string;
   total_ms: number;
+  attached: true;
+  note: string;
 }
 
 interface InternalPendingResult {
@@ -448,13 +461,13 @@ async function finalizePdf(
     status: 'succeeded',
     job_id: submit.job_id,
     cached: submit.cached,
-    pdf_url: mirrorResult.url,
-    pdf_size_bytes: mirrorResult.size_bytes,
     preset: presetId,
     translation,
     book,
     filename,
     total_ms,
+    attached: true,
+    note: 'PDF has been delivered to the user as an attachment. Write a brief one-line confirmation (e.g. "Here you go!") and do NOT include any URL or link — the user already has the file.',
   };
 }
 
