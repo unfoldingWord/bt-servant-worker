@@ -227,101 +227,248 @@ function buildMessageBody(ctx: OrchestrationContext, stream: boolean): string {
  * This appears to be a Cloudflare platform issue with SDK-managed fetch from DOs,
  * not strictly a nesting problem. Raw globalThis.fetch works in all contexts.
  */
-async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message> {
-  if (ctx.callbacks) {
-    return streamClaudeResponse(ctx);
-  }
+/**
+ * Hard ceiling on a single Anthropic Messages API request. Cloudflare Workers'
+ * subrequest fetch has its own time budget but does not surface a useful error
+ * when the upstream stalls; we add an explicit AbortSignal so an unresponsive
+ * Anthropic stream surfaces as a clear `claude_fetch_aborted` error instead of
+ * a silent orchestration death (which is what staging exhibited on
+ * 2026-04-30 — the loop simply stopped emitting events after iteration 4).
+ */
+const CLAUDE_REQUEST_TIMEOUT_MS = 90_000;
 
-  const response = await globalThis.fetch(ANTHROPIC_API_URL, {
+function buildClaudeAbortSignal(timeoutMs: number): {
+  signal: AbortSignal;
+  cleanup: () => void;
+} {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return { signal: controller.signal, cleanup: () => clearTimeout(timer) };
+}
+
+async function postToAnthropic(
+  body: string,
+  signal: AbortSignal,
+  apiKey: string
+): Promise<Response> {
+  return globalThis.fetch(ANTHROPIC_API_URL, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'x-api-key': ctx.apiKey,
+      'x-api-key': apiKey,
       'anthropic-version': ANTHROPIC_API_VERSION,
     },
-    body: buildMessageBody(ctx, false),
+    body,
+    signal,
   });
+}
 
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => '(unreadable)');
-    throw new Anthropic.APIError(
-      response.status,
-      { message: errorText },
-      errorText,
-      response.headers
-    );
+async function throwAnthropicHttpError(
+  ctx: OrchestrationContext,
+  response: Response,
+  streaming: boolean,
+  fetchStart: number
+): Promise<never> {
+  const errorText = await response.text().catch(() => '(unreadable)');
+  ctx.logger.error('claude_fetch_http_error', null, {
+    streaming,
+    status: response.status,
+    has_body: !!response.body,
+    body_preview: errorText.slice(0, 500),
+    duration_ms: Date.now() - fetchStart,
+  });
+  throw new Anthropic.APIError(
+    response.status,
+    { message: errorText },
+    errorText,
+    response.headers
+  );
+}
+
+function logFetchCommencement(ctx: OrchestrationContext, body: string, streaming: boolean): void {
+  ctx.logger.log('claude_fetch_start', {
+    streaming,
+    body_size_bytes: body.length,
+    message_count: ctx.messages.length,
+    timeout_ms: CLAUDE_REQUEST_TIMEOUT_MS,
+  });
+}
+
+function logFetchAborted(
+  ctx: OrchestrationContext,
+  error: unknown,
+  streaming: boolean,
+  fetchStart: number
+): void {
+  if ((error as Error)?.name !== 'AbortError') return;
+  ctx.logger.error('claude_fetch_aborted', error, {
+    streaming,
+    timeout_ms: CLAUDE_REQUEST_TIMEOUT_MS,
+    duration_ms: Date.now() - fetchStart,
+  });
+}
+
+async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message> {
+  if (ctx.callbacks) return streamClaudeResponse(ctx);
+  const body = buildMessageBody(ctx, false);
+  logFetchCommencement(ctx, body, false);
+  const { signal, cleanup } = buildClaudeAbortSignal(CLAUDE_REQUEST_TIMEOUT_MS);
+  const fetchStart = Date.now();
+  try {
+    const response = await postToAnthropic(body, signal, ctx.apiKey);
+    ctx.logger.log('claude_fetch_response_received', {
+      streaming: false,
+      status: response.status,
+      duration_ms: Date.now() - fetchStart,
+    });
+    if (!response.ok) await throwAnthropicHttpError(ctx, response, false, fetchStart);
+    const parsed = (await response.json()) as Anthropic.Message;
+    ctx.logger.log('claude_fetch_complete', {
+      streaming: false,
+      stop_reason: parsed.stop_reason,
+      content_blocks: parsed.content.length,
+      duration_ms: Date.now() - fetchStart,
+    });
+    return parsed;
+  } catch (error) {
+    logFetchAborted(ctx, error, false, fetchStart);
+    throw error;
+  } finally {
+    cleanup();
   }
-
-  return (await response.json()) as Anthropic.Message;
 }
 
 async function streamClaudeResponse(ctx: OrchestrationContext): Promise<Anthropic.Message> {
-  const response = await globalThis.fetch(ANTHROPIC_API_URL, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': ctx.apiKey,
-      'anthropic-version': ANTHROPIC_API_VERSION,
-    },
-    body: buildMessageBody(ctx, true),
-  });
-
-  if (!response.ok || !response.body) {
-    const errorText = await response.text().catch(() => '(unreadable)');
-    throw new Anthropic.APIError(
-      response.status,
-      { message: errorText },
-      errorText,
-      response.headers
-    );
+  const body = buildMessageBody(ctx, true);
+  logFetchCommencement(ctx, body, true);
+  const { signal, cleanup } = buildClaudeAbortSignal(CLAUDE_REQUEST_TIMEOUT_MS);
+  const fetchStart = Date.now();
+  try {
+    const response = await postToAnthropic(body, signal, ctx.apiKey);
+    ctx.logger.log('claude_fetch_response_received', {
+      streaming: true,
+      status: response.status,
+      has_body: !!response.body,
+      duration_ms: Date.now() - fetchStart,
+    });
+    if (!response.ok || !response.body) {
+      await throwAnthropicHttpError(ctx, response, true, fetchStart);
+    }
+    const parsed = await parseSSEStream(response.body!, ctx.logger, ctx.callbacks, signal);
+    ctx.logger.log('claude_fetch_complete', {
+      streaming: true,
+      stop_reason: parsed.stop_reason,
+      content_blocks: parsed.content.length,
+      duration_ms: Date.now() - fetchStart,
+    });
+    return parsed;
+  } catch (error) {
+    logFetchAborted(ctx, error, true, fetchStart);
+    throw error;
+  } finally {
+    cleanup();
   }
+}
 
-  return parseSSEStream(response.body, ctx.logger, ctx.callbacks);
+interface SSEParseState {
+  message: Anthropic.Message | undefined;
+  eventCounts: Record<string, number>;
+}
+
+function applySSELines(
+  state: SSEParseState,
+  lines: string[],
+  logger: RequestLogger,
+  callbacks?: StreamCallbacks
+): void {
+  for (const line of lines) {
+    if (!line.startsWith('data: ')) continue;
+    const data = line.slice(6).trim();
+    if (data === '[DONE]') continue;
+    let event: Anthropic.RawMessageStreamEvent;
+    try {
+      event = JSON.parse(data) as Anthropic.RawMessageStreamEvent;
+    } catch {
+      logger.warn('sse_parse_error', { data: data.slice(0, 200) });
+      continue;
+    }
+    const t = (event as { type?: string }).type ?? 'unknown';
+    state.eventCounts[t] = (state.eventCounts[t] ?? 0) + 1;
+    if (t === 'ping') continue;
+    state.message = applySSEEvent(state.message, event, logger, callbacks);
+  }
+}
+
+function attachSSEAbortListener(
+  signal: AbortSignal | undefined,
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  logger: RequestLogger,
+  ref: { chunks: number; bytes: number; start: number; state: SSEParseState }
+): (() => void) | undefined {
+  if (!signal) return undefined;
+  const onAbort = () => {
+    logger.warn('sse_stream_aborted', {
+      elapsed_ms: Date.now() - ref.start,
+      chunks: ref.chunks,
+      bytes: ref.bytes,
+      event_counts: { ...ref.state.eventCounts },
+    });
+    reader.cancel('upstream-abort').catch(() => {
+      /* ignore — already logged */
+    });
+  };
+  signal.addEventListener('abort', onAbort);
+  return () => signal.removeEventListener('abort', onAbort);
 }
 
 /** Parse an SSE stream from the Anthropic Messages API into a final Message. */
 async function parseSSEStream(
   body: ReadableStream<Uint8Array>,
   logger: RequestLogger,
-  callbacks?: StreamCallbacks
+  callbacks?: StreamCallbacks,
+  signal?: AbortSignal
 ): Promise<Anthropic.Message> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
+  const state: SSEParseState = { message: undefined, eventCounts: {} };
+  const ref = { chunks: 0, bytes: 0, start: Date.now(), state };
   let buffer = '';
-  let message: Anthropic.Message | undefined;
 
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+  logger.log('sse_stream_start', {});
+  const detachAbort = attachSSEAbortListener(signal, reader, logger, ref);
 
-    const lines = buffer.split('\n');
-    buffer = lines.pop() ?? '';
-
-    for (const line of lines) {
-      if (!line.startsWith('data: ')) continue;
-      const data = line.slice(6).trim();
-      if (data === '[DONE]') continue;
-
-      let event: Anthropic.RawMessageStreamEvent;
-      try {
-        event = JSON.parse(data) as Anthropic.RawMessageStreamEvent;
-      } catch {
-        logger.warn('sse_parse_error', { data: data.slice(0, 200) });
-        continue;
-      }
-
-      // Anthropic keepalive; spec allows it between any events. No-op everywhere.
-      if ((event as { type?: string }).type === 'ping') continue;
-
-      message = applySSEEvent(message, event, logger, callbacks);
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      ref.chunks += 1;
+      ref.bytes += value.length;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      applySSELines(state, lines, logger, callbacks);
     }
+    if (!state.message) {
+      logger.error('sse_stream_no_message', null, {
+        elapsed_ms: Date.now() - ref.start,
+        chunks: ref.chunks,
+        bytes: ref.bytes,
+        event_counts: { ...state.eventCounts },
+      });
+      throw new Error('Claude stream ended before producing a message');
+    }
+    logger.log('sse_stream_complete', {
+      elapsed_ms: Date.now() - ref.start,
+      chunks: ref.chunks,
+      bytes: ref.bytes,
+      stop_reason: state.message.stop_reason,
+      content_blocks: state.message.content.length,
+      event_counts: { ...state.eventCounts },
+    });
+    return state.message;
+  } finally {
+    detachAbort?.();
   }
-
-  if (!message) {
-    throw new Error('Claude stream ended before producing a message');
-  }
-  return message;
 }
 
 function applyContentDelta(
@@ -405,53 +552,86 @@ function notifyCallback(logger: RequestLogger, fn: () => unknown): void {
   }
 }
 
-async function processIteration(ctx: OrchestrationContext, iteration: number): Promise<boolean> {
-  ctx.logger.log('claude_request', {
-    iteration,
-    message_count: ctx.messages.length,
-  });
+async function callClaudeForIteration(
+  ctx: OrchestrationContext,
+  iteration: number,
+  iterStart: number
+): Promise<Anthropic.Message> {
+  try {
+    return await callClaude(ctx);
+  } catch (error) {
+    ctx.logger.error('iteration_claude_call_failed', error, {
+      iteration,
+      message_count: ctx.messages.length,
+      elapsed_ms: Date.now() - iterStart,
+    });
+    throw error;
+  }
+}
 
-  // Add separator before subsequent iterations for streaming
+async function executeIterationTools(
+  toolCalls: ToolUseBlock[],
+  ctx: OrchestrationContext,
+  iteration: number,
+  iterStart: number
+): Promise<Anthropic.ToolResultBlockParam[]> {
+  try {
+    return await executeToolCalls(toolCalls, ctx);
+  } catch (error) {
+    ctx.logger.error('iteration_tool_execution_failed', error, {
+      iteration,
+      tool_calls: toolCalls.map((tc) => tc.name),
+      elapsed_ms: Date.now() - iterStart,
+    });
+    throw error;
+  }
+}
+
+async function processIteration(ctx: OrchestrationContext, iteration: number): Promise<boolean> {
+  const iterStart = Date.now();
+  ctx.logger.log('iteration_start', { iteration, message_count: ctx.messages.length });
+  ctx.logger.log('claude_request', { iteration, message_count: ctx.messages.length });
+
   if (iteration > 0 && ctx.callbacks) {
     notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress('\n'));
     notifyCallback(ctx.logger, () => ctx.callbacks?.onStatus('Preparing your response...'));
   }
 
-  const startTime = Date.now();
-  const response = await callClaude(ctx);
-  const duration = Date.now() - startTime;
-
+  const response = await callClaudeForIteration(ctx, iteration, iterStart);
   const toolCalls = extractToolCalls(response.content);
-
   ctx.logger.log('claude_response', {
     iteration,
     stop_reason: response.stop_reason,
     tool_calls_count: toolCalls.length,
-    duration_ms: duration,
+    text_blocks_count: response.content.filter((b) => b.type === 'text').length,
+    duration_ms: Date.now() - iterStart,
   });
 
   ctx.lastIterationStartIndex = ctx.responses.length;
   ctx.responses.push(...extractTextResponses(response.content));
 
   if (response.stop_reason === 'end_turn' || toolCalls.length === 0) {
+    ctx.logger.log('iteration_end', {
+      iteration,
+      reason: response.stop_reason === 'end_turn' ? 'end_turn' : 'no_tool_calls',
+      total_duration_ms: Date.now() - iterStart,
+    });
     return true;
   }
 
   notifyCallback(ctx.logger, () =>
     ctx.callbacks?.onStatus(`Executing ${toolCalls.length} tool(s)...`)
   );
-
-  const toolResults = await executeToolCalls(toolCalls, ctx);
-
-  ctx.messages.push({
-    role: 'assistant',
-    content: response.content as Anthropic.ContentBlock[],
-  });
+  const toolResults = await executeIterationTools(toolCalls, ctx, iteration, iterStart);
+  ctx.messages.push({ role: 'assistant', content: response.content as Anthropic.ContentBlock[] });
   ctx.messages.push({ role: 'user', content: toolResults });
-
-  // Notify iteration complete for progress callbacks (only when tools were used)
   notifyCallback(ctx.logger, () => ctx.callbacks?.onIterationComplete?.(ctx.responses.join('\n')));
-
+  ctx.logger.log('iteration_end', {
+    iteration,
+    reason: 'continuing',
+    tool_calls_executed: toolCalls.length,
+    total_duration_ms: Date.now() - iterStart,
+  });
   return false;
 }
 
@@ -618,10 +798,27 @@ async function runOrchestrationLoop(
   ctx: OrchestrationContext,
   maxIterations: number
 ): Promise<void> {
+  ctx.logger.log('orchestration_loop_start', { max_iterations: maxIterations });
+  let lastIteration = -1;
+  let exitReason: 'done' | 'max_iterations' = 'max_iterations';
   for (let i = 0; i < maxIterations; i++) {
+    lastIteration = i;
     const done = await processIteration(ctx, i);
-    if (done) break;
+    if (done) {
+      exitReason = 'done';
+      break;
+    }
   }
+  if (exitReason === 'max_iterations') {
+    ctx.logger.warn('orchestration_max_iterations_reached', {
+      max_iterations: maxIterations,
+      last_iteration: lastIteration,
+    });
+  }
+  ctx.logger.log('orchestration_loop_end', {
+    exit_reason: exitReason,
+    last_iteration: lastIteration,
+  });
 
   // Log health summary and budget status at end of orchestration
   logOrchestrationSummary(ctx);
@@ -990,12 +1187,55 @@ function handleToolError(
   };
 }
 
+/**
+ * Internal tools that are safe and useful from inside the execute_code sandbox.
+ *
+ * Curated list — most internal tools are inappropriate for sandbox calls:
+ *  - `request_audio` toggles output mode (response-shape side effect, not a value).
+ *  - `read_memory` / `update_memory` are durable user state; sandbox computation
+ *    should not write through.
+ *  - `generate_scripture_pdf` is the no-sandbox happy path; if Claude is in the
+ *    sandbox doing custom work it has explicitly chosen to bypass the macro.
+ *  - `get_tool_definitions` / `execute_code` itself are top-level only.
+ *
+ * `prepare_usfm_source` is a pure (translation, book) → source-spec resolver.
+ * It is exactly the shape Claude needs while assembling a custom payload for
+ * the raw `submit_typeset` MCP tool, so we expose it inside the sandbox.
+ */
+const SANDBOX_INTERNAL_TOOLS = ['prepare_usfm_source'] as const;
+
+function isSandboxInternalTool(name: string): boolean {
+  return (SANDBOX_INTERNAL_TOOLS as readonly string[]).includes(name);
+}
+
+async function dispatchSandboxInternalTool(
+  name: string,
+  args: unknown,
+  ctx: OrchestrationContext
+): Promise<unknown> {
+  if (name === 'prepare_usfm_source') {
+    if (!isPrepareUsfmSourceInput(args)) {
+      throw new ValidationError(
+        `Invalid input for prepare_usfm_source: expected { translation: string, book: string }, got ${truncateInput(args)}`
+      );
+    }
+    return handlePrepareUsfmSource(args, buildPtxprintCtx(ctx));
+  }
+  throw new ValidationError(`Unknown sandbox-internal tool: ${name}`);
+}
+
 async function handleExecuteCode(
   input: { code: string },
   ctx: OrchestrationContext
 ): Promise<unknown> {
-  const toolNames = getToolNames(ctx.catalog);
-  const toolCaller = (name: string, args: unknown) => handleMCPToolCall(name, args, ctx);
+  const mcpToolNames = getToolNames(ctx.catalog);
+  const toolNames = [...mcpToolNames, ...SANDBOX_INTERNAL_TOOLS];
+  const toolCaller = async (name: string, args: unknown): Promise<unknown> => {
+    if (isSandboxInternalTool(name)) {
+      return dispatchSandboxInternalTool(name, args, ctx);
+    }
+    return handleMCPToolCall(name, args, ctx);
+  };
   const hostFunctions = createMCPHostFunctions(toolCaller, toolNames);
 
   const result = await executeCode(
