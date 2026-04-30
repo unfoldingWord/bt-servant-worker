@@ -164,6 +164,14 @@ export function buildGenerateScripturePdfTool(): Anthropic.Tool {
     name: 'generate_scripture_pdf',
     description:
       'Generate a print-ready PDF of a single book from the Berean Standard Bible (BSB), using the canon-validated default layout. Returns a PDF attachment that renders inline in chat clients. Use this for the standard "give me a PDF of John from BSB"-style request. ' +
+      'Result handling — branch on `status`: ' +
+      '(1) `succeeded` — briefly confirm the PDF is ready. The attachment is already on the chat response; do NOT paste the raw URL. ' +
+      '(2) `pending` — the job is still typesetting. Tell the user it is taking longer than expected and ALWAYS include the `job_id` in your reply formatted exactly as `Tracking ID: <job_id>` on its own line. This format is the only way a follow-up turn can identify the running job (cancel, explicit status check). Surface `human_summary` and `last_state` if present so the user knows roughly where things are. Encourage them to ask again in about a minute — the cache will return the finished PDF instantly when it lands. ' +
+      '(3) `failed` — summarize the failure briefly using `errors` and `message`. Do not dump raw TeX log output to the user. ' +
+      '(4) `error` — relay the human-readable `message`; the `cause` field is for logging, not for the user. ' +
+      'Follow-up-turn handling: ' +
+      '(a) If the user asks for status of a previously pending PDF, prefer calling this macro again with the same translation/book. ptxprint-mcp content-addresses by payload, so a re-ask returns the cached PDF instantly when ready or another `pending` with refreshed state. ' +
+      '(b) If the user asks to cancel a previously pending PDF, scan earlier assistant replies for the most recent `Tracking ID: <hash>` line and call the catalog tool `cancel_job({ job_id: <hash> })`. If no Tracking ID exists in conversation, tell the user you cannot identify the running job and offer to re-submit so they can cancel a fresh attempt. ' +
       'For custom layouts, paper sizes, fonts, or anything else off the happy path: do NOT request multiple parameters here — instead, query the `docs` tool from ptxprint-mcp (e.g. `docs("config_files for letter two-column")`) to retrieve canon guidance, then assemble a payload yourself with `prepare_usfm_source` + the raw `submit_typeset` MCP tool. The canon is the source of truth for layout recipes; this macro only covers the default.',
     input_schema: {
       type: 'object',
