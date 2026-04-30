@@ -512,8 +512,7 @@ function buildPayloadForRequest(
   source: import('./types.js').PayloadSource
 ): ReturnType<typeof buildPayload> | InternalErrorResult {
   // eslint-disable-next-line security/detect-object-injection -- book validated above
-  const bookNum = BOOK_INDEX[book];
-  if (!bookNum) {
+  if (!BOOK_INDEX[book]) {
     ctx.logger.error('generate_scripture_pdf_unknown_book_for_payload', null, { book });
     return { status: 'error', message: `Unknown book code: ${book}`, cause: 'unknown_book' };
   }
@@ -522,14 +521,6 @@ function buildPayloadForRequest(
     projectId: translation,
     books: [book],
     sources: [source],
-    settingsXml: {
-      languageIsoCode: 'en',
-      versification: 4,
-      books: [book],
-      fileNameBookNameForm: `${bookNum}${book}`,
-      fileNamePrePart: '',
-      fileNamePostPart: '.SFM',
-    },
   });
   ctx.logger.log('generate_scripture_pdf_payload_built', {
     project_id: payload.project_id,
@@ -538,6 +529,7 @@ function buildPayloadForRequest(
     mode: payload.mode,
     source_count: payload.sources.length,
     config_file_keys: Object.keys(payload.config_files),
+    font_count: payload.fonts.length,
   });
   return payload;
 }

@@ -69,14 +69,27 @@ export function buildDcsUrl(translation: SupportedTranslation, book: string): st
   return `https://git.door43.org/unfoldingWord/${translation}/raw/branch/master/${num}-${book}.usfm`;
 }
 
-/** Build the canonical Paratext filename PTXprint expects in `sources[].filename`. */
+/**
+ * Build the source filename PTXprint expects in `sources[].filename`.
+ *
+ * Pattern is `{N}{BOOK}test.usfm` (e.g. `44JHNtest.usfm`) to match the
+ * canon-validated `bsb-empirical` preset's Settings.xml convention
+ * (`FileNamePostPart=test.usfm`). The container resolves source files
+ * by walking the `FileNamePrePart + bookcode + FileNamePostPart` template
+ * out of Settings.xml — if our filenames don't match the template the
+ * container can't find them, which surfaces as
+ * "PTXprint produced no output (silent exit)".
+ *
+ * If/when we move past the bsb-empirical preset, this should grow a
+ * preset-aware path or move into the docs+raw-tools loop.
+ */
 export function buildParatextFilename(book: string): string {
   // eslint-disable-next-line security/detect-object-injection -- book validated upstream
   const num = BOOK_INDEX[book];
   if (!num) {
     throw new UsfmSourceError(`Unknown book code: ${book}`, 'unknown_book');
   }
-  return `${num}${book}.SFM`;
+  return `${num}${book}test.usfm`;
 }
 
 /** Build the R2 key for a USFM source. Content-addressed by sha256 — same bytes get the same key. */

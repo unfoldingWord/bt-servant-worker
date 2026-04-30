@@ -3,32 +3,10 @@ import { buildPayload, truncateProjectId } from '../../src/services/ptxprint/pay
 
 const sampleSource = {
   book: 'JHN',
-  filename: '44JHN.SFM',
-  url: 'https://example.com/public/ptxprint/usfm/en_ult/abc/44JHN.SFM',
+  filename: '44JHNtest.usfm',
+  url: 'https://example.com/public/ptxprint/usfm/en_ult/abc/44JHNtest.usfm',
   sha256: 'a'.repeat(64),
 };
-
-const baseSettings = {
-  languageIsoCode: 'en',
-  versification: 4,
-  books: ['JHN'],
-  fileNamePrePart: '',
-  fileNamePostPart: '.SFM',
-  fileNameBookNameForm: '44JHN',
-};
-
-function makePayload(
-  presetId: 'paperback-a5' | 'letter-2col' | 'large-print-a4',
-  projectId = 'en_ult'
-) {
-  return buildPayload({
-    presetId,
-    projectId,
-    books: ['JHN'],
-    sources: [sampleSource],
-    settingsXml: baseSettings,
-  });
-}
 
 describe('truncateProjectId', () => {
   it('truncates to 8 chars and strips non-alphanumerics', () => {
@@ -45,7 +23,12 @@ describe('truncateProjectId', () => {
 
 describe('buildPayload', () => {
   it('produces a schema-shaped payload', () => {
-    const payload = makePayload('paperback-a5');
+    const payload = buildPayload({
+      presetId: 'bsb-empirical',
+      projectId: 'en_ult',
+      books: ['JHN'],
+      sources: [sampleSource],
+    });
     expect(payload.schema_version).toBe('1.0');
     expect(payload.project_id).toBe('enult');
     expect(payload.config_name).toBe('Default');
@@ -53,25 +36,36 @@ describe('buildPayload', () => {
     expect(payload.mode).toBe('simple');
     expect(payload.define).toEqual({});
     expect(payload.sources).toEqual([sampleSource]);
-    expect(payload.fonts).toEqual([]);
     expect(payload.figures).toEqual([]);
   });
 
-  it('includes Settings.xml and ptxprint.cfg in config_files', () => {
-    const payload = makePayload('paperback-a5', 'enult');
+  it('embeds the canon-validated config_files from the bsb-empirical preset', () => {
+    const payload = buildPayload({
+      presetId: 'bsb-empirical',
+      projectId: 'enult',
+      books: ['JHN'],
+      sources: [sampleSource],
+    });
     const keys = Object.keys(payload.config_files).sort();
-    expect(keys).toEqual(['Settings.xml', 'shared/ptxprint/Default/ptxprint.cfg']);
+    expect(keys).toEqual([
+      'Settings.xml',
+      'custom.sty',
+      'shared/ptxprint/Default/ptxprint-mods.sty',
+      'shared/ptxprint/Default/ptxprint.cfg',
+      'shared/ptxprint/Default/ptxprint.sty',
+    ]);
     expect(payload.config_files['Settings.xml']).toContain('LanguageIsoCode');
     expect(payload.config_files['shared/ptxprint/Default/ptxprint.cfg']).toContain('[paper]');
   });
 
-  it('preset choice is reflected in the embedded cfg', () => {
-    const a5 = makePayload('paperback-a5', 'enult');
-    const a4 = makePayload('large-print-a4', 'enult');
-    expect(a5.config_files['shared/ptxprint/Default/ptxprint.cfg']).toContain('A5');
-    expect(a4.config_files['shared/ptxprint/Default/ptxprint.cfg']).toContain('A4');
-    expect(a5.config_files['shared/ptxprint/Default/ptxprint.cfg']).not.toEqual(
-      a4.config_files['shared/ptxprint/Default/ptxprint.cfg']
-    );
+  it('attaches the Gentium Plus font references', () => {
+    const payload = buildPayload({
+      presetId: 'bsb-empirical',
+      projectId: 'enult',
+      books: ['JHN'],
+      sources: [sampleSource],
+    });
+    expect(payload.fonts).toHaveLength(4);
+    expect(payload.fonts[0]?.family_id).toBe('gentiumplus');
   });
 });

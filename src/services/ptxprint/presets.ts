@@ -1,157 +1,69 @@
 /**
- * Three hardcoded layout presets for ptxprint-mcp v1.
+ * v1 ships one canon-validated preset, `bsb-empirical`.
  *
- * Each preset emits a `config_files` map keyed by virtual paths the container
- * lays down inside the project tree (`shared/ptxprint/Default/...` matches
- * `config_name = "Default"`). The actual PTXprint config (`ptxprint.cfg`) is
- * built from a shared template — presets vary only in the [paper] block plus
- * a font-size factor.
+ * Source of truth: `fixture-bsb-empirical.json`, copied verbatim from
+ * `ptxprint-mcp/smoke/bsb-jhn-empirical.json`. That fixture is the working
+ * config the upstream maintainer landed in their session-12 iteration —
+ * tracked, reproducible, validated end-to-end through the deployed worker
+ * (renders BSB Gospel of John as a 360KB / 61-page PDF in ~13s).
  *
- * Settings.xml is interpolated per-request because it carries
- * translation-specific values (LanguageIsoCode, BooksPresent bitmap,
- * filename pattern). The other two files are static per-preset.
+ * Why pin to that fixture instead of hand-crafting layout variants:
+ *   1. Hand-crafted cfg/sty content is brittle. Our own first attempt at
+ *      A5 / letter-2col / A4 presets passed payload validation but produced
+ *      "PTXprint produced no output (silent exit)" inside the container —
+ *      the cfg shape is not something to invent without the canon.
+ *   2. ptxprint-mcp now exposes a `docs` tool (auto-discovered on the
+ *      catalog now that streamable-HTTP transport works). The intended path
+ *      for layout variation is: agent calls `docs("config_files for X")`,
+ *      gets canon guidance, hand-builds a payload via `prepare_usfm_source`
+ *      + `submit_typeset`. The macro-tool stays as the one-shot happy path
+ *      for the default; everything else goes through that loop.
  *
- * These are intentionally minimal — every key omitted falls back to PTXprint's
- * built-in default, and the smoke `smoke/minimal-payload.json` in ptxprint-mcp
- * proved that even `config_files: {}` produces a usable PDF. We layer on just
- * enough cfg to differentiate the three presets visibly.
+ * BooksPresent: the fixture's bitmap covers all 66 canonical books, so the
+ * single fixture works for any DCS book we resolve. PTXprint only typesets
+ * books listed in `payload.books`, so the bitmap being permissive does not
+ * cause unrelated books to render.
  *
- * The colleague's upcoming config-generator MCP tool will replace these with
- * on-the-fly generation; presets become a thin compatibility wrapper or get
- * removed entirely. See issue #172.
+ * Settings.xml: kept verbatim from the fixture (no per-request templating in
+ * v1). The fixture's `LanguageIsoCode = en` is fine for the four DCS open
+ * translations we ship, all of which are English. When non-English
+ * translations land, this becomes a templated field — alternatively, that
+ * codepath migrates entirely to the docs+raw-tools loop.
  */
 
-import { PresetId } from './types.js';
+import fixture from './fixture-bsb-empirical.json' with { type: 'json' };
+import { PayloadFont, PresetId } from './types.js';
 
-export interface PresetSpec {
+export interface PresetData {
   id: PresetId;
-  label: string;
-  description: string;
-  /** PTXprint paper-size string. Format is mirrored from the fonts-payload smoke. */
-  pageSize: string;
-  /** Page width literal (same string PTXprint expects in [paper].width). */
-  width: string;
-  /** Page height literal. */
-  height: string;
-  /** Single-column (false) vs two-column (true) body. */
-  twoColumn: boolean;
-  /** Body font factor — bigger = larger body text. */
-  fontFactor: number;
-  /** Top margin in points. */
-  topMargin: number;
-  /** Bottom margin in points. */
-  bottomMargin: number;
-  /** Left/right margin in points. */
-  margins: number;
+  /** Map of relative path → file content. Passed verbatim into payload.config_files. */
+  configFiles: Record<string, string>;
+  /** Font references already hosted in ptxprint-mcp's R2 — no rehosting required. */
+  fonts: PayloadFont[];
 }
 
-export const PRESETS: Record<PresetId, PresetSpec> = {
-  'paperback-a5': {
-    id: 'paperback-a5',
-    label: 'Paperback A5',
-    description: 'A5 single-column reading Bible. Charis SIL 11pt body.',
-    pageSize: '148mm, 210mm (A5)',
-    width: '148mm',
-    height: '210mm',
-    twoColumn: false,
-    fontFactor: 11,
-    topMargin: 18,
-    bottomMargin: 14.4,
-    margins: 12,
-  },
-  'letter-2col': {
-    id: 'letter-2col',
-    label: 'Letter, 2 columns',
-    description: 'US Letter two-column pew Bible. Charis SIL 10pt body.',
-    pageSize: '8.5in, 11in (Letter)',
-    width: '8.5in',
-    height: '11in',
-    twoColumn: true,
-    fontFactor: 10,
-    topMargin: 18,
-    bottomMargin: 14.4,
-    margins: 14,
-  },
-  'large-print-a4': {
-    id: 'large-print-a4',
-    label: 'Large Print A4',
-    description: 'A4 single-column accessibility layout. Charis SIL 14pt body.',
-    pageSize: '210mm, 297mm (A4)',
-    width: '210mm',
-    height: '297mm',
-    twoColumn: false,
-    fontFactor: 14,
-    topMargin: 18,
-    bottomMargin: 14.4,
-    margins: 14,
-  },
-};
+const FIXTURE_CONFIG_FILES = fixture.config_files as Record<string, string>;
+const FIXTURE_FONTS = fixture.fonts as PayloadFont[];
 
-export function getPreset(id: PresetId): PresetSpec {
-  // Object access on a known-narrow union is safe — TS guarantees membership.
-  // eslint-disable-next-line security/detect-object-injection
-  return PRESETS[id];
-}
-
-export function listPresets(): PresetSpec[] {
-  // eslint-disable-next-line security/detect-object-injection
-  return (Object.keys(PRESETS) as PresetId[]).map((id) => PRESETS[id]);
+export function getPreset(id: PresetId): PresetData {
+  if (id !== 'bsb-empirical') {
+    throw new Error(`Unknown preset id: ${id}`);
+  }
+  return {
+    id,
+    configFiles: FIXTURE_CONFIG_FILES,
+    fonts: FIXTURE_FONTS,
+  };
 }
 
 export function isPresetId(value: unknown): value is PresetId {
-  return (
-    typeof value === 'string' &&
-    (value === 'paperback-a5' || value === 'letter-2col' || value === 'large-print-a4')
-  );
-}
-
-/**
- * Render the ptxprint.cfg INI from a preset. Only the layout-relevant sections
- * are emitted — every other key falls back to bundled defaults. Charis SIL is
- * the bundled default font family in the container, so we don't have to ship
- * font references for v1 (see issue #173 for explicit fonts work).
- */
-export function buildPtxprintCfg(preset: PresetSpec): string {
-  const columns = preset.twoColumn ? 'True' : 'False';
-  return `[paper]
-pagesize = ${preset.pageSize}
-width = ${preset.width}
-height = ${preset.height}
-columns = ${columns}
-fontfactor = ${preset.fontFactor}
-margins = ${preset.margins}
-topmargin = ${preset.topMargin}
-bottommargin = ${preset.bottomMargin}
-
-[document]
-fontregular = Charis SIL||false|false|
-fontbold = Charis SIL| Bold|false|false|
-fontitalic = Charis SIL| Italic|false|false|
-fontbolditalic = Charis SIL| Bold Italic|false|false|
-ifshowchapternums = True
-ifshowversenums = True
-ifusepiclist = False
-ifinclfigs = False
-
-[paragraph]
-ifjustify = True
-ifhyphenate = True
-linespacing = 15
-
-[notes]
-includefootnotes = True
-includexrefs = True
-
-[config]
-name = Default
-`;
+  return value === 'bsb-empirical';
 }
 
 /**
  * Bookcode → 2-digit Paratext index used in canonical filenames like
  * "44JHN.SFM". USFM canonical book ordering — Genesis is 01, Matthew is 41,
- * Revelation is 67. Source: USFM spec book-id table (also referenced in
- * ptxprint-mcp/smoke/minimal-payload.json).
+ * Revelation is 67. Source: USFM spec book-id table.
  */
 export const BOOK_INDEX: Record<string, string> = {
   GEN: '01',
@@ -221,35 +133,3 @@ export const BOOK_INDEX: Record<string, string> = {
   JUD: '66',
   REV: '67',
 };
-
-/** Total slots in the BooksPresent bitmap (USFM canon length). */
-export const BOOKS_PRESENT_LENGTH = 124;
-
-/**
- * Position of each Paratext book in the BooksPresent bitmap.
- * Index = (parseInt(BOOK_INDEX[book]) - 1). Genesis at 0, John at 43.
- */
-export function bookBitmapIndex(book: string): number | null {
-  // eslint-disable-next-line security/detect-object-injection -- book is validated upstream
-  const idx = BOOK_INDEX[book];
-  if (!idx) return null;
-  return parseInt(idx, 10) - 1;
-}
-
-/**
- * Build a 124-bit BooksPresent string with `1` set at the canonical position
- * of each requested book and `0` elsewhere. Mirrors the format seen in
- * ptxprint-mcp/smoke/fonts-payload.json's Settings.xml.
- */
-export function buildBooksPresentBitmap(books: string[]): string {
-  const bits = new Array<string>(BOOKS_PRESENT_LENGTH).fill('0');
-  for (const book of books) {
-    const idx = bookBitmapIndex(book);
-    if (idx === null || idx < 0 || idx >= BOOKS_PRESENT_LENGTH) {
-      throw new Error(`Unknown book code "${book}" — cannot build BooksPresent bitmap`);
-    }
-    // eslint-disable-next-line security/detect-object-injection
-    bits[idx] = '1';
-  }
-  return bits.join('');
-}

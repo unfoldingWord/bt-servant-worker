@@ -65,15 +65,15 @@ describe('URL/key builders', () => {
     expect(() => buildDcsUrl('en_ult', 'XYZ')).toThrow(UsfmSourceError);
   });
 
-  it('buildParatextFilename produces canonical 44JHN.SFM-style names', () => {
-    expect(buildParatextFilename('JHN')).toBe('44JHN.SFM');
-    expect(buildParatextFilename('GEN')).toBe('01GEN.SFM');
-    expect(buildParatextFilename('REV')).toBe('67REV.SFM');
+  it('buildParatextFilename produces canonical 44JHNtest.usfm-style names', () => {
+    expect(buildParatextFilename('JHN')).toBe('44JHNtest.usfm');
+    expect(buildParatextFilename('GEN')).toBe('01GENtest.usfm');
+    expect(buildParatextFilename('REV')).toBe('67REVtest.usfm');
   });
 
   it('buildUsfmR2Key is content-addressed', () => {
-    const key = buildUsfmR2Key('en_ult', 'a'.repeat(64), '44JHN.SFM');
-    expect(key).toBe(`usfm/en_ult/${'a'.repeat(64)}/44JHN.SFM`);
+    const key = buildUsfmR2Key('en_ult', 'a'.repeat(64), '44JHNtest.usfm');
+    expect(key).toBe(`usfm/en_ult/${'a'.repeat(64)}/44JHNtest.usfm`);
   });
 
   it('buildUsfmPublicUrl strips trailing slash on baseUrl', () => {
@@ -104,12 +104,12 @@ describe('resolveUsfmSource — happy path', () => {
     );
     const result = await callResolve();
     expect(result.book).toBe('JHN');
-    expect(result.filename).toBe('44JHN.SFM');
+    expect(result.filename).toBe('44JHNtest.usfm');
     expect(result.url).toMatch(
-      /^https:\/\/w\.example\.com\/public\/ptxprint\/usfm\/en_ult\/[a-f0-9]{64}\/44JHN\.SFM$/
+      /^https:\/\/w\.example\.com\/public\/ptxprint\/usfm\/en_ult\/[a-f0-9]{64}\/44JHNtest\.usfm$/
     );
     expect(result.sha256).toMatch(/^[a-f0-9]{64}$/);
-    const obj = await env.PTXPRINT_BUCKET.get(`usfm/en_ult/${result.sha256}/44JHN.SFM`);
+    const obj = await env.PTXPRINT_BUCKET.get(`usfm/en_ult/${result.sha256}/44JHNtest.usfm`);
     expect(obj).not.toBeNull();
     const text = await obj!.text();
     expect(text).toBe(SAMPLE_USFM);

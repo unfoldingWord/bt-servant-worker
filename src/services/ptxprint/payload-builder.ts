@@ -1,12 +1,17 @@
 /**
- * Build the ptxprint-mcp `submit_typeset` payload from preset + sources +
- * Settings.xml. Pure function — deterministic for cacheability (ptxprint-mcp
- * content-addresses payloads with sha256-of-canonicalized-JSON, so any
- * non-determinism here costs us cache hits).
+ * Build the ptxprint-mcp `submit_typeset` payload from preset + sources.
+ *
+ * Pure function — deterministic for cacheability (ptxprint-mcp content-
+ * addresses payloads with sha256-of-canonicalized-JSON, so any non-
+ * determinism here costs us cache hits).
+ *
+ * v1 thin shape: the preset supplies config_files + fonts verbatim from the
+ * canon-validated fixture; the caller supplies the resolved DCS source(s).
+ * No Settings.xml interpolation in v1 — see presets.ts for the rationale and
+ * the migration path through the `docs` MCP tool.
  */
 
-import { buildPtxprintCfg, getPreset } from './presets.js';
-import { buildSettingsXml, SettingsXmlInput } from './settings-xml.js';
+import { getPreset } from './presets.js';
 import { PayloadSource, PresetId, PtxprintPayload } from './types.js';
 
 export interface BuildPayloadInput {
@@ -15,7 +20,6 @@ export interface BuildPayloadInput {
   projectId: string;
   books: string[];
   sources: PayloadSource[];
-  settingsXml: SettingsXmlInput;
 }
 
 /** Truncate a string to the ptxprint project_id constraint (≤8 chars). */
@@ -28,8 +32,6 @@ export function truncateProjectId(input: string): string {
 
 export function buildPayload(input: BuildPayloadInput): PtxprintPayload {
   const preset = getPreset(input.presetId);
-  const cfg = buildPtxprintCfg(preset);
-  const settingsXml = buildSettingsXml(input.settingsXml);
 
   return {
     schema_version: '1.0',
@@ -38,12 +40,9 @@ export function buildPayload(input: BuildPayloadInput): PtxprintPayload {
     books: input.books,
     mode: 'simple',
     define: {},
-    config_files: {
-      'Settings.xml': settingsXml,
-      'shared/ptxprint/Default/ptxprint.cfg': cfg,
-    },
+    config_files: { ...preset.configFiles },
     sources: input.sources,
-    fonts: [],
+    fonts: [...preset.fonts],
     figures: [],
   };
 }

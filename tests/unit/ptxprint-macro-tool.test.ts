@@ -70,7 +70,7 @@ describe('isGenerateScripturePdfInput', () => {
   it('accepts valid input', () => {
     expect(isGenerateScripturePdfInput({ translation: 'en_ult', book: 'JHN' })).toBe(true);
     expect(
-      isGenerateScripturePdfInput({ translation: 'en_ult', book: 'JHN', preset: 'paperback-a5' })
+      isGenerateScripturePdfInput({ translation: 'en_ult', book: 'JHN', preset: 'bsb-empirical' })
     ).toBe(true);
   });
 
@@ -108,7 +108,7 @@ describe('handlePrepareUsfmSource', () => {
     );
     expect(result).toMatchObject({
       book: 'JHN',
-      filename: '44JHN.SFM',
+      filename: '44JHNtest.usfm',
       sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
     });
   });
@@ -156,7 +156,7 @@ describe('handleGenerateScripturePdf — happy path (cached)', () => {
       status: 'succeeded',
       job_id: 'job-cached',
       cached: true,
-      preset: 'paperback-a5',
+      preset: 'bsb-empirical',
       translation: 'en_ult',
       book: 'JHN',
     });

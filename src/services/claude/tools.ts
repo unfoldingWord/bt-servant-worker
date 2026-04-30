@@ -163,7 +163,8 @@ export function buildGenerateScripturePdfTool(): Anthropic.Tool {
   return {
     name: 'generate_scripture_pdf',
     description:
-      'Generate a print-ready PDF of a single book from a Door43 open translation. Returns a PDF attachment that renders inline in chat clients. Use this for standard "make me a PDF of John in ULT"-style requests; for advanced cases (custom layout, multiple books, fonts, figures) use the raw submit_typeset tool from ptxprint-mcp.',
+      'Generate a print-ready PDF of a single book from a Door43 open translation, using the canon-validated default layout. Returns a PDF attachment that renders inline in chat clients. Use this for the standard "give me a PDF of John in ULT"-style request. ' +
+      'For custom layouts, paper sizes, fonts, or anything else off the happy path: do NOT request multiple parameters here — instead, query the `docs` tool from ptxprint-mcp (e.g. `docs("config_files for letter two-column")`) to retrieve canon guidance, then assemble a payload yourself with `prepare_usfm_source` + the raw `submit_typeset` MCP tool. The canon is the source of truth for layout recipes; this macro only covers the default.',
     input_schema: {
       type: 'object',
       properties: {
@@ -180,9 +181,9 @@ export function buildGenerateScripturePdfTool(): Anthropic.Tool {
         },
         preset: {
           type: 'string',
-          enum: ['paperback-a5', 'letter-2col', 'large-print-a4'],
+          enum: ['bsb-empirical'],
           description:
-            'Layout preset. Defaults to paperback-a5 if omitted. paperback-a5 = A5 single-column, letter-2col = US Letter two-column, large-print-a4 = A4 14pt accessibility.',
+            'Layout preset. Defaults to bsb-empirical (canon-validated single-column reference layout) if omitted. v1 ships exactly this one preset; for other layouts use the docs+raw-tools loop described in the tool summary.',
         },
       },
       required: ['translation', 'book'],
@@ -202,7 +203,8 @@ export function buildPrepareUsfmSourceTool(): Anthropic.Tool {
   return {
     name: 'prepare_usfm_source',
     description:
-      "Resolve a (translation, book) pair to a `sources[]` entry suitable for ptxprint-mcp's `submit_typeset` payload. Returns { book, filename, url, sha256 } — drop straight into the sources array. Use this before calling submit_typeset directly when generate_scripture_pdf does not fit your needs.",
+      "Resolve a (translation, book) pair to a `sources[]` entry suitable for ptxprint-mcp's `submit_typeset` payload. Returns { book, filename, url, sha256 } — drop straight into the sources array. " +
+      'Use this when assembling a custom payload for raw `submit_typeset` — typical custom flow is: (1) call `docs` on ptxprint-mcp for layout guidance, (2) call this tool to resolve USFM sources, (3) use execute_code to splice the docs recipe + this output into a valid payload, (4) call `submit_typeset` and poll `get_job_status` until done.',
     input_schema: {
       type: 'object',
       properties: {

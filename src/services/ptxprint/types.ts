@@ -24,9 +24,17 @@ export function createAttachmentsContext(): AttachmentsContext {
   };
 }
 
-export type PresetId = 'paperback-a5' | 'letter-2col' | 'large-print-a4';
+/**
+ * v1 ships one canon-validated preset. The id stays a string union (rather
+ * than collapsing to no parameter) so the macro-tool's contract is forward-
+ * compatible: future presets become additional union members without a
+ * breaking change. Layout variation beyond this default is meant to flow
+ * through ptxprint-mcp's `docs` tool plus the raw `submit_typeset` path —
+ * see the tool descriptions in src/services/claude/tools.ts.
+ */
+export type PresetId = 'bsb-empirical';
 
-export const DEFAULT_PRESET: PresetId = 'paperback-a5';
+export const DEFAULT_PRESET: PresetId = 'bsb-empirical';
 
 /** The per-source payload entry expected by ptxprint-mcp's submit_typeset. */
 export interface PayloadSource {
