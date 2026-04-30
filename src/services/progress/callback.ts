@@ -5,7 +5,7 @@
  * Accumulates text chunks and sends them on complete, with immediate status updates.
  */
 
-import { ChatResponse, ProgressMode, StreamCallbacks } from '../../types/engine.js';
+import { Attachment, ChatResponse, ProgressMode, StreamCallbacks } from '../../types/engine.js';
 import { RequestLogger, safeAsync } from '../../utils/logger.js';
 
 export interface ProgressCallbackConfig {
@@ -21,6 +21,11 @@ export interface ProgressCallbackConfig {
 
 type CallbackPayloadType = 'status' | 'progress' | 'complete' | 'error';
 
+/**
+ * Internal payload shape sent over the wire. Must stay in sync with the
+ * exported `ProgressCallback` contract in `src/types/engine.ts` — that's
+ * the public type consumers (whatsapp gateway, etc.) model against.
+ */
 interface CallbackPayload {
   type: CallbackPayloadType;
   user_id: string;
@@ -31,6 +36,12 @@ interface CallbackPayload {
   error?: string;
   voice_audio_base64?: string | null;
   voice_audio_url?: string | null;
+  /**
+   * Tool-produced artifacts (e.g., generated PDFs). Forwarded verbatim from
+   * ChatResponse.attachments so callback consumers can render artifacts on
+   * the same final event that delivers the text.
+   */
+  attachments?: Attachment[];
   /** Group/supergroup chat ID (present only for group chats). */
   chat_id?: string;
   /** Thread ID within a supergroup (present only for threaded chats). */
@@ -71,13 +82,15 @@ export class ProgressCallbackSender {
   async sendComplete(
     text: string,
     voiceAudioUrl?: string | null,
-    voiceAudioBase64?: string | null
+    voiceAudioBase64?: string | null,
+    attachments?: Attachment[] | null
   ): Promise<void> {
     await this.post({
       type: 'complete',
       ...(text ? { text } : {}),
       ...(voiceAudioUrl ? { voice_audio_url: voiceAudioUrl } : {}),
       ...(voiceAudioBase64 ? { voice_audio_base64: voiceAudioBase64 } : {}),
+      ...(attachments && attachments.length > 0 ? { attachments } : {}),
     });
   }
 
@@ -138,11 +151,16 @@ export class ProgressCallbackSender {
     const hasAudio =
       ('voice_audio_url' in payload && !!payload.voice_audio_url) ||
       ('voice_audio_base64' in payload && !!payload.voice_audio_base64);
+    const attachmentCount =
+      'attachments' in payload && Array.isArray(payload.attachments)
+        ? payload.attachments.length
+        : 0;
     this.logger?.log('webhook_send', {
       ...ctx,
       has_text: textLen > 0,
       text_length: textLen,
       has_audio: hasAudio,
+      attachment_count: attachmentCount,
     });
   }
 
@@ -293,6 +311,31 @@ function runSafe(logger: RequestLogger, event: string, fn: () => Promise<unknown
   safeAsync(logger, event, fn);
 }
 
+function buildOnComplete(
+  sender: ProgressCallbackSender,
+  logger: RequestLogger,
+  incrementalSender: IncrementalProgressSender | null,
+  getLastSentText: () => string
+) {
+  return (response: ChatResponse) => {
+    incrementalSender?.complete();
+    const fullText = response.responses.join('\n');
+    const delta = fullText.slice(getLastSentText().length);
+    const hasAttachments = !!response.attachments && response.attachments.length > 0;
+    if (!delta && !response.voice_audio_url && !response.voice_audio_base64 && !hasAttachments) {
+      return;
+    }
+    runSafe(logger, 'webhook_complete_failed', () =>
+      sender.sendComplete(
+        delta,
+        response.voice_audio_url,
+        response.voice_audio_base64,
+        response.attachments
+      )
+    );
+  };
+}
+
 export function createWebhookCallbacks(
   sender: ProgressCallbackSender,
   logger: RequestLogger,
@@ -323,16 +366,7 @@ export function createWebhookCallbacks(
         sender.accumulateProgress(text);
       }
     },
-    onComplete: (response: ChatResponse) => {
-      incrementalSender?.complete();
-      const fullText = response.responses.join('\n');
-      const delta = fullText.slice(lastSentText.length);
-      if (delta || response.voice_audio_url || response.voice_audio_base64) {
-        runSafe(logger, 'webhook_complete_failed', () =>
-          sender.sendComplete(delta, response.voice_audio_url, response.voice_audio_base64)
-        );
-      }
-    },
+    onComplete: buildOnComplete(sender, logger, incrementalSender, () => lastSentText),
     onError: (error) => {
       incrementalSender?.complete();
       runSafe(logger, 'webhook_error_failed', () => sender.sendError(error));

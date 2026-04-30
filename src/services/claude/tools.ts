@@ -148,6 +148,82 @@ export function buildRequestAudioTool(): Anthropic.Tool {
 }
 
 /**
+ * Build generate_scripture_pdf tool definition.
+ *
+ * Macro-tool that orchestrates the whole ptxprint pipeline. Prefer this for
+ * standard scripture PDF requests; drop to the raw catalog tools
+ * (submit_typeset / get_job_status / cancel_job) only when the user wants
+ * something the macro doesn't support — autofill mode, multi-book payloads,
+ * custom configs, illustration figures, etc. The macro returns
+ * `{ status: "succeeded", pdf_url, ... }` on the happy path; an attachment
+ * is auto-attached to the chat response so the URL renders natively, not as
+ * a raw link.
+ */
+export function buildGenerateScripturePdfTool(): Anthropic.Tool {
+  return {
+    name: 'generate_scripture_pdf',
+    description:
+      'Generate a print-ready PDF of a single book from the Berean Standard Bible (BSB), using the canon-validated default layout. Returns a PDF attachment that renders inline in chat clients. Use this for the standard "give me a PDF of John from BSB"-style request. ' +
+      'For custom layouts, paper sizes, fonts, or anything else off the happy path: do NOT request multiple parameters here — instead, query the `docs` tool from ptxprint-mcp (e.g. `docs("config_files for letter two-column")`) to retrieve canon guidance, then assemble a payload yourself with `prepare_usfm_source` + the raw `submit_typeset` MCP tool. The canon is the source of truth for layout recipes; this macro only covers the default.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        translation: {
+          type: 'string',
+          enum: ['bsb'],
+          description:
+            'Translation id. v1 supports bsb (Berean Standard Bible). Door43 unfoldingWord translations are tracked as v1.1 — they need additional stylesheet support for UFW-specific markers (\\s5 plus alignment markers in en_ult/en_ust).',
+        },
+        book: {
+          type: 'string',
+          description:
+            '3-letter Paratext book code, e.g. "JHN" for John, "GEN" for Genesis. Single book only in v1.',
+        },
+        preset: {
+          type: 'string',
+          enum: ['bsb-empirical'],
+          description:
+            'Layout preset. Defaults to bsb-empirical (canon-validated single-column reference layout) if omitted. v1 ships exactly this one preset; for other layouts use the docs+raw-tools loop described in the tool summary.',
+        },
+      },
+      required: ['translation', 'book'],
+    },
+  };
+}
+
+/**
+ * Build prepare_usfm_source tool definition.
+ *
+ * Helper that exposes our USFM resolver so Claude can hand-build payloads
+ * for the raw `submit_typeset` MCP tool. Required because submit_typeset
+ * needs sha256 on every source entry, which Claude cannot compute in
+ * conversation without falling back to execute_code.
+ */
+export function buildPrepareUsfmSourceTool(): Anthropic.Tool {
+  return {
+    name: 'prepare_usfm_source',
+    description:
+      "Resolve a (translation, book) pair to a `sources[]` entry suitable for ptxprint-mcp's `submit_typeset` payload. Returns { book, filename, url, sha256 } — drop straight into the sources array. " +
+      'Use this when assembling a custom payload for raw `submit_typeset` — typical custom flow is: (1) call `docs` on ptxprint-mcp for layout guidance, (2) call this tool to resolve USFM sources, (3) use execute_code to splice the docs recipe + this output into a valid payload, (4) call `submit_typeset` and poll `get_job_status` until done.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        translation: {
+          type: 'string',
+          enum: ['bsb'],
+          description: 'Translation id (same set as generate_scripture_pdf — v1 ships bsb only).',
+        },
+        book: {
+          type: 'string',
+          description: '3-letter Paratext book code, e.g. "JHN".',
+        },
+      },
+      required: ['translation', 'book'],
+    },
+  };
+}
+
+/**
  * Build list_modes tool definition
  */
 export function buildListModesTool(): Anthropic.Tool {
@@ -208,6 +284,8 @@ export function buildAllTools(
     buildReadMemoryTool(),
     buildUpdateMemoryTool(),
     buildRequestAudioTool(), // Always available — TTS is a platform capability, not org-gated
+    buildGenerateScripturePdfTool(), // Always available — short-circuits to error if ptxprint-mcp not registered for the org
+    buildPrepareUsfmSourceTool(),
   ];
 
   if (opts?.hasModes) {
@@ -228,7 +306,9 @@ export function isBuiltInTool(toolName: string): boolean {
     toolName === 'update_memory' ||
     toolName === 'request_audio' ||
     toolName === 'list_modes' ||
-    toolName === 'switch_mode'
+    toolName === 'switch_mode' ||
+    toolName === 'generate_scripture_pdf' ||
+    toolName === 'prepare_usfm_source'
   );
 }
 

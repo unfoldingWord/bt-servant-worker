@@ -52,7 +52,7 @@ export default defineConfig({
           ANTHROPIC_API_KEY: anthropicKey,
         },
         kvNamespaces: ['ORG_ADMIN_KEYS', 'MCP_SERVERS', 'ORG_CONFIG', 'PROMPT_OVERRIDES'],
-        r2Buckets: ['AUDIO_BUCKET'],
+        r2Buckets: ['AUDIO_BUCKET', 'PTXPRINT_BUCKET'],
       },
       // Disable isolated storage to avoid issues with multi-request DO tests
       // See: https://developers.cloudflare.com/workers/testing/vitest-integration/known-issues/#isolated-storage

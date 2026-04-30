@@ -51,12 +51,14 @@ describe('buildAllTools', () => {
   it('should only include core tools when hasModes is false', () => {
     const tools = buildAllTools(catalog);
 
-    expect(tools.length).toBe(5);
+    expect(tools.length).toBe(7);
     expect(tools.map((t) => t.name)).toContain('execute_code');
     expect(tools.map((t) => t.name)).toContain('get_tool_definitions');
     expect(tools.map((t) => t.name)).toContain('read_memory');
     expect(tools.map((t) => t.name)).toContain('update_memory');
     expect(tools.map((t) => t.name)).toContain('request_audio');
+    expect(tools.map((t) => t.name)).toContain('generate_scripture_pdf');
+    expect(tools.map((t) => t.name)).toContain('prepare_usfm_source');
     expect(tools.map((t) => t.name)).not.toContain('list_modes');
     expect(tools.map((t) => t.name)).not.toContain('switch_mode');
     expect(tools.map((t) => t.name)).not.toContain('mcp_tool');
@@ -65,10 +67,12 @@ describe('buildAllTools', () => {
   it('should include mode tools when hasModes is true', () => {
     const tools = buildAllTools(catalog, { hasModes: true });
 
-    expect(tools.length).toBe(7);
+    expect(tools.length).toBe(9);
     expect(tools.map((t) => t.name)).toContain('list_modes');
     expect(tools.map((t) => t.name)).toContain('switch_mode');
     expect(tools.map((t) => t.name)).toContain('request_audio');
+    expect(tools.map((t) => t.name)).toContain('generate_scripture_pdf');
+    expect(tools.map((t) => t.name)).toContain('prepare_usfm_source');
     expect(tools.map((t) => t.name)).not.toContain('mcp_tool');
   });
 });

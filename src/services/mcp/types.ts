@@ -92,6 +92,34 @@ export interface MCPToolResultWithMetadata extends MCPToolResult {
 }
 
 /**
+ * Options accepted by `callMCPTool` and its transport-specific dispatchers.
+ *
+ * Lives here (not in `discovery.ts`) so the streamable-HTTP adapter can
+ * import it without creating a cycle with `discovery.ts` (which in turn
+ * imports the adapter).
+ */
+export interface CallMCPToolOptions {
+  healthTracker?: import('./health.js').HealthTracker;
+  maxResponseSizeBytes?: number;
+}
+
+/**
+ * Normalized result from any MCP tool call regardless of transport.
+ */
+export interface MCPToolCallResult {
+  result: unknown;
+  metadata: MCPResponseMetadata | undefined;
+  responseTimeMs: number;
+}
+
+/**
+ * Default max bytes accepted for an MCP tool/list or tool/call response.
+ * Enforced by both transports (json-rpc and streamable-http) so a misbehaving
+ * server cannot blow up worker memory with an unbounded payload.
+ */
+export const DEFAULT_MAX_RESPONSE_SIZE_BYTES = 1_048_576; // 1MB
+
+/**
  * No default MCP servers - each org must explicitly configure their servers.
  * This ensures orgs intentionally set up their MCP infrastructure.
  */

@@ -26,6 +26,7 @@ import {
   ProgressCallbackSender,
 } from '../services/progress/index.js';
 import {
+  Attachment,
   ChatHistoryEntry,
   ChatHistoryResponse,
   ChatRequest,
@@ -59,6 +60,7 @@ import {
   audioKeyToUrl,
   uploadAudio,
 } from '../services/audio/index.js';
+import { AttachmentsContext, createAttachmentsContext } from '../services/ptxprint/index.js';
 import { AudioTranscriptionError, ValidationError } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
 import { applyTemplateVariables } from '../utils/template.js';
@@ -900,25 +902,15 @@ export class UserDO {
     logger.log('process_chat_start', { message_type: body.message_type, has_audio: !!body.audio_base64, has_callbacks: !!callbacks, chat_type: body.chat_type ?? 'private' });
 
     const loaded = await this.loadChatContext(body, ctx, callbacks);
-
-    // Apply response_language_hint override for this request
     const effectivePreferences = body.response_language_hint
       ? { ...loaded.preferences, response_language: body.response_language_hint }
       : loaded.preferences;
-
-    // Build group context for system prompt
-    const chatType = body.chat_type ?? 'private';
-    const isGroupChat = chatType === 'group' || chatType === 'supergroup';
-    const groupContext = isGroupChat
-      ? {
-          isGroupChat: true,
-          ...(body.speaker ? { currentSpeaker: body.speaker } : {}),
-        }
-      : undefined;
+    const groupContext = this.maybeBuildGroupContext(body);
 
     const audioContext = this.buildAudioContext();
+    const attachmentsContext = createAttachmentsContext();
     // prettier-ignore
-    const orchOpts = this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, loaded.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, loaded.activeModeName, audioContext, logger, callbacks, groupContext);
+    const orchOpts = this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, loaded.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, loaded.activeModeName, audioContext, attachmentsContext, workerOrigin, logger, callbacks, groupContext);
 
     const orchResult = await this.tracedPhase(ctx, 'orchestration', () =>
       this.runOrchestration(loaded.messageText, orchOpts)
@@ -937,19 +929,24 @@ export class UserDO {
         responses,
         loaded.preferences,
         body._org_config ?? {},
-        { logger, audioKey, ...(body.speaker ? { speaker: body.speaker } : {}) }
+        {
+          logger,
+          audioKey,
+          speaker: body.speaker,
+          attachments: attachmentsContext.list(),
+        }
       )
     );
 
-    const voiceAudioUrl = audioKey ? audioKeyToUrl(audioKey, workerOrigin) : null;
-    // prettier-ignore
-    logger.log('process_chat_complete', { total_ms: Date.now() - ctx.startTime, response_count: responses.length, has_voice_audio: voiceAudioUrl !== null, voice_audio_key: audioKey, total_response_chars: responses.join('').length, response: responses.join('\n') });
-    return {
+    return this.assembleChatResponse({
       responses,
-      response_language: effectivePreferences.response_language,
-      voice_audio_base64: null,
-      voice_audio_url: voiceAudioUrl,
-    };
+      audioKey,
+      workerOrigin,
+      attachmentsContext,
+      effectivePreferences,
+      logger,
+      startTime: ctx.startTime,
+    });
   }
 
   /** Load all context needed for orchestration. */
@@ -1127,11 +1124,17 @@ export class UserDO {
     responses: string[],
     preferences: UserPreferencesInternal,
     orgConfig: OrgConfig,
-    opts: { logger: RequestLogger; audioKey?: string | null; speaker?: string }
+    opts: {
+      logger: RequestLogger;
+      audioKey?: string | null;
+      speaker?: string | undefined;
+      attachments?: Attachment[];
+    }
   ) {
-    const { logger, audioKey, speaker } = opts;
+    const { logger, audioKey, speaker, attachments } = opts;
     const startTime = Date.now();
     const storageMax = orgConfig.max_history_storage ?? DEFAULT_ORG_CONFIG.max_history_storage;
+    const hasAttachments = !!attachments && attachments.length > 0;
     await this.addHistoryEntry(
       {
         user_message: message,
@@ -1139,13 +1142,18 @@ export class UserDO {
         timestamp: Date.now(),
         ...(audioKey ? { voice_audio_key: audioKey } : {}),
         ...(speaker ? { speaker } : {}),
+        ...(hasAttachments ? { attachments } : {}),
       },
       storageMax
     );
     if (preferences.first_interaction) {
       await this.updatePreferences({ ...preferences, first_interaction: false });
     }
-    logger.log('phase_save_complete', { duration_ms: Date.now() - startTime, storageMax });
+    logger.log('phase_save_complete', {
+      duration_ms: Date.now() - startTime,
+      storageMax,
+      attachment_count: attachments?.length ?? 0,
+    });
   }
 
   // ── Audio ─────────────────────────────────────────────────────────────────────
@@ -1306,6 +1314,8 @@ export class UserDO {
     orgModes: { modes: PromptMode[] },
     activeModeName: string | undefined,
     audioContext: AudioContext,
+    attachmentsContext: AttachmentsContext,
+    workerOrigin: string,
     logger: RequestLogger,
     callbacks?: StreamCallbacks,
     groupContext?: GroupChatContext
@@ -1324,11 +1334,53 @@ export class UserDO {
       memoryTOC: formattedTOC || undefined,
       modeContext: this.buildModeContext(orgModes, activeModeName, isAdminClient(body.client_id)),
       audioContext,
+      attachmentsContext,
+      workerOrigin,
       clientId: body.client_id,
       groupContext,
       isVoiceMessage: body.message_type === 'audio',
       logger,
       callbacks,
+    };
+  }
+
+  private maybeBuildGroupContext(body: ChatRequest): GroupChatContext | undefined {
+    const chatType = body.chat_type ?? 'private';
+    if (chatType !== 'group' && chatType !== 'supergroup') return undefined;
+    return {
+      isGroupChat: true,
+      ...(body.speaker ? { currentSpeaker: body.speaker } : {}),
+    };
+  }
+
+  private assembleChatResponse(opts: {
+    responses: string[];
+    audioKey: string | null;
+    workerOrigin: string;
+    attachmentsContext: AttachmentsContext;
+    effectivePreferences: { response_language: string };
+    logger: RequestLogger;
+    startTime: number;
+  }): ChatResponse {
+    const {
+      responses,
+      audioKey,
+      workerOrigin,
+      attachmentsContext,
+      effectivePreferences,
+      logger,
+      startTime,
+    } = opts;
+    const voiceAudioUrl = audioKey ? audioKeyToUrl(audioKey, workerOrigin) : null;
+    const attachments = attachmentsContext.list();
+    // prettier-ignore
+    logger.log('process_chat_complete', { total_ms: Date.now() - startTime, response_count: responses.length, has_voice_audio: voiceAudioUrl !== null, voice_audio_key: audioKey, total_response_chars: responses.join('').length, attachment_count: attachments.length, attachment_summary: attachments.map((a) => ({ type: a.type, filename: a.filename, size_bytes: a.size_bytes })), response: responses.join('\n') });
+    return {
+      responses,
+      response_language: effectivePreferences.response_language,
+      voice_audio_base64: null,
+      voice_audio_url: voiceAudioUrl,
+      ...(attachments.length > 0 ? { attachments } : {}),
     };
   }
 

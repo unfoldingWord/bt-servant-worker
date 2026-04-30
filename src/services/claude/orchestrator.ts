@@ -41,6 +41,13 @@ import {
 } from '../mcp/index.js';
 import { MAX_MEMORY_SIZE_BYTES, UserMemoryStore } from '../memory/index.js';
 import {
+  AttachmentsContext,
+  handleGenerateScripturePdf,
+  handlePrepareUsfmSource,
+  isGenerateScripturePdfInput,
+  isPrepareUsfmSourceInput,
+} from '../ptxprint/index.js';
+import {
   buildSystemPrompt,
   GroupChatContext,
   historyToMessages,
@@ -90,6 +97,9 @@ interface OrchestratorOptions {
   memoryTOC?: string | undefined;
   modeContext?: ModeContext | undefined;
   audioContext?: AudioContext | undefined;
+  attachmentsContext?: AttachmentsContext | undefined;
+  /** Public worker origin (e.g. https://bt-servant-worker-staging.example.workers.dev). Used to build public URLs for ptxprint artifacts. */
+  workerOrigin?: string | undefined;
   clientId?: string | undefined;
   groupContext?: GroupChatContext | undefined;
   isVoiceMessage?: boolean | undefined;
@@ -170,6 +180,9 @@ interface OrchestrationContext {
   memoryStore: UserMemoryStore | undefined;
   modeContext: ModeContext | undefined;
   audioContext: AudioContext | undefined;
+  attachmentsContext: AttachmentsContext | undefined;
+  workerOrigin: string;
+  env: Env;
 }
 
 /** Result of an orchestration run. */
@@ -595,6 +608,9 @@ function createOrchestrationContext(
     memoryStore: options.memoryStore,
     modeContext: options.modeContext,
     audioContext: options.audioContext,
+    attachmentsContext: options.attachmentsContext,
+    workerOrigin: options.workerOrigin ?? '',
+    env: options.env,
   };
 }
 
@@ -702,6 +718,28 @@ async function executeSingleTool(
   }
 }
 
+function dispatchPtxprintTool(
+  toolCall: ToolUseBlock,
+  ctx: OrchestrationContext
+): Promise<unknown> | null {
+  if (toolCall.name === 'generate_scripture_pdf')
+    return dispatchGenerateScripturePdf(toolCall, ctx);
+  if (toolCall.name === 'prepare_usfm_source') return dispatchPrepareUsfmSource(toolCall, ctx);
+  return null;
+}
+
+function dispatchSimpleInternalTool(
+  toolCall: ToolUseBlock,
+  ctx: OrchestrationContext
+): Promise<unknown> | unknown | null {
+  if (toolCall.name === 'read_memory') return handleReadMemory(toolCall.input, ctx);
+  if (toolCall.name === 'update_memory') return handleUpdateMemory(toolCall.input, ctx);
+  if (toolCall.name === 'request_audio') return handleRequestAudio(ctx);
+  if (toolCall.name === 'list_modes') return handleListModes(ctx);
+  if (toolCall.name === 'switch_mode') return handleSwitchMode(toolCall.input, ctx);
+  return null;
+}
+
 async function dispatchToolCall(
   toolCall: ToolUseBlock,
   ctx: OrchestrationContext
@@ -722,22 +760,45 @@ async function dispatchToolCall(
     }
     return getToolDefinitions(ctx.catalog, toolCall.input.tool_names);
   }
-  if (toolCall.name === 'read_memory') {
-    return handleReadMemory(toolCall.input, ctx);
-  }
-  if (toolCall.name === 'update_memory') {
-    return handleUpdateMemory(toolCall.input, ctx);
-  }
-  if (toolCall.name === 'request_audio') {
-    return handleRequestAudio(ctx);
-  }
-  if (toolCall.name === 'list_modes') {
-    return handleListModes(ctx);
-  }
-  if (toolCall.name === 'switch_mode') {
-    return handleSwitchMode(toolCall.input, ctx);
-  }
+  const simpleResult = dispatchSimpleInternalTool(toolCall, ctx);
+  if (simpleResult !== null) return simpleResult;
+  const ptxprintResult = dispatchPtxprintTool(toolCall, ctx);
+  if (ptxprintResult) return ptxprintResult;
   return handleMCPToolCall(toolCall.name, toolCall.input, ctx);
+}
+
+function buildPtxprintCtx(ctx: OrchestrationContext) {
+  return {
+    env: ctx.env,
+    catalog: ctx.catalog,
+    workerOrigin: ctx.workerOrigin,
+    attachmentsContext: ctx.attachmentsContext,
+    logger: ctx.logger,
+  };
+}
+
+async function dispatchGenerateScripturePdf(
+  toolCall: ToolUseBlock,
+  ctx: OrchestrationContext
+): Promise<unknown> {
+  if (!isGenerateScripturePdfInput(toolCall.input)) {
+    throw new ValidationError(
+      `Invalid input for generate_scripture_pdf: expected { translation: string, book: string, preset?: string }, got ${truncateInput(toolCall.input)}`
+    );
+  }
+  return handleGenerateScripturePdf(toolCall.input, buildPtxprintCtx(ctx));
+}
+
+async function dispatchPrepareUsfmSource(
+  toolCall: ToolUseBlock,
+  ctx: OrchestrationContext
+): Promise<unknown> {
+  if (!isPrepareUsfmSourceInput(toolCall.input)) {
+    throw new ValidationError(
+      `Invalid input for prepare_usfm_source: expected { translation: string, book: string }, got ${truncateInput(toolCall.input)}`
+    );
+  }
+  return handlePrepareUsfmSource(toolCall.input, buildPtxprintCtx(ctx));
 }
 
 async function handleReadMemory(input: unknown, ctx: OrchestrationContext): Promise<unknown> {

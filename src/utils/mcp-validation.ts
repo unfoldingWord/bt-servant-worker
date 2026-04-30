@@ -89,6 +89,18 @@ export function validateAllowedTools(allowedTools: unknown): string | null {
 }
 
 /**
+ * Validate optional MCP transport field.
+ * @returns Error message if invalid, null if valid
+ */
+export function validateTransport(transport: unknown): string | null {
+  if (transport === undefined) return null;
+  if (transport !== 'json-rpc' && transport !== 'streamable-http') {
+    return "transport must be 'json-rpc' or 'streamable-http'";
+  }
+  return null;
+}
+
+/**
  * Validate optional MCP server fields
  * @returns Error message if invalid, null if valid
  */
@@ -96,7 +108,8 @@ export function validateOptionalFields(server: MCPServerConfig): string | null {
   return (
     validateServerName(server.name) ||
     validateServerPriority(server.priority) ||
-    validateAllowedTools(server.allowedTools)
+    validateAllowedTools(server.allowedTools) ||
+    validateTransport(server.transport)
   );
 }
 
