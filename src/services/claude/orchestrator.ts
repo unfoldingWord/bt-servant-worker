@@ -482,6 +482,49 @@ function attachSSEAbortListener(
   return () => signal.removeEventListener('abort', onAbort);
 }
 
+/**
+ * Validate the post-loop SSE state and surface a final Message.
+ *
+ * CRITICAL: must check abort BEFORE the !state.message guard. The abort
+ * listener cancels the reader, which makes reader.read() resolve with
+ * done=true — so the loop exits "cleanly" even though we never saw
+ * message_stop. Without this check, a 90s timeout that fires AFTER
+ * message_start arrived would silently return the partial message
+ * (truncated text or a half-built tool call) as a successful response,
+ * defeating the entire reason this timeout exists.
+ */
+function finalizeSSEStream(
+  state: SSEParseState,
+  ref: { chunks: number; bytes: number; start: number },
+  logger: RequestLogger,
+  signal: AbortSignal | undefined
+): Anthropic.Message {
+  const base = {
+    elapsed_ms: Date.now() - ref.start,
+    chunks: ref.chunks,
+    bytes: ref.bytes,
+    event_counts: { ...state.eventCounts },
+  };
+  if (signal?.aborted) {
+    logger.error('sse_stream_aborted_with_partial', null, {
+      ...base,
+      had_partial_message: !!state.message,
+      partial_stop_reason: state.message?.stop_reason ?? null,
+    });
+    throw new Error('Claude stream aborted (timeout) before completing');
+  }
+  if (!state.message) {
+    logger.error('sse_stream_no_message', null, base);
+    throw new Error('Claude stream ended before producing a message');
+  }
+  logger.log('sse_stream_complete', {
+    ...base,
+    stop_reason: state.message.stop_reason,
+    content_blocks: state.message.content.length,
+  });
+  return state.message;
+}
+
 /** Parse an SSE stream from the Anthropic Messages API into a final Message. */
 async function parseSSEStream(
   body: ReadableStream<Uint8Array>,
@@ -509,24 +552,7 @@ async function parseSSEStream(
       buffer = lines.pop() ?? '';
       applySSELines(state, lines, logger, callbacks);
     }
-    if (!state.message) {
-      logger.error('sse_stream_no_message', null, {
-        elapsed_ms: Date.now() - ref.start,
-        chunks: ref.chunks,
-        bytes: ref.bytes,
-        event_counts: { ...state.eventCounts },
-      });
-      throw new Error('Claude stream ended before producing a message');
-    }
-    logger.log('sse_stream_complete', {
-      elapsed_ms: Date.now() - ref.start,
-      chunks: ref.chunks,
-      bytes: ref.bytes,
-      stop_reason: state.message.stop_reason,
-      content_blocks: state.message.content.length,
-      event_counts: { ...state.eventCounts },
-    });
-    return state.message;
+    return finalizeSSEStream(state, ref, logger, signal);
   } finally {
     detachAbort?.();
   }
