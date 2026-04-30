@@ -3,8 +3,8 @@
  * ptxprint-mcp's `submit_typeset` payload.
  *
  * Pipeline:
- *   1. Map (translation, book) → DCS raw URL.
- *   2. Fetch the USFM bytes from DCS.
+ *   1. Map (translation, book) → upstream raw USFM URL.
+ *   2. Fetch the USFM bytes from upstream.
  *   3. Compute sha256 of the bytes (ptxprint-mcp's PayloadSchema requires it).
  *   4. Upload to PTXPRINT_BUCKET at a content-addressed key (idempotent —
  *      we `bucket.head()` first and skip the put on hit).
@@ -14,15 +14,27 @@
  *
  * The container at klappy.workers.dev cannot satisfy our /api/* auth
  * middleware, which is why we serve these via /public/* instead.
+ *
+ * v1 ships with the Berean Standard Bible (BSB) only. Door43 unfoldingWord
+ * translations (en_ult/en_ust/en_t4t/en_ueb) require additional stylesheet
+ * work to handle UFW-specific markers (`\s5` everywhere, plus alignment
+ * markers `\zaln-s`/`\w` in en_ult/en_ust); tracked as v1.1 follow-up.
  */
 
 import { RequestLogger } from '../../utils/logger.js';
 import { BOOK_INDEX } from './presets.js';
 import { PayloadSource } from './types.js';
 
-/** Translation IDs we know how to resolve to DCS in v1. */
-export const SUPPORTED_TRANSLATIONS = ['en_ult', 'en_ust', 'en_t4t', 'en_ueb'] as const;
+/** Translation IDs we know how to resolve in v1. */
+export const SUPPORTED_TRANSLATIONS = ['bsb'] as const;
 export type SupportedTranslation = (typeof SUPPORTED_TRANSLATIONS)[number];
+
+/**
+ * BSB upstream is content-addressed by commit. Pinning the same commit the
+ * canon-validated bsb-empirical fixture was built against keeps the source
+ * bytes stable and aligned with what the preset's stylesheet was tuned for.
+ */
+const BSB_COMMIT = '48a9feb71f0a66f9b8f418b11ae25b7ad2e49a0d';
 
 export function isSupportedTranslation(value: unknown): value is SupportedTranslation {
   return typeof value === 'string' && (SUPPORTED_TRANSLATIONS as readonly string[]).includes(value);
@@ -53,20 +65,23 @@ export interface ResolveUsfmSourceInput {
 }
 
 /**
- * Build the DCS raw URL for a translation+book. Pattern is uniform across
- * unfoldingWord's en_* repos: `<paratext-num>-<BOOK3>.usfm`.
+ * Build the upstream raw USFM URL for a translation+book.
  *
- * Smoke testing will tell us quickly if any translation diverges from this
- * pattern. The fail mode is a 404 on fetch, which we log loudly — easy fix
- * by adding a per-translation override here.
+ * BSB pattern: `<NN><BOOK3>BSB.usfm` at the pinned `usfm-bible/examples.bsb`
+ * commit. Future translations would add their own URL builders here.
  */
-export function buildDcsUrl(translation: SupportedTranslation, book: string): string {
+export function buildSourceUrl(translation: SupportedTranslation, book: string): string {
   // eslint-disable-next-line security/detect-object-injection -- book validated upstream
   const num = BOOK_INDEX[book];
   if (!num) {
     throw new UsfmSourceError(`Unknown book code: ${book}`, 'unknown_book');
   }
-  return `https://git.door43.org/unfoldingWord/${translation}/raw/branch/master/${num}-${book}.usfm`;
+  if (translation === 'bsb') {
+    return `https://raw.githubusercontent.com/usfm-bible/examples.bsb/${BSB_COMMIT}/${num}${book}BSB.usfm`;
+  }
+  // Exhaustiveness guard — TypeScript would catch missing cases, but the
+  // runtime guard makes the intent explicit.
+  throw new UsfmSourceError(`Unsupported translation: ${translation}`, 'unsupported_translation');
 }
 
 /**
@@ -110,32 +125,35 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
 
 async function fetchUsfmBytes(url: string, logger: RequestLogger): Promise<Uint8Array> {
   const start = Date.now();
-  logger.log('usfm_dcs_fetch_start', { url });
+  logger.log('usfm_upstream_fetch_start', { url });
   let response: Response;
   try {
     response = await fetch(url, {
       headers: { 'User-Agent': 'bt-servant-worker/ptxprint-integration' },
     });
   } catch (error) {
-    logger.error('usfm_dcs_fetch_network_error', error, {
+    logger.error('usfm_upstream_fetch_network_error', error, {
       url,
       duration_ms: Date.now() - start,
     });
-    throw new UsfmSourceError(`Network error fetching USFM from DCS: ${url}`, 'fetch_failed');
+    throw new UsfmSourceError(`Network error fetching USFM from upstream: ${url}`, 'fetch_failed');
   }
   if (!response.ok) {
     const bodyPeek = await response.text().catch(() => '<unreadable>');
-    logger.error('usfm_dcs_fetch_http_error', null, {
+    logger.error('usfm_upstream_fetch_http_error', null, {
       url,
       status: response.status,
       status_text: response.statusText,
       body_peek: bodyPeek.slice(0, 500),
       duration_ms: Date.now() - start,
     });
-    throw new UsfmSourceError(`DCS returned HTTP ${response.status} for ${url}`, 'fetch_failed');
+    throw new UsfmSourceError(
+      `Upstream returned HTTP ${response.status} for ${url}`,
+      'fetch_failed'
+    );
   }
   const bytes = new Uint8Array(await response.arrayBuffer());
-  logger.log('usfm_dcs_fetch_complete', {
+  logger.log('usfm_upstream_fetch_complete', {
     url,
     size_bytes: bytes.byteLength,
     duration_ms: Date.now() - start,
@@ -206,16 +224,16 @@ export async function resolveUsfmSource(input: ResolveUsfmSourceInput): Promise<
   const overall = Date.now();
   logger.log('usfm_resolve_start', { translation, book });
 
-  const dcsUrl = buildDcsUrl(translation, book);
+  const upstreamUrl = buildSourceUrl(translation, book);
   const filename = buildParatextFilename(book);
   logger.log('usfm_resolve_resolved_locations', {
     translation,
     book,
-    dcs_url: dcsUrl,
+    upstream_url: upstreamUrl,
     paratext_filename: filename,
   });
 
-  const bytes = await fetchUsfmBytes(dcsUrl, logger);
+  const bytes = await fetchUsfmBytes(upstreamUrl, logger);
   const hashStart = Date.now();
   const sha256 = await sha256Hex(bytes);
   logger.log('usfm_sha256_computed', {

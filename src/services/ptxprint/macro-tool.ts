@@ -141,7 +141,7 @@ export async function handlePrepareUsfmSource(
       translation: input.translation,
     });
     return {
-      error: `Unsupported translation: ${input.translation}. v1 supports en_ult, en_ust, en_t4t, en_ueb.`,
+      error: `Unsupported translation: ${input.translation}. v1 supports bsb (Berean Standard Bible).`,
     };
   }
 
@@ -260,27 +260,48 @@ function buildTimeoutResult(
   };
 }
 
+function buildTerminalFailureLogContext(
+  pollResult: import('./poll.js').PollResult,
+  jobId: string
+): Record<string, unknown> {
+  const s = pollResult.lastStatus ?? ({} as JobStatusResult);
+  return {
+    job_id: jobId,
+    outcome: pollResult.outcome,
+    failure_mode: s.failure_mode ?? null,
+    errors: s.errors ?? [],
+    human_summary: s.human_summary ?? null,
+    log_url: s.log_url ?? null,
+    log_tail_excerpt: (s.log_tail ?? '').slice(-4000),
+  };
+}
+
+function logTerminalFailure(
+  pollResult: import('./poll.js').PollResult,
+  jobId: string,
+  logger: import('../../utils/logger.js').RequestLogger
+): void {
+  logger.error(
+    'generate_scripture_pdf_terminal_failure',
+    null,
+    buildTerminalFailureLogContext(pollResult, jobId)
+  );
+}
+
 function buildTerminalFailureResult(
   pollResult: import('./poll.js').PollResult,
   submit: SubmitTypesetResult,
   logger: import('../../utils/logger.js').RequestLogger
 ): InternalErrorResult {
-  const errs = pollResult.lastStatus?.errors;
-  const fm = pollResult.lastStatus?.failure_mode;
-  logger.error('generate_scripture_pdf_terminal_failure', null, {
-    job_id: submit.job_id,
-    outcome: pollResult.outcome,
-    failure_mode: fm ?? null,
-    errors: errs ?? [],
-    human_summary: pollResult.lastStatus?.human_summary ?? null,
-  });
+  logTerminalFailure(pollResult, submit.job_id, logger);
+  const status = pollResult.lastStatus;
   const result: InternalErrorResult = {
     status: 'failed',
     job_id: submit.job_id,
     message: `PDF generation ${pollResult.outcome}.`,
   };
-  if (errs) result.errors = errs;
-  if (fm) result.failure_mode = fm;
+  if (status?.errors) result.errors = status.errors;
+  if (status?.failure_mode) result.failure_mode = status.failure_mode;
   return result;
 }
 
@@ -468,7 +489,7 @@ function preflight(
     logger.warn('generate_scripture_pdf_unsupported_translation', { translation });
     return {
       status: 'error',
-      message: `Unsupported translation: ${translation}. v1 supports en_ult, en_ust, en_t4t, en_ueb.`,
+      message: `Unsupported translation: ${translation}. v1 supports bsb (Berean Standard Bible).`,
       cause: 'unsupported_translation',
     };
   }

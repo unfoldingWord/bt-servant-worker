@@ -68,29 +68,29 @@ afterEach(() => {
 
 describe('isGenerateScripturePdfInput', () => {
   it('accepts valid input', () => {
-    expect(isGenerateScripturePdfInput({ translation: 'en_ult', book: 'JHN' })).toBe(true);
+    expect(isGenerateScripturePdfInput({ translation: 'bsb', book: 'JHN' })).toBe(true);
     expect(
-      isGenerateScripturePdfInput({ translation: 'en_ult', book: 'JHN', preset: 'bsb-empirical' })
+      isGenerateScripturePdfInput({ translation: 'bsb', book: 'JHN', preset: 'bsb-empirical' })
     ).toBe(true);
   });
 
   it('rejects malformed input', () => {
     expect(isGenerateScripturePdfInput({})).toBe(false);
-    expect(isGenerateScripturePdfInput({ translation: 'en_ult' })).toBe(false);
-    expect(isGenerateScripturePdfInput({ translation: 'en_ult', book: '' })).toBe(false);
-    expect(isGenerateScripturePdfInput({ translation: 'en_ult', book: 'JOHN' })).toBe(false);
+    expect(isGenerateScripturePdfInput({ translation: 'bsb' })).toBe(false);
+    expect(isGenerateScripturePdfInput({ translation: 'bsb', book: '' })).toBe(false);
+    expect(isGenerateScripturePdfInput({ translation: 'bsb', book: 'JOHN' })).toBe(false);
     expect(isGenerateScripturePdfInput(null)).toBe(false);
   });
 });
 
 describe('isPrepareUsfmSourceInput', () => {
   it('accepts valid input', () => {
-    expect(isPrepareUsfmSourceInput({ translation: 'en_ult', book: 'JHN' })).toBe(true);
+    expect(isPrepareUsfmSourceInput({ translation: 'bsb', book: 'JHN' })).toBe(true);
   });
 
   it('rejects malformed input', () => {
     expect(isPrepareUsfmSourceInput({})).toBe(false);
-    expect(isPrepareUsfmSourceInput({ translation: 'en_ult', book: 123 })).toBe(false);
+    expect(isPrepareUsfmSourceInput({ translation: 'bsb', book: 123 })).toBe(false);
   });
 });
 
@@ -102,10 +102,7 @@ describe('handlePrepareUsfmSource', () => {
       'fetch',
       vi.fn(async () => new Response(FAKE_USFM, { status: 200 }))
     );
-    const result = await handlePrepareUsfmSource(
-      { translation: 'en_ult', book: 'JHN' },
-      buildCtx()
-    );
+    const result = await handlePrepareUsfmSource({ translation: 'bsb', book: 'JHN' }, buildCtx());
     expect(result).toMatchObject({
       book: 'JHN',
       filename: '44JHNtest.usfm',
@@ -115,7 +112,7 @@ describe('handlePrepareUsfmSource', () => {
 
   it('rejects unsupported translation with a structured error', async () => {
     const result = (await handlePrepareUsfmSource(
-      { translation: 'en_kjv', book: 'JHN' },
+      { translation: 'en_ult', book: 'JHN' },
       buildCtx()
     )) as { error?: string };
     expect(result.error).toMatch(/Unsupported translation/);
@@ -150,14 +147,14 @@ describe('handleGenerateScripturePdf — happy path (cached)', () => {
     });
 
     const ctx = buildCtx();
-    const result = await handleGenerateScripturePdf({ translation: 'en_ult', book: 'JHN' }, ctx);
+    const result = await handleGenerateScripturePdf({ translation: 'bsb', book: 'JHN' }, ctx);
 
     expect(result).toMatchObject({
       status: 'succeeded',
       job_id: 'job-cached',
       cached: true,
       preset: 'bsb-empirical',
-      translation: 'en_ult',
+      translation: 'bsb',
       book: 'JHN',
     });
     expect((result as { pdf_url: string }).pdf_url).toMatch(
@@ -217,7 +214,7 @@ describe('handleGenerateScripturePdf — happy path (poll succeeds)', () => {
     // We can't pass it through the public macro signature, so we monkey-patch
     // setTimeout to fire immediately.
     vi.useFakeTimers();
-    const promise = handleGenerateScripturePdf({ translation: 'en_ult', book: 'JHN' }, ctx);
+    const promise = handleGenerateScripturePdf({ translation: 'bsb', book: 'JHN' }, ctx);
     // Drain timers until the promise resolves.
     await vi.runAllTimersAsync();
     const result = await promise;
@@ -230,7 +227,7 @@ describe('handleGenerateScripturePdf — happy path (poll succeeds)', () => {
   });
 });
 
-function callMacro(ctx: PtxprintToolContext, translation = 'en_ult', book = 'JHN') {
+function callMacro(ctx: PtxprintToolContext, translation = 'bsb', book = 'JHN') {
   return handleGenerateScripturePdf({ translation, book }, ctx);
 }
 
@@ -243,7 +240,7 @@ describe('handleGenerateScripturePdf — config errors', () => {
   });
 
   it('rejects unsupported translation before any I/O', async () => {
-    const result = await callMacro(buildCtx(), 'en_kjv');
+    const result = await callMacro(buildCtx(), 'en_ult');
     expect(result.status).toBe('error');
     expect((result as { cause: string }).cause).toBe('unsupported_translation');
     expect(callMCPToolMock).not.toHaveBeenCalled();

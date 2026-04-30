@@ -4,7 +4,7 @@ import { buildPayload, truncateProjectId } from '../../src/services/ptxprint/pay
 const sampleSource = {
   book: 'JHN',
   filename: '44JHNtest.usfm',
-  url: 'https://example.com/public/ptxprint/usfm/en_ult/abc/44JHNtest.usfm',
+  url: 'https://example.com/public/ptxprint/usfm/bsb/abc/44JHNtest.usfm',
   sha256: 'a'.repeat(64),
 };
 
@@ -25,12 +25,12 @@ describe('buildPayload', () => {
   it('produces a schema-shaped payload', () => {
     const payload = buildPayload({
       presetId: 'bsb-empirical',
-      projectId: 'en_ult',
+      projectId: 'bsb',
       books: ['JHN'],
       sources: [sampleSource],
     });
     expect(payload.schema_version).toBe('1.0');
-    expect(payload.project_id).toBe('enult');
+    expect(payload.project_id).toBe('bsb');
     expect(payload.config_name).toBe('Default');
     expect(payload.books).toEqual(['JHN']);
     expect(payload.mode).toBe('simple');

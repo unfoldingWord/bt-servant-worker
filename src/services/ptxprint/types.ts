@@ -90,6 +90,7 @@ export interface JobStatusResult {
   failure_mode?: 'hard' | 'soft' | 'success';
   pdf_url?: string | null;
   log_url?: string | null;
+  log_tail?: string;
   errors?: string[];
   human_summary?: string;
   progress?: {

@@ -1,7 +1,7 @@
 import { env } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  buildDcsUrl,
+  buildSourceUrl,
   buildParatextFilename,
   buildUsfmPublicUrl,
   buildUsfmR2Key,
@@ -36,14 +36,14 @@ afterEach(() => {
 });
 
 describe('isSupportedTranslation', () => {
-  it('accepts the four v1 translations', () => {
-    expect(isSupportedTranslation('en_ult')).toBe(true);
-    expect(isSupportedTranslation('en_ust')).toBe(true);
-    expect(isSupportedTranslation('en_t4t')).toBe(true);
-    expect(isSupportedTranslation('en_ueb')).toBe(true);
+  it('accepts the v1 bsb translation', () => {
+    expect(isSupportedTranslation('bsb')).toBe(true);
   });
 
-  it('rejects unknown translations', () => {
+  it('rejects unknown translations (DCS UFW translations are v1.1 follow-up)', () => {
+    expect(isSupportedTranslation('en_ult')).toBe(false);
+    expect(isSupportedTranslation('en_ust')).toBe(false);
+    expect(isSupportedTranslation('en_ueb')).toBe(false);
     expect(isSupportedTranslation('en_kjv')).toBe(false);
     expect(isSupportedTranslation('something')).toBe(false);
     expect(isSupportedTranslation(null)).toBe(false);
@@ -52,17 +52,17 @@ describe('isSupportedTranslation', () => {
 });
 
 describe('URL/key builders', () => {
-  it('buildDcsUrl uses unfoldingWord/{translation}/raw/branch/master/{N}-{BOOK}.usfm', () => {
-    expect(buildDcsUrl('en_ult', 'JHN')).toBe(
-      'https://git.door43.org/unfoldingWord/en_ult/raw/branch/master/44-JHN.usfm'
+  it('buildSourceUrl points BSB at the pinned usfm-bible/examples.bsb commit', () => {
+    expect(buildSourceUrl('bsb', 'JHN')).toBe(
+      'https://raw.githubusercontent.com/usfm-bible/examples.bsb/48a9feb71f0a66f9b8f418b11ae25b7ad2e49a0d/44JHNBSB.usfm'
     );
-    expect(buildDcsUrl('en_ust', 'GEN')).toBe(
-      'https://git.door43.org/unfoldingWord/en_ust/raw/branch/master/01-GEN.usfm'
+    expect(buildSourceUrl('bsb', 'GEN')).toBe(
+      'https://raw.githubusercontent.com/usfm-bible/examples.bsb/48a9feb71f0a66f9b8f418b11ae25b7ad2e49a0d/01GENBSB.usfm'
     );
   });
 
-  it('buildDcsUrl throws on unknown book', () => {
-    expect(() => buildDcsUrl('en_ult', 'XYZ')).toThrow(UsfmSourceError);
+  it('buildSourceUrl throws on unknown book', () => {
+    expect(() => buildSourceUrl('bsb', 'XYZ')).toThrow(UsfmSourceError);
   });
 
   it('buildParatextFilename produces canonical 44JHNtest.usfm-style names', () => {
@@ -72,23 +72,23 @@ describe('URL/key builders', () => {
   });
 
   it('buildUsfmR2Key is content-addressed', () => {
-    const key = buildUsfmR2Key('en_ult', 'a'.repeat(64), '44JHNtest.usfm');
-    expect(key).toBe(`usfm/en_ult/${'a'.repeat(64)}/44JHNtest.usfm`);
+    const key = buildUsfmR2Key('bsb', 'a'.repeat(64), '44JHNtest.usfm');
+    expect(key).toBe(`usfm/bsb/${'a'.repeat(64)}/44JHNtest.usfm`);
   });
 
   it('buildUsfmPublicUrl strips trailing slash on baseUrl', () => {
-    expect(buildUsfmPublicUrl('https://w.example.com/', 'usfm/en_ult/abc/foo.SFM')).toBe(
-      'https://w.example.com/public/ptxprint/usfm/en_ult/abc/foo.SFM'
+    expect(buildUsfmPublicUrl('https://w.example.com/', 'usfm/bsb/abc/foo.SFM')).toBe(
+      'https://w.example.com/public/ptxprint/usfm/bsb/abc/foo.SFM'
     );
-    expect(buildUsfmPublicUrl('https://w.example.com', 'usfm/en_ult/abc/foo.SFM')).toBe(
-      'https://w.example.com/public/ptxprint/usfm/en_ult/abc/foo.SFM'
+    expect(buildUsfmPublicUrl('https://w.example.com', 'usfm/bsb/abc/foo.SFM')).toBe(
+      'https://w.example.com/public/ptxprint/usfm/bsb/abc/foo.SFM'
     );
   });
 });
 
 function callResolve() {
   return resolveUsfmSource({
-    translation: 'en_ult',
+    translation: 'bsb',
     book: 'JHN',
     bucket: env.PTXPRINT_BUCKET,
     baseUrl: 'https://w.example.com',
@@ -97,7 +97,7 @@ function callResolve() {
 }
 
 describe('resolveUsfmSource — happy path', () => {
-  it('fetches USFM from DCS, hashes, uploads, and returns the public URL', async () => {
+  it('fetches USFM from upstream, hashes, uploads, and returns the public URL', async () => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async () => new Response(SAMPLE_USFM, { status: 200 }))
@@ -106,10 +106,10 @@ describe('resolveUsfmSource — happy path', () => {
     expect(result.book).toBe('JHN');
     expect(result.filename).toBe('44JHNtest.usfm');
     expect(result.url).toMatch(
-      /^https:\/\/w\.example\.com\/public\/ptxprint\/usfm\/en_ult\/[a-f0-9]{64}\/44JHNtest\.usfm$/
+      /^https:\/\/w\.example\.com\/public\/ptxprint\/usfm\/bsb\/[a-f0-9]{64}\/44JHNtest\.usfm$/
     );
     expect(result.sha256).toMatch(/^[a-f0-9]{64}$/);
-    const obj = await env.PTXPRINT_BUCKET.get(`usfm/en_ult/${result.sha256}/44JHNtest.usfm`);
+    const obj = await env.PTXPRINT_BUCKET.get(`usfm/bsb/${result.sha256}/44JHNtest.usfm`);
     expect(obj).not.toBeNull();
     const text = await obj!.text();
     expect(text).toBe(SAMPLE_USFM);
@@ -128,7 +128,7 @@ describe('resolveUsfmSource — happy path', () => {
 });
 
 describe('resolveUsfmSource — error paths', () => {
-  it('throws UsfmSourceError on DCS 404', async () => {
+  it('throws UsfmSourceError on upstream 404', async () => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async () => new Response('not found', { status: 404 }))

@@ -163,16 +163,16 @@ export function buildGenerateScripturePdfTool(): Anthropic.Tool {
   return {
     name: 'generate_scripture_pdf',
     description:
-      'Generate a print-ready PDF of a single book from a Door43 open translation, using the canon-validated default layout. Returns a PDF attachment that renders inline in chat clients. Use this for the standard "give me a PDF of John in ULT"-style request. ' +
+      'Generate a print-ready PDF of a single book from the Berean Standard Bible (BSB), using the canon-validated default layout. Returns a PDF attachment that renders inline in chat clients. Use this for the standard "give me a PDF of John from BSB"-style request. ' +
       'For custom layouts, paper sizes, fonts, or anything else off the happy path: do NOT request multiple parameters here — instead, query the `docs` tool from ptxprint-mcp (e.g. `docs("config_files for letter two-column")`) to retrieve canon guidance, then assemble a payload yourself with `prepare_usfm_source` + the raw `submit_typeset` MCP tool. The canon is the source of truth for layout recipes; this macro only covers the default.',
     input_schema: {
       type: 'object',
       properties: {
         translation: {
           type: 'string',
-          enum: ['en_ult', 'en_ust', 'en_t4t', 'en_ueb'],
+          enum: ['bsb'],
           description:
-            'Door43 translation id. v1 supports en_ult (Literal), en_ust (Simplified), en_t4t (Translation for Translators), en_ueb (Unlocked English Bible).',
+            'Translation id. v1 supports bsb (Berean Standard Bible). Door43 unfoldingWord translations are tracked as v1.1 — they need additional stylesheet support for UFW-specific markers (\\s5 plus alignment markers in en_ult/en_ust).',
         },
         book: {
           type: 'string',
@@ -210,8 +210,8 @@ export function buildPrepareUsfmSourceTool(): Anthropic.Tool {
       properties: {
         translation: {
           type: 'string',
-          enum: ['en_ult', 'en_ust', 'en_t4t', 'en_ueb'],
-          description: 'Door43 translation id (same set as generate_scripture_pdf).',
+          enum: ['bsb'],
+          description: 'Translation id (same set as generate_scripture_pdf — v1 ships bsb only).',
         },
         book: {
           type: 'string',
