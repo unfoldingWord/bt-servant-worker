@@ -78,6 +78,9 @@ jobs:
       - name: Run type check
         run: pnpm run check
 
+      - name: Run type check (tail worker)
+        run: pnpm run check:tail
+
   architecture:
     name: Architecture Check
     needs: [security-audit]

@@ -6,6 +6,13 @@ compatibility_date = "2024-01-01"
 enabled = true
 head_sampling_rate = 1
 
+# Tail consumer captures non-ok outcomes (CPU/memory/wall-time exhaustion,
+# uncaught exceptions, isolate eviction) that the producer cannot log from
+# inside its own catch blocks. See tail-worker/src/index.ts.
+tail_consumers = [
+  { service = "bt-servant-tail" }
+]
+
 [vars]
 ENVIRONMENT = "development"
 MAX_ORCHESTRATION_ITERATIONS = "10"
@@ -69,6 +76,9 @@ deleted_classes = ["UserQueue"]
 # ──── Staging environment ────
 [env.staging]
 name = "bt-servant-worker-staging"
+tail_consumers = [
+  { service = "bt-servant-tail-staging" }
+]
 
 [env.staging.vars]
 ENVIRONMENT = "staging"
