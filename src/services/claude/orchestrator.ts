@@ -869,6 +869,28 @@ function createOrchestrationContext(
   };
 }
 
+/**
+ * User-facing message appended to the response when the orchestration loop
+ * exits because it hit MAX_ORCHESTRATION_ITERATIONS. Without this, the user
+ * sees only whatever progress text Claude streamed during the final iteration
+ * — typically a mid-thought like "Let me fix by adding fontsize too:" — with
+ * no indication that the bot has stopped trying. Observed live on
+ * 2026-04-30 (request `de4c4d28-…`): a user got an abrupt half-sentence and
+ * had no way to know the bot wasn't about to send the next message.
+ *
+ * This text is both pushed through `callbacks.onProgress` (so it lands in
+ * the user's chat client immediately as a final webhook delivery) and
+ * appended to `ctx.responses` (so it persists in the saved history and the
+ * next conversation turn has the right context — otherwise next turn would
+ * see only the partial mid-thought as the assistant's "previous reply").
+ */
+const MAX_ITERATIONS_USER_MESSAGE =
+  "\n\n⚠️ I've reached my limit on how many steps I can take in a single turn while " +
+  'working on this. The work above is what I got done; some of it may be incomplete. ' +
+  "If you'd like me to keep going, send me a follow-up telling me what to focus on " +
+  '(e.g. "just submit the standard PDF" or "try once more with X"), and I\'ll pick ' +
+  'up from here without re-doing the parts that already worked.';
+
 async function runOrchestrationLoop(
   ctx: OrchestrationContext,
   maxIterations: number
@@ -889,6 +911,8 @@ async function runOrchestrationLoop(
       max_iterations: maxIterations,
       last_iteration: lastIteration,
     });
+    notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress(MAX_ITERATIONS_USER_MESSAGE));
+    ctx.responses.push(MAX_ITERATIONS_USER_MESSAGE);
   }
   ctx.logger.log('orchestration_loop_end', {
     exit_reason: exitReason,
