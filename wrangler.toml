@@ -2,16 +2,18 @@ name = "bt-servant-worker"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
-[observability]
-enabled = true
-head_sampling_rate = 1
-
 # Tail consumer captures non-ok outcomes (CPU/memory/wall-time exhaustion,
 # uncaught exceptions, isolate eviction) that the producer cannot log from
 # inside its own catch blocks. See tail-worker/src/index.ts.
+# Must be a top-level field — TOML scoping makes it part of the previous
+# table if placed after a [section], so keep it above [observability].
 tail_consumers = [
   { service = "bt-servant-tail" }
 ]
+
+[observability]
+enabled = true
+head_sampling_rate = 1
 
 [vars]
 ENVIRONMENT = "development"
