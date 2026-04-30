@@ -85,20 +85,6 @@ export class MCPCallLimitError extends AppError {
   }
 }
 
-export class MCPBudgetExceededError extends AppError {
-  constructor(
-    public readonly estimated: number,
-    public readonly limit: number
-  ) {
-    super(
-      `MCP downstream API budget exceeded. Estimated calls: ${estimated}, limit: ${limit}. Reduce scope or batch requests.`,
-      'MCP_BUDGET_EXCEEDED',
-      429
-    );
-    this.name = 'MCPBudgetExceededError';
-  }
-}
-
 export class AudioTranscriptionError extends AppError {
   constructor(message: string) {
     super(message, 'AUDIO_TRANSCRIPTION_ERROR', 400);

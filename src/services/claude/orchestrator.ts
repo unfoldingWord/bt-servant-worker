@@ -14,30 +14,17 @@ import { AudioContext } from '../audio/index.js';
 import { ChatHistoryEntry, StreamCallbacks } from '../../types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig } from '../../types/org-config.js';
 import { DEFAULT_PROMPT_VALUES, ModeContext, PromptSlot } from '../../types/prompt-overrides.js';
-import {
-  ClaudeAPIError,
-  MCPBudgetExceededError,
-  MCPError,
-  ValidationError,
-} from '../../utils/errors.js';
+import { ClaudeAPIError, MCPError, ValidationError } from '../../utils/errors.js';
 import { redactToolInputForError, RequestLogger, summarizeToolInput } from '../../utils/logger.js';
 import { createMCPHostFunctions, executeCode } from '../code-execution/index.js';
 import {
   callMCPTool,
-  createBudget,
   createHealthTracker,
-  DEFAULT_BUDGET_LIMIT,
-  DEFAULT_DOWNSTREAM_PER_CALL,
-  getBudgetStatus,
   getHealthSummary,
   getToolNames,
   HealthTracker,
-  isBudgetExceeded,
   isServerHealthy,
-  MCPCallBudget,
-  recordMCPCall,
   ToolCatalog,
-  wouldExceedBudget,
 } from '../mcp/index.js';
 import { MAX_MEMORY_SIZE_BYTES, UserMemoryStore } from '../memory/index.js';
 import {
@@ -248,7 +235,6 @@ interface OrchestrationContext {
   catalog: ToolCatalog;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
-  mcpBudget: MCPCallBudget;
   healthTracker: HealthTracker;
   memoryStore: UserMemoryStore | undefined;
   modeContext: ModeContext | undefined;
@@ -782,37 +768,25 @@ function parseOrchestrationConfig(env: Env, logger: RequestLogger) {
   return { codeExecTimeout, maxIterations, maxMcpCalls };
 }
 
-function parseMcpBudgetConfig(env: Env, logger: RequestLogger) {
-  const maxDownstreamCalls = parseIntEnvVar(
-    env.MAX_DOWNSTREAM_CALLS_PER_REQUEST,
-    'MAX_DOWNSTREAM_CALLS_PER_REQUEST',
-    DEFAULT_BUDGET_LIMIT,
-    logger
-  );
-  const defaultDownstreamPerCall = parseIntEnvVar(
-    env.DEFAULT_DOWNSTREAM_PER_MCP_CALL,
-    'DEFAULT_DOWNSTREAM_PER_MCP_CALL',
-    DEFAULT_DOWNSTREAM_PER_CALL,
-    logger
-  );
+function parseMcpResponseSizeConfig(env: Env, logger: RequestLogger) {
   const maxMcpResponseSize = parseIntEnvVar(
     env.MAX_MCP_RESPONSE_SIZE_BYTES,
     'MAX_MCP_RESPONSE_SIZE_BYTES',
     DEFAULT_MAX_MCP_RESPONSE_SIZE,
     logger
   );
-  return { maxDownstreamCalls, defaultDownstreamPerCall, maxMcpResponseSize };
+  return { maxMcpResponseSize };
 }
 
 function parseEnvConfig(env: Env, logger: RequestLogger) {
   const claudeConfig = parseClaudeConfig(env, logger);
   const orchestrationConfig = parseOrchestrationConfig(env, logger);
-  const mcpBudgetConfig = parseMcpBudgetConfig(env, logger);
+  const mcpResponseSizeConfig = parseMcpResponseSizeConfig(env, logger);
 
   return {
     ...claudeConfig,
     ...orchestrationConfig,
-    ...mcpBudgetConfig,
+    ...mcpResponseSizeConfig,
   };
 }
 
@@ -858,7 +832,6 @@ function createOrchestrationContext(
     catalog,
     logger,
     callbacks,
-    mcpBudget: createBudget(config.maxDownstreamCalls, config.defaultDownstreamPerCall),
     healthTracker: createHealthTracker(),
     memoryStore: options.memoryStore,
     modeContext: options.modeContext,
@@ -919,22 +892,14 @@ async function runOrchestrationLoop(
     last_iteration: lastIteration,
   });
 
-  // Log health summary and budget status at end of orchestration
+  // Log health summary at end of orchestration
   logOrchestrationSummary(ctx);
 }
 
 function logOrchestrationSummary(ctx: OrchestrationContext): void {
   const healthSummary = getHealthSummary(ctx.healthTracker);
-  const budgetStatus = getBudgetStatus(ctx.mcpBudget);
 
   ctx.logger.log('orchestration_summary', {
-    mcp_call_count: ctx.mcpBudget.mcpCallCount,
-    budget: {
-      total_downstream_calls: budgetStatus.totalDownstreamCalls,
-      limit: ctx.mcpBudget.limit,
-      percent_used: Math.round(budgetStatus.percentUsed),
-      using_estimates: budgetStatus.usingEstimates,
-    },
     server_health:
       healthSummary.length > 0
         ? healthSummary.map((s) => ({
@@ -946,10 +911,6 @@ function logOrchestrationSummary(ctx: OrchestrationContext): void {
           }))
         : undefined,
   });
-
-  if (budgetStatus.warning) {
-    ctx.logger.warn('budget_warning', { message: budgetStatus.warning });
-  }
 }
 
 function handleOrchestrationError(error: unknown, logger: RequestLogger): never {
@@ -1392,23 +1353,6 @@ function validateMCPToolCall(toolName: string, ctx: OrchestrationContext) {
   return { tool, server };
 }
 
-function checkMCPBudgetBeforeCall(
-  toolName: string,
-  serverId: string,
-  ctx: OrchestrationContext
-): void {
-  if (wouldExceedBudget(ctx.mcpBudget)) {
-    const status = getBudgetStatus(ctx.mcpBudget);
-    ctx.logger.warn('mcp_budget_exceeded', {
-      tool_name: toolName,
-      server_id: serverId,
-      estimated_calls: status.totalDownstreamCalls,
-      limit: ctx.mcpBudget.limit,
-    });
-    throw new MCPBudgetExceededError(status.totalDownstreamCalls, ctx.mcpBudget.limit);
-  }
-}
-
 function checkServerHealth(toolName: string, serverId: string, ctx: OrchestrationContext): void {
   if (!isServerHealthy(ctx.healthTracker, serverId)) {
     ctx.logger.warn('mcp_server_unhealthy', { tool_name: toolName, server_id: serverId });
@@ -1419,48 +1363,18 @@ function checkServerHealth(toolName: string, serverId: string, ctx: Orchestratio
   }
 }
 
-function logMCPBudgetStatus(
-  toolName: string,
-  hasMetadata: boolean,
-  ctx: OrchestrationContext
-): void {
-  const budgetStatus = getBudgetStatus(ctx.mcpBudget);
-  ctx.logger.log('mcp_budget_status', {
-    tool_name: toolName,
-    mcp_calls: ctx.mcpBudget.mcpCallCount,
-    downstream_calls: budgetStatus.totalDownstreamCalls,
-    percent_used: Math.round(budgetStatus.percentUsed),
-    has_metadata: hasMetadata,
-  });
-
-  if (budgetStatus.warning) {
-    ctx.logger.warn('mcp_budget_warning', { message: budgetStatus.warning });
-  }
-
-  if (isBudgetExceeded(ctx.mcpBudget)) {
-    ctx.logger.warn('mcp_budget_exhausted', {
-      downstream_calls: budgetStatus.totalDownstreamCalls,
-      limit: ctx.mcpBudget.limit,
-    });
-  }
-}
-
 async function handleMCPToolCall(
   toolName: string,
   input: unknown,
   ctx: OrchestrationContext
 ): Promise<unknown> {
   const { server } = validateMCPToolCall(toolName, ctx);
-  checkMCPBudgetBeforeCall(toolName, server.id, ctx);
   checkServerHealth(toolName, server.id, ctx);
 
   const callResult = await callMCPTool(server, toolName, input, ctx.logger, {
     healthTracker: ctx.healthTracker,
     maxResponseSizeBytes: ctx.maxMcpResponseSize,
   });
-
-  recordMCPCall(ctx.mcpBudget, callResult.metadata);
-  logMCPBudgetStatus(toolName, !!callResult.metadata, ctx);
 
   return callResult.result;
 }
