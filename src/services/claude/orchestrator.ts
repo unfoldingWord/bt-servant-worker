@@ -65,6 +65,79 @@ import {
 /** Default max response size for MCP calls (1MB) */
 const DEFAULT_MAX_MCP_RESPONSE_SIZE = 1048576;
 
+/**
+ * Per-tool-result content cap appended to the conversation history.
+ *
+ * Why: a tool result that is multiple MCP responses worth of `docs(...)`
+ * output (the canonical bloat path — observed 96 KB single results from
+ * `ptxprint-mcp.docs`) accumulates across iterations and pushes the next
+ * Claude request body into the danger zone (>200 KB), which correlates
+ * with silent SSE-consumer hangs in the DO that emit no exception. Cap
+ * each tool_result content at the boundary where we serialize it into
+ * the next message so that a chatty tool cannot silently destabilize the
+ * loop. Truncation marker is plaintext (Anthropic accepts string content
+ * for tool_result) and tells Claude to narrow its query rather than
+ * fetch more.
+ */
+const DEFAULT_MAX_TOOL_RESULT_BYTES = 12_288; // 12 KB
+
+function truncateToolResultContent(content: string, toolName: string): string {
+  if (content.length <= DEFAULT_MAX_TOOL_RESULT_BYTES) return content;
+  const head = content.slice(0, DEFAULT_MAX_TOOL_RESULT_BYTES);
+  return (
+    `${head}\n\n` +
+    `…[TRUNCATED: tool '${toolName}' returned ${content.length} bytes; ` +
+    `capped at ${DEFAULT_MAX_TOOL_RESULT_BYTES} to keep the conversation context bounded. ` +
+    `To get more detail, narrow your query (e.g. a more specific 'query' string, ` +
+    `or lower 'depth') or ask the user a clarifying question instead of fetching more. ` +
+    `Do NOT retry with the same broad query — you will hit this cap again.]`
+  );
+}
+
+/**
+ * Hard ceiling on the JSON body size sent to the Anthropic Messages API.
+ *
+ * Why: above ~200 KB we have repeatedly observed silent SSE-consumer
+ * hangs in the DO — the streaming response opens, then `reader.read()`
+ * stops yielding chunks and no JS-level exception is ever thrown
+ * (`$workers.outcome` stays "ok" because the response 200'd). Failing
+ * fast here surfaces the runaway as a clear `claude_request_body_too_large`
+ * error instead of an indefinite hang the user has no way to escape.
+ * Pairs with truncateToolResultContent — the per-result cap is the
+ * primary defense; this is the seatbelt for whatever it misses.
+ */
+const MAX_REQUEST_BODY_BYTES = 200_000;
+
+class ClaudeRequestBodyTooLargeError extends Error {
+  constructor(
+    public readonly bodySize: number,
+    public readonly limit: number,
+    public readonly messageCount: number
+  ) {
+    super(
+      `Conversation context grew too large to send to Claude ` +
+        `(${bodySize} bytes > ${limit} byte limit, ${messageCount} messages). ` +
+        `This usually means a tool returned a very large result that is now stuck in history. ` +
+        `Start a new conversation or ask a narrower follow-up question.`
+    );
+    this.name = 'ClaudeRequestBodyTooLargeError';
+  }
+}
+
+function assertRequestBodyWithinLimit(body: string, ctx: OrchestrationContext): void {
+  if (body.length <= MAX_REQUEST_BODY_BYTES) return;
+  ctx.logger.error('claude_request_body_too_large', null, {
+    body_size_bytes: body.length,
+    limit: MAX_REQUEST_BODY_BYTES,
+    message_count: ctx.messages.length,
+  });
+  throw new ClaudeRequestBodyTooLargeError(
+    body.length,
+    MAX_REQUEST_BODY_BYTES,
+    ctx.messages.length
+  );
+}
+
 /** Default Claude model - can be overridden via CLAUDE_MODEL env var */
 const DEFAULT_MODEL = 'claude-sonnet-4-6';
 
@@ -311,6 +384,7 @@ function logFetchAborted(
 async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message> {
   if (ctx.callbacks) return streamClaudeResponse(ctx);
   const body = buildMessageBody(ctx, false);
+  assertRequestBodyWithinLimit(body, ctx);
   logFetchCommencement(ctx, body, false);
   const { signal, cleanup } = buildClaudeAbortSignal(CLAUDE_REQUEST_TIMEOUT_MS);
   const fetchStart = Date.now();
@@ -340,6 +414,7 @@ async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message>
 
 async function streamClaudeResponse(ctx: OrchestrationContext): Promise<Anthropic.Message> {
   const body = buildMessageBody(ctx, true);
+  assertRequestBodyWithinLimit(body, ctx);
   logFetchCommencement(ctx, body, true);
   const { signal, cleanup } = buildClaudeAbortSignal(CLAUDE_REQUEST_TIMEOUT_MS);
   const fetchStart = Date.now();
@@ -909,7 +984,16 @@ async function executeSingleTool(
     const result = await dispatchToolCall(toolCall, ctx);
     logToolSuccess(ctx, toolCall, startTime);
     ctx.callbacks?.onToolResult?.(toolCall.name, result);
-    return { type: 'tool_result', tool_use_id: toolCall.id, content: JSON.stringify(result) };
+    const serialized = JSON.stringify(result);
+    const content = truncateToolResultContent(serialized, toolCall.name);
+    if (content.length < serialized.length) {
+      ctx.logger.warn('tool_result_truncated', {
+        tool_name: toolCall.name,
+        original_bytes: serialized.length,
+        capped_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+      });
+    }
+    return { type: 'tool_result', tool_use_id: toolCall.id, content };
   } catch (error) {
     return handleToolError(ctx, toolCall, error, startTime);
   }
