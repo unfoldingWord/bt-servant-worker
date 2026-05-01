@@ -15,6 +15,7 @@ import { ChatHistoryEntry, StreamCallbacks } from '../../types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig } from '../../types/org-config.js';
 import { DEFAULT_PROMPT_VALUES, ModeContext, PromptSlot } from '../../types/prompt-overrides.js';
 import {
+  AppError,
   ClaudeAPIError,
   MCPError,
   MCPRequestCallLimitError,
@@ -105,7 +106,7 @@ function truncateToolResultContent(content: string, toolName: string): string {
  */
 const MAX_REQUEST_BODY_BYTES = 200_000;
 
-class ClaudeRequestBodyTooLargeError extends Error {
+class ClaudeRequestBodyTooLargeError extends AppError {
   constructor(
     public readonly bodySize: number,
     public readonly limit: number,
@@ -115,7 +116,9 @@ class ClaudeRequestBodyTooLargeError extends Error {
       `Conversation context grew too large to send to Claude ` +
         `(${bodySize} bytes > ${limit} byte limit, ${messageCount} messages). ` +
         `This usually means a tool returned a very large result that is now stuck in history. ` +
-        `Start a new conversation or ask a narrower follow-up question.`
+        `Start a new conversation or ask a narrower follow-up question.`,
+      'CLAUDE_REQUEST_BODY_TOO_LARGE',
+      413
     );
     this.name = 'ClaudeRequestBodyTooLargeError';
   }
