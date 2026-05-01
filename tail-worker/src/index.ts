@@ -49,14 +49,44 @@ interface TraceItem {
   diagnosticsChannelEvents?: unknown[];
   scriptVersion?: { id?: string; tag?: string; message?: string } | null;
   truncated?: boolean;
+  // Resource usage — surfaced by the runtime on every TraceItem. We only
+  // care about these for the "long_invocation" branch, but they exist on
+  // both ok and non-ok outcomes.
+  cpuTime?: number | null;
+  wallTime?: number | null;
 }
 
 const MAX_LOGS_FORWARDED = 50;
 const MAX_LOG_MESSAGE_CHARS = 2000;
 
+/**
+ * Thresholds for the "long_invocation" branch.
+ *
+ * The default per-invocation CPU cap is 30,000 ms. We log at 25,000 ms so
+ * we catch invocations that came close to the limit (whether or not they
+ * were actually killed). Wall-clock 60s catches long-lived requests where
+ * we want to know about lifetime even when CPU usage was low — those are
+ * the cases most at risk of silent termination after the fetch handler's
+ * Response promise resolves.
+ *
+ * Outcome: a producer invocation that hit ~30 KPL CPU with outcome=ok is
+ * the smoking-gun signature of "ran out of CPU mid-orchestration". The
+ * existing worker_death branch only catches non-ok outcomes; this branch
+ * catches the silent-CPU-kill case where the response was already returned.
+ */
+const LONG_INVOCATION_CPU_THRESHOLD_MS = 25_000;
+const LONG_INVOCATION_WALL_THRESHOLD_MS = 60_000;
+
+function isLongInvocation(item: TraceItem): boolean {
+  const cpu = item.cpuTime ?? 0;
+  const wall = item.wallTime ?? 0;
+  return cpu >= LONG_INVOCATION_CPU_THRESHOLD_MS || wall >= LONG_INVOCATION_WALL_THRESHOLD_MS;
+}
+
 function shouldEmit(item: TraceItem): boolean {
   if (item.outcome !== 'ok') return true;
   if ((item.exceptions?.length ?? 0) > 0) return true;
+  if (isLongInvocation(item)) return true;
   return false;
 }
 
@@ -131,6 +161,19 @@ function buildExceptionSummary(item: TraceItem): {
   return { exception_count: exceptions.length, exceptions: exceptions.map(summarizeException) };
 }
 
+function buildResourceUsage(item: TraceItem): {
+  cpu_time_ms: number | null;
+  wall_time_ms: number | null;
+  cpu_pct_of_default_limit: number | null;
+} {
+  const cpu = item.cpuTime ?? null;
+  const wall = item.wallTime ?? null;
+  // 30,000 ms is the default Workers per-invocation CPU cap. Reporting the
+  // percentage makes "we're approaching/at the limit" obvious at a glance.
+  const cpu_pct_of_default_limit = cpu === null ? null : Math.round((cpu / 30_000) * 100);
+  return { cpu_time_ms: cpu, wall_time_ms: wall, cpu_pct_of_default_limit };
+}
+
 function emitDeath(item: TraceItem): void {
   const death = {
     event: 'worker_death',
@@ -140,6 +183,7 @@ function emitDeath(item: TraceItem): void {
     event_timestamp: item.eventTimestamp ?? null,
     request: summarizeRequest(item.event?.request),
     request_id: extractRequestId(item),
+    ...buildResourceUsage(item),
     ...buildExceptionSummary(item),
     ...buildLogSummary(item),
     script_version: summarizeScriptVersion(item.scriptVersion),
@@ -148,12 +192,49 @@ function emitDeath(item: TraceItem): void {
   console.log(JSON.stringify(death));
 }
 
+/**
+ * Emit a structured marker for `outcome=ok` invocations that crossed the
+ * CPU or wall-time thresholds. Distinct from worker_death so the two
+ * cases are queryable separately. We keep the log surface tight: just
+ * the resource numbers and a few correlating identifiers — no log tail.
+ *
+ * Why no log tail: long_invocations are by definition successful runs.
+ * The producer's own structured logs already carry the per-iteration
+ * detail; this event exists purely to surface "this run was expensive,
+ * cross-reference its request_id".
+ */
+function emitLongInvocation(item: TraceItem): void {
+  const event = {
+    event: 'long_invocation',
+    script_name: item.scriptName ?? null,
+    outcome: item.outcome,
+    event_timestamp: item.eventTimestamp ?? null,
+    request_id: extractRequestId(item),
+    ...buildResourceUsage(item),
+    script_version: summarizeScriptVersion(item.scriptVersion),
+  };
+  console.log(JSON.stringify(event));
+}
+
+function emitForItem(item: TraceItem): void {
+  // Non-ok or exception → death event takes priority and includes resource
+  // usage already, so no need to also emit long_invocation for the same
+  // trace. Ok-but-long is the long_invocation-only branch.
+  if (item.outcome !== 'ok' || (item.exceptions?.length ?? 0) > 0) {
+    emitDeath(item);
+    return;
+  }
+  if (isLongInvocation(item)) {
+    emitLongInvocation(item);
+  }
+}
+
 export default {
   tail(events: TraceItem[]): void {
     for (const item of events) {
       try {
         if (!shouldEmit(item)) continue;
-        emitDeath(item);
+        emitForItem(item);
       } catch (error) {
         // Never silent — emit a tail-worker self-failure marker so we can
         // see when our own forwarding is broken. Using a distinct event so

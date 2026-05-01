@@ -15,6 +15,18 @@ tail_consumers = [
 enabled = true
 head_sampling_rate = 1
 
+# Per-invocation CPU cap. Default is 30,000 ms; Cloudflare's hard ceiling
+# is 300,000 ms (5 min, raised in March 2025). The orchestration loop runs
+# inside a single DO fetch invocation (no waitUntil — it is a no-op in
+# DOs) and a long ptxprint flow with custom configs has been observed to
+# burn CPU in the SSE parser + QuickJS sandbox + tool dispatch over many
+# iterations. A silent termination at the 30s default presents the same
+# way as a hung fetch (no exception, outcome=ok), which is what
+# tail-worker now flags via long_invocation events. See:
+# https://developers.cloudflare.com/changelog/post/2025-03-25-higher-cpu-limits/
+[limits]
+cpu_ms = 300000
+
 [vars]
 ENVIRONMENT = "development"
 MAX_ORCHESTRATION_ITERATIONS = "30"
@@ -81,6 +93,9 @@ name = "bt-servant-worker-staging"
 tail_consumers = [
   { service = "bt-servant-tail-staging" }
 ]
+
+[env.staging.limits]
+cpu_ms = 300000
 
 [env.staging.vars]
 ENVIRONMENT = "staging"
