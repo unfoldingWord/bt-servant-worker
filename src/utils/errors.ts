@@ -85,6 +85,31 @@ export class MCPCallLimitError extends AppError {
   }
 }
 
+/**
+ * Whole-request MCP fan-out cap. Distinct from MCPCallLimitError, which is
+ * the per-`execute_code` sandbox cap. This one counts every MCP tool call
+ * across the entire user turn — top-level Claude tool_use calls plus host
+ * function calls inside any number of execute_code blocks. Splitting work
+ * into multiple execute_code calls does NOT bypass it.
+ */
+export class MCPRequestCallLimitError extends AppError {
+  constructor(
+    public readonly callsMade: number,
+    public readonly limit: number
+  ) {
+    super(
+      `Per-request MCP call limit (${limit}) exceeded. ` +
+        `Total calls in this user turn: ${callsMade}. ` +
+        `This is the whole-request cap — splitting into multiple execute_code blocks ` +
+        `will NOT bypass it. Stop tool calls and ask the user a clarifying question, ` +
+        `or summarize what you have and let them direct next steps.`,
+      'MCP_REQUEST_CALL_LIMIT_EXCEEDED',
+      429
+    );
+    this.name = 'MCPRequestCallLimitError';
+  }
+}
+
 export class AudioTranscriptionError extends AppError {
   constructor(message: string) {
     super(message, 'AUDIO_TRANSCRIPTION_ERROR', 400);

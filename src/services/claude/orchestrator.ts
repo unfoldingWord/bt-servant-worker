@@ -14,7 +14,12 @@ import { AudioContext } from '../audio/index.js';
 import { ChatHistoryEntry, StreamCallbacks } from '../../types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig } from '../../types/org-config.js';
 import { DEFAULT_PROMPT_VALUES, ModeContext, PromptSlot } from '../../types/prompt-overrides.js';
-import { ClaudeAPIError, MCPError, ValidationError } from '../../utils/errors.js';
+import {
+  ClaudeAPIError,
+  MCPError,
+  MCPRequestCallLimitError,
+  ValidationError,
+} from '../../utils/errors.js';
 import { redactToolInputForError, RequestLogger, summarizeToolInput } from '../../utils/logger.js';
 import { createMCPHostFunctions, executeCode } from '../code-execution/index.js';
 import {
@@ -237,6 +242,20 @@ interface OrchestrationContext {
   codeExecTimeout: number;
   maxMcpCalls: number;
   maxMcpResponseSize: number;
+  /**
+   * Whole-request cap on the number of MCP tool calls. Counts ACTUAL calls
+   * (no fan-out estimation, no per-server heuristics). Top-level Claude
+   * tool_use calls and execute_code-internal host-function calls both
+   * increment the same counter; the cap fires when the next call would
+   * cross the limit. Restored after the budget removal in this PR per
+   * codex review feedback (PR #177): without it, raising
+   * MAX_ORCHESTRATION_ITERATIONS to 100 + cpu_ms to 5min lets a chatty
+   * tool loop run for minutes and burn hundreds of downstream calls
+   * before anything stops it.
+   */
+  maxMcpCallsPerRequest: number;
+  /** Mutable counter — increments inside handleMCPToolCall before each call. */
+  mcpCallsMade: { count: number };
   catalog: ToolCatalog;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
@@ -734,6 +753,21 @@ const DEFAULT_CODE_EXEC_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_ITERATIONS = 10;
 
 /**
+ * Default whole-request MCP call cap.
+ *
+ * Counts every MCP tool call across one user turn — top-level tool_use
+ * calls plus host-function calls inside any number of execute_code blocks.
+ * Defends against runaway fan-out when MAX_ORCHESTRATION_ITERATIONS and
+ * cpu_ms are set high enough for many turns to fit in one invocation.
+ *
+ * 100 = enough for the most call-heavy ptxprint flow we have observed
+ * (low double-digit MCP calls per orchestration in current usage), with
+ * ~10x headroom before tripping. If a flow legitimately needs more, raise
+ * MAX_MCP_CALLS_PER_REQUEST in wrangler.toml — do NOT silently bypass.
+ */
+const DEFAULT_MAX_MCP_CALLS_PER_REQUEST = 100;
+
+/**
  * Parse and validate an integer environment variable.
  * Returns the parsed value if valid, or the default if missing/invalid.
  * Logs a warning if the value is present but malformed.
@@ -796,7 +830,13 @@ function parseOrchestrationConfig(env: Env, logger: RequestLogger) {
     10,
     logger
   );
-  return { codeExecTimeout, maxIterations, maxMcpCalls };
+  const maxMcpCallsPerRequest = parseIntEnvVar(
+    env.MAX_MCP_CALLS_PER_REQUEST,
+    'MAX_MCP_CALLS_PER_REQUEST',
+    DEFAULT_MAX_MCP_CALLS_PER_REQUEST,
+    logger
+  );
+  return { codeExecTimeout, maxIterations, maxMcpCalls, maxMcpCallsPerRequest };
 }
 
 function parseMcpResponseSizeConfig(env: Env, logger: RequestLogger) {
@@ -860,6 +900,8 @@ function createOrchestrationContext(
     codeExecTimeout: config.codeExecTimeout,
     maxMcpCalls: config.maxMcpCalls,
     maxMcpResponseSize: config.maxMcpResponseSize,
+    maxMcpCallsPerRequest: config.maxMcpCallsPerRequest,
+    mcpCallsMade: { count: 0 },
     catalog,
     logger,
     callbacks,
@@ -931,6 +973,9 @@ function logOrchestrationSummary(ctx: OrchestrationContext): void {
   const healthSummary = getHealthSummary(ctx.healthTracker);
 
   ctx.logger.log('orchestration_summary', {
+    mcp_calls_made: ctx.mcpCallsMade.count,
+    mcp_calls_limit: ctx.maxMcpCallsPerRequest,
+    mcp_calls_pct_of_limit: Math.round((ctx.mcpCallsMade.count / ctx.maxMcpCallsPerRequest) * 100),
     server_health:
       healthSummary.length > 0
         ? healthSummary.map((s) => ({
@@ -1394,6 +1439,29 @@ function checkServerHealth(toolName: string, serverId: string, ctx: Orchestratio
   }
 }
 
+/**
+ * Enforce the whole-request MCP call cap. Counts ACTUAL MCP tool calls,
+ * with no inference about what each MCP server does downstream — one
+ * MCP call increments the counter by exactly one regardless of whether
+ * the server makes 0, 1, or 100 internal API calls under the hood.
+ *
+ * Increments BEFORE the call so a denied call never reaches the network.
+ * The thrown error message tells Claude this is the per-request cap (not
+ * a per-execute_code cap), so it does not try to bypass by splitting work
+ * across multiple sandbox blocks.
+ */
+function checkAndCountRequestMCPCall(toolName: string, ctx: OrchestrationContext): void {
+  ctx.mcpCallsMade.count++;
+  if (ctx.mcpCallsMade.count > ctx.maxMcpCallsPerRequest) {
+    ctx.logger.warn('mcp_request_call_limit_exceeded', {
+      tool_name: toolName,
+      calls_made: ctx.mcpCallsMade.count,
+      limit: ctx.maxMcpCallsPerRequest,
+    });
+    throw new MCPRequestCallLimitError(ctx.mcpCallsMade.count, ctx.maxMcpCallsPerRequest);
+  }
+}
+
 async function handleMCPToolCall(
   toolName: string,
   input: unknown,
@@ -1401,6 +1469,7 @@ async function handleMCPToolCall(
 ): Promise<unknown> {
   const { server } = validateMCPToolCall(toolName, ctx);
   checkServerHealth(toolName, server.id, ctx);
+  checkAndCountRequestMCPCall(toolName, ctx);
 
   const callResult = await callMCPTool(server, toolName, input, ctx.logger, {
     healthTracker: ctx.healthTracker,
