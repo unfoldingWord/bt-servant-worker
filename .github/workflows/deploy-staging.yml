@@ -31,6 +31,9 @@ jobs:
       - name: Type check
         run: pnpm check
 
+      - name: Type check (tail worker)
+        run: pnpm check:tail
+
       - name: Lint
         run: pnpm lint
 
@@ -42,6 +45,15 @@ jobs:
 
       - name: Build
         run: pnpm build
+
+      # Tail consumer must exist before the producer worker references it
+      # via tail_consumers in wrangler.toml — deploy it first.
+      - name: Deploy Tail Worker (Staging)
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy --config tail-worker/wrangler.toml --env staging
 
       - name: Deploy to Staging
         uses: cloudflare/wrangler-action@v3

@@ -15,29 +15,22 @@ import { ChatHistoryEntry, StreamCallbacks } from '../../types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig } from '../../types/org-config.js';
 import { DEFAULT_PROMPT_VALUES, ModeContext, PromptSlot } from '../../types/prompt-overrides.js';
 import {
+  AppError,
   ClaudeAPIError,
-  MCPBudgetExceededError,
   MCPError,
+  MCPRequestCallLimitError,
   ValidationError,
 } from '../../utils/errors.js';
 import { redactToolInputForError, RequestLogger, summarizeToolInput } from '../../utils/logger.js';
 import { createMCPHostFunctions, executeCode } from '../code-execution/index.js';
 import {
   callMCPTool,
-  createBudget,
   createHealthTracker,
-  DEFAULT_BUDGET_LIMIT,
-  DEFAULT_DOWNSTREAM_PER_CALL,
-  getBudgetStatus,
   getHealthSummary,
   getToolNames,
   HealthTracker,
-  isBudgetExceeded,
   isServerHealthy,
-  MCPCallBudget,
-  recordMCPCall,
   ToolCatalog,
-  wouldExceedBudget,
 } from '../mcp/index.js';
 import { MAX_MEMORY_SIZE_BYTES, UserMemoryStore } from '../memory/index.js';
 import {
@@ -64,6 +57,86 @@ import {
 
 /** Default max response size for MCP calls (1MB) */
 const DEFAULT_MAX_MCP_RESPONSE_SIZE = 1048576;
+
+/**
+ * Per-tool-result content cap appended to the conversation history.
+ *
+ * Why: a tool result that is multiple MCP responses worth of `docs(...)`
+ * output (the canonical bloat path — observed 96 KB single results from
+ * `ptxprint-mcp.docs`) accumulates across iterations and pushes the next
+ * Claude request body into the danger zone (>200 KB), which correlates
+ * with silent SSE-consumer hangs in the DO that emit no exception. Cap
+ * each tool_result content at the boundary where we serialize it into
+ * the next message so that a chatty tool cannot silently destabilize the
+ * loop. Truncation marker is plaintext (Anthropic accepts string content
+ * for tool_result) and tells Claude to narrow its query rather than
+ * fetch more.
+ */
+// Was 12 KB initially. Bumped to 32 KB on 2026-04-30 because the 12 KB
+// cap was chopping virtually every meaningful ptxprint `docs(...)` read
+// (typical articles return 30-90 KB). 32 KB lets the typical case
+// through while still capping pathological 90+ KB returns. The 200 KB
+// request body cap downstream still bounds total conversation size.
+const DEFAULT_MAX_TOOL_RESULT_BYTES = 32_768; // 32 KB
+
+function truncateToolResultContent(content: string, toolName: string): string {
+  if (content.length <= DEFAULT_MAX_TOOL_RESULT_BYTES) return content;
+  const head = content.slice(0, DEFAULT_MAX_TOOL_RESULT_BYTES);
+  return (
+    `${head}\n\n` +
+    `…[TRUNCATED: tool '${toolName}' returned ${content.length} bytes; ` +
+    `capped at ${DEFAULT_MAX_TOOL_RESULT_BYTES} to keep the conversation context bounded. ` +
+    `To get more detail, narrow your query (e.g. a more specific 'query' string, ` +
+    `or lower 'depth') or ask the user a clarifying question instead of fetching more. ` +
+    `Do NOT retry with the same broad query — you will hit this cap again.]`
+  );
+}
+
+/**
+ * Hard ceiling on the JSON body size sent to the Anthropic Messages API.
+ *
+ * Why: above ~200 KB we have repeatedly observed silent SSE-consumer
+ * hangs in the DO — the streaming response opens, then `reader.read()`
+ * stops yielding chunks and no JS-level exception is ever thrown
+ * (`$workers.outcome` stays "ok" because the response 200'd). Failing
+ * fast here surfaces the runaway as a clear `claude_request_body_too_large`
+ * error instead of an indefinite hang the user has no way to escape.
+ * Pairs with truncateToolResultContent — the per-result cap is the
+ * primary defense; this is the seatbelt for whatever it misses.
+ */
+const MAX_REQUEST_BODY_BYTES = 200_000;
+
+class ClaudeRequestBodyTooLargeError extends AppError {
+  constructor(
+    public readonly bodySize: number,
+    public readonly limit: number,
+    public readonly messageCount: number
+  ) {
+    super(
+      `Conversation context grew too large to send to Claude ` +
+        `(${bodySize} bytes > ${limit} byte limit, ${messageCount} messages). ` +
+        `This usually means a tool returned a very large result that is now stuck in history. ` +
+        `Start a new conversation or ask a narrower follow-up question.`,
+      'CLAUDE_REQUEST_BODY_TOO_LARGE',
+      413
+    );
+    this.name = 'ClaudeRequestBodyTooLargeError';
+  }
+}
+
+function assertRequestBodyWithinLimit(body: string, ctx: OrchestrationContext): void {
+  if (body.length <= MAX_REQUEST_BODY_BYTES) return;
+  ctx.logger.error('claude_request_body_too_large', null, {
+    body_size_bytes: body.length,
+    limit: MAX_REQUEST_BODY_BYTES,
+    message_count: ctx.messages.length,
+  });
+  throw new ClaudeRequestBodyTooLargeError(
+    body.length,
+    MAX_REQUEST_BODY_BYTES,
+    ctx.messages.length
+  );
+}
 
 /** Default Claude model - can be overridden via CLAUDE_MODEL env var */
 const DEFAULT_MODEL = 'claude-sonnet-4-6';
@@ -172,10 +245,23 @@ interface OrchestrationContext {
   codeExecTimeout: number;
   maxMcpCalls: number;
   maxMcpResponseSize: number;
+  /**
+   * Whole-request cap on the number of MCP tool calls. Counts ACTUAL calls
+   * (no fan-out estimation, no per-server heuristics). Top-level Claude
+   * tool_use calls and execute_code-internal host-function calls both
+   * increment the same counter; the cap fires when the next call would
+   * cross the limit. Restored after the budget removal in this PR per
+   * codex review feedback (PR #177): without it, raising
+   * MAX_ORCHESTRATION_ITERATIONS to 100 + cpu_ms to 5min lets a chatty
+   * tool loop run for minutes and burn hundreds of downstream calls
+   * before anything stops it.
+   */
+  maxMcpCallsPerRequest: number;
+  /** Mutable counter — increments inside handleMCPToolCall before each call. */
+  mcpCallsMade: { count: number };
   catalog: ToolCatalog;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
-  mcpBudget: MCPCallBudget;
   healthTracker: HealthTracker;
   memoryStore: UserMemoryStore | undefined;
   modeContext: ModeContext | undefined;
@@ -227,101 +313,276 @@ function buildMessageBody(ctx: OrchestrationContext, stream: boolean): string {
  * This appears to be a Cloudflare platform issue with SDK-managed fetch from DOs,
  * not strictly a nesting problem. Raw globalThis.fetch works in all contexts.
  */
-async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message> {
-  if (ctx.callbacks) {
-    return streamClaudeResponse(ctx);
-  }
+/**
+ * Hard ceiling on a single Anthropic Messages API request. Cloudflare Workers'
+ * subrequest fetch has its own time budget but does not surface a useful error
+ * when the upstream stalls; we add an explicit AbortSignal so an unresponsive
+ * Anthropic stream surfaces as a clear `claude_fetch_aborted` error instead of
+ * a silent orchestration death (which is what staging exhibited on
+ * 2026-04-30 — the loop simply stopped emitting events after iteration 4).
+ */
+const CLAUDE_REQUEST_TIMEOUT_MS = 90_000;
 
-  const response = await globalThis.fetch(ANTHROPIC_API_URL, {
+function buildClaudeAbortSignal(timeoutMs: number): {
+  signal: AbortSignal;
+  cleanup: () => void;
+} {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return { signal: controller.signal, cleanup: () => clearTimeout(timer) };
+}
+
+async function postToAnthropic(
+  body: string,
+  signal: AbortSignal,
+  apiKey: string
+): Promise<Response> {
+  return globalThis.fetch(ANTHROPIC_API_URL, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      'x-api-key': ctx.apiKey,
+      'x-api-key': apiKey,
       'anthropic-version': ANTHROPIC_API_VERSION,
     },
-    body: buildMessageBody(ctx, false),
+    body,
+    signal,
   });
+}
 
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => '(unreadable)');
-    throw new Anthropic.APIError(
-      response.status,
-      { message: errorText },
-      errorText,
-      response.headers
-    );
+async function throwAnthropicHttpError(
+  ctx: OrchestrationContext,
+  response: Response,
+  streaming: boolean,
+  fetchStart: number
+): Promise<never> {
+  const errorText = await response.text().catch(() => '(unreadable)');
+  ctx.logger.error('claude_fetch_http_error', null, {
+    streaming,
+    status: response.status,
+    has_body: !!response.body,
+    body_preview: errorText.slice(0, 500),
+    duration_ms: Date.now() - fetchStart,
+  });
+  throw new Anthropic.APIError(
+    response.status,
+    { message: errorText },
+    errorText,
+    response.headers
+  );
+}
+
+function logFetchCommencement(ctx: OrchestrationContext, body: string, streaming: boolean): void {
+  ctx.logger.log('claude_fetch_start', {
+    streaming,
+    body_size_bytes: body.length,
+    message_count: ctx.messages.length,
+    timeout_ms: CLAUDE_REQUEST_TIMEOUT_MS,
+  });
+}
+
+function logFetchAborted(
+  ctx: OrchestrationContext,
+  error: unknown,
+  streaming: boolean,
+  fetchStart: number
+): void {
+  if ((error as Error)?.name !== 'AbortError') return;
+  ctx.logger.error('claude_fetch_aborted', error, {
+    streaming,
+    timeout_ms: CLAUDE_REQUEST_TIMEOUT_MS,
+    duration_ms: Date.now() - fetchStart,
+  });
+}
+
+async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message> {
+  if (ctx.callbacks) return streamClaudeResponse(ctx);
+  const body = buildMessageBody(ctx, false);
+  assertRequestBodyWithinLimit(body, ctx);
+  logFetchCommencement(ctx, body, false);
+  const { signal, cleanup } = buildClaudeAbortSignal(CLAUDE_REQUEST_TIMEOUT_MS);
+  const fetchStart = Date.now();
+  try {
+    const response = await postToAnthropic(body, signal, ctx.apiKey);
+    ctx.logger.log('claude_fetch_response_received', {
+      streaming: false,
+      status: response.status,
+      duration_ms: Date.now() - fetchStart,
+    });
+    if (!response.ok) await throwAnthropicHttpError(ctx, response, false, fetchStart);
+    const parsed = (await response.json()) as Anthropic.Message;
+    ctx.logger.log('claude_fetch_complete', {
+      streaming: false,
+      stop_reason: parsed.stop_reason,
+      content_blocks: parsed.content.length,
+      duration_ms: Date.now() - fetchStart,
+    });
+    return parsed;
+  } catch (error) {
+    logFetchAborted(ctx, error, false, fetchStart);
+    throw error;
+  } finally {
+    cleanup();
   }
-
-  return (await response.json()) as Anthropic.Message;
 }
 
 async function streamClaudeResponse(ctx: OrchestrationContext): Promise<Anthropic.Message> {
-  const response = await globalThis.fetch(ANTHROPIC_API_URL, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': ctx.apiKey,
-      'anthropic-version': ANTHROPIC_API_VERSION,
-    },
-    body: buildMessageBody(ctx, true),
-  });
-
-  if (!response.ok || !response.body) {
-    const errorText = await response.text().catch(() => '(unreadable)');
-    throw new Anthropic.APIError(
-      response.status,
-      { message: errorText },
-      errorText,
-      response.headers
-    );
+  const body = buildMessageBody(ctx, true);
+  assertRequestBodyWithinLimit(body, ctx);
+  logFetchCommencement(ctx, body, true);
+  const { signal, cleanup } = buildClaudeAbortSignal(CLAUDE_REQUEST_TIMEOUT_MS);
+  const fetchStart = Date.now();
+  try {
+    const response = await postToAnthropic(body, signal, ctx.apiKey);
+    ctx.logger.log('claude_fetch_response_received', {
+      streaming: true,
+      status: response.status,
+      has_body: !!response.body,
+      duration_ms: Date.now() - fetchStart,
+    });
+    if (!response.ok || !response.body) {
+      await throwAnthropicHttpError(ctx, response, true, fetchStart);
+    }
+    const parsed = await parseSSEStream(response.body!, ctx.logger, ctx.callbacks, signal);
+    ctx.logger.log('claude_fetch_complete', {
+      streaming: true,
+      stop_reason: parsed.stop_reason,
+      content_blocks: parsed.content.length,
+      duration_ms: Date.now() - fetchStart,
+    });
+    return parsed;
+  } catch (error) {
+    logFetchAborted(ctx, error, true, fetchStart);
+    throw error;
+  } finally {
+    cleanup();
   }
+}
 
-  return parseSSEStream(response.body, ctx.logger, ctx.callbacks);
+interface SSEParseState {
+  message: Anthropic.Message | undefined;
+  eventCounts: Record<string, number>;
+}
+
+function applySSELines(
+  state: SSEParseState,
+  lines: string[],
+  logger: RequestLogger,
+  callbacks?: StreamCallbacks
+): void {
+  for (const line of lines) {
+    if (!line.startsWith('data: ')) continue;
+    const data = line.slice(6).trim();
+    if (data === '[DONE]') continue;
+    let event: Anthropic.RawMessageStreamEvent;
+    try {
+      event = JSON.parse(data) as Anthropic.RawMessageStreamEvent;
+    } catch {
+      logger.warn('sse_parse_error', { data: data.slice(0, 200) });
+      continue;
+    }
+    const t = (event as { type?: string }).type ?? 'unknown';
+    state.eventCounts[t] = (state.eventCounts[t] ?? 0) + 1;
+    if (t === 'ping') continue;
+    state.message = applySSEEvent(state.message, event, logger, callbacks);
+  }
+}
+
+function attachSSEAbortListener(
+  signal: AbortSignal | undefined,
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  logger: RequestLogger,
+  ref: { chunks: number; bytes: number; start: number; state: SSEParseState }
+): (() => void) | undefined {
+  if (!signal) return undefined;
+  const onAbort = () => {
+    logger.warn('sse_stream_aborted', {
+      elapsed_ms: Date.now() - ref.start,
+      chunks: ref.chunks,
+      bytes: ref.bytes,
+      event_counts: { ...ref.state.eventCounts },
+    });
+    reader.cancel('upstream-abort').catch(() => {
+      /* ignore — already logged */
+    });
+  };
+  signal.addEventListener('abort', onAbort);
+  return () => signal.removeEventListener('abort', onAbort);
+}
+
+/**
+ * Validate the post-loop SSE state and surface a final Message.
+ *
+ * CRITICAL: must check abort BEFORE the !state.message guard. The abort
+ * listener cancels the reader, which makes reader.read() resolve with
+ * done=true — so the loop exits "cleanly" even though we never saw
+ * message_stop. Without this check, a 90s timeout that fires AFTER
+ * message_start arrived would silently return the partial message
+ * (truncated text or a half-built tool call) as a successful response,
+ * defeating the entire reason this timeout exists.
+ */
+function finalizeSSEStream(
+  state: SSEParseState,
+  ref: { chunks: number; bytes: number; start: number },
+  logger: RequestLogger,
+  signal: AbortSignal | undefined
+): Anthropic.Message {
+  const base = {
+    elapsed_ms: Date.now() - ref.start,
+    chunks: ref.chunks,
+    bytes: ref.bytes,
+    event_counts: { ...state.eventCounts },
+  };
+  if (signal?.aborted) {
+    logger.error('sse_stream_aborted_with_partial', null, {
+      ...base,
+      had_partial_message: !!state.message,
+      partial_stop_reason: state.message?.stop_reason ?? null,
+    });
+    throw new Error('Claude stream aborted (timeout) before completing');
+  }
+  if (!state.message) {
+    logger.error('sse_stream_no_message', null, base);
+    throw new Error('Claude stream ended before producing a message');
+  }
+  logger.log('sse_stream_complete', {
+    ...base,
+    stop_reason: state.message.stop_reason,
+    content_blocks: state.message.content.length,
+  });
+  return state.message;
 }
 
 /** Parse an SSE stream from the Anthropic Messages API into a final Message. */
 async function parseSSEStream(
   body: ReadableStream<Uint8Array>,
   logger: RequestLogger,
-  callbacks?: StreamCallbacks
+  callbacks?: StreamCallbacks,
+  signal?: AbortSignal
 ): Promise<Anthropic.Message> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
+  const state: SSEParseState = { message: undefined, eventCounts: {} };
+  const ref = { chunks: 0, bytes: 0, start: Date.now(), state };
   let buffer = '';
-  let message: Anthropic.Message | undefined;
 
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+  logger.log('sse_stream_start', {});
+  const detachAbort = attachSSEAbortListener(signal, reader, logger, ref);
 
-    const lines = buffer.split('\n');
-    buffer = lines.pop() ?? '';
-
-    for (const line of lines) {
-      if (!line.startsWith('data: ')) continue;
-      const data = line.slice(6).trim();
-      if (data === '[DONE]') continue;
-
-      let event: Anthropic.RawMessageStreamEvent;
-      try {
-        event = JSON.parse(data) as Anthropic.RawMessageStreamEvent;
-      } catch {
-        logger.warn('sse_parse_error', { data: data.slice(0, 200) });
-        continue;
-      }
-
-      // Anthropic keepalive; spec allows it between any events. No-op everywhere.
-      if ((event as { type?: string }).type === 'ping') continue;
-
-      message = applySSEEvent(message, event, logger, callbacks);
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      ref.chunks += 1;
+      ref.bytes += value.length;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      applySSELines(state, lines, logger, callbacks);
     }
+    return finalizeSSEStream(state, ref, logger, signal);
+  } finally {
+    detachAbort?.();
   }
-
-  if (!message) {
-    throw new Error('Claude stream ended before producing a message');
-  }
-  return message;
 }
 
 function applyContentDelta(
@@ -405,53 +666,86 @@ function notifyCallback(logger: RequestLogger, fn: () => unknown): void {
   }
 }
 
-async function processIteration(ctx: OrchestrationContext, iteration: number): Promise<boolean> {
-  ctx.logger.log('claude_request', {
-    iteration,
-    message_count: ctx.messages.length,
-  });
+async function callClaudeForIteration(
+  ctx: OrchestrationContext,
+  iteration: number,
+  iterStart: number
+): Promise<Anthropic.Message> {
+  try {
+    return await callClaude(ctx);
+  } catch (error) {
+    ctx.logger.error('iteration_claude_call_failed', error, {
+      iteration,
+      message_count: ctx.messages.length,
+      elapsed_ms: Date.now() - iterStart,
+    });
+    throw error;
+  }
+}
 
-  // Add separator before subsequent iterations for streaming
+async function executeIterationTools(
+  toolCalls: ToolUseBlock[],
+  ctx: OrchestrationContext,
+  iteration: number,
+  iterStart: number
+): Promise<Anthropic.ToolResultBlockParam[]> {
+  try {
+    return await executeToolCalls(toolCalls, ctx);
+  } catch (error) {
+    ctx.logger.error('iteration_tool_execution_failed', error, {
+      iteration,
+      tool_calls: toolCalls.map((tc) => tc.name),
+      elapsed_ms: Date.now() - iterStart,
+    });
+    throw error;
+  }
+}
+
+async function processIteration(ctx: OrchestrationContext, iteration: number): Promise<boolean> {
+  const iterStart = Date.now();
+  ctx.logger.log('iteration_start', { iteration, message_count: ctx.messages.length });
+  ctx.logger.log('claude_request', { iteration, message_count: ctx.messages.length });
+
   if (iteration > 0 && ctx.callbacks) {
     notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress('\n'));
     notifyCallback(ctx.logger, () => ctx.callbacks?.onStatus('Preparing your response...'));
   }
 
-  const startTime = Date.now();
-  const response = await callClaude(ctx);
-  const duration = Date.now() - startTime;
-
+  const response = await callClaudeForIteration(ctx, iteration, iterStart);
   const toolCalls = extractToolCalls(response.content);
-
   ctx.logger.log('claude_response', {
     iteration,
     stop_reason: response.stop_reason,
     tool_calls_count: toolCalls.length,
-    duration_ms: duration,
+    text_blocks_count: response.content.filter((b) => b.type === 'text').length,
+    duration_ms: Date.now() - iterStart,
   });
 
   ctx.lastIterationStartIndex = ctx.responses.length;
   ctx.responses.push(...extractTextResponses(response.content));
 
   if (response.stop_reason === 'end_turn' || toolCalls.length === 0) {
+    ctx.logger.log('iteration_end', {
+      iteration,
+      reason: response.stop_reason === 'end_turn' ? 'end_turn' : 'no_tool_calls',
+      total_duration_ms: Date.now() - iterStart,
+    });
     return true;
   }
 
   notifyCallback(ctx.logger, () =>
     ctx.callbacks?.onStatus(`Executing ${toolCalls.length} tool(s)...`)
   );
-
-  const toolResults = await executeToolCalls(toolCalls, ctx);
-
-  ctx.messages.push({
-    role: 'assistant',
-    content: response.content as Anthropic.ContentBlock[],
-  });
+  const toolResults = await executeIterationTools(toolCalls, ctx, iteration, iterStart);
+  ctx.messages.push({ role: 'assistant', content: response.content as Anthropic.ContentBlock[] });
   ctx.messages.push({ role: 'user', content: toolResults });
-
-  // Notify iteration complete for progress callbacks (only when tools were used)
   notifyCallback(ctx.logger, () => ctx.callbacks?.onIterationComplete?.(ctx.responses.join('\n')));
-
+  ctx.logger.log('iteration_end', {
+    iteration,
+    reason: 'continuing',
+    tool_calls_executed: toolCalls.length,
+    total_duration_ms: Date.now() - iterStart,
+  });
   return false;
 }
 
@@ -460,6 +754,21 @@ const DEFAULT_CODE_EXEC_TIMEOUT_MS = 30_000;
 
 /** Default maximum orchestration iterations */
 const DEFAULT_MAX_ITERATIONS = 10;
+
+/**
+ * Default whole-request MCP call cap.
+ *
+ * Counts every MCP tool call across one user turn — top-level tool_use
+ * calls plus host-function calls inside any number of execute_code blocks.
+ * Defends against runaway fan-out when MAX_ORCHESTRATION_ITERATIONS and
+ * cpu_ms are set high enough for many turns to fit in one invocation.
+ *
+ * 100 = enough for the most call-heavy ptxprint flow we have observed
+ * (low double-digit MCP calls per orchestration in current usage), with
+ * ~10x headroom before tripping. If a flow legitimately needs more, raise
+ * MAX_MCP_CALLS_PER_REQUEST in wrangler.toml — do NOT silently bypass.
+ */
+const DEFAULT_MAX_MCP_CALLS_PER_REQUEST = 100;
 
 /**
  * Parse and validate an integer environment variable.
@@ -524,40 +833,34 @@ function parseOrchestrationConfig(env: Env, logger: RequestLogger) {
     10,
     logger
   );
-  return { codeExecTimeout, maxIterations, maxMcpCalls };
+  const maxMcpCallsPerRequest = parseIntEnvVar(
+    env.MAX_MCP_CALLS_PER_REQUEST,
+    'MAX_MCP_CALLS_PER_REQUEST',
+    DEFAULT_MAX_MCP_CALLS_PER_REQUEST,
+    logger
+  );
+  return { codeExecTimeout, maxIterations, maxMcpCalls, maxMcpCallsPerRequest };
 }
 
-function parseMcpBudgetConfig(env: Env, logger: RequestLogger) {
-  const maxDownstreamCalls = parseIntEnvVar(
-    env.MAX_DOWNSTREAM_CALLS_PER_REQUEST,
-    'MAX_DOWNSTREAM_CALLS_PER_REQUEST',
-    DEFAULT_BUDGET_LIMIT,
-    logger
-  );
-  const defaultDownstreamPerCall = parseIntEnvVar(
-    env.DEFAULT_DOWNSTREAM_PER_MCP_CALL,
-    'DEFAULT_DOWNSTREAM_PER_MCP_CALL',
-    DEFAULT_DOWNSTREAM_PER_CALL,
-    logger
-  );
+function parseMcpResponseSizeConfig(env: Env, logger: RequestLogger) {
   const maxMcpResponseSize = parseIntEnvVar(
     env.MAX_MCP_RESPONSE_SIZE_BYTES,
     'MAX_MCP_RESPONSE_SIZE_BYTES',
     DEFAULT_MAX_MCP_RESPONSE_SIZE,
     logger
   );
-  return { maxDownstreamCalls, defaultDownstreamPerCall, maxMcpResponseSize };
+  return { maxMcpResponseSize };
 }
 
 function parseEnvConfig(env: Env, logger: RequestLogger) {
   const claudeConfig = parseClaudeConfig(env, logger);
   const orchestrationConfig = parseOrchestrationConfig(env, logger);
-  const mcpBudgetConfig = parseMcpBudgetConfig(env, logger);
+  const mcpResponseSizeConfig = parseMcpResponseSizeConfig(env, logger);
 
   return {
     ...claudeConfig,
     ...orchestrationConfig,
-    ...mcpBudgetConfig,
+    ...mcpResponseSizeConfig,
   };
 }
 
@@ -600,10 +903,11 @@ function createOrchestrationContext(
     codeExecTimeout: config.codeExecTimeout,
     maxMcpCalls: config.maxMcpCalls,
     maxMcpResponseSize: config.maxMcpResponseSize,
+    maxMcpCallsPerRequest: config.maxMcpCallsPerRequest,
+    mcpCallsMade: { count: 0 },
     catalog,
     logger,
     callbacks,
-    mcpBudget: createBudget(config.maxDownstreamCalls, config.defaultDownstreamPerCall),
     healthTracker: createHealthTracker(),
     memoryStore: options.memoryStore,
     modeContext: options.modeContext,
@@ -614,31 +918,67 @@ function createOrchestrationContext(
   };
 }
 
+/**
+ * User-facing message appended to the response when the orchestration loop
+ * exits because it hit MAX_ORCHESTRATION_ITERATIONS. Without this, the user
+ * sees only whatever progress text Claude streamed during the final iteration
+ * — typically a mid-thought like "Let me fix by adding fontsize too:" — with
+ * no indication that the bot has stopped trying. Observed live on
+ * 2026-04-30 (request `de4c4d28-…`): a user got an abrupt half-sentence and
+ * had no way to know the bot wasn't about to send the next message.
+ *
+ * This text is both pushed through `callbacks.onProgress` (so it lands in
+ * the user's chat client immediately as a final webhook delivery) and
+ * appended to `ctx.responses` (so it persists in the saved history and the
+ * next conversation turn has the right context — otherwise next turn would
+ * see only the partial mid-thought as the assistant's "previous reply").
+ */
+const MAX_ITERATIONS_USER_MESSAGE =
+  "\n\n⚠️ I've reached my limit on how many steps I can take in a single turn while " +
+  'working on this. The work above is what I got done; some of it may be incomplete. ' +
+  "If you'd like me to keep going, send me a follow-up telling me what to focus on " +
+  '(e.g. "just submit the standard PDF" or "try once more with X"), and I\'ll pick ' +
+  'up from here without re-doing the parts that already worked.';
+
 async function runOrchestrationLoop(
   ctx: OrchestrationContext,
   maxIterations: number
 ): Promise<void> {
+  ctx.logger.log('orchestration_loop_start', { max_iterations: maxIterations });
+  let lastIteration = -1;
+  let exitReason: 'done' | 'max_iterations' = 'max_iterations';
   for (let i = 0; i < maxIterations; i++) {
+    lastIteration = i;
     const done = await processIteration(ctx, i);
-    if (done) break;
+    if (done) {
+      exitReason = 'done';
+      break;
+    }
   }
+  if (exitReason === 'max_iterations') {
+    ctx.logger.warn('orchestration_max_iterations_reached', {
+      max_iterations: maxIterations,
+      last_iteration: lastIteration,
+    });
+    notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress(MAX_ITERATIONS_USER_MESSAGE));
+    ctx.responses.push(MAX_ITERATIONS_USER_MESSAGE);
+  }
+  ctx.logger.log('orchestration_loop_end', {
+    exit_reason: exitReason,
+    last_iteration: lastIteration,
+  });
 
-  // Log health summary and budget status at end of orchestration
+  // Log health summary at end of orchestration
   logOrchestrationSummary(ctx);
 }
 
 function logOrchestrationSummary(ctx: OrchestrationContext): void {
   const healthSummary = getHealthSummary(ctx.healthTracker);
-  const budgetStatus = getBudgetStatus(ctx.mcpBudget);
 
   ctx.logger.log('orchestration_summary', {
-    mcp_call_count: ctx.mcpBudget.mcpCallCount,
-    budget: {
-      total_downstream_calls: budgetStatus.totalDownstreamCalls,
-      limit: ctx.mcpBudget.limit,
-      percent_used: Math.round(budgetStatus.percentUsed),
-      using_estimates: budgetStatus.usingEstimates,
-    },
+    mcp_calls_made: ctx.mcpCallsMade.count,
+    mcp_calls_limit: ctx.maxMcpCallsPerRequest,
+    mcp_calls_pct_of_limit: Math.round((ctx.mcpCallsMade.count / ctx.maxMcpCallsPerRequest) * 100),
     server_health:
       healthSummary.length > 0
         ? healthSummary.map((s) => ({
@@ -650,10 +990,6 @@ function logOrchestrationSummary(ctx: OrchestrationContext): void {
           }))
         : undefined,
   });
-
-  if (budgetStatus.warning) {
-    ctx.logger.warn('budget_warning', { message: budgetStatus.warning });
-  }
 }
 
 function handleOrchestrationError(error: unknown, logger: RequestLogger): never {
@@ -712,7 +1048,16 @@ async function executeSingleTool(
     const result = await dispatchToolCall(toolCall, ctx);
     logToolSuccess(ctx, toolCall, startTime);
     ctx.callbacks?.onToolResult?.(toolCall.name, result);
-    return { type: 'tool_result', tool_use_id: toolCall.id, content: JSON.stringify(result) };
+    const serialized = JSON.stringify(result);
+    const content = truncateToolResultContent(serialized, toolCall.name);
+    if (content.length < serialized.length) {
+      ctx.logger.warn('tool_result_truncated', {
+        tool_name: toolCall.name,
+        original_bytes: serialized.length,
+        capped_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+      });
+    }
+    return { type: 'tool_result', tool_use_id: toolCall.id, content };
   } catch (error) {
     return handleToolError(ctx, toolCall, error, startTime);
   }
@@ -990,12 +1335,55 @@ function handleToolError(
   };
 }
 
+/**
+ * Internal tools that are safe and useful from inside the execute_code sandbox.
+ *
+ * Curated list — most internal tools are inappropriate for sandbox calls:
+ *  - `request_audio` toggles output mode (response-shape side effect, not a value).
+ *  - `read_memory` / `update_memory` are durable user state; sandbox computation
+ *    should not write through.
+ *  - `generate_scripture_pdf` is the no-sandbox happy path; if Claude is in the
+ *    sandbox doing custom work it has explicitly chosen to bypass the macro.
+ *  - `get_tool_definitions` / `execute_code` itself are top-level only.
+ *
+ * `prepare_usfm_source` is a pure (translation, book) → source-spec resolver.
+ * It is exactly the shape Claude needs while assembling a custom payload for
+ * the raw `submit_typeset` MCP tool, so we expose it inside the sandbox.
+ */
+const SANDBOX_INTERNAL_TOOLS = ['prepare_usfm_source'] as const;
+
+function isSandboxInternalTool(name: string): boolean {
+  return (SANDBOX_INTERNAL_TOOLS as readonly string[]).includes(name);
+}
+
+async function dispatchSandboxInternalTool(
+  name: string,
+  args: unknown,
+  ctx: OrchestrationContext
+): Promise<unknown> {
+  if (name === 'prepare_usfm_source') {
+    if (!isPrepareUsfmSourceInput(args)) {
+      throw new ValidationError(
+        `Invalid input for prepare_usfm_source: expected { translation: string, book: string }, got ${truncateInput(args)}`
+      );
+    }
+    return handlePrepareUsfmSource(args, buildPtxprintCtx(ctx));
+  }
+  throw new ValidationError(`Unknown sandbox-internal tool: ${name}`);
+}
+
 async function handleExecuteCode(
   input: { code: string },
   ctx: OrchestrationContext
 ): Promise<unknown> {
-  const toolNames = getToolNames(ctx.catalog);
-  const toolCaller = (name: string, args: unknown) => handleMCPToolCall(name, args, ctx);
+  const mcpToolNames = getToolNames(ctx.catalog);
+  const toolNames = [...mcpToolNames, ...SANDBOX_INTERNAL_TOOLS];
+  const toolCaller = async (name: string, args: unknown): Promise<unknown> => {
+    if (isSandboxInternalTool(name)) {
+      return dispatchSandboxInternalTool(name, args, ctx);
+    }
+    return handleMCPToolCall(name, args, ctx);
+  };
   const hostFunctions = createMCPHostFunctions(toolCaller, toolNames);
 
   const result = await executeCode(
@@ -1044,23 +1432,6 @@ function validateMCPToolCall(toolName: string, ctx: OrchestrationContext) {
   return { tool, server };
 }
 
-function checkMCPBudgetBeforeCall(
-  toolName: string,
-  serverId: string,
-  ctx: OrchestrationContext
-): void {
-  if (wouldExceedBudget(ctx.mcpBudget)) {
-    const status = getBudgetStatus(ctx.mcpBudget);
-    ctx.logger.warn('mcp_budget_exceeded', {
-      tool_name: toolName,
-      server_id: serverId,
-      estimated_calls: status.totalDownstreamCalls,
-      limit: ctx.mcpBudget.limit,
-    });
-    throw new MCPBudgetExceededError(status.totalDownstreamCalls, ctx.mcpBudget.limit);
-  }
-}
-
 function checkServerHealth(toolName: string, serverId: string, ctx: OrchestrationContext): void {
   if (!isServerHealthy(ctx.healthTracker, serverId)) {
     ctx.logger.warn('mcp_server_unhealthy', { tool_name: toolName, server_id: serverId });
@@ -1071,29 +1442,26 @@ function checkServerHealth(toolName: string, serverId: string, ctx: Orchestratio
   }
 }
 
-function logMCPBudgetStatus(
-  toolName: string,
-  hasMetadata: boolean,
-  ctx: OrchestrationContext
-): void {
-  const budgetStatus = getBudgetStatus(ctx.mcpBudget);
-  ctx.logger.log('mcp_budget_status', {
-    tool_name: toolName,
-    mcp_calls: ctx.mcpBudget.mcpCallCount,
-    downstream_calls: budgetStatus.totalDownstreamCalls,
-    percent_used: Math.round(budgetStatus.percentUsed),
-    has_metadata: hasMetadata,
-  });
-
-  if (budgetStatus.warning) {
-    ctx.logger.warn('mcp_budget_warning', { message: budgetStatus.warning });
-  }
-
-  if (isBudgetExceeded(ctx.mcpBudget)) {
-    ctx.logger.warn('mcp_budget_exhausted', {
-      downstream_calls: budgetStatus.totalDownstreamCalls,
-      limit: ctx.mcpBudget.limit,
+/**
+ * Enforce the whole-request MCP call cap. Counts ACTUAL MCP tool calls,
+ * with no inference about what each MCP server does downstream — one
+ * MCP call increments the counter by exactly one regardless of whether
+ * the server makes 0, 1, or 100 internal API calls under the hood.
+ *
+ * Increments BEFORE the call so a denied call never reaches the network.
+ * The thrown error message tells Claude this is the per-request cap (not
+ * a per-execute_code cap), so it does not try to bypass by splitting work
+ * across multiple sandbox blocks.
+ */
+function checkAndCountRequestMCPCall(toolName: string, ctx: OrchestrationContext): void {
+  ctx.mcpCallsMade.count++;
+  if (ctx.mcpCallsMade.count > ctx.maxMcpCallsPerRequest) {
+    ctx.logger.warn('mcp_request_call_limit_exceeded', {
+      tool_name: toolName,
+      calls_made: ctx.mcpCallsMade.count,
+      limit: ctx.maxMcpCallsPerRequest,
     });
+    throw new MCPRequestCallLimitError(ctx.mcpCallsMade.count, ctx.maxMcpCallsPerRequest);
   }
 }
 
@@ -1103,16 +1471,13 @@ async function handleMCPToolCall(
   ctx: OrchestrationContext
 ): Promise<unknown> {
   const { server } = validateMCPToolCall(toolName, ctx);
-  checkMCPBudgetBeforeCall(toolName, server.id, ctx);
   checkServerHealth(toolName, server.id, ctx);
+  checkAndCountRequestMCPCall(toolName, ctx);
 
   const callResult = await callMCPTool(server, toolName, input, ctx.logger, {
     healthTracker: ctx.healthTracker,
     maxResponseSizeBytes: ctx.maxMcpResponseSize,
   });
-
-  recordMCPCall(ctx.mcpBudget, callResult.metadata);
-  logMCPBudgetStatus(toolName, !!callResult.metadata, ctx);
 
   return callResult.result;
 }

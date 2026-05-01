@@ -61,7 +61,7 @@ import {
   uploadAudio,
 } from '../services/audio/index.js';
 import { AttachmentsContext, createAttachmentsContext } from '../services/ptxprint/index.js';
-import { AudioTranscriptionError, ValidationError } from '../utils/errors.js';
+import { AppError, AudioTranscriptionError, ValidationError } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
 import { applyTemplateVariables } from '../utils/template.js';
 import { createTimingContext, timePhase, TimingContext } from '../utils/timing.js';
@@ -393,12 +393,28 @@ export class UserDO {
       logger.log('immediate_final_complete', { message_id: messageId });
       response = Response.json({ message_id: messageId, ...chatResponse });
     } catch (error) {
-      if (error instanceof ValidationError) {
-        logger.warn('immediate_final_validation_failed', {
-          message_id: messageId,
-          error: error.message,
-        });
-        response = createErrorResponse('Validation failed', 'VALIDATION_ERROR', error.message, 400);
+      if (error instanceof AppError) {
+        // Surface structured app errors (ValidationError, MCPRequestCallLimitError,
+        // MCPCallLimitError, etc.) with their declared code + status so callers
+        // can distinguish 4xx user-correctable conditions (e.g. 429 rate-limit)
+        // from genuine 500 server failures. Without this, every AppError other
+        // than ValidationError collapsed to a generic 500.
+        const isClientError = error.statusCode >= 400 && error.statusCode < 500;
+        if (isClientError) {
+          logger.warn('immediate_final_app_error', {
+            message_id: messageId,
+            code: error.code,
+            status: error.statusCode,
+            error: error.message,
+          });
+        } else {
+          logger.error('immediate_final_app_error', error, {
+            message_id: messageId,
+            code: error.code,
+            status: error.statusCode,
+          });
+        }
+        response = createErrorResponse(error.name, error.code, error.message, error.statusCode);
       } else {
         const message = error instanceof Error ? error.message : 'Processing failed';
         logger.error('immediate_final_error', error, { message_id: messageId });

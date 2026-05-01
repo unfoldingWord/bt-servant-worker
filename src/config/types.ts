@@ -18,10 +18,9 @@ export interface Env {
 
   // MCP call limits (optional - has defaults)
   MAX_MCP_CALLS_PER_EXECUTION?: string;
+  MAX_MCP_CALLS_PER_REQUEST?: string;
 
   // MCP resilience configuration (optional - has defaults)
-  MAX_DOWNSTREAM_CALLS_PER_REQUEST?: string;
-  DEFAULT_DOWNSTREAM_PER_MCP_CALL?: string;
   MAX_MCP_RESPONSE_SIZE_BYTES?: string;
 
   // Queue configuration (optional - has defaults)

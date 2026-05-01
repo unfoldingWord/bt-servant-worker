@@ -36,6 +36,34 @@ export function sanitizeSpeaker(name: string): string {
   return name.replace(/[[\]]/g, '').trim().slice(0, MAX_SPEAKER_LENGTH) || 'Unknown';
 }
 
+/**
+ * Discovery-loop guard rail for the ptxprint custom-layout flow.
+ *
+ * Why: when a user asks for a custom ptxprint layout (line spacing, columns,
+ * font, etc.) Claude has been observed to make 4+ back-to-back `docs(...)`
+ * calls into ptxprint-mcp groping for the right config keys. Each docs
+ * result balloons the conversation context (observed 24–96 KB per call),
+ * and by iteration 5–6 the request body crosses ~200 KB, which correlates
+ * with silent SSE-consumer hangs in the DO. The orchestrator now caps each
+ * tool result at 12 KB and refuses requests >200 KB, but those are the
+ * seatbelt; this guidance prevents Claude from driving into the wall in
+ * the first place. Only injected when ptxprint-mcp is in the org catalog.
+ */
+const PTXPRINT_FLOW_GUIDANCE =
+  '## ptxprint custom layout flow\n\n' +
+  'When a user asks for a custom ptxprint layout (line spacing, columns, fonts, paper size, etc.) ' +
+  'that the `generate_scripture_pdf` macro does not cover:\n\n' +
+  '- Make AT MOST ONE `docs(...)` call to discover the right config keys per turn. Use a tight, specific ' +
+  'query — `docs("linespacing", depth: 1)` not `docs("paragraph layout typography font config recipe", depth: 3)`.\n' +
+  '- If the first `docs(...)` result is unclear or you need more, ASK THE USER a clarifying question ' +
+  'instead of making another docs call. Each docs result is large and accumulates in conversation history.\n' +
+  '- Once you have the recipe and the USFM source from `prepare_usfm_source`, assemble the entire ' +
+  '`submit_typeset` payload in a single `execute_code` block and submit it. Do not iterate on the payload — ' +
+  'get it right the first time, or ask the user.\n' +
+  '- If you cannot complete the request after 3 iterations (counting orchestration turns), STOP and tell ' +
+  'the user clearly what you tried and what you need from them. Do not silently keep trying — ' +
+  'the conversation will hit a hard size limit and fail with no response to the user.';
+
 const AUDIO_GUIDANCE =
   '## Audio Response (IMPORTANT)\n\n' +
   'You have a `request_audio` tool. You MUST call it when any of these apply:\n' +
@@ -187,6 +215,9 @@ export function buildSystemPrompt(
   sections.push(resolvedPromptValues.memory_instructions);
   if (memoryTOC) sections.push(memoryTOC);
   sections.push(AUDIO_GUIDANCE);
+  if (catalog.tools.some((t) => t.serverId === 'ptxprint-mcp')) {
+    sections.push(PTXPRINT_FLOW_GUIDANCE);
+  }
   if (options?.isVoiceMessage) {
     sections.push(VOICE_RESPONSE_GUIDANCE);
   }

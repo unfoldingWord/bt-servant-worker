@@ -81,6 +81,19 @@ export default [
   },
 
   // ===========================================
+  // TAIL WORKER: console.log is the emission API
+  // A tail consumer's only way to forward events into Workers
+  // Observability is via console.log — the runtime captures stdout
+  // and indexes it as log events. Allow it in this directory only.
+  // ===========================================
+  {
+    files: ['tail-worker/**/*.ts'],
+    rules: {
+      'no-console': 'off',
+    },
+  },
+
+  // ===========================================
   // ONION ARCHITECTURE: Types layer
   // Types should have no internal dependencies
   // ===========================================

@@ -222,18 +222,63 @@ function logMcpCall(
 }
 
 /**
+ * Race a host call against the wall-clock budget remaining in this execute_code
+ * block. The QuickJS interrupt handler only fires while JS bytecode is running
+ * — it cannot interrupt a host function that is awaiting an HTTP fetch (e.g.
+ * an MCP tool call to a hung server). Without this race, a host fetch that
+ * never resolves wedges the entire orchestration loop indefinitely (no
+ * code_execution_complete, no mcp_tool_call_complete, silent DO death).
+ *
+ * Live repro 2026-04-30 staging: ptxprint-mcp `get_job_status` host fetch
+ * stuck for 5+ minutes with zero events emitted; CODE_EXEC_TIMEOUT_MS=30000
+ * never fired because no JS was executing for the interrupt to catch.
+ */
+async function callWithWallClockBudget<T>(
+  promise: Promise<T>,
+  remainingMs: number,
+  callName: string
+): Promise<T> {
+  if (remainingMs <= 0) {
+    throw new TimeoutError(
+      `Host call '${callName}' rejected: execute_code budget already exhausted`
+    );
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(
+        new TimeoutError(
+          `Host call '${callName}' exceeded execute_code wall-clock budget (${remainingMs}ms remaining)`
+        )
+      );
+    }, remainingMs);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
  * Execute a single pending MCP call, tracking it in the counter and resolving/rejecting the VM promise.
  */
 async function executePendingCall(
   vm: QuickJSContext,
   call: PendingCall,
   mcpCounter: MCPCallCounter,
-  logger: RequestLogger
+  logger: RequestLogger,
+  budget: { startTime: number; timeoutMs: number }
 ): Promise<void> {
   mcpCounter.count++;
   logMcpCall(logger, mcpCounter, call.fn.name, call.args);
   try {
-    const result = await call.fn.fn(...call.args);
+    const remainingMs = budget.timeoutMs - (Date.now() - budget.startTime);
+    const result = await callWithWallClockBudget(
+      Promise.resolve().then(() => call.fn.fn(...call.args)),
+      remainingMs,
+      call.fn.name
+    );
     resolvePendingCall(vm, call.id, result);
   } catch (error) {
     rejectPendingCall(vm, call.id, error);
@@ -248,7 +293,8 @@ async function processPendingCalls(
   vm: QuickJSContext,
   pendingCalls: PendingCall[],
   mcpCounter: MCPCallCounter,
-  logger: RequestLogger
+  logger: RequestLogger,
+  budget: { startTime: number; timeoutMs: number }
 ): Promise<void> {
   do {
     if (pendingCalls.length > 0) {
@@ -261,7 +307,9 @@ async function processPendingCalls(
         });
         throw new MCPCallLimitError(mcpCounter.count, mcpCounter.limit);
       }
-      await Promise.all(batch.map((call) => executePendingCall(vm, call, mcpCounter, logger)));
+      await Promise.all(
+        batch.map((call) => executePendingCall(vm, call, mcpCounter, logger, budget))
+      );
     }
     vm.runtime.executePendingJobs();
   } while (pendingCalls.length > 0);
@@ -438,7 +486,10 @@ async function runCodeInVM(ctx: VMExecutionContext): Promise<unknown> {
     throw new TimeoutError(`Code execution exceeded ${ctx.options.timeout_ms}ms`);
   }
   ctx.vm.runtime.executePendingJobs();
-  await processPendingCalls(ctx.vm, pendingCalls, ctx.mcpCounter, ctx.logger);
+  await processPendingCalls(ctx.vm, pendingCalls, ctx.mcpCounter, ctx.logger, {
+    startTime,
+    timeoutMs: ctx.options.timeout_ms,
+  });
   checkExecutionError(ctx.vm);
   return extractResult(ctx.vm);
 }

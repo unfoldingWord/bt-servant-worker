@@ -70,10 +70,9 @@ export interface MCPToolResult {
 
 /**
  * Metadata returned by MCP servers about downstream API activity.
- * This enables budget tracking and optimization.
  *
- * Note: MCP servers must implement this contract for accurate tracking.
- * When servers don't return metadata, the worker falls back to default estimates.
+ * Surfaced into per-call logs for observability — useful for spotting
+ * fan-out hotspots and cache effectiveness across servers.
  */
 export interface MCPResponseMetadata {
   /** Number of downstream API calls made by the MCP server */
