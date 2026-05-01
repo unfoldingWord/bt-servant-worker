@@ -66,7 +66,12 @@ const DEFAULT_MAX_MCP_RESPONSE_SIZE = 1048576;
  * for tool_result) and tells Claude to narrow its query rather than
  * fetch more.
  */
-const DEFAULT_MAX_TOOL_RESULT_BYTES = 12_288; // 12 KB
+// Was 12 KB initially. Bumped to 32 KB on 2026-04-30 because the 12 KB
+// cap was chopping virtually every meaningful ptxprint `docs(...)` read
+// (typical articles return 30-90 KB). 32 KB lets the typical case
+// through while still capping pathological 90+ KB returns. The 200 KB
+// request body cap downstream still bounds total conversation size.
+const DEFAULT_MAX_TOOL_RESULT_BYTES = 32_768; // 32 KB
 
 function truncateToolResultContent(content: string, toolName: string): string {
   if (content.length <= DEFAULT_MAX_TOOL_RESULT_BYTES) return content;
