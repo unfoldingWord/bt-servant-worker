@@ -29,17 +29,17 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.71.2",
-    "@cf-wasm/quickjs": "^0.2.4",
+    "@cf-wasm/quickjs": "^0.2.5",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "hono": "^4.12.14",
-    "openai": "^6.34.0",
+    "hono": "^4.12.18",
+    "openai": "^6.37.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.14.6",
-    "@cloudflare/workers-types": "^4.20260414.1",
+    "@cloudflare/vitest-pool-workers": "^0.14.9",
+    "@cloudflare/workers-types": "^4.20260508.1",
     "@eslint/js": "^9.39.4",
-    "@types/node": "^22.19.17",
+    "@types/node": "^22.19.18",
     "@types/semver": "^7.7.1",
     "dependency-cruiser": "^16.10.4",
     "eslint": "^9.39.4",
@@ -48,13 +48,13 @@
     "globals": "^15.15.0",
     "husky": "^9.1.7",
     "lint-staged": "^15.5.2",
-    "prettier": "^3.8.2",
-    "semver": "^7.7.4",
+    "prettier": "^3.8.3",
+    "semver": "^7.8.0",
     "typescript": "^5.9.3",
-    "typescript-eslint": "^8.58.2",
+    "typescript-eslint": "^8.59.2",
     "vite": "^6.4.2",
-    "vitest": "^4.1.4",
-    "wrangler": "^4.72.0"
+    "vitest": "^4.1.5",
+    "wrangler": "^4.90.0"
   },
   "lint-staged": {
     "*.{js,mjs,cjs,ts}": [
