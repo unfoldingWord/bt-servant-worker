@@ -160,7 +160,7 @@ Keep memory organized with clear section names. Remove outdated information when
 };
 
 /** Strip control characters (except newline, tab, carriage return) from a string */
-function stripControlChars(value: string): string {
+export function stripControlChars(value: string): string {
   // eslint-disable-next-line no-control-regex -- intentional: stripping control chars for safety
   return value.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
 }

@@ -25,6 +25,14 @@ import {
   validatePromptMode,
   validatePromptOverrides,
 } from './types/prompt-overrides.js';
+import {
+  Language,
+  MAX_LANGUAGES_PER_ORG,
+  OrgLanguages,
+  sanitizeLanguageDocument,
+  validateLanguage,
+  validateLanguageName,
+} from './types/languages.js';
 import { constantTimeCompare } from './utils/crypto.js';
 import { ValidationError } from './utils/errors.js';
 import { getAudio } from './services/audio/index.js';
@@ -610,6 +618,148 @@ app.delete('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
   }
 });
 
+// Admin endpoints for org-level language management
+app.get('/api/v1/admin/orgs/:org/languages', async (c) => {
+  const org = c.req.param('org');
+  const logger = createRequestLogger(crypto.randomUUID());
+
+  try {
+    const orgLanguages = (await c.env.PROMPT_OVERRIDES.get<OrgLanguages>(
+      `${org}:languages`,
+      'json'
+    )) ?? {
+      languages: [],
+    };
+
+    logger.log('admin_action', {
+      action: 'list_languages',
+      org,
+      language_count: orgLanguages.languages.length,
+    });
+    return c.json({ org, ...orgLanguages });
+  } catch (error) {
+    logger.error('admin_action', error, { action: 'list_languages', org });
+    return c.json({ error: 'Failed to read languages from storage' }, 500);
+  }
+});
+
+app.get('/api/v1/admin/orgs/:org/languages/:languageName', async (c) => {
+  const org = c.req.param('org');
+  const languageName = c.req.param('languageName');
+  const logger = createRequestLogger(crypto.randomUUID());
+
+  const nameError = validateLanguageName(languageName);
+  if (nameError) {
+    return c.json({ error: nameError }, 400);
+  }
+
+  try {
+    const orgLanguages = (await c.env.PROMPT_OVERRIDES.get<OrgLanguages>(
+      `${org}:languages`,
+      'json'
+    )) ?? {
+      languages: [],
+    };
+    const language = orgLanguages.languages.find((l) => l.name === languageName);
+    if (!language) {
+      return c.json({ error: `Language '${languageName}' not found` }, 404);
+    }
+
+    logger.log('admin_action', { action: 'get_language', org, language_name: languageName });
+    return c.json({ org, language });
+  } catch (error) {
+    logger.error('admin_action', error, { action: 'get_language', org });
+    return c.json({ error: 'Failed to read language from storage' }, 500);
+  }
+});
+
+app.put('/api/v1/admin/orgs/:org/languages/:languageName', async (c) => {
+  const org = c.req.param('org');
+  const languageName = c.req.param('languageName');
+  const logger = createRequestLogger(crypto.randomUUID());
+
+  const nameError = validateLanguageName(languageName);
+  if (nameError) {
+    return c.json({ error: nameError }, 400);
+  }
+
+  const body = await c.req.json();
+  const languageInput = { ...body, name: languageName };
+  const languageError = validateLanguage(languageInput);
+  if (languageError) {
+    return c.json({ error: languageError }, 400);
+  }
+
+  try {
+    // NOTE: This read-modify-write pattern can race with concurrent requests (last write wins).
+    // This is acceptable for admin endpoints which are low-volume and authenticated.
+    const orgLanguages = (await c.env.PROMPT_OVERRIDES.get<OrgLanguages>(
+      `${org}:languages`,
+      'json'
+    )) ?? {
+      languages: [],
+    };
+
+    const result = upsertLanguage(orgLanguages, languageInput as Language, org, logger);
+    if (!result.ok) {
+      return c.json({ error: result.error }, 400);
+    }
+
+    await c.env.PROMPT_OVERRIDES.put(`${org}:languages`, JSON.stringify(orgLanguages));
+    logger.log('admin_action', {
+      action: 'upsert_language',
+      org,
+      language_name: languageName,
+      language_count: orgLanguages.languages.length,
+      published: result.savedLanguage.published === true,
+      document_length: result.savedLanguage.document.length,
+    });
+    return c.json({ org, language: result.savedLanguage, message: 'Language saved' });
+  } catch (error) {
+    logger.error('admin_action', error, { action: 'upsert_language', org });
+    return c.json({ error: 'Failed to save language to storage' }, 500);
+  }
+});
+
+app.delete('/api/v1/admin/orgs/:org/languages/:languageName', async (c) => {
+  const org = c.req.param('org');
+  const languageName = c.req.param('languageName');
+  const logger = createRequestLogger(crypto.randomUUID());
+
+  const nameError = validateLanguageName(languageName);
+  if (nameError) {
+    return c.json({ error: nameError }, 400);
+  }
+
+  try {
+    const orgLanguages = (await c.env.PROMPT_OVERRIDES.get<OrgLanguages>(
+      `${org}:languages`,
+      'json'
+    )) ?? {
+      languages: [],
+    };
+
+    const filtered = orgLanguages.languages.filter((l) => l.name !== languageName);
+    if (filtered.length === orgLanguages.languages.length) {
+      return c.json({ error: `Language '${languageName}' not found` }, 404);
+    }
+
+    orgLanguages.languages = filtered;
+
+    await c.env.PROMPT_OVERRIDES.put(`${org}:languages`, JSON.stringify(orgLanguages));
+    logger.log('admin_action', {
+      action: 'delete_language',
+      org,
+      language_name: languageName,
+      language_count: orgLanguages.languages.length,
+    });
+    return c.json({ org, languages: orgLanguages.languages, message: 'Language deleted' });
+  } catch (error) {
+    logger.error('admin_action', error, { action: 'delete_language', org });
+    return c.json({ error: 'Failed to delete language from storage' }, 500);
+  }
+});
+
 // Admin endpoints for user mode selection (routed to DO)
 app.get('/api/v1/admin/orgs/:org/users/:userId/mode', async (c) => {
   const org = c.req.param('org');
@@ -803,6 +953,67 @@ export function upsertMode(
   });
   orgModes.modes.push(modeInput);
   return { ok: true, savedMode: modeInput };
+}
+
+/** Merge an incoming language with an existing one. Document is replaced wholesale. */
+function mergeExistingLanguage(existing: Language, incoming: Language): Language {
+  // published is rebuilt explicitly: incoming wins if present (publish/unpublish action),
+  // otherwise existing carries through. Mirrors mergeExistingMode semantics.
+  const publishedResolved = incoming.published ?? existing.published;
+  return {
+    name: incoming.name,
+    document: sanitizeLanguageDocument(incoming.document),
+    ...((incoming.label ?? existing.label) ? { label: incoming.label ?? existing.label } : {}),
+    ...(publishedResolved !== undefined ? { published: publishedResolved } : {}),
+  };
+}
+
+/**
+ * Upsert a language into an OrgLanguages collection.
+ * Mutates orgLanguages.languages in-place (splice/push) and returns the result.
+ */
+export function upsertLanguage(
+  orgLanguages: OrgLanguages,
+  languageInput: Language,
+  org: string,
+  logger?: ReturnType<typeof createRequestLogger>
+): { ok: true; savedLanguage: Language } | { ok: false; error: string } {
+  const existingIdx = orgLanguages.languages.findIndex((l) => l.name === languageInput.name);
+  if (existingIdx >= 0) {
+    const savedLanguage = mergeExistingLanguage(
+      orgLanguages.languages[existingIdx]!,
+      languageInput
+    );
+    logger?.log('admin_action', {
+      action: 'upsert_language_before',
+      org,
+      language_name: languageInput.name,
+      existing_document_length: orgLanguages.languages[existingIdx]!.document.length,
+      incoming_document_length: languageInput.document.length,
+    });
+    orgLanguages.languages.splice(existingIdx, 1, savedLanguage);
+    return { ok: true, savedLanguage };
+  }
+
+  if (orgLanguages.languages.length >= MAX_LANGUAGES_PER_ORG) {
+    return {
+      ok: false,
+      error: `Cannot have more than ${MAX_LANGUAGES_PER_ORG} languages per org`,
+    };
+  }
+  const sanitized: Language = {
+    ...languageInput,
+    document: sanitizeLanguageDocument(languageInput.document),
+  };
+  logger?.log('admin_action', {
+    action: 'upsert_language_before',
+    org,
+    language_name: languageInput.name,
+    existing_document_length: null,
+    incoming_document_length: languageInput.document.length,
+  });
+  orgLanguages.languages.push(sanitized);
+  return { ok: true, savedLanguage: sanitized };
 }
 
 /**
