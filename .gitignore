@@ -9,3 +9,4 @@ dist
 .codex
 /AGENTS.md
 skills-lock.json
+scripts/*.opus
