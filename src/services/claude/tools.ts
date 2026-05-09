@@ -261,6 +261,44 @@ export function buildSwitchModeTool(): Anthropic.Tool {
 }
 
 /**
+ * Build list_languages tool definition
+ */
+export function buildListLanguagesTool(): Anthropic.Tool {
+  return {
+    name: 'list_languages',
+    description:
+      'List all available language tuning profiles and which language is currently active. Languages shape tone, register, lexicon, and cultural guidance for responses.',
+    input_schema: {
+      type: 'object',
+      properties: {},
+      required: [],
+    },
+  };
+}
+
+/**
+ * Build switch_language tool definition
+ */
+export function buildSwitchLanguageTool(): Anthropic.Tool {
+  return {
+    name: 'switch_language',
+    description:
+      'Switch to a different language tuning profile. The change takes effect on the next message. Pass the language name to switch to, or null to clear the current language and return to the default.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        language: {
+          oneOf: [{ type: 'string' }, { type: 'null' }],
+          description:
+            'The name of the language to switch to, or null to clear the current language.',
+        },
+      },
+      required: ['language'],
+    },
+  };
+}
+
+/**
  * Build all tool definitions for Claude
  *
  * NOTE: We intentionally do NOT expose MCP tools as direct Claude tools.
@@ -276,7 +314,7 @@ export function buildSwitchModeTool(): Anthropic.Tool {
  */
 export function buildAllTools(
   _catalog: ToolCatalog,
-  opts?: { hasModes?: boolean }
+  opts?: { hasModes?: boolean; hasLanguages?: boolean }
 ): Anthropic.Tool[] {
   const tools: Anthropic.Tool[] = [
     buildExecuteCodeTool(),
@@ -291,6 +329,9 @@ export function buildAllTools(
   if (opts?.hasModes) {
     tools.push(buildListModesTool(), buildSwitchModeTool());
   }
+  if (opts?.hasLanguages) {
+    tools.push(buildListLanguagesTool(), buildSwitchLanguageTool());
+  }
 
   return tools;
 }
@@ -298,18 +339,22 @@ export function buildAllTools(
 /**
  * Check if a tool is a built-in tool (not an MCP tool)
  */
+const BUILT_IN_TOOL_NAMES = new Set([
+  'execute_code',
+  'get_tool_definitions',
+  'read_memory',
+  'update_memory',
+  'request_audio',
+  'list_modes',
+  'switch_mode',
+  'list_languages',
+  'switch_language',
+  'generate_scripture_pdf',
+  'prepare_usfm_source',
+]);
+
 export function isBuiltInTool(toolName: string): boolean {
-  return (
-    toolName === 'execute_code' ||
-    toolName === 'get_tool_definitions' ||
-    toolName === 'read_memory' ||
-    toolName === 'update_memory' ||
-    toolName === 'request_audio' ||
-    toolName === 'list_modes' ||
-    toolName === 'switch_mode' ||
-    toolName === 'generate_scripture_pdf' ||
-    toolName === 'prepare_usfm_source'
-  );
+  return BUILT_IN_TOOL_NAMES.has(toolName);
 }
 
 /** Maximum number of sections in a single read_memory request */
@@ -373,6 +418,17 @@ export function isSwitchModeInput(input: unknown): input is { mode: string | nul
   if (!('mode' in input)) return false;
   const mode = (input as { mode: unknown }).mode;
   return mode === null || (typeof mode === 'string' && mode.length > 0);
+}
+
+/**
+ * Type guard for switch_language input.
+ * language is required and must be a string or null.
+ */
+export function isSwitchLanguageInput(input: unknown): input is { language: string | null } {
+  if (typeof input !== 'object' || input === null) return false;
+  if (!('language' in input)) return false;
+  const language = (input as { language: unknown }).language;
+  return language === null || (typeof language === 'string' && language.length > 0);
 }
 
 /**

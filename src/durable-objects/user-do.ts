@@ -65,9 +65,8 @@ import { AppError, AudioTranscriptionError, ValidationError } from '../utils/err
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
 import { applyTemplateVariables } from '../utils/template.js';
 import { createTimingContext, timePhase, TimingContext } from '../utils/timing.js';
-import { classifyTriggers, ClassifierResult } from '../services/classifier/index.js';
 import { isAdminClient, validateChatBody } from '../utils/chat-validation.js';
-import { OrgLanguages } from '../types/languages.js';
+import { LanguageContext, OrgLanguages, validateLanguageName } from '../types/languages.js';
 import { InternalQueueEntry } from '../types/queue.js';
 
 // ── Storage keys ───────────────────────────────────────────────────────────────
@@ -75,17 +74,10 @@ const HISTORY_KEY = 'history';
 const PREFERENCES_KEY = 'preferences';
 const PROMPT_OVERRIDES_KEY = 'prompt_overrides';
 const SELECTED_MODE_KEY = 'selected_mode';
+const SELECTED_LANGUAGE_KEY = 'selected_language';
 const PROCESSING_LOCK_KEY = '_processing_lock';
 const QUEUE_KEY = 'queue';
 const QUEUE_PROCESSING_KEY = 'queue_processing';
-
-/** Prepend soft warnings for unrecognized trigger tokens to the first response. */
-function prependTriggerWarnings(responses: string[], warnings: string[]): void {
-  if (warnings.length > 0 && responses.length > 0) {
-    const warningText = warnings.map((w) => `_${w}_`).join('\n');
-    responses[0] = `${warningText}\n\n${responses[0]}`;
-  }
-}
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 const LOCK_STALE_THRESHOLD_MS = 90_000; // 90 seconds
@@ -150,6 +142,9 @@ export class UserDO {
     this.app.get('/mode', () => this.handleGetMode());
     this.app.put('/mode', (c) => this.handleSetMode(c.req.raw));
     this.app.delete('/mode', () => this.handleDeleteMode());
+    this.app.get('/language', () => this.handleGetLanguage());
+    this.app.put('/language', (c) => this.handleSetLanguage(c.req.raw));
+    this.app.delete('/language', () => this.handleDeleteLanguage());
     this.app.get('/memory', () => this.handleGetMemory());
     this.app.delete('/memory', () => this.handleDeleteMemory());
   }
@@ -928,11 +923,6 @@ export class UserDO {
     logger.log('process_chat_start', { message_type: body.message_type, has_audio: !!body.audio_base64, has_callbacks: !!callbacks, chat_type: body.chat_type ?? 'private' });
 
     const loaded = await this.loadChatContext(body, ctx, callbacks);
-
-    // Classify trigger tokens and resolve per-turn mode/language overrides
-    const triggerCtx = await this.classifyAndResolveTriggers(body, loaded, ctx, logger);
-
-    // ── Build orchestrator options ────────────────────────────────────────────
     const effectivePreferences = body.response_language_hint
       ? { ...loaded.preferences, response_language: body.response_language_hint }
       : loaded.preferences;
@@ -941,12 +931,12 @@ export class UserDO {
     const audioContext = this.buildAudioContext();
     const attachmentsContext = createAttachmentsContext();
     // prettier-ignore
-    const orchOpts = this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, triggerCtx.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, triggerCtx.activeModeName, audioContext, attachmentsContext, workerOrigin, logger, callbacks, groupContext, triggerCtx.languageDocument);
+    const orchOpts = this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, loaded.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, loaded.activeModeName, loaded.orgLanguages, loaded.activeLanguageName, loaded.languageDocument, audioContext, attachmentsContext, workerOrigin, logger, callbacks, groupContext);
 
     const orchResult = await this.tracedPhase(ctx, 'orchestration', () =>
-      this.runOrchestration(triggerCtx.messageText, orchOpts)
+      this.runOrchestration(loaded.messageText, orchOpts)
     );
-    prependTriggerWarnings(orchResult.responses, triggerCtx.warnings);
+    const { responses } = orchResult;
     const ttsResponses = this.extractTtsResponses(orchResult, logger);
 
     const voiceAudio = await this.tracedPhase(ctx, 'audio_generation', () =>
@@ -954,84 +944,30 @@ export class UserDO {
     );
     const audioKey = voiceAudio?.audioKey ?? null;
 
-    // prettier-ignore
     await this.tracedPhase(ctx, 'save_conversation', () =>
-      this.saveConversation(triggerCtx.messageText, orchResult.responses, loaded.preferences, body._org_config ?? {}, { logger, audioKey, speaker: body.speaker, attachments: attachmentsContext.list() })
+      this.saveConversation(
+        loaded.messageText,
+        responses,
+        loaded.preferences,
+        body._org_config ?? {},
+        {
+          logger,
+          audioKey,
+          speaker: body.speaker,
+          attachments: attachmentsContext.list(),
+        }
+      )
     );
 
-    // prettier-ignore
-    return this.assembleChatResponse({ responses: orchResult.responses, audioKey, workerOrigin, attachmentsContext, effectivePreferences, logger, startTime: ctx.startTime });
-  }
-
-  /**
-   * Run the trigger classifier and resolve per-turn mode/language overrides.
-   * Extracted from processChat to keep each method within lint complexity limits.
-   */
-  private async classifyAndResolveTriggers(
-    body: ChatRequest,
-    loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
-    ctx: { timing: TimingContext; logger: RequestLogger; startTime: number },
-    logger: RequestLogger
-  ) {
-    const classified = await this.tracedPhase(ctx, 'classify_triggers', () =>
-      classifyTriggers(loaded.messageText, {
-        apiKey: this.env.ANTHROPIC_API_KEY,
-        availableModes: loaded.orgModes.modes
-          .filter((m) => loaded.isAdmin || m.published === true)
-          .map((m) => ({ name: m.name, label: m.label })),
-        availableLanguages: loaded.orgLanguages.languages
-          .filter((l) => loaded.isAdmin || l.published === true)
-          .map((l) => ({ name: l.name, label: l.label })),
-        logger,
-      })
-    );
-
-    const result = await this.applyTriggerOverrides(body, loaded, classified);
-
-    logger.log('trigger_classifier_result', {
-      classifier_ran: classified.classifierRan,
-      classifier_latency_ms: classified.classifierLatencyMs ?? null,
-      requested_mode: classified.modeName ?? null,
-      requested_language: classified.languageName ?? null,
-      effective_mode: result.activeModeName ?? null,
-      language_document_injected: !!result.languageDocument,
-      warnings: classified.warnings,
-      message_stripped: classified.strippedMessage !== loaded.messageText,
+    return this.assembleChatResponse({
+      responses,
+      audioKey,
+      workerOrigin,
+      attachmentsContext,
+      effectivePreferences,
+      logger,
+      startTime: ctx.startTime,
     });
-
-    return { ...result, messageText: classified.strippedMessage, warnings: classified.warnings };
-  }
-
-  /** Apply classifier results: resolve per-turn mode override and language document. */
-  private async applyTriggerOverrides(
-    body: ChatRequest,
-    loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
-    classified: ClassifierResult
-  ) {
-    let resolved = loaded.resolved;
-    let activeModeName = loaded.activeModeName;
-
-    if (classified.modeName && classified.modeName !== loaded.activeModeName) {
-      const mode = resolveEffectiveMode(loaded.orgModes, classified.modeName, {
-        includeUnpublished: loaded.isAdmin,
-      });
-      if (mode.effectiveModeName) {
-        activeModeName = mode.effectiveModeName;
-        const orgOverrides = body._org_prompt_overrides ?? {};
-        const userOverrides = await this.getPromptOverrides();
-        resolved = applyTemplateVariables(
-          resolvePromptOverrides(orgOverrides, mode.modeOverrides, userOverrides)
-        );
-      }
-    }
-
-    let languageDocument: string | undefined;
-    if (classified.languageName) {
-      const lang = loaded.orgLanguages.languages.find((l) => l.name === classified.languageName);
-      if (lang) languageDocument = lang.document;
-    }
-
-    return { resolved, activeModeName, languageDocument };
   }
 
   /** Load all context needed for orchestration. */
@@ -1059,6 +995,11 @@ export class UserDO {
       this.loadMemoryContext(logger)
     );
     const orgLanguages: OrgLanguages = body._org_languages ?? { languages: [] };
+    const { activeLanguageName, languageDocument } = await this.resolveLanguage(
+      orgLanguages,
+      isAdmin,
+      logger
+    );
     return {
       messageText,
       preferences,
@@ -1069,6 +1010,8 @@ export class UserDO {
       activeModeName,
       isAdmin,
       orgLanguages,
+      activeLanguageName,
+      languageDocument,
       memoryStore,
       formattedTOC,
     };
@@ -1401,14 +1344,17 @@ export class UserDO {
     formattedTOC: string | undefined,
     orgModes: { modes: PromptMode[] },
     activeModeName: string | undefined,
+    orgLanguages: OrgLanguages,
+    activeLanguageName: string | undefined,
+    languageDocument: string | undefined,
     audioContext: AudioContext,
     attachmentsContext: AttachmentsContext,
     workerOrigin: string,
     logger: RequestLogger,
     callbacks?: StreamCallbacks,
-    groupContext?: GroupChatContext,
-    languageDocument?: string
+    groupContext?: GroupChatContext
   ): Parameters<typeof orchestrate>[1] {
+    const isAdmin = isAdminClient(body.client_id);
     return {
       env: this.env,
       catalog,
@@ -1421,14 +1367,15 @@ export class UserDO {
       resolvedPromptValues,
       memoryStore,
       memoryTOC: formattedTOC || undefined,
-      modeContext: this.buildModeContext(orgModes, activeModeName, isAdminClient(body.client_id)),
+      modeContext: this.buildModeContext(orgModes, activeModeName, isAdmin),
+      languageContext: this.buildLanguageContext(orgLanguages, activeLanguageName, isAdmin),
+      languageDocument,
       audioContext,
       attachmentsContext,
       workerOrigin,
       clientId: body.client_id,
       groupContext,
       isVoiceMessage: body.message_type === 'audio',
-      languageDocument,
       logger,
       callbacks,
     };
@@ -1502,7 +1449,53 @@ export class UserDO {
     };
   }
 
-  // ── Preferences / history / overrides / mode / memory handlers ────────────────
+  private buildLanguageContext(
+    orgLanguages: OrgLanguages,
+    activeLanguageName: string | undefined,
+    isAdmin: boolean
+  ): LanguageContext {
+    const visible = isAdmin
+      ? orgLanguages.languages
+      : orgLanguages.languages.filter((l) => l.published === true);
+    return {
+      availableLanguages: visible,
+      activeLanguageName,
+      setSelectedLanguage: async (name: string | null) => {
+        if (name === null) {
+          await this.state.storage.delete(SELECTED_LANGUAGE_KEY);
+        } else {
+          await this.state.storage.put(SELECTED_LANGUAGE_KEY, name);
+        }
+      },
+    };
+  }
+
+  /** Resolve the active language and its document from DO storage + org languages. */
+  private async resolveLanguage(
+    orgLanguages: OrgLanguages,
+    isAdmin: boolean,
+    logger: RequestLogger
+  ): Promise<{ activeLanguageName: string | undefined; languageDocument: string | undefined }> {
+    const selectedName = await this.getSelectedLanguage();
+    if (!selectedName) return { activeLanguageName: undefined, languageDocument: undefined };
+
+    const lang = orgLanguages.languages.find((l) => l.name === selectedName);
+    if (!lang) {
+      logger.warn('language_not_found', { selected_language: selectedName, reason: 'missing' });
+      return { activeLanguageName: undefined, languageDocument: undefined };
+    }
+    if (lang.published !== true && !isAdmin) {
+      logger.warn('language_not_found', { selected_language: selectedName, reason: 'unpublished' });
+      return { activeLanguageName: undefined, languageDocument: undefined };
+    }
+    return { activeLanguageName: selectedName, languageDocument: lang.document };
+  }
+
+  private async getSelectedLanguage(): Promise<string | undefined> {
+    return this.state.storage.get<string>(SELECTED_LANGUAGE_KEY);
+  }
+
+  // ── Preferences / history / overrides / mode / language / memory handlers ─────
 
   private async handleGetPreferences(): Promise<Response> {
     return withEndpointLogging(this.getLogger(), 'get_preferences', async () => {
@@ -1679,6 +1672,32 @@ export class UserDO {
     return withEndpointLogging(this.getLogger(), 'delete_mode', async () => {
       await this.state.storage.delete(SELECTED_MODE_KEY);
       return Response.json({ mode: null, message: 'User mode cleared' });
+    });
+  }
+
+  private async handleGetLanguage(): Promise<Response> {
+    return withEndpointLogging(this.getLogger(), 'get_language', async () => {
+      const language = await this.getSelectedLanguage();
+      return Response.json({ language: language ?? null });
+    });
+  }
+
+  private async handleSetLanguage(request: Request): Promise<Response> {
+    return withEndpointLogging(this.getLogger(), 'set_language', async () => {
+      const body = (await request.json()) as Record<string, unknown>;
+      const nameError = validateLanguageName(body.language);
+      if (nameError) {
+        return Response.json({ error: nameError }, { status: 400 });
+      }
+      await this.state.storage.put(SELECTED_LANGUAGE_KEY, body.language as string);
+      return Response.json({ language: body.language, message: 'User language updated' });
+    });
+  }
+
+  private async handleDeleteLanguage(): Promise<Response> {
+    return withEndpointLogging(this.getLogger(), 'delete_language', async () => {
+      await this.state.storage.delete(SELECTED_LANGUAGE_KEY);
+      return Response.json({ language: null, message: 'User language cleared' });
     });
   }
 
