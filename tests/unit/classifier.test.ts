@@ -38,7 +38,9 @@ function buildCtx(overrides?: Partial<ClassifierContext>): ClassifierContext {
 /** Build a mock Anthropic Messages API response with the given JSON content. */
 function mockApiResponse(json: {
   mode: string | null;
+  mode_raw?: string | null;
   language: string | null;
+  language_raw?: string | null;
   stripped_message: string;
 }): Response {
   return new Response(
@@ -150,7 +152,7 @@ describe('classifyTriggers - unknown token fallback', () => {
     fetchSpy.mockRestore();
   });
 
-  it('returns warning when mode is not recognized', async () => {
+  it('returns warning when mode is not recognized (LLM returns non-null match attempt)', async () => {
     fetchSpy.mockResolvedValueOnce(
       mockApiResponse({ mode: 'nonexistent', language: null, stripped_message: 'hello' })
     );
@@ -163,9 +165,32 @@ describe('classifyTriggers - unknown token fallback', () => {
     expect(result.warnings[0]).toContain('#nonexistent');
   });
 
+  it('returns warning when mode token detected but LLM returns null match', async () => {
+    fetchSpy.mockResolvedValueOnce(
+      mockApiResponse({
+        mode: null,
+        mode_raw: 'spokne',
+        language: null,
+        stripped_message: 'hello',
+      })
+    );
+
+    const result = await classifyTriggers('#spokne hello', buildCtx());
+
+    expect(result.modeName).toBeUndefined();
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings[0]).toContain('not recognized');
+    expect(result.warnings[0]).toContain('#spokne');
+  });
+
   it('returns warning when language is not recognized', async () => {
     fetchSpy.mockResolvedValueOnce(
-      mockApiResponse({ mode: null, language: 'klingon', stripped_message: 'hello' })
+      mockApiResponse({
+        mode: null,
+        language: null,
+        language_raw: 'klingon',
+        stripped_message: 'hello',
+      })
     );
 
     const result = await classifyTriggers('@klingon hello', buildCtx());

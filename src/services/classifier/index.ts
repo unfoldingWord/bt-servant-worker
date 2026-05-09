@@ -67,13 +67,13 @@ Rules:
 - When both are present, they can appear in either order.
 - Tokens are case-insensitive. Fuzzy-match against the available options (e.g. "#mast" matches "mast-methodology", "@arab" matches "arabic").
 - After extracting tokens, return the remaining message with the trigger tokens stripped and leading whitespace trimmed.
-- If a token is present but does not fuzzy-match any available option, return null for that field.
+- If a token is present but does not fuzzy-match any available option, set the matched field to null but still report the raw token text in the corresponding _raw field.
 
 Available modes: ${modesList || '(none)'}
 Available languages: ${langsList || '(none)'}
 
 Respond ONLY with a JSON object (no markdown fences, no explanation):
-{"mode": "<matched mode name or null>", "language": "<matched language name or null>", "stripped_message": "<message with trigger tokens removed, trimmed>"}`;
+{"mode": "<matched mode name or null>", "mode_raw": "<raw token text without # or null>", "language": "<matched language name or null>", "language_raw": "<raw token text without @ or null>", "stripped_message": "<message with trigger tokens removed, trimmed>"}`;
 }
 
 // ─── Pre-filter ─────────────────────────────────────────────────────────────
@@ -91,7 +91,9 @@ function hasTriggerPrefix(message: string): boolean {
 
 interface RawClassifierResponse {
   mode: string | null;
+  mode_raw: string | null;
   language: string | null;
+  language_raw: string | null;
   stripped_message: string;
 }
 
@@ -105,7 +107,9 @@ function parseClassifierResponse(text: string): RawClassifierResponse | null {
 
     return {
       mode: typeof obj.mode === 'string' ? obj.mode : null,
+      mode_raw: typeof obj.mode_raw === 'string' ? obj.mode_raw : null,
       language: typeof obj.language === 'string' ? obj.language : null,
+      language_raw: typeof obj.language_raw === 'string' ? obj.language_raw : null,
       stripped_message: obj.stripped_message,
     };
   } catch {
@@ -163,6 +167,9 @@ function validateClassifierMatches(
     } else {
       warnings.push(`Mode '#${parsed.mode}' was not recognized. Using your default mode.`);
     }
+  } else if (parsed.mode_raw) {
+    // LLM detected a #token but couldn't match it — warn the user
+    warnings.push(`Mode '#${parsed.mode_raw}' was not recognized. Using your default mode.`);
   }
 
   if (parsed.language) {
@@ -174,6 +181,11 @@ function validateClassifierMatches(
         `Language '@${parsed.language}' was not recognized. No language guidance applied.`
       );
     }
+  } else if (parsed.language_raw) {
+    // LLM detected an @token but couldn't match it — warn the user
+    warnings.push(
+      `Language '@${parsed.language_raw}' was not recognized. No language guidance applied.`
+    );
   }
 
   return { modeName, languageName, warnings };
