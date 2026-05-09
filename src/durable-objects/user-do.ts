@@ -929,8 +929,8 @@ export class UserDO {
 
     const loaded = await this.loadChatContext(body, ctx, callbacks);
 
-    // Classify trigger tokens and resolve per-turn mode/language overrides
-    const triggerCtx = await this.classifyAndResolveTriggers(body, loaded, ctx, logger);
+    // Extract #mode/@language trigger tokens and resolve per-turn overrides
+    const triggerCtx = await this.classifyAndResolveTriggers(body, loaded, logger);
 
     // ── Build orchestrator options ────────────────────────────────────────────
     const effectivePreferences = body.response_language_hint
@@ -964,33 +964,24 @@ export class UserDO {
   }
 
   /**
-   * Run the trigger classifier and resolve per-turn mode/language overrides.
+   * Extract trigger tokens and resolve per-turn mode/language overrides.
    * Extracted from processChat to keep each method within lint complexity limits.
    */
   private async classifyAndResolveTriggers(
     body: ChatRequest,
     loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
-    ctx: { timing: TimingContext; logger: RequestLogger; startTime: number },
     logger: RequestLogger
   ) {
-    const classified = await this.tracedPhase(ctx, 'classify_triggers', () =>
-      classifyTriggers(loaded.messageText, {
-        apiKey: this.env.ANTHROPIC_API_KEY,
-        availableModes: loaded.orgModes.modes
-          .filter((m) => loaded.isAdmin || m.published === true)
-          .map((m) => ({ name: m.name, label: m.label })),
-        availableLanguages: loaded.orgLanguages.languages
-          .filter((l) => loaded.isAdmin || l.published === true)
-          .map((l) => ({ name: l.name, label: l.label })),
-        logger,
-      })
-    );
+    const classified = classifyTriggers(loaded.messageText, {
+      availableModes: loaded.orgModes.modes.filter((m) => loaded.isAdmin || m.published === true),
+      availableLanguages: loaded.orgLanguages.languages.filter(
+        (l) => loaded.isAdmin || l.published === true
+      ),
+    });
 
     const result = await this.applyTriggerOverrides(body, loaded, classified);
 
-    logger.log('trigger_classifier_result', {
-      classifier_ran: classified.classifierRan,
-      classifier_latency_ms: classified.classifierLatencyMs ?? null,
+    logger.log('trigger_tokens_resolved', {
       requested_mode: classified.modeName ?? null,
       requested_language: classified.languageName ?? null,
       effective_mode: result.activeModeName ?? null,
