@@ -964,7 +964,7 @@ export class UserDO {
   }
 
   /**
-   * Extract trigger tokens and resolve per-turn mode/language overrides.
+   * Run the trigger classifier and resolve per-turn mode/language overrides.
    * Extracted from processChat to keep each method within lint complexity limits.
    */
   private async classifyAndResolveTriggers(
@@ -972,16 +972,22 @@ export class UserDO {
     loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
     logger: RequestLogger
   ) {
-    const classified = classifyTriggers(loaded.messageText, {
-      availableModes: loaded.orgModes.modes.filter((m) => loaded.isAdmin || m.published === true),
-      availableLanguages: loaded.orgLanguages.languages.filter(
-        (l) => loaded.isAdmin || l.published === true
-      ),
+    const classified = await classifyTriggers(loaded.messageText, {
+      apiKey: this.env.ANTHROPIC_API_KEY,
+      availableModes: loaded.orgModes.modes
+        .filter((m) => loaded.isAdmin || m.published === true)
+        .map((m) => ({ name: m.name, label: m.label })),
+      availableLanguages: loaded.orgLanguages.languages
+        .filter((l) => loaded.isAdmin || l.published === true)
+        .map((l) => ({ name: l.name, label: l.label })),
+      logger,
     });
 
     const result = await this.applyTriggerOverrides(body, loaded, classified);
 
-    logger.log('trigger_tokens_resolved', {
+    logger.log('trigger_classifier_result', {
+      classifier_ran: classified.classifierRan,
+      classifier_latency_ms: classified.classifierLatencyMs ?? null,
       requested_mode: classified.modeName ?? null,
       requested_language: classified.languageName ?? null,
       effective_mode: result.activeModeName ?? null,
