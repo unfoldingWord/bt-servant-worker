@@ -40,6 +40,39 @@ const CLASSIFIER_MAX_TOKENS = 256;
 const CLASSIFIER_TIMEOUT_MS = 5_000;
 const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_API_VERSION = '2023-06-01';
+const CLASSIFIER_TOOL_NAME = 'extract_triggers';
+
+const CLASSIFIER_TOOL_SCHEMA = {
+  type: 'object' as const,
+  properties: {
+    mode: {
+      type: 'string',
+      description:
+        'Matched mode slug from the available list. Omit if no #token is present at the start of the message, or if the #token does not fuzzy-match any available mode.',
+    },
+    mode_raw: {
+      type: 'string',
+      description:
+        'Raw #token text with the leading # removed. Omit if no #token is present at the start of the message.',
+    },
+    language: {
+      type: 'string',
+      description:
+        'Matched language slug from the available list. Omit if no @token is present at the start of the message, or if the @token does not fuzzy-match any available language.',
+    },
+    language_raw: {
+      type: 'string',
+      description:
+        'Raw @token text with the leading @ removed. Omit if no @token is present at the start of the message.',
+    },
+    stripped_message: {
+      type: 'string',
+      description:
+        'The message with any leading #/@ trigger tokens removed and leading whitespace trimmed. If no triggers are present, return the original message unchanged.',
+    },
+  },
+  required: ['stripped_message'],
+};
 
 /**
  * Number of leading characters to scan for trigger-like tokens.
@@ -72,8 +105,7 @@ Rules:
 Available modes: ${modesList || '(none)'}
 Available languages: ${langsList || '(none)'}
 
-Respond ONLY with a JSON object (no markdown fences, no explanation):
-{"mode": "<matched mode name or null>", "mode_raw": "<raw token text without # or null>", "language": "<matched language name or null>", "language_raw": "<raw token text without @ or null>", "stripped_message": "<message with trigger tokens removed, trimmed>"}`;
+Use the ${CLASSIFIER_TOOL_NAME} tool to report your findings. Omit any field that is not applicable; only stripped_message is always required.`;
 }
 
 // ─── Local token stripping ──────────────────────────────────────────────────
@@ -115,26 +147,6 @@ interface RawClassifierResponse {
   stripped_message: string;
 }
 
-function parseClassifierResponse(text: string): RawClassifierResponse | null {
-  try {
-    const parsed: unknown = JSON.parse(text);
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
-
-    const obj = parsed as Record<string, unknown>;
-    if (typeof obj.stripped_message !== 'string') return null;
-
-    return {
-      mode: typeof obj.mode === 'string' ? obj.mode : null,
-      mode_raw: typeof obj.mode_raw === 'string' ? obj.mode_raw : null,
-      language: typeof obj.language === 'string' ? obj.language : null,
-      language_raw: typeof obj.language_raw === 'string' ? obj.language_raw : null,
-      stripped_message: obj.stripped_message,
-    };
-  } catch {
-    return null;
-  }
-}
-
 // ─── API call ───────────────────────────────────────────────────────────────
 
 async function callClassifierAPI(
@@ -147,6 +159,15 @@ async function callClassifierAPI(
     max_tokens: CLASSIFIER_MAX_TOKENS,
     system: systemPrompt,
     messages: [{ role: 'user', content: messageText }],
+    tools: [
+      {
+        name: CLASSIFIER_TOOL_NAME,
+        description:
+          'Report extracted #mode and @language trigger tokens from the start of a user message.',
+        input_schema: CLASSIFIER_TOOL_SCHEMA,
+      },
+    ],
+    tool_choice: { type: 'tool', name: CLASSIFIER_TOOL_NAME },
   });
 
   const controller = new AbortController();
@@ -211,26 +232,50 @@ function validateClassifierMatches(
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-/**
- * Extract text content from an Anthropic Messages API response.
- * Returns the first text block's content, or null if none found.
- */
-function extractTextContent(apiResponse: unknown): string | null {
-  if (typeof apiResponse !== 'object' || apiResponse === null) return null;
-  const resp = apiResponse as Record<string, unknown>;
-  if (!Array.isArray(resp.content)) return null;
+/** True when the value is a non-null, non-array object (a record). */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
 
-  for (const block of resp.content) {
-    if (
-      typeof block === 'object' &&
-      block !== null &&
-      (block as Record<string, unknown>).type === 'text' &&
-      typeof (block as Record<string, unknown>).text === 'string'
-    ) {
-      return (block as Record<string, unknown>).text as string;
-    }
+/**
+ * Locate the classifier tool_use block in an Anthropic Messages API response.
+ * Returns the raw `input` record if found, otherwise null.
+ */
+function findClassifierToolBlock(apiResponse: unknown): Record<string, unknown> | null {
+  if (!isRecord(apiResponse) || !Array.isArray(apiResponse.content)) return null;
+
+  for (const block of apiResponse.content) {
+    if (!isRecord(block)) continue;
+    if (block.type !== 'tool_use' || block.name !== CLASSIFIER_TOOL_NAME) continue;
+    return isRecord(block.input) ? block.input : null;
   }
   return null;
+}
+
+/**
+ * Coerce a verified tool_use input record into a RawClassifierResponse.
+ * Returns null when stripped_message is missing or non-string.
+ */
+function coerceClassifierInput(input: Record<string, unknown>): RawClassifierResponse | null {
+  if (typeof input.stripped_message !== 'string') return null;
+  return {
+    mode: typeof input.mode === 'string' ? input.mode : null,
+    mode_raw: typeof input.mode_raw === 'string' ? input.mode_raw : null,
+    language: typeof input.language === 'string' ? input.language : null,
+    language_raw: typeof input.language_raw === 'string' ? input.language_raw : null,
+    stripped_message: input.stripped_message,
+  };
+}
+
+/**
+ * Extract the classifier tool_use input from an Anthropic Messages API response.
+ * Returns null if no matching tool_use block is present or its input is not the
+ * shape we expect.
+ */
+function extractToolUseInput(apiResponse: unknown): RawClassifierResponse | null {
+  const input = findClassifierToolBlock(apiResponse);
+  if (!input) return null;
+  return coerceClassifierInput(input);
 }
 
 /** Build a no-op result that passes the original message through unchanged. */
@@ -306,16 +351,11 @@ export async function classifyTriggers(
       return fallbackResult(messageText, latencyMs);
     }
 
-    const content = extractTextContent(await response.json());
-    if (!content) {
-      ctx.logger.warn('classifier_empty_response', { latency_ms: latencyMs });
-      return fallbackResult(messageText, latencyMs);
-    }
-
-    const parsed = parseClassifierResponse(content);
+    const apiResponse: unknown = await response.json();
+    const parsed = extractToolUseInput(apiResponse);
     if (!parsed) {
-      ctx.logger.warn('classifier_parse_failed', {
-        raw_content: content.slice(0, 300),
+      ctx.logger.warn('classifier_tool_use_missing', {
+        response_preview: JSON.stringify(apiResponse).slice(0, 300),
         latency_ms: latencyMs,
       });
       return fallbackResult(messageText, latencyMs);

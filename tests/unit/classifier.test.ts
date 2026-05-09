@@ -35,17 +35,36 @@ function buildCtx(overrides?: Partial<ClassifierContext>): ClassifierContext {
   };
 }
 
-/** Build a mock Anthropic Messages API response with the given JSON content. */
-function mockApiResponse(json: {
-  mode: string | null;
+/**
+ * Build a mock Anthropic Messages API response with a tool_use block matching
+ * the classifier's structured output schema.
+ */
+function mockApiResponse(input: {
+  mode?: string | null;
   mode_raw?: string | null;
-  language: string | null;
+  language?: string | null;
   language_raw?: string | null;
   stripped_message: string;
 }): Response {
+  // Strip null fields — the tool_use schema has them as optional, so the model
+  // would omit them rather than send literal null. Mirroring that here keeps
+  // tests faithful to real API shape.
+  const toolInput: Record<string, string> = { stripped_message: input.stripped_message };
+  if (typeof input.mode === 'string') toolInput.mode = input.mode;
+  if (typeof input.mode_raw === 'string') toolInput.mode_raw = input.mode_raw;
+  if (typeof input.language === 'string') toolInput.language = input.language;
+  if (typeof input.language_raw === 'string') toolInput.language_raw = input.language_raw;
+
   return new Response(
     JSON.stringify({
-      content: [{ type: 'text', text: JSON.stringify(json) }],
+      content: [
+        {
+          type: 'tool_use',
+          id: 'toolu_test',
+          name: 'extract_triggers',
+          input: toolInput,
+        },
+      ],
     }),
     { status: 200, headers: { 'content-type': 'application/json' } }
   );
@@ -249,11 +268,12 @@ describe('classifyTriggers - response parsing errors', () => {
     fetchSpy.mockRestore();
   });
 
-  it('degrades gracefully on malformed LLM response', async () => {
+  it('degrades gracefully when response has no tool_use block', async () => {
     fetchSpy.mockResolvedValueOnce(
-      new Response(JSON.stringify({ content: [{ type: 'text', text: 'not valid json' }] }), {
-        status: 200,
-      })
+      new Response(
+        JSON.stringify({ content: [{ type: 'text', text: 'I cannot use the tool right now.' }] }),
+        { status: 200 }
+      )
     );
 
     const ctx = buildCtx();
@@ -264,11 +284,21 @@ describe('classifyTriggers - response parsing errors', () => {
     expect(ctx.logger.warn).toHaveBeenCalled();
   });
 
-  it('degrades gracefully on missing stripped_message in response', async () => {
+  it('degrades gracefully when tool_use input is missing stripped_message', async () => {
     fetchSpy.mockResolvedValueOnce(
-      new Response(JSON.stringify({ content: [{ type: 'text', text: '{"mode":"spoken"}' }] }), {
-        status: 200,
-      })
+      new Response(
+        JSON.stringify({
+          content: [
+            {
+              type: 'tool_use',
+              id: 'toolu_test',
+              name: 'extract_triggers',
+              input: { mode: 'spoken' },
+            },
+          ],
+        }),
+        { status: 200 }
+      )
     );
 
     const ctx = buildCtx();
