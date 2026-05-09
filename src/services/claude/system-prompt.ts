@@ -26,6 +26,8 @@ interface SystemPromptOptions {
   clientId?: string | undefined;
   groupContext?: GroupChatContext | undefined;
   isVoiceMessage?: boolean | undefined;
+  /** Per-turn language document to inject into the system prompt */
+  languageDocument?: string | undefined;
 }
 
 /** Max length for speaker names (prevents prompt bloat). */
@@ -182,12 +184,20 @@ function buildConditionalSections(
   return sections;
 }
 
+/** Inject the per-turn language guidance section if a language document is active. */
+function pushLanguageSection(sections: string[], languageDocument: string | undefined): void {
+  if (languageDocument) {
+    sections.push(`## Language Guidance\n\n${languageDocument}`);
+  }
+}
+
 /**
  * Build the full system prompt with tool catalog and user context.
  *
  * Assembly order:
  *   [identity] → [methodology] → [tool_guidance] → [tool catalog] →
  *   [instructions] → [client_instructions] → [group context] →
+ *   [language guidance] →
  *   [memory_instructions + TOC] → [audio guidance] → [voice guidance] →
  *   [user preferences] → [conversation context] → [first interaction] →
  *   [media formatting rules (non-overridable, text mode only)] → [closing]
@@ -211,6 +221,8 @@ export function buildSystemPrompt(
 
   const groupSection = buildGroupSection(groupContext);
   if (groupSection) sections.push(groupSection);
+
+  pushLanguageSection(sections, options?.languageDocument);
 
   sections.push(resolvedPromptValues.memory_instructions);
   if (memoryTOC) sections.push(memoryTOC);

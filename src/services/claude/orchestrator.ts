@@ -176,6 +176,8 @@ interface OrchestratorOptions {
   clientId?: string | undefined;
   groupContext?: GroupChatContext | undefined;
   isVoiceMessage?: boolean | undefined;
+  /** Per-turn language document to inject into the system prompt */
+  languageDocument?: string | undefined;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
 }
@@ -880,12 +882,8 @@ function createOrchestrationContext(
     apiKey: env.ANTHROPIC_API_KEY,
     model: config.model,
     maxTokens: config.maxTokens,
-    systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues, {
-      memoryTOC: options.memoryTOC,
-      clientId: options.clientId,
-      groupContext: options.groupContext,
-      isVoiceMessage: options.isVoiceMessage,
-    }),
+    // prettier-ignore
+    systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument: options.languageDocument }),
     tools: buildAllTools(catalog, {
       hasModes: (options.modeContext?.availableModes.length ?? 0) > 0,
     }),

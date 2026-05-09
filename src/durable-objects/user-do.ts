@@ -65,7 +65,9 @@ import { AppError, AudioTranscriptionError, ValidationError } from '../utils/err
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
 import { applyTemplateVariables } from '../utils/template.js';
 import { createTimingContext, timePhase, TimingContext } from '../utils/timing.js';
+import { classifyTriggers, ClassifierResult } from '../services/classifier/index.js';
 import { isAdminClient, validateChatBody } from '../utils/chat-validation.js';
+import { OrgLanguages } from '../types/languages.js';
 import { InternalQueueEntry } from '../types/queue.js';
 
 // ── Storage keys ───────────────────────────────────────────────────────────────
@@ -76,6 +78,14 @@ const SELECTED_MODE_KEY = 'selected_mode';
 const PROCESSING_LOCK_KEY = '_processing_lock';
 const QUEUE_KEY = 'queue';
 const QUEUE_PROCESSING_KEY = 'queue_processing';
+
+/** Prepend soft warnings for unrecognized trigger tokens to the first response. */
+function prependTriggerWarnings(responses: string[], warnings: string[]): void {
+  if (warnings.length > 0 && responses.length > 0) {
+    const warningText = warnings.map((w) => `_${w}_`).join('\n');
+    responses[0] = `${warningText}\n\n${responses[0]}`;
+  }
+}
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 const LOCK_STALE_THRESHOLD_MS = 90_000; // 90 seconds
@@ -918,6 +928,11 @@ export class UserDO {
     logger.log('process_chat_start', { message_type: body.message_type, has_audio: !!body.audio_base64, has_callbacks: !!callbacks, chat_type: body.chat_type ?? 'private' });
 
     const loaded = await this.loadChatContext(body, ctx, callbacks);
+
+    // Classify trigger tokens and resolve per-turn mode/language overrides
+    const triggerCtx = await this.classifyAndResolveTriggers(body, loaded, ctx, logger);
+
+    // ── Build orchestrator options ────────────────────────────────────────────
     const effectivePreferences = body.response_language_hint
       ? { ...loaded.preferences, response_language: body.response_language_hint }
       : loaded.preferences;
@@ -926,12 +941,12 @@ export class UserDO {
     const audioContext = this.buildAudioContext();
     const attachmentsContext = createAttachmentsContext();
     // prettier-ignore
-    const orchOpts = this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, loaded.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, loaded.activeModeName, audioContext, attachmentsContext, workerOrigin, logger, callbacks, groupContext);
+    const orchOpts = this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, triggerCtx.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, triggerCtx.activeModeName, audioContext, attachmentsContext, workerOrigin, logger, callbacks, groupContext, triggerCtx.languageDocument);
 
     const orchResult = await this.tracedPhase(ctx, 'orchestration', () =>
-      this.runOrchestration(loaded.messageText, orchOpts)
+      this.runOrchestration(triggerCtx.messageText, orchOpts)
     );
-    const { responses } = orchResult;
+    prependTriggerWarnings(orchResult.responses, triggerCtx.warnings);
     const ttsResponses = this.extractTtsResponses(orchResult, logger);
 
     const voiceAudio = await this.tracedPhase(ctx, 'audio_generation', () =>
@@ -939,30 +954,84 @@ export class UserDO {
     );
     const audioKey = voiceAudio?.audioKey ?? null;
 
+    // prettier-ignore
     await this.tracedPhase(ctx, 'save_conversation', () =>
-      this.saveConversation(
-        loaded.messageText,
-        responses,
-        loaded.preferences,
-        body._org_config ?? {},
-        {
-          logger,
-          audioKey,
-          speaker: body.speaker,
-          attachments: attachmentsContext.list(),
-        }
-      )
+      this.saveConversation(triggerCtx.messageText, orchResult.responses, loaded.preferences, body._org_config ?? {}, { logger, audioKey, speaker: body.speaker, attachments: attachmentsContext.list() })
     );
 
-    return this.assembleChatResponse({
-      responses,
-      audioKey,
-      workerOrigin,
-      attachmentsContext,
-      effectivePreferences,
-      logger,
-      startTime: ctx.startTime,
+    // prettier-ignore
+    return this.assembleChatResponse({ responses: orchResult.responses, audioKey, workerOrigin, attachmentsContext, effectivePreferences, logger, startTime: ctx.startTime });
+  }
+
+  /**
+   * Run the trigger classifier and resolve per-turn mode/language overrides.
+   * Extracted from processChat to keep each method within lint complexity limits.
+   */
+  private async classifyAndResolveTriggers(
+    body: ChatRequest,
+    loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
+    ctx: { timing: TimingContext; logger: RequestLogger; startTime: number },
+    logger: RequestLogger
+  ) {
+    const classified = await this.tracedPhase(ctx, 'classify_triggers', () =>
+      classifyTriggers(loaded.messageText, {
+        apiKey: this.env.ANTHROPIC_API_KEY,
+        availableModes: loaded.orgModes.modes
+          .filter((m) => loaded.isAdmin || m.published === true)
+          .map((m) => ({ name: m.name, label: m.label })),
+        availableLanguages: loaded.orgLanguages.languages
+          .filter((l) => loaded.isAdmin || l.published === true)
+          .map((l) => ({ name: l.name, label: l.label })),
+        logger,
+      })
+    );
+
+    const result = await this.applyTriggerOverrides(body, loaded, classified);
+
+    logger.log('trigger_classifier_result', {
+      classifier_ran: classified.classifierRan,
+      classifier_latency_ms: classified.classifierLatencyMs ?? null,
+      requested_mode: classified.modeName ?? null,
+      requested_language: classified.languageName ?? null,
+      effective_mode: result.activeModeName ?? null,
+      language_document_injected: !!result.languageDocument,
+      warnings: classified.warnings,
+      message_stripped: classified.strippedMessage !== loaded.messageText,
     });
+
+    return { ...result, messageText: classified.strippedMessage, warnings: classified.warnings };
+  }
+
+  /** Apply classifier results: resolve per-turn mode override and language document. */
+  private async applyTriggerOverrides(
+    body: ChatRequest,
+    loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
+    classified: ClassifierResult
+  ) {
+    let resolved = loaded.resolved;
+    let activeModeName = loaded.activeModeName;
+
+    if (classified.modeName && classified.modeName !== loaded.activeModeName) {
+      const mode = resolveEffectiveMode(loaded.orgModes, classified.modeName, {
+        includeUnpublished: loaded.isAdmin,
+      });
+      if (mode.effectiveModeName) {
+        activeModeName = mode.effectiveModeName;
+        const orgOverrides = body._org_prompt_overrides ?? {};
+        const userOverrides = await this.getPromptOverrides();
+        resolved = applyTemplateVariables(
+          resolvePromptOverrides(orgOverrides, mode.modeOverrides, userOverrides)
+        );
+      }
+    }
+
+    let languageDocument: string | undefined;
+    if (classified.languageName) {
+      const lang = loaded.orgLanguages.languages.find((l) => l.name === classified.languageName);
+      if (lang) languageDocument = lang.document;
+    }
+
+    return { resolved, activeModeName, languageDocument };
   }
 
   /** Load all context needed for orchestration. */
@@ -981,7 +1050,7 @@ export class UserDO {
     const catalog = await this.tracedPhase(ctx, 'mcp_discovery', () =>
       this.discoverMCPTools(body._mcp_servers ?? [], logger)
     );
-    const { resolved, orgModes, activeModeName } = await this.tracedPhase(
+    const { resolved, orgModes, activeModeName, isAdmin } = await this.tracedPhase(
       ctx,
       'resolve_prompts',
       () => this.resolvePrompts(body, logger)
@@ -989,6 +1058,7 @@ export class UserDO {
     const { memoryStore, formattedTOC } = await this.tracedPhase(ctx, 'load_memory', () =>
       this.loadMemoryContext(logger)
     );
+    const orgLanguages: OrgLanguages = body._org_languages ?? { languages: [] };
     return {
       messageText,
       preferences,
@@ -997,6 +1067,8 @@ export class UserDO {
       resolved,
       orgModes,
       activeModeName,
+      isAdmin,
+      orgLanguages,
       memoryStore,
       formattedTOC,
     };
@@ -1334,7 +1406,8 @@ export class UserDO {
     workerOrigin: string,
     logger: RequestLogger,
     callbacks?: StreamCallbacks,
-    groupContext?: GroupChatContext
+    groupContext?: GroupChatContext,
+    languageDocument?: string
   ): Parameters<typeof orchestrate>[1] {
     return {
       env: this.env,
@@ -1355,6 +1428,7 @@ export class UserDO {
       clientId: body.client_id,
       groupContext,
       isVoiceMessage: body.message_type === 'audio',
+      languageDocument,
       logger,
       callbacks,
     };
