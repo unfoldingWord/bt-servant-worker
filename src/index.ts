@@ -740,18 +740,19 @@ app.delete('/api/v1/admin/orgs/:org/languages/:languageName', async (c) => {
     };
 
     const filtered = orgLanguages.languages.filter((l) => l.name !== languageName);
-    if (filtered.length === orgLanguages.languages.length) {
-      return c.json({ error: `Language '${languageName}' not found` }, 404);
+    const removed = filtered.length !== orgLanguages.languages.length;
+
+    if (removed) {
+      orgLanguages.languages = filtered;
+      await c.env.PROMPT_OVERRIDES.put(`${org}:languages`, JSON.stringify(orgLanguages));
     }
 
-    orgLanguages.languages = filtered;
-
-    await c.env.PROMPT_OVERRIDES.put(`${org}:languages`, JSON.stringify(orgLanguages));
     logger.log('admin_action', {
       action: 'delete_language',
       org,
       language_name: languageName,
       language_count: orgLanguages.languages.length,
+      already_absent: !removed,
     });
     return c.json({ org, languages: orgLanguages.languages, message: 'Language deleted' });
   } catch (error) {
