@@ -53,6 +53,19 @@ export interface OrgLanguages {
   languages: Language[];
 }
 
+/**
+ * Language context passed to the orchestrator for list_languages / switch_language tools.
+ * Mirrors `ModeContext` from prompt-overrides.ts.
+ */
+export interface LanguageContext {
+  /** All languages available for this org (filtered by publish status for non-admins) */
+  availableLanguages: Language[];
+  /** Currently active language name (if any) */
+  activeLanguageName: string | undefined;
+  /** Callback to persist the user's language selection */
+  setSelectedLanguage: (name: string | null) => Promise<void>;
+}
+
 // ─── Validation ───────────────────────────────────────────────────────────────
 
 /**

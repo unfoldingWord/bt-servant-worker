@@ -13,6 +13,7 @@ import { Env } from '../../config/types.js';
 import { AudioContext } from '../audio/index.js';
 import { ChatHistoryEntry, StreamCallbacks } from '../../types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig } from '../../types/org-config.js';
+import { LanguageContext } from '../../types/languages.js';
 import { DEFAULT_PROMPT_VALUES, ModeContext, PromptSlot } from '../../types/prompt-overrides.js';
 import {
   AppError,
@@ -51,6 +52,7 @@ import {
   buildAllTools,
   getToolDefinitions,
   isReadMemoryInput,
+  isSwitchLanguageInput,
   isSwitchModeInput,
   isUpdateMemoryInput,
 } from './tools.js';
@@ -169,6 +171,7 @@ interface OrchestratorOptions {
   memoryStore?: UserMemoryStore | undefined;
   memoryTOC?: string | undefined;
   modeContext?: ModeContext | undefined;
+  languageContext?: LanguageContext | undefined;
   audioContext?: AudioContext | undefined;
   attachmentsContext?: AttachmentsContext | undefined;
   /** Public worker origin (e.g. https://bt-servant-worker-staging.example.workers.dev). Used to build public URLs for ptxprint artifacts. */
@@ -267,6 +270,7 @@ interface OrchestrationContext {
   healthTracker: HealthTracker;
   memoryStore: UserMemoryStore | undefined;
   modeContext: ModeContext | undefined;
+  languageContext: LanguageContext | undefined;
   audioContext: AudioContext | undefined;
   attachmentsContext: AttachmentsContext | undefined;
   workerOrigin: string;
@@ -866,16 +870,25 @@ function parseEnvConfig(env: Env, logger: RequestLogger) {
   };
 }
 
+function buildToolOpts(options: OrchestratorOptions) {
+  return {
+    hasModes: (options.modeContext?.availableModes.length ?? 0) > 0,
+    hasLanguages: (options.languageContext?.availableLanguages.length ?? 0) > 0,
+  };
+}
+
 function createOrchestrationContext(
   userMessage: string,
   options: OrchestratorOptions,
   config: ReturnType<typeof parseEnvConfig>
 ): OrchestrationContext {
-  const { env, catalog, history, preferences, orgConfig, logger, callbacks } = options;
+  const { env, catalog, history, preferences, logger, callbacks } = options;
   const promptValues = options.resolvedPromptValues ?? DEFAULT_PROMPT_VALUES;
-
-  // Use LLM limit from org config (default: 5)
-  const llmMax = orgConfig?.max_history_llm ?? DEFAULT_ORG_CONFIG.max_history_llm;
+  const llmMax = options.orgConfig?.max_history_llm ?? DEFAULT_ORG_CONFIG.max_history_llm;
+  const speaker = options.groupContext?.currentSpeaker;
+  const userContent = speaker ? `[${sanitizeSpeaker(speaker)}]: ${userMessage}` : userMessage;
+  const workerOrigin = options.workerOrigin ?? '';
+  const toolOpts = buildToolOpts(options);
 
   return {
     client: new Anthropic({ apiKey: env.ANTHROPIC_API_KEY }),
@@ -884,18 +897,8 @@ function createOrchestrationContext(
     maxTokens: config.maxTokens,
     // prettier-ignore
     systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument: options.languageDocument }),
-    tools: buildAllTools(catalog, {
-      hasModes: (options.modeContext?.availableModes.length ?? 0) > 0,
-    }),
-    messages: [
-      ...historyToMessages(history, llmMax),
-      {
-        role: 'user',
-        content: options.groupContext?.currentSpeaker
-          ? `[${sanitizeSpeaker(options.groupContext.currentSpeaker)}]: ${userMessage}`
-          : userMessage,
-      },
-    ],
+    tools: buildAllTools(catalog, toolOpts),
+    messages: [...historyToMessages(history, llmMax), { role: 'user', content: userContent }],
     responses: [],
     lastIterationStartIndex: 0,
     codeExecTimeout: config.codeExecTimeout,
@@ -909,9 +912,10 @@ function createOrchestrationContext(
     healthTracker: createHealthTracker(),
     memoryStore: options.memoryStore,
     modeContext: options.modeContext,
+    languageContext: options.languageContext,
     audioContext: options.audioContext,
     attachmentsContext: options.attachmentsContext,
-    workerOrigin: options.workerOrigin ?? '',
+    workerOrigin,
     env: options.env,
   };
 }
@@ -1080,6 +1084,8 @@ function dispatchSimpleInternalTool(
   if (toolCall.name === 'request_audio') return handleRequestAudio(ctx);
   if (toolCall.name === 'list_modes') return handleListModes(ctx);
   if (toolCall.name === 'switch_mode') return handleSwitchMode(toolCall.input, ctx);
+  if (toolCall.name === 'list_languages') return handleListLanguages(ctx);
+  if (toolCall.name === 'switch_language') return handleSwitchLanguage(toolCall.input, ctx);
   return null;
 }
 
@@ -1294,6 +1300,56 @@ async function handleSwitchMode(input: unknown, ctx: OrchestrationContext): Prom
     success: true,
     mode: found.name,
     message: `Switched to ${label} mode. This will take effect on your next message.`,
+  };
+}
+
+function handleListLanguages(ctx: OrchestrationContext): unknown {
+  if (!ctx.languageContext) {
+    return { languages: [], active_language: null };
+  }
+  return {
+    languages: ctx.languageContext.availableLanguages.map((l) => ({
+      name: l.name,
+      label: l.label ?? l.name,
+    })),
+    active_language: ctx.languageContext.activeLanguageName ?? null,
+  };
+}
+
+async function handleSwitchLanguage(input: unknown, ctx: OrchestrationContext): Promise<unknown> {
+  if (!ctx.languageContext) {
+    return { error: 'Languages are not configured for this organization.' };
+  }
+  if (!isSwitchLanguageInput(input)) {
+    throw new ValidationError(
+      `Invalid input for switch_language: expected { language: string | null }, got ${truncateInput(input)}`
+    );
+  }
+
+  const { language } = input;
+
+  if (language === null) {
+    await ctx.languageContext.setSelectedLanguage(null);
+    ctx.logger.log('language_tool_dispatch', { tool_name: 'switch_language', language: null });
+    return { success: true, language: null, message: 'Language cleared. Using default settings.' };
+  }
+
+  const found = ctx.languageContext.availableLanguages.find((l) => l.name === language);
+  if (!found) {
+    const available = ctx.languageContext.availableLanguages.map((l) => l.name).join(', ');
+    return {
+      error: `Language '${language}' not found.${available ? ` Available languages: ${available}` : ' No languages are configured.'}`,
+    };
+  }
+
+  await ctx.languageContext.setSelectedLanguage(language);
+  ctx.logger.log('language_tool_dispatch', { tool_name: 'switch_language', language });
+
+  const label = found.label ?? found.name;
+  return {
+    success: true,
+    language: found.name,
+    message: `Switched to ${label} language profile. This will take effect on your next message.`,
   };
 }
 

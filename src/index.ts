@@ -857,6 +857,25 @@ app.delete('/api/v1/admin/orgs/:org/users/:userId/mode', async (c) => {
   return handleUserRequest(c.req.raw, c.env, org, userId, '/mode');
 });
 
+// Admin endpoints for user language selection (routed to DO)
+app.get('/api/v1/admin/orgs/:org/users/:userId/language', async (c) => {
+  const org = c.req.param('org');
+  const userId = c.req.param('userId');
+  return handleUserRequest(c.req.raw, c.env, org, userId, '/language');
+});
+
+app.put('/api/v1/admin/orgs/:org/users/:userId/language', async (c) => {
+  const org = c.req.param('org');
+  const userId = c.req.param('userId');
+  return handleUserRequest(c.req.raw, c.env, org, userId, '/language');
+});
+
+app.delete('/api/v1/admin/orgs/:org/users/:userId/language', async (c) => {
+  const org = c.req.param('org');
+  const userId = c.req.param('userId');
+  return handleUserRequest(c.req.raw, c.env, org, userId, '/language');
+});
+
 // Admin endpoints for user-level prompt overrides (routed to DO)
 app.get('/api/v1/admin/orgs/:org/users/:userId/prompt-overrides', async (c) => {
   const org = c.req.param('org');

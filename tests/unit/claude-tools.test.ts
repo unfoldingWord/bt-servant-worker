@@ -5,11 +5,14 @@ import {
   buildReadMemoryTool,
   buildUpdateMemoryTool,
   buildRequestAudioTool,
+  buildListLanguagesTool,
+  buildSwitchLanguageTool,
   buildAllTools,
   isBuiltInTool,
   isReadMemoryInput,
   isUpdateMemoryInput,
   isSwitchModeInput,
+  isSwitchLanguageInput,
   getToolDefinitions,
 } from '../../src/services/claude/tools.js';
 import { buildToolCatalog } from '../../src/services/mcp/catalog.js';
@@ -61,6 +64,8 @@ describe('buildAllTools', () => {
     expect(tools.map((t) => t.name)).toContain('prepare_usfm_source');
     expect(tools.map((t) => t.name)).not.toContain('list_modes');
     expect(tools.map((t) => t.name)).not.toContain('switch_mode');
+    expect(tools.map((t) => t.name)).not.toContain('list_languages');
+    expect(tools.map((t) => t.name)).not.toContain('switch_language');
     expect(tools.map((t) => t.name)).not.toContain('mcp_tool');
   });
 
@@ -70,10 +75,26 @@ describe('buildAllTools', () => {
     expect(tools.length).toBe(9);
     expect(tools.map((t) => t.name)).toContain('list_modes');
     expect(tools.map((t) => t.name)).toContain('switch_mode');
-    expect(tools.map((t) => t.name)).toContain('request_audio');
-    expect(tools.map((t) => t.name)).toContain('generate_scripture_pdf');
-    expect(tools.map((t) => t.name)).toContain('prepare_usfm_source');
-    expect(tools.map((t) => t.name)).not.toContain('mcp_tool');
+    expect(tools.map((t) => t.name)).not.toContain('list_languages');
+  });
+
+  it('should include language tools when hasLanguages is true', () => {
+    const tools = buildAllTools(catalog, { hasLanguages: true });
+
+    expect(tools.length).toBe(9);
+    expect(tools.map((t) => t.name)).toContain('list_languages');
+    expect(tools.map((t) => t.name)).toContain('switch_language');
+    expect(tools.map((t) => t.name)).not.toContain('list_modes');
+  });
+
+  it('should include both mode and language tools when both flags are true', () => {
+    const tools = buildAllTools(catalog, { hasModes: true, hasLanguages: true });
+
+    expect(tools.length).toBe(11);
+    expect(tools.map((t) => t.name)).toContain('list_modes');
+    expect(tools.map((t) => t.name)).toContain('switch_mode');
+    expect(tools.map((t) => t.name)).toContain('list_languages');
+    expect(tools.map((t) => t.name)).toContain('switch_language');
   });
 });
 
@@ -86,6 +107,8 @@ describe('isBuiltInTool', () => {
     expect(isBuiltInTool('request_audio')).toBe(true);
     expect(isBuiltInTool('list_modes')).toBe(true);
     expect(isBuiltInTool('switch_mode')).toBe(true);
+    expect(isBuiltInTool('list_languages')).toBe(true);
+    expect(isBuiltInTool('switch_language')).toBe(true);
     expect(isBuiltInTool('some_mcp_tool')).toBe(false);
   });
 });
@@ -284,5 +307,49 @@ describe('isSwitchModeInput', () => {
     expect(isSwitchModeInput({ mode: 42 })).toBe(false);
     expect(isSwitchModeInput({ mode: true })).toBe(false);
     expect(isSwitchModeInput({ mode: ['fia'] })).toBe(false);
+  });
+});
+
+describe('buildListLanguagesTool', () => {
+  it('returns valid tool definition', () => {
+    const tool = buildListLanguagesTool();
+    expect(tool.name).toBe('list_languages');
+    expect(tool.description).toContain('language');
+  });
+});
+
+describe('buildSwitchLanguageTool', () => {
+  it('returns valid tool definition', () => {
+    const tool = buildSwitchLanguageTool();
+    expect(tool.name).toBe('switch_language');
+    expect(tool.input_schema.required).toContain('language');
+  });
+});
+
+describe('isSwitchLanguageInput', () => {
+  it('accepts string language', () => {
+    expect(isSwitchLanguageInput({ language: 'arabic' })).toBe(true);
+  });
+
+  it('accepts null language (clear)', () => {
+    expect(isSwitchLanguageInput({ language: null })).toBe(true);
+  });
+
+  it('rejects missing language', () => {
+    expect(isSwitchLanguageInput({})).toBe(false);
+  });
+
+  it('rejects non-object', () => {
+    expect(isSwitchLanguageInput('arabic')).toBe(false);
+    expect(isSwitchLanguageInput(null)).toBe(false);
+  });
+
+  it('rejects empty string language', () => {
+    expect(isSwitchLanguageInput({ language: '' })).toBe(false);
+  });
+
+  it('rejects non-string non-null language', () => {
+    expect(isSwitchLanguageInput({ language: 42 })).toBe(false);
+    expect(isSwitchLanguageInput({ language: true })).toBe(false);
   });
 });
