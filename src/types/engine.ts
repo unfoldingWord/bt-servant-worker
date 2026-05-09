@@ -2,6 +2,7 @@
  * API contract types matching bt-servant-web-client and bt-servant-whatsapp-gateway
  */
 
+import { OrgLanguages } from './languages.js';
 import { MCPServerConfig } from './mcp.js';
 import { OrgConfig } from './org-config.js';
 import { OrgModes, PromptOverrides } from './prompt-overrides.js';
@@ -70,6 +71,9 @@ export interface ChatRequest {
 
   /** Internal: Org modes injected by worker from KV (not from client) */
   _org_modes?: OrgModes;
+
+  /** Internal: Org languages injected by worker from KV (not from client) */
+  _org_languages?: OrgLanguages;
 }
 
 /**

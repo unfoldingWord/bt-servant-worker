@@ -1132,6 +1132,13 @@ async function readAllOrgKV(env: Env, org: string, logger: ReturnType<typeof cre
       'org_modes_kv_read_error',
       logger
     ),
+    readOrgKV<OrgLanguages>(
+      env.PROMPT_OVERRIDES,
+      `${org}:languages`,
+      { languages: [] },
+      'org_languages_kv_read_error',
+      logger
+    ),
   ]);
 }
 
@@ -1200,7 +1207,11 @@ async function buildDOChatRequest(
 ): Promise<{ stub: DurableObjectStub; doRequest: Request }> {
   const { body, org, transport, logger } = opts;
 
-  const [mcpServers, orgConfig, promptOverrides, orgModes] = await readAllOrgKV(env, org, logger);
+  const [mcpServers, orgConfig, promptOverrides, orgModes, orgLanguages] = await readAllOrgKV(
+    env,
+    org,
+    logger
+  );
 
   const doId = resolveDOId(env, org, body);
   const stub = env.USER_DO.get(doId);
@@ -1231,6 +1242,7 @@ async function buildDOChatRequest(
       _org_config: orgConfig,
       _org_prompt_overrides: promptOverrides,
       _org_modes: orgModes,
+      _org_languages: orgLanguages,
     }),
   });
 

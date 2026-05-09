@@ -377,6 +377,41 @@ describe('buildSystemPrompt - media formatting rules (non-overridable)', () => {
   });
 });
 
+describe('buildSystemPrompt - language guidance', () => {
+  it('includes language guidance section when languageDocument is provided', () => {
+    const prompt = buildSystemPrompt(
+      createEmptyCatalog(),
+      defaultPrefs,
+      [],
+      DEFAULT_PROMPT_VALUES,
+      { languageDocument: '## Tone\nUse formal Arabic register.' }
+    );
+    expect(prompt).toContain('## Language Guidance');
+    expect(prompt).toContain('Use formal Arabic register.');
+  });
+
+  it('excludes language guidance section when languageDocument is undefined', () => {
+    const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
+    expect(prompt).not.toContain('## Language Guidance');
+  });
+
+  it('language guidance appears between client_instructions and memory_instructions', () => {
+    const prompt = buildSystemPrompt(
+      createEmptyCatalog(),
+      defaultPrefs,
+      [],
+      DEFAULT_PROMPT_VALUES,
+      { languageDocument: 'LANG_DOC_MARKER' }
+    );
+    const clientIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.client_instructions);
+    const langIdx = prompt.indexOf('LANG_DOC_MARKER');
+    const memoryIdx = prompt.indexOf(DEFAULT_PROMPT_VALUES.memory_instructions);
+
+    expect(clientIdx).toBeLessThan(langIdx);
+    expect(langIdx).toBeLessThan(memoryIdx);
+  });
+});
+
 describe('buildSystemPrompt - media formatting rules placement & voice mode', () => {
   it('media rules appear after memory + audio guidance and before closing', () => {
     const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
