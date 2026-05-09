@@ -35,7 +35,7 @@ export interface ClassifierContext {
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const CLASSIFIER_MODEL = 'claude-haiku-3-5-latest';
+const CLASSIFIER_MODEL = 'claude-3-5-haiku-latest';
 const CLASSIFIER_MAX_TOKENS = 256;
 const CLASSIFIER_TIMEOUT_MS = 5_000;
 const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
@@ -74,6 +74,24 @@ Available languages: ${langsList || '(none)'}
 
 Respond ONLY with a JSON object (no markdown fences, no explanation):
 {"mode": "<matched mode name or null>", "mode_raw": "<raw token text without # or null>", "language": "<matched language name or null>", "language_raw": "<raw token text without @ or null>", "stripped_message": "<message with trigger tokens removed, trimmed>"}`;
+}
+
+// ─── Local token stripping ──────────────────────────────────────────────────
+
+/**
+ * Strip leading `#word` and `@word` tokens from the message head.
+ * Derived deterministically — never trusts the LLM to rewrite user text.
+ */
+function stripLeadingTriggerTokens(message: string): string {
+  let remaining = message.trimStart();
+  while (remaining.length > 0) {
+    const ch = remaining[0];
+    if (ch !== '#' && ch !== '@') break;
+    const spaceIdx = remaining.search(/\s/);
+    if (spaceIdx === -1) return '';
+    remaining = remaining.slice(spaceIdx).trimStart();
+  }
+  return remaining;
 }
 
 // ─── Pre-filter ─────────────────────────────────────────────────────────────
@@ -231,6 +249,28 @@ function fallbackResult(messageText: string, latencyMs: number): ClassifierResul
   return { ...noTriggerResult(messageText), classifierRan: true, classifierLatencyMs: latencyMs };
 }
 
+// ─── Result builders ────────────────────────────────────────────────────────
+
+/** Build the final result after a successful classifier response. */
+function buildSuccessResult(
+  parsed: RawClassifierResponse,
+  messageText: string,
+  latencyMs: number,
+  ctx: ClassifierContext
+): ClassifierResult {
+  const { modeName, languageName, warnings } = validateClassifierMatches(parsed, ctx);
+  // Strip tokens locally — never trust the LLM to rewrite user text
+  const stripped = stripLeadingTriggerTokens(messageText);
+  return {
+    modeName,
+    languageName,
+    strippedMessage: stripped || messageText,
+    classifierRan: true,
+    classifierLatencyMs: latencyMs,
+    warnings,
+  };
+}
+
 // ─── Main classifier ────────────────────────────────────────────────────────
 
 /**
@@ -281,16 +321,7 @@ export async function classifyTriggers(
       return fallbackResult(messageText, latencyMs);
     }
 
-    const { modeName, languageName, warnings } = validateClassifierMatches(parsed, ctx);
-
-    return {
-      modeName,
-      languageName,
-      strippedMessage: parsed.stripped_message || messageText,
-      classifierRan: true,
-      classifierLatencyMs: latencyMs,
-      warnings,
-    };
+    return buildSuccessResult(parsed, messageText, latencyMs, ctx);
   } catch (error) {
     const latencyMs = Date.now() - startTime;
     ctx.logger.error('classifier_call_failed', error, { latency_ms: latencyMs });
