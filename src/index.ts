@@ -33,6 +33,12 @@ import {
   validateLanguage,
   validateLanguageName,
 } from './types/languages.js';
+import {
+  DEFAULT_LANGUAGE_SCAFFOLD,
+  LanguageScaffold,
+  sanitizeScaffoldDocument,
+  validateLanguageScaffold,
+} from './types/language-scaffold.js';
 import { constantTimeCompare } from './utils/crypto.js';
 import { ValidationError } from './utils/errors.js';
 import { getAudio } from './services/audio/index.js';
@@ -758,6 +764,81 @@ app.delete('/api/v1/admin/orgs/:org/languages/:languageName', async (c) => {
   } catch (error) {
     logger.error('admin_action', error, { action: 'delete_language', org });
     return c.json({ error: 'Failed to delete language from storage' }, 500);
+  }
+});
+
+// Admin endpoints for per-org language scaffold
+app.get('/api/v1/admin/orgs/:org/language-scaffold', async (c) => {
+  const org = c.req.param('org');
+  const logger = createRequestLogger(crypto.randomUUID());
+
+  try {
+    const stored = await c.env.PROMPT_OVERRIDES.get<LanguageScaffold>(
+      `${org}:language-scaffold`,
+      'json'
+    );
+    const scaffold = stored ?? DEFAULT_LANGUAGE_SCAFFOLD;
+
+    logger.log('admin_action', {
+      action: 'get_language_scaffold',
+      org,
+      is_default: stored === null,
+      document_length: scaffold.document.length,
+    });
+    return c.json({ org, scaffold });
+  } catch (error) {
+    logger.error('admin_action', error, { action: 'get_language_scaffold', org });
+    return c.json({
+      org,
+      scaffold: DEFAULT_LANGUAGE_SCAFFOLD,
+      warning: 'Failed to read language scaffold from storage, returning default',
+    });
+  }
+});
+
+app.put('/api/v1/admin/orgs/:org/language-scaffold', async (c) => {
+  const org = c.req.param('org');
+  const logger = createRequestLogger(crypto.randomUUID());
+  const body = await c.req.json();
+
+  const validationError = validateLanguageScaffold(body);
+  if (validationError) {
+    return c.json({ error: validationError }, 400);
+  }
+
+  const scaffold: LanguageScaffold = {
+    document: sanitizeScaffoldDocument((body as LanguageScaffold).document),
+  };
+
+  try {
+    await c.env.PROMPT_OVERRIDES.put(`${org}:language-scaffold`, JSON.stringify(scaffold));
+    logger.log('admin_action', {
+      action: 'update_language_scaffold',
+      org,
+      document_length: scaffold.document.length,
+    });
+    return c.json({ org, scaffold, message: 'Language scaffold updated' });
+  } catch (error) {
+    logger.error('admin_action', error, { action: 'update_language_scaffold', org });
+    return c.json({ error: 'Failed to update language scaffold in storage' }, 500);
+  }
+});
+
+app.delete('/api/v1/admin/orgs/:org/language-scaffold', async (c) => {
+  const org = c.req.param('org');
+  const logger = createRequestLogger(crypto.randomUUID());
+
+  try {
+    await c.env.PROMPT_OVERRIDES.delete(`${org}:language-scaffold`);
+    logger.log('admin_action', { action: 'reset_language_scaffold', org });
+    return c.json({
+      org,
+      scaffold: DEFAULT_LANGUAGE_SCAFFOLD,
+      message: 'Language scaffold reset to default',
+    });
+  } catch (error) {
+    logger.error('admin_action', error, { action: 'reset_language_scaffold', org });
+    return c.json({ error: 'Failed to reset language scaffold in storage' }, 500);
   }
 });
 
