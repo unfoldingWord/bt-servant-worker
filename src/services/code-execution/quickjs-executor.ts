@@ -519,6 +519,9 @@ export async function executeCode(
   try {
     const module = await getQuickJSModule();
     vm = module.newContext();
+    if (!vm) {
+      throw new Error('Failed to create QuickJS context: newContext() returned null');
+    }
     const value = await runCodeInVM({ vm, code, options, logs, mcpCounter, logger });
     logger.log('code_execution_complete', {
       duration_ms: Date.now() - startTime,
