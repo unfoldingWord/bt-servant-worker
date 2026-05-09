@@ -35,7 +35,7 @@ export interface ClassifierContext {
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const CLASSIFIER_MODEL = 'claude-3-5-haiku-latest';
+const CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001';
 const CLASSIFIER_MAX_TOKENS = 256;
 const CLASSIFIER_TIMEOUT_MS = 5_000;
 const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
