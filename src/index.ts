@@ -788,11 +788,7 @@ app.get('/api/v1/admin/orgs/:org/language-scaffold', async (c) => {
     return c.json({ org, scaffold });
   } catch (error) {
     logger.error('admin_action', error, { action: 'get_language_scaffold', org });
-    return c.json({
-      org,
-      scaffold: DEFAULT_LANGUAGE_SCAFFOLD,
-      warning: 'Failed to read language scaffold from storage, returning default',
-    });
+    return c.json({ error: 'Failed to read language scaffold from storage' }, 500);
   }
 });
 
