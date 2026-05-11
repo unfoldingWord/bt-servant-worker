@@ -224,10 +224,22 @@ function pushUnmatchedTriggersSection(
   const lines: string[] = [
     '## Unrecognized Triggers',
     '',
-    "The user's message began with trigger tokens that did not match any configured option. " +
-      'Address this gently in your reply: acknowledge the unrecognized token, list the ' +
-      'available options for that kind, suggest the closest plausible intent if one is obvious, ' +
-      "and then answer the user's actual question in the same response.",
+    "The user's message began with one or more `#` or `@` tokens that did not match any " +
+      'configured mode or language. They are reported below for context only.',
+    '',
+    "**Default: stay silent about them and just answer the user's question normally.** Most of " +
+      'the time these tokens are not routing directives at all — they are email addresses ' +
+      '(`@gmail.com`), social hashtags (`#hashtag`), casual addressee mentions (`@team`, ' +
+      '`@john`), list markers (`#1`), or other coincidental uses of `#`/`@`. Treat them as ' +
+      'incidental and proceed as if the user had not used the sigil at all. Do NOT add a ' +
+      "'heads up' or 'I noticed' note in these cases.",
+    '',
+    'Only acknowledge an unrecognized trigger when the user clearly seems to be trying to ' +
+      'switch modes or languages — for example, they explicitly ask which modes or languages ' +
+      'exist, or the rest of the message reads like a routing directive (`#fya-cooch please ' +
+      'help me translate...`). When you do acknowledge one, name the token, list the ' +
+      'available options for that kind, suggest the closest plausible intent if one is ' +
+      "obvious, then answer the user's actual question in the same response.",
     '',
   ];
 
