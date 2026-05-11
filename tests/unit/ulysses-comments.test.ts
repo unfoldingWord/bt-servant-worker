@@ -53,15 +53,13 @@ describe('stripUlyssesComments — inline span comments', () => {
   });
 
   it('strips a span at the start of the input', () => {
-    expect(stripUlyssesComments('++lead++rest').cleaned).toBe('rest');
+    // Opener at column 0 is allowed (no preceding char); closer must not be
+    // followed by a word char, so the closing `++` is the one before the space.
+    expect(stripUlyssesComments('++lead++ rest').cleaned).toBe(' rest');
   });
 
   it('strips a span at the end of the input', () => {
     expect(stripUlyssesComments('prefix ++trailing++').cleaned).toBe('prefix ');
-  });
-
-  it('strips an empty span (`++++`)', () => {
-    expect(stripUlyssesComments('a++++b').cleaned).toBe('ab');
   });
 
   it('strips two distinct spans on the same line', () => {
@@ -81,6 +79,33 @@ describe('stripUlyssesComments — inline span comments', () => {
   });
 });
 
+describe('stripUlyssesComments — word-boundary protection for `++`', () => {
+  it('does not flag C-style increment in code: `for (let i = 0; i < 50; i++) { … }`', () => {
+    const code = 'for (let i = 0; i < 50; i++) { console.log(i); }';
+    expect(stripUlyssesComments(code)).toEqual({ cleaned: code, hadUnbalancedSpan: false });
+  });
+
+  it('does not strip `a++++b` because the `++` is glued to word chars on both sides', () => {
+    // Each `++` is adjacent to a word char (`a` before / `b` after the
+    // outer pair, and to each other in the middle). No valid opener.
+    const input = 'a++++b';
+    expect(stripUlyssesComments(input)).toEqual({ cleaned: input, hadUnbalancedSpan: false });
+  });
+
+  it('does not treat `i++` followed by another `i++` later as a span', () => {
+    const input = 'i++ then later i++ done';
+    expect(stripUlyssesComments(input)).toEqual({ cleaned: input, hadUnbalancedSpan: false });
+  });
+
+  it('treats `++note++` (no surrounding context) as a span', () => {
+    expect(stripUlyssesComments('++note++').cleaned).toBe('');
+  });
+
+  it('treats `++ note ++` (Ulysses canonical with spaces) as a span', () => {
+    expect(stripUlyssesComments('a ++ note ++ b').cleaned).toBe('a  b');
+  });
+});
+
 // ─── Unbalanced delimiters ───────────────────────────────────────────────────
 
 describe('stripUlyssesComments — unbalanced spans', () => {
@@ -97,8 +122,8 @@ describe('stripUlyssesComments — unbalanced spans', () => {
   });
 
   it('flags unbalanced even when the orphan appears after content', () => {
-    const r = stripUlyssesComments('intact start ++unpaired');
-    expect(r.cleaned).toBe('intact start ++unpaired');
+    const r = stripUlyssesComments('intact start ++ unpaired');
+    expect(r.cleaned).toBe('intact start ++ unpaired');
     expect(r.hadUnbalancedSpan).toBe(true);
   });
 });
@@ -106,12 +131,15 @@ describe('stripUlyssesComments — unbalanced spans', () => {
 // ─── Combined / acceptance fixture ──────────────────────────────────────────
 
 describe('stripUlyssesComments — combined fixture', () => {
-  it('handles a realistic mode document with mixed comments', () => {
+  it('handles a realistic mode document with mixed comments and code', () => {
     const input = [
       '## Identity',
       '',
       'You are TestBot. %% rewrite this section',
       'Always be concise. ++this aside is editor-only++',
+      '',
+      'Example loop: `for (let i = 0; i < 50; i++) { fetch(i); }`',
+      '',
       '++long aside',
       'across multiple lines',
       'with %% nested line-marker inside++',
@@ -122,6 +150,9 @@ describe('stripUlyssesComments — combined fixture', () => {
       '',
       'You are TestBot. ',
       'Always be concise. ',
+      '',
+      'Example loop: `for (let i = 0; i < 50; i++) { fetch(i); }`',
+      '',
       '',
       'Final sentence.',
     ].join('\n');

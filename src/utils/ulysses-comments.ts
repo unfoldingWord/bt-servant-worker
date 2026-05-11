@@ -12,6 +12,14 @@
  *   `++…++`  — Paired inline span. May span newlines. Removed wholesale,
  *              including the delimiters.
  *
+ *              `++` is only recognized as a span delimiter at word
+ *              boundaries: an opener cannot be immediately preceded by a
+ *              word character (`[A-Za-z0-9_]`), and a closer cannot be
+ *              immediately followed by one. This protects realistic prompt
+ *              content that contains C-style increment operators like
+ *              `for (let i = 1; i <= 50; i++) { … }` — the `++` after `i`
+ *              is glued to a word character and never starts a span.
+ *
  * Stripping happens on a copy of the input — the caller is expected to apply
  * it to in-flight prompt assembly only. Stored documents are never mutated.
  *
@@ -27,7 +35,8 @@
  *
  * No escape mechanism exists for literal `%%` or `++`. Ulysses does not
  * specify one; authors who need those characters verbatim in prompt content
- * are out of luck for now. Document the limitation in PR notes.
+ * should keep them adjacent to word characters (the word-boundary rule
+ * means glued-to-identifier `++` is preserved) or avoid them otherwise.
  */
 
 export interface StripResult {
@@ -37,23 +46,63 @@ export interface StripResult {
 
 const LINE_MARKER = '%%';
 const SPAN_DELIM = '++';
+const WORD_OR_PLUS_RE = /[A-Za-z0-9_+]/;
+
+/** True iff the character at `pos` is in `[A-Za-z0-9_+]` (out-of-bounds → false). */
+function isWordOrPlusAt(text: string, pos: number): boolean {
+  if (pos < 0 || pos >= text.length) return false;
+  return WORD_OR_PLUS_RE.test(text[pos] as string);
+}
+
+/** True iff the character at `pos` is `+` (out-of-bounds → false). */
+function isPlusAt(text: string, pos: number): boolean {
+  return pos >= 0 && pos < text.length && text[pos] === '+';
+}
 
 /**
- * Span pass: remove every `++…++` matched pair (greedy, left-to-right). If a
- * lone `++` remains, leave it literal and report it.
+ * Find the next position of a `++` span delimiter starting at or after `from`,
+ * filtered by word-boundary rules:
+ *   - opener: char at pos-1 is NOT word-or-plus AND char at pos+2 is NOT `+`.
+ *   - closer: char at pos-1 is NOT `+` AND char at pos+2 is NOT word-or-plus.
+ *
+ * The "or-plus" component in the opener's left side and the closer's right
+ * side prevents `+++` runs from being interpreted as a `++` delimiter
+ * adjacent to a stray `+`. The pure-`+` component on the opener's right and
+ * the closer's left prevents `++++` (and longer) runs from being chopped
+ * into multiple delimiters.
+ */
+function findSpanDelim(text: string, from: number, role: 'open' | 'close'): number {
+  let i = from;
+  while (i <= text.length - SPAN_DELIM.length) {
+    const at = text.indexOf(SPAN_DELIM, i);
+    if (at === -1) return -1;
+    const blocked =
+      role === 'open'
+        ? isWordOrPlusAt(text, at - 1) || isPlusAt(text, at + SPAN_DELIM.length)
+        : isPlusAt(text, at - 1) || isWordOrPlusAt(text, at + SPAN_DELIM.length);
+    if (!blocked) return at;
+    i = at + 1;
+  }
+  return -1;
+}
+
+/**
+ * Span pass: remove every `++…++` matched pair (greedy, left-to-right),
+ * respecting the word-boundary rule above. If a lone `++` opener with no
+ * corresponding closer remains, leave it literal and report it.
  */
 function stripSpans(text: string): StripResult {
   let cleaned = '';
   let i = 0;
   while (i < text.length) {
-    const open = text.indexOf(SPAN_DELIM, i);
+    const open = findSpanDelim(text, i, 'open');
     if (open === -1) {
       cleaned += text.slice(i);
       return { cleaned, hadUnbalancedSpan: false };
     }
-    const close = text.indexOf(SPAN_DELIM, open + SPAN_DELIM.length);
+    const close = findSpanDelim(text, open + SPAN_DELIM.length, 'close');
     if (close === -1) {
-      // Lone `++` with no closing pair — leave the remainder literal.
+      // Opener with no valid closer — leave the remainder literal.
       cleaned += text.slice(i);
       return { cleaned, hadUnbalancedSpan: true };
     }
