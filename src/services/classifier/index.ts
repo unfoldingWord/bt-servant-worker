@@ -199,9 +199,19 @@ function matchToken(raw: string, options: AvailableOption[]): string | null {
  * Synchronous, deterministic, allocation-light. The vast majority of messages
  * (no leading `#`/`@`) short-circuit through `extractLeadingTokens` with no
  * matching work.
+ *
+ * Stripping policy: only tokens that resolve to a configured mode/language
+ * are removed from the message. Tokens that fail the cascade are LEFT IN
+ * PLACE in `strippedMessage` because most leading `#`/`@` in the wild are
+ * coincidental — email handles (`@gmail.com`), social hashtags (`#hashtag`),
+ * addressee mentions (`@team`/`@john`), list markers (`#1`) — not failed
+ * routing attempts. Stripping them would silently delete real user content
+ * before the orchestrator ever sees it. The orchestrator still receives the
+ * unmatched tokens via the `unmatchedTriggers` system-prompt section so it
+ * can choose to acknowledge them when the user clearly was trying to route.
  */
 export function classifyTriggers(messageText: string, ctx: ClassifierContext): ClassifierResult {
-  const { tokens, stripped } = extractLeadingTokens(messageText);
+  const { tokens, stripped: postTokens } = extractLeadingTokens(messageText);
 
   if (tokens.length === 0) {
     return {
@@ -215,6 +225,7 @@ export function classifyTriggers(messageText: string, ctx: ClassifierContext): C
   let modeName: string | undefined;
   let languageName: string | undefined;
   const unmatchedTriggers: UnmatchedTrigger[] = [];
+  const unmatchedTokenTexts: string[] = [];
 
   for (const token of tokens) {
     const isMode = token.sigil === '#';
@@ -227,13 +238,19 @@ export function classifyTriggers(messageText: string, ctx: ClassifierContext): C
       else languageName = matched;
     } else {
       unmatchedTriggers.push({ kind, rawToken: token.raw, availableOptions: options });
+      unmatchedTokenTexts.push(`${token.sigil}${token.raw}`);
     }
   }
+
+  const strippedMessage =
+    unmatchedTokenTexts.length === 0
+      ? postTokens
+      : `${unmatchedTokenTexts.join(' ')}${postTokens.length > 0 ? ' ' + postTokens : ''}`;
 
   return {
     modeName,
     languageName,
-    strippedMessage: stripped,
+    strippedMessage,
     unmatchedTriggers,
   };
 }

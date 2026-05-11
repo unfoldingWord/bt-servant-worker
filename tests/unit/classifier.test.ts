@@ -127,8 +127,8 @@ describe('classifyTriggers — unique prefix match', () => {
     expect(result.modeName).toBeUndefined();
     expect(result.unmatchedTriggers).toHaveLength(1);
     expect(result.unmatchedTriggers[0]).toMatchObject({ kind: 'mode', rawToken: 'trans' });
-    // Token is still stripped even when unmatched
-    expect(result.strippedMessage).toBe('hi');
+    // Unmatched tokens stay in place — they may be coincidental content.
+    expect(result.strippedMessage).toBe('#trans hi');
   });
 });
 
@@ -178,7 +178,8 @@ describe('classifyTriggers — unmatched trigger handling', () => {
       rawToken: 'fza-ocahch',
     });
     expect(result.unmatchedTriggers[0].availableOptions).toEqual(modes);
-    expect(result.strippedMessage).toBe('hello there');
+    // Matched @english stripped; unmatched #fza-ocahch preserved in place.
+    expect(result.strippedMessage).toBe('#fza-ocahch hello there');
   });
 
   it('records both as unmatched when neither falls within the cascade', () => {
@@ -191,7 +192,8 @@ describe('classifyTriggers — unmatched trigger handling', () => {
     expect(kinds).toEqual(['language', 'mode']);
     const rawTokens = result.unmatchedTriggers.map((t) => t.rawToken).sort();
     expect(rawTokens).toEqual(['klingon', 'qwertyzz'].sort());
-    expect(result.strippedMessage).toBe('hello there');
+    // No tokens matched — both stay in place so Opus sees the literal text.
+    expect(result.strippedMessage).toBe('@klingon #qwertyzz hello there');
   });
 
   it('resolves fuzzy tokens within Levenshtein ≤ 2 (e.g. @enzish → english)', () => {
@@ -214,7 +216,7 @@ describe('classifyTriggers — unmatched trigger handling', () => {
 // ─── Empty option lists ─────────────────────────────────────────────────────
 
 describe('classifyTriggers — empty option lists', () => {
-  it('strips tokens and records them as unmatched when no modes/languages configured', () => {
+  it('records tokens as unmatched (and leaves them in place) when no modes/languages configured', () => {
     const ctx = buildCtx({ availableModes: [], availableLanguages: [] });
     const result = classifyTriggers('#spoken @english hi', ctx);
     expect(result.modeName).toBeUndefined();
@@ -222,7 +224,7 @@ describe('classifyTriggers — empty option lists', () => {
     expect(result.unmatchedTriggers).toHaveLength(2);
     expect(result.unmatchedTriggers[0].availableOptions).toEqual([]);
     expect(result.unmatchedTriggers[1].availableOptions).toEqual([]);
-    expect(result.strippedMessage).toBe('hi');
+    expect(result.strippedMessage).toBe('#spoken @english hi');
   });
 
   it('still resolves the kind with available options when only the other is empty', () => {
@@ -233,6 +235,54 @@ describe('classifyTriggers — empty option lists', () => {
     expect(result.unmatchedTriggers).toHaveLength(1);
     expect(result.unmatchedTriggers[0].kind).toBe('language');
     expect(result.unmatchedTriggers[0].rawToken).toBe('english');
+    // Matched #spoken stripped; unmatched @english preserved.
+    expect(result.strippedMessage).toBe('@english hi');
+  });
+});
+
+// ─── Coincidental leading sigils (Codex finding) ────────────────────────────
+
+describe('classifyTriggers — coincidental leading sigils preserve user content', () => {
+  it('keeps @gmail.com in the stripped message so Opus sees the literal text', () => {
+    const result = classifyTriggers(
+      '@gmail.com is my address — but my question is about John 3:16.',
+      buildCtx()
+    );
+    expect(result.languageName).toBeUndefined();
+    expect(result.unmatchedTriggers).toHaveLength(1);
+    expect(result.unmatchedTriggers[0].rawToken).toBe('gmail.com');
+    expect(result.strippedMessage).toBe(
+      '@gmail.com is my address — but my question is about John 3:16.'
+    );
+  });
+
+  it('keeps a leading social hashtag in place', () => {
+    const result = classifyTriggers(
+      "#hashtag what's the best way to start translating Mark?",
+      buildCtx()
+    );
+    expect(result.modeName).toBeUndefined();
+    expect(result.strippedMessage).toBe("#hashtag what's the best way to start translating Mark?");
+  });
+
+  it('keeps a leading list marker like #1', () => {
+    const result = classifyTriggers('#1 give me a one-sentence summary of John 3:16.', buildCtx());
+    expect(result.modeName).toBeUndefined();
+    expect(result.strippedMessage).toBe('#1 give me a one-sentence summary of John 3:16.');
+  });
+
+  it('keeps an unmatched language token while still stripping a matched mode', () => {
+    // `@klingon` unmatched (preserved); `#fia-coach` matched (stripped).
+    const result = classifyTriggers('@klingon #fia-coach hello', buildCtx());
+    expect(result.modeName).toBe('fia-coach');
+    expect(result.languageName).toBeUndefined();
+    expect(result.strippedMessage).toBe('@klingon hello');
+  });
+
+  it('keeps the original case of an unmatched token', () => {
+    const result = classifyTriggers('@GMAIL.com check this out', buildCtx());
+    expect(result.unmatchedTriggers[0].rawToken).toBe('GMAIL.com');
+    expect(result.strippedMessage).toBe('@GMAIL.com check this out');
   });
 });
 
