@@ -4,6 +4,7 @@
 
 import { ChatHistoryEntry } from '../../types/engine.js';
 import { PromptSlot } from '../../types/prompt-overrides.js';
+import { UnmatchedTrigger } from '../classifier/index.js';
 import { generateToolCatalog, ToolCatalog } from '../mcp/index.js';
 
 /**
@@ -28,6 +29,10 @@ interface SystemPromptOptions {
   isVoiceMessage?: boolean | undefined;
   /** Per-turn language document to inject into the system prompt */
   languageDocument?: string | undefined;
+  /** Triggers from the user's leading `#<mode>` / `@<language>` tokens that
+   *  could not be resolved. When non-empty, the orchestrator is instructed to
+   *  compose a contextual "did you mean…" reply. */
+  unmatchedTriggers?: UnmatchedTrigger[] | undefined;
 }
 
 /** Max length for speaker names (prevents prompt bloat). */
@@ -191,6 +196,52 @@ function pushLanguageSection(sections: string[], languageDocument: string | unde
   }
 }
 
+/** Format an available-option list as `name ("label"), name2 ("label2"), …` */
+function formatAvailableOptions(
+  options: ReadonlyArray<{ name: string; label?: string | undefined }>
+): string {
+  if (options.length === 0) return '(none configured)';
+  return options.map((o) => (o.label ? `${o.name} ("${o.label}")` : o.name)).join(', ');
+}
+
+const KIND_SIGIL: Record<UnmatchedTrigger['kind'], string> = { mode: '#', language: '@' };
+const KIND_LABEL_PLURAL: Record<UnmatchedTrigger['kind'], string> = {
+  mode: 'modes',
+  language: 'languages',
+};
+
+/**
+ * Inject the unrecognized-triggers directive so the orchestrator can compose
+ * a contextual "did you mean…" reply for tokens the deterministic classifier
+ * could not resolve. Only emitted when at least one token failed to match.
+ */
+function pushUnmatchedTriggersSection(
+  sections: string[],
+  unmatchedTriggers: UnmatchedTrigger[] | undefined
+): void {
+  if (!unmatchedTriggers || unmatchedTriggers.length === 0) return;
+
+  const lines: string[] = [
+    '## Unrecognized Triggers',
+    '',
+    "The user's message began with trigger tokens that did not match any configured option. " +
+      'Address this gently in your reply: acknowledge the unrecognized token, list the ' +
+      'available options for that kind, suggest the closest plausible intent if one is obvious, ' +
+      "and then answer the user's actual question in the same response.",
+    '',
+  ];
+
+  for (const t of unmatchedTriggers) {
+    const sigil = KIND_SIGIL[t.kind];
+    const optionsLabel = KIND_LABEL_PLURAL[t.kind];
+    lines.push(
+      `- Unrecognized ${sigil}${t.kind}: "${t.rawToken}". Available ${optionsLabel}: ${formatAvailableOptions(t.availableOptions)}.`
+    );
+  }
+
+  sections.push(lines.join('\n'));
+}
+
 /**
  * Build the full system prompt with tool catalog and user context.
  *
@@ -202,6 +253,23 @@ function pushLanguageSection(sections: string[], languageDocument: string | unde
  *   [user preferences] → [conversation context] → [first interaction] →
  *   [media formatting rules (non-overridable, text mode only)] → [closing]
  */
+/** Push memory, audio, ptxprint, and voice sections in their declared order. */
+function pushMiddleSections(
+  sections: string[],
+  resolvedPromptValues: Required<Record<PromptSlot, string>>,
+  catalog: ToolCatalog,
+  memoryTOC: string | undefined,
+  isVoiceMessage: boolean | undefined
+): void {
+  sections.push(resolvedPromptValues.memory_instructions);
+  if (memoryTOC) sections.push(memoryTOC);
+  sections.push(AUDIO_GUIDANCE);
+  if (catalog.tools.some((t) => t.serverId === 'ptxprint-mcp')) {
+    sections.push(PTXPRINT_FLOW_GUIDANCE);
+  }
+  if (isVoiceMessage) sections.push(VOICE_RESPONSE_GUIDANCE);
+}
+
 export function buildSystemPrompt(
   catalog: ToolCatalog,
   preferences: OrchestrationPreferences,
@@ -209,7 +277,7 @@ export function buildSystemPrompt(
   resolvedPromptValues: Required<Record<PromptSlot, string>>,
   options?: SystemPromptOptions
 ): string {
-  const { memoryTOC, clientId, groupContext } = options ?? {};
+  const { memoryTOC, clientId, groupContext, isVoiceMessage } = options ?? {};
   const sections: string[] = [
     resolvedPromptValues.identity,
     resolvedPromptValues.methodology,
@@ -223,18 +291,11 @@ export function buildSystemPrompt(
   if (groupSection) sections.push(groupSection);
 
   pushLanguageSection(sections, options?.languageDocument);
+  pushUnmatchedTriggersSection(sections, options?.unmatchedTriggers);
 
-  sections.push(resolvedPromptValues.memory_instructions);
-  if (memoryTOC) sections.push(memoryTOC);
-  sections.push(AUDIO_GUIDANCE);
-  if (catalog.tools.some((t) => t.serverId === 'ptxprint-mcp')) {
-    sections.push(PTXPRINT_FLOW_GUIDANCE);
-  }
-  if (options?.isVoiceMessage) {
-    sections.push(VOICE_RESPONSE_GUIDANCE);
-  }
+  pushMiddleSections(sections, resolvedPromptValues, catalog, memoryTOC, isVoiceMessage);
   sections.push(...buildConditionalSections(preferences, history));
-  if (!options?.isVoiceMessage) {
+  if (!isVoiceMessage) {
     sections.push(MEDIA_FORMATTING_RULES);
   }
   sections.push(resolvedPromptValues.closing);

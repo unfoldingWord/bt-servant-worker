@@ -438,3 +438,89 @@ describe('buildSystemPrompt - media formatting rules placement & voice mode', ()
     expect(prompt).toContain('## Voice Response Mode (ACTIVE)');
   });
 });
+
+describe('buildSystemPrompt - unmatched triggers section: omission', () => {
+  it('is omitted when unmatchedTriggers is undefined', () => {
+    const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
+    expect(prompt).not.toContain('## Unrecognized Triggers');
+  });
+
+  it('is omitted when unmatchedTriggers is empty', () => {
+    const prompt = buildSystemPrompt(
+      createEmptyCatalog(),
+      defaultPrefs,
+      [],
+      DEFAULT_PROMPT_VALUES,
+      { unmatchedTriggers: [] }
+    );
+    expect(prompt).not.toContain('## Unrecognized Triggers');
+  });
+});
+
+describe('buildSystemPrompt - unmatched triggers section: single token', () => {
+  it('injects the directive when a single unmatched #mode token is present', () => {
+    const prompt = buildSystemPrompt(
+      createEmptyCatalog(),
+      defaultPrefs,
+      [],
+      DEFAULT_PROMPT_VALUES,
+      {
+        unmatchedTriggers: [
+          {
+            kind: 'mode',
+            rawToken: 'fza-ocahch',
+            availableOptions: [
+              { name: 'translation-coach', label: 'Translation Coach' },
+              { name: 'fia-coach' },
+            ],
+          },
+        ],
+      }
+    );
+    expect(prompt).toContain('## Unrecognized Triggers');
+    expect(prompt).toContain('Unrecognized #mode: "fza-ocahch"');
+    expect(prompt).toContain('translation-coach ("Translation Coach")');
+    expect(prompt).toContain('fia-coach');
+  });
+});
+
+describe('buildSystemPrompt - unmatched triggers section: both kinds', () => {
+  it('injects both kinds when mode and language tokens are unmatched', () => {
+    const prompt = buildSystemPrompt(
+      createEmptyCatalog(),
+      defaultPrefs,
+      [],
+      DEFAULT_PROMPT_VALUES,
+      {
+        unmatchedTriggers: [
+          { kind: 'mode', rawToken: 'fza-ocahch', availableOptions: [{ name: 'fia-coach' }] },
+          {
+            kind: 'language',
+            rawToken: 'enzish',
+            availableOptions: [{ name: 'english' }, { name: 'spanish' }],
+          },
+        ],
+      }
+    );
+    expect(prompt).toContain('Unrecognized #mode: "fza-ocahch"');
+    expect(prompt).toContain('Unrecognized @language: "enzish"');
+    expect(prompt).toContain('Available modes: fia-coach');
+    expect(prompt).toContain('Available languages: english, spanish');
+  });
+});
+
+describe('buildSystemPrompt - unmatched triggers section: empty options', () => {
+  it('handles an empty availableOptions list gracefully', () => {
+    const prompt = buildSystemPrompt(
+      createEmptyCatalog(),
+      defaultPrefs,
+      [],
+      DEFAULT_PROMPT_VALUES,
+      {
+        unmatchedTriggers: [{ kind: 'mode', rawToken: 'spoken', availableOptions: [] }],
+      }
+    );
+    expect(prompt).toContain('Unrecognized #mode: "spoken"');
+    expect(prompt).toContain('(none configured)');
+  });
+});

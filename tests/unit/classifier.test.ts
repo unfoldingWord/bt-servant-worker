@@ -1,281 +1,248 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { classifyTriggers, ClassifierContext } from '../../src/services/classifier/index.js';
+import { describe, it, expect } from 'vitest';
+import {
+  classifyTriggers,
+  ClassifierContext,
+  AvailableOption,
+} from '../../src/services/classifier/index.js';
 
-// ─── Mock logger ────────────────────────────────────────────────────────────
+// ─── Fixtures ───────────────────────────────────────────────────────────────
 
-function createMockLogger() {
-  return {
-    log: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    flush: vi.fn(),
-    requestId: 'test-req-id',
-  } as unknown as ClassifierContext['logger'];
-}
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-const modes = [
+const modes: AvailableOption[] = [
   { name: 'spoken', label: 'Spoken' },
   { name: 'mast-methodology', label: 'MAST Methodology' },
+  { name: 'translation-coach', label: 'Translation Coach' },
+  { name: 'fia-coach', label: 'FIA Coach' },
 ];
 
-const languages = [
-  { name: 'arabic', label: 'Arabic' },
+const languages: AvailableOption[] = [
+  { name: 'english', label: 'English' },
+  { name: 'spanish', label: 'Spanish' },
   { name: 'french', label: 'French' },
 ];
 
 function buildCtx(overrides?: Partial<ClassifierContext>): ClassifierContext {
   return {
-    apiKey: 'test-key',
     availableModes: modes,
     availableLanguages: languages,
-    logger: createMockLogger(),
     ...overrides,
   };
 }
 
-/** Build a mock Anthropic Messages API response with the given JSON content. */
-function mockApiResponse(json: {
-  mode: string | null;
-  mode_raw?: string | null;
-  language: string | null;
-  language_raw?: string | null;
-  stripped_message: string;
-}): Response {
-  return new Response(
-    JSON.stringify({
-      content: [{ type: 'text', text: JSON.stringify(json) }],
-    }),
-    { status: 200, headers: { 'content-type': 'application/json' } }
-  );
-}
+// ─── No-trigger passthrough ─────────────────────────────────────────────────
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
-
-describe('classifyTriggers - pre-filter bypass', () => {
-  it('skips LLM call when message has no # or @ in first 100 chars', async () => {
-    const fetchSpy = vi.spyOn(globalThis, 'fetch');
-    const result = await classifyTriggers('How do I translate Genesis 1:1?', buildCtx());
-
-    expect(result.classifierRan).toBe(false);
-    expect(result.strippedMessage).toBe('How do I translate Genesis 1:1?');
-    expect(result.modeName).toBeUndefined();
-    expect(result.languageName).toBeUndefined();
-    expect(result.warnings).toEqual([]);
-    expect(fetchSpy).not.toHaveBeenCalled();
-    fetchSpy.mockRestore();
+describe('classifyTriggers — no triggers in message', () => {
+  it('returns message unchanged when no leading # or @', () => {
+    const result = classifyTriggers('How do I translate Genesis 1:1?', buildCtx());
+    expect(result).toEqual({
+      modeName: undefined,
+      languageName: undefined,
+      strippedMessage: 'How do I translate Genesis 1:1?',
+      unmatchedTriggers: [],
+    });
   });
 
-  it('skips LLM call when no modes and no languages are available', async () => {
-    const fetchSpy = vi.spyOn(globalThis, 'fetch');
-    const ctx = buildCtx({ availableModes: [], availableLanguages: [] });
-    const result = await classifyTriggers('#spoken How do I translate?', ctx);
+  it('does not match # or @ that appear mid-message (head-of-message scope)', () => {
+    const result = classifyTriggers('Tell me about #spoken and @english.', buildCtx());
+    expect(result.modeName).toBeUndefined();
+    expect(result.languageName).toBeUndefined();
+    expect(result.strippedMessage).toBe('Tell me about #spoken and @english.');
+    expect(result.unmatchedTriggers).toEqual([]);
+  });
 
-    expect(result.classifierRan).toBe(false);
-    expect(result.strippedMessage).toBe('#spoken How do I translate?');
-    expect(fetchSpy).not.toHaveBeenCalled();
-    fetchSpy.mockRestore();
+  it('treats a bare `#` or `@` as not a trigger', () => {
+    const result = classifyTriggers('#', buildCtx());
+    expect(result.strippedMessage).toBe('#');
+    expect(result.unmatchedTriggers).toEqual([]);
   });
 });
 
-describe('classifyTriggers - happy path', () => {
-  let fetchSpy: ReturnType<typeof vi.spyOn>;
+// ─── Tier 1: exact match ────────────────────────────────────────────────────
 
-  beforeEach(() => {
-    fetchSpy = vi.spyOn(globalThis, 'fetch');
+describe('classifyTriggers — exact match', () => {
+  it('matches #fia-coach exactly', () => {
+    const result = classifyTriggers('#fia-coach hello there', buildCtx());
+    expect(result.modeName).toBe('fia-coach');
+    expect(result.languageName).toBeUndefined();
+    expect(result.strippedMessage).toBe('hello there');
+    expect(result.unmatchedTriggers).toEqual([]);
   });
 
-  afterEach(() => {
-    fetchSpy.mockRestore();
+  it('matches @spanish exactly (no spurious "null" warning)', () => {
+    const result = classifyTriggers('@spanish ¿cómo estás?', buildCtx());
+    expect(result.languageName).toBe('spanish');
+    expect(result.modeName).toBeUndefined();
+    expect(result.strippedMessage).toBe('¿cómo estás?');
+    expect(result.unmatchedTriggers).toEqual([]);
   });
 
-  it('extracts both #mode and @language', async () => {
-    fetchSpy.mockResolvedValueOnce(
-      mockApiResponse({
-        mode: 'spoken',
-        language: 'arabic',
-        stripped_message: 'How do I translate Genesis 1:1?',
-      })
-    );
-
-    const result = await classifyTriggers(
-      '#spoken @arabic How do I translate Genesis 1:1?',
-      buildCtx()
-    );
-
-    expect(result.classifierRan).toBe(true);
-    expect(result.modeName).toBe('spoken');
-    expect(result.languageName).toBe('arabic');
-    expect(result.strippedMessage).toBe('How do I translate Genesis 1:1?');
-    expect(result.warnings).toEqual([]);
-    expect(result.classifierLatencyMs).toBeDefined();
+  it('is case-insensitive on exact match', () => {
+    const result = classifyTriggers('@SPANISH hola', buildCtx());
+    expect(result.languageName).toBe('spanish');
+    expect(result.strippedMessage).toBe('hola');
   });
 
-  it('extracts only #mode when no @language is present', async () => {
-    fetchSpy.mockResolvedValueOnce(
-      mockApiResponse({
-        mode: 'mast-methodology',
-        language: null,
-        stripped_message: 'What steps do I follow?',
-      })
-    );
+  it('matches both #mode and @language at the head, in either order', () => {
+    const a = classifyTriggers('#fia-coach @english hi', buildCtx());
+    expect(a.modeName).toBe('fia-coach');
+    expect(a.languageName).toBe('english');
+    expect(a.strippedMessage).toBe('hi');
 
-    const result = await classifyTriggers('#mast What steps do I follow?', buildCtx());
+    const b = classifyTriggers('@english #fia-coach hi', buildCtx());
+    expect(b.modeName).toBe('fia-coach');
+    expect(b.languageName).toBe('english');
+    expect(b.strippedMessage).toBe('hi');
+    expect(b.unmatchedTriggers).toEqual([]);
+  });
+});
 
+// ─── Tier 2: unique prefix ──────────────────────────────────────────────────
+
+describe('classifyTriggers — unique prefix match', () => {
+  it('matches #mast → mast-methodology when only one option starts with "mast"', () => {
+    const result = classifyTriggers('#mast tell me more', buildCtx());
     expect(result.modeName).toBe('mast-methodology');
+    expect(result.strippedMessage).toBe('tell me more');
+    expect(result.unmatchedTriggers).toEqual([]);
+  });
+
+  it('matches #fia → fia-coach', () => {
+    const result = classifyTriggers('#fia hello', buildCtx());
+    expect(result.modeName).toBe('fia-coach');
+  });
+
+  it('matches #trans → translation-coach (single prefix winner)', () => {
+    const result = classifyTriggers('#trans hi', buildCtx());
+    expect(result.modeName).toBe('translation-coach');
+  });
+
+  it('does NOT prefix-match when multiple options share the prefix', () => {
+    const ctx = buildCtx({
+      availableModes: [
+        { name: 'translation-coach' },
+        { name: 'translation-help' },
+        { name: 'spoken' },
+      ],
+    });
+    const result = classifyTriggers('#trans hi', ctx);
+    expect(result.modeName).toBeUndefined();
+    expect(result.unmatchedTriggers).toHaveLength(1);
+    expect(result.unmatchedTriggers[0]).toMatchObject({ kind: 'mode', rawToken: 'trans' });
+    // Token is still stripped even when unmatched
+    expect(result.strippedMessage).toBe('hi');
+  });
+});
+
+// ─── Tier 3: Levenshtein ────────────────────────────────────────────────────
+
+describe('classifyTriggers — Levenshtein fuzzy match', () => {
+  it('matches #spokne → spoken (transposition, distance 2)', () => {
+    const result = classifyTriggers('#spokne ok', buildCtx());
+    expect(result.modeName).toBe('spoken');
+    expect(result.strippedMessage).toBe('ok');
+  });
+
+  it('matches @englsh → english (single deletion)', () => {
+    const result = classifyTriggers('@englsh hi', buildCtx());
+    expect(result.languageName).toBe('english');
+  });
+
+  it('does NOT match when two options tie on minimum edit distance', () => {
+    // Both "mode-a" and "mode-b" are at edit distance 1 from "mode-x" — strict tie.
+    const ctx = buildCtx({
+      availableModes: [{ name: 'mode-a' }, { name: 'mode-b' }],
+    });
+    const result = classifyTriggers('#mode-x hi', ctx);
+    expect(result.modeName).toBeUndefined();
+    expect(result.unmatchedTriggers).toHaveLength(1);
+    expect(result.unmatchedTriggers[0]).toMatchObject({ kind: 'mode', rawToken: 'mode-x' });
+  });
+
+  it('does NOT match when distance exceeds 2', () => {
+    const result = classifyTriggers('#xyzabc hi', buildCtx());
+    expect(result.modeName).toBeUndefined();
+    expect(result.unmatchedTriggers).toHaveLength(1);
+    expect(result.unmatchedTriggers[0]).toMatchObject({ kind: 'mode', rawToken: 'xyzabc' });
+  });
+});
+
+// ─── Unmatched / mixed ──────────────────────────────────────────────────────
+
+describe('classifyTriggers — unmatched trigger handling', () => {
+  it('mixes matched + unmatched: @english resolves, #fza-ocahch is unmatched', () => {
+    const result = classifyTriggers('@english #fza-ocahch hello there', buildCtx());
+    expect(result.languageName).toBe('english');
+    expect(result.modeName).toBeUndefined();
+    expect(result.unmatchedTriggers).toHaveLength(1);
+    expect(result.unmatchedTriggers[0]).toMatchObject({
+      kind: 'mode',
+      rawToken: 'fza-ocahch',
+    });
+    expect(result.unmatchedTriggers[0].availableOptions).toEqual(modes);
+    expect(result.strippedMessage).toBe('hello there');
+  });
+
+  it('records both as unmatched when neither falls within the cascade', () => {
+    // Both tokens are well outside Levenshtein ≤ 2 from any configured option.
+    const result = classifyTriggers('@klingon #qwertyzz hello there', buildCtx());
+    expect(result.modeName).toBeUndefined();
     expect(result.languageName).toBeUndefined();
-    expect(result.strippedMessage).toBe('What steps do I follow?');
+    expect(result.unmatchedTriggers).toHaveLength(2);
+    const kinds = result.unmatchedTriggers.map((t) => t.kind).sort();
+    expect(kinds).toEqual(['language', 'mode']);
+    const rawTokens = result.unmatchedTriggers.map((t) => t.rawToken).sort();
+    expect(rawTokens).toEqual(['klingon', 'qwertyzz'].sort());
+    expect(result.strippedMessage).toBe('hello there');
   });
 
-  it('extracts only @language when no #mode is present', async () => {
-    fetchSpy.mockResolvedValueOnce(
-      mockApiResponse({ mode: null, language: 'french', stripped_message: 'Translate this verse' })
-    );
+  it('resolves fuzzy tokens within Levenshtein ≤ 2 (e.g. @enzish → english)', () => {
+    // Sanity check that the cascade actually fuzzy-matches the example from
+    // the issue — distance 2 (z→l substitution + g insertion) is in range and
+    // unique among the configured languages.
+    const result = classifyTriggers('@enzish hi', buildCtx());
+    expect(result.languageName).toBe('english');
+    expect(result.unmatchedTriggers).toEqual([]);
+  });
 
-    const result = await classifyTriggers('@french Translate this verse', buildCtx());
-
-    expect(result.modeName).toBeUndefined();
-    expect(result.languageName).toBe('french');
-    expect(result.strippedMessage).toBe('Translate this verse');
+  it('availableOptions in unmatched entry comes from the relevant kind', () => {
+    const result = classifyTriggers('@klingon hi', buildCtx());
+    expect(result.unmatchedTriggers).toHaveLength(1);
+    expect(result.unmatchedTriggers[0].kind).toBe('language');
+    expect(result.unmatchedTriggers[0].availableOptions).toEqual(languages);
   });
 });
 
-describe('classifyTriggers - unknown token fallback', () => {
-  let fetchSpy: ReturnType<typeof vi.spyOn>;
+// ─── Empty option lists ─────────────────────────────────────────────────────
 
-  beforeEach(() => {
-    fetchSpy = vi.spyOn(globalThis, 'fetch');
-  });
-
-  afterEach(() => {
-    fetchSpy.mockRestore();
-  });
-
-  it('returns warning when mode is not recognized (LLM returns non-null match attempt)', async () => {
-    fetchSpy.mockResolvedValueOnce(
-      mockApiResponse({ mode: 'nonexistent', language: null, stripped_message: 'hello' })
-    );
-
-    const result = await classifyTriggers('#nonexistent hello', buildCtx());
-
+describe('classifyTriggers — empty option lists', () => {
+  it('strips tokens and records them as unmatched when no modes/languages configured', () => {
+    const ctx = buildCtx({ availableModes: [], availableLanguages: [] });
+    const result = classifyTriggers('#spoken @english hi', ctx);
     expect(result.modeName).toBeUndefined();
-    expect(result.warnings).toHaveLength(1);
-    expect(result.warnings[0]).toContain('not recognized');
-    expect(result.warnings[0]).toContain('#nonexistent');
-  });
-
-  it('returns warning when mode token detected but LLM returns null match', async () => {
-    fetchSpy.mockResolvedValueOnce(
-      mockApiResponse({
-        mode: null,
-        mode_raw: 'spokne',
-        language: null,
-        stripped_message: 'hello',
-      })
-    );
-
-    const result = await classifyTriggers('#spokne hello', buildCtx());
-
-    expect(result.modeName).toBeUndefined();
-    expect(result.warnings).toHaveLength(1);
-    expect(result.warnings[0]).toContain('not recognized');
-    expect(result.warnings[0]).toContain('#spokne');
-  });
-
-  it('returns warning when language is not recognized', async () => {
-    fetchSpy.mockResolvedValueOnce(
-      mockApiResponse({
-        mode: null,
-        language: null,
-        language_raw: 'klingon',
-        stripped_message: 'hello',
-      })
-    );
-
-    const result = await classifyTriggers('@klingon hello', buildCtx());
-
     expect(result.languageName).toBeUndefined();
-    expect(result.warnings).toHaveLength(1);
-    expect(result.warnings[0]).toContain('not recognized');
-    expect(result.warnings[0]).toContain('@klingon');
+    expect(result.unmatchedTriggers).toHaveLength(2);
+    expect(result.unmatchedTriggers[0].availableOptions).toEqual([]);
+    expect(result.unmatchedTriggers[1].availableOptions).toEqual([]);
+    expect(result.strippedMessage).toBe('hi');
+  });
+
+  it('still resolves the kind with available options when only the other is empty', () => {
+    const ctx = buildCtx({ availableLanguages: [] });
+    const result = classifyTriggers('#spoken @english hi', ctx);
+    expect(result.modeName).toBe('spoken');
+    expect(result.languageName).toBeUndefined();
+    expect(result.unmatchedTriggers).toHaveLength(1);
+    expect(result.unmatchedTriggers[0].kind).toBe('language');
+    expect(result.unmatchedTriggers[0].rawToken).toBe('english');
   });
 });
 
-describe('classifyTriggers - API error handling', () => {
-  let fetchSpy: ReturnType<typeof vi.spyOn>;
+// ─── No network call ────────────────────────────────────────────────────────
 
-  beforeEach(() => {
-    fetchSpy = vi.spyOn(globalThis, 'fetch');
-  });
-
-  afterEach(() => {
-    fetchSpy.mockRestore();
-  });
-
-  it('degrades gracefully on API error (non-200)', async () => {
-    fetchSpy.mockResolvedValueOnce(new Response('Internal Server Error', { status: 500 }));
-
-    const ctx = buildCtx();
-    const result = await classifyTriggers('#spoken hello', ctx);
-
-    expect(result.classifierRan).toBe(true);
-    expect(result.strippedMessage).toBe('#spoken hello');
-    expect(result.modeName).toBeUndefined();
-    expect(ctx.logger.error).toHaveBeenCalled();
-  });
-
-  it('degrades gracefully on network error', async () => {
-    fetchSpy.mockRejectedValueOnce(new Error('Network failure'));
-
-    const ctx = buildCtx();
-    const result = await classifyTriggers('#spoken hello', ctx);
-
-    expect(result.classifierRan).toBe(true);
-    expect(result.strippedMessage).toBe('#spoken hello');
-    expect(result.modeName).toBeUndefined();
-    expect(ctx.logger.error).toHaveBeenCalled();
-  });
-});
-
-describe('classifyTriggers - response parsing errors', () => {
-  let fetchSpy: ReturnType<typeof vi.spyOn>;
-
-  beforeEach(() => {
-    fetchSpy = vi.spyOn(globalThis, 'fetch');
-  });
-
-  afterEach(() => {
-    fetchSpy.mockRestore();
-  });
-
-  it('degrades gracefully on malformed LLM response', async () => {
-    fetchSpy.mockResolvedValueOnce(
-      new Response(JSON.stringify({ content: [{ type: 'text', text: 'not valid json' }] }), {
-        status: 200,
-      })
-    );
-
-    const ctx = buildCtx();
-    const result = await classifyTriggers('#spoken hello', ctx);
-
-    expect(result.classifierRan).toBe(true);
-    expect(result.strippedMessage).toBe('#spoken hello');
-    expect(ctx.logger.warn).toHaveBeenCalled();
-  });
-
-  it('degrades gracefully on missing stripped_message in response', async () => {
-    fetchSpy.mockResolvedValueOnce(
-      new Response(JSON.stringify({ content: [{ type: 'text', text: '{"mode":"spoken"}' }] }), {
-        status: 200,
-      })
-    );
-
-    const ctx = buildCtx();
-    const result = await classifyTriggers('#spoken hello', ctx);
-
-    expect(result.classifierRan).toBe(true);
-    expect(result.strippedMessage).toBe('#spoken hello');
-    expect(ctx.logger.warn).toHaveBeenCalled();
+describe('classifyTriggers — synchronous, no I/O', () => {
+  it('returns a plain object synchronously without touching fetch', () => {
+    // If the implementation accidentally falls back to an async classifier, the
+    // typeof check below will fail because the return value would be a Promise.
+    const result: unknown = classifyTriggers('#spoken hi', buildCtx());
+    expect(typeof (result as { then?: unknown }).then).not.toBe('function');
   });
 });
