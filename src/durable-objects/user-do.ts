@@ -47,11 +47,11 @@ import {
   PromptMode,
   PromptOverrides,
   resolveActiveModeName,
-  resolveEffectiveMode,
   resolvePromptOverrides,
   validateModeName,
   validatePromptOverrides,
 } from '../types/prompt-overrides.js';
+import { resolveEffectiveMode } from '../types/mode-markdown.js';
 import {
   transcribeAudio,
   synthesizeSpeech,
