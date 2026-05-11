@@ -13,7 +13,12 @@ import { Env } from '../../config/types.js';
 import { AudioContext } from '../audio/index.js';
 import { ChatHistoryEntry, StreamCallbacks } from '../../types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig } from '../../types/org-config.js';
-import { DEFAULT_PROMPT_VALUES, ModeContext, PromptSlot } from '../../types/prompt-overrides.js';
+import {
+  DEFAULT_PROMPT_VALUES,
+  ModeContext,
+  PROMPT_OVERRIDE_SLOTS,
+  PromptSlot,
+} from '../../types/prompt-overrides.js';
 import {
   AppError,
   ClaudeAPIError,
@@ -22,6 +27,7 @@ import {
   ValidationError,
 } from '../../utils/errors.js';
 import { redactToolInputForError, RequestLogger, summarizeToolInput } from '../../utils/logger.js';
+import { stripUlyssesComments } from '../../utils/ulysses-comments.js';
 import { UnmatchedTrigger } from '../classifier/index.js';
 import { createMCPHostFunctions, executeCode } from '../code-execution/index.js';
 import {
@@ -871,13 +877,50 @@ function parseEnvConfig(env: Env, logger: RequestLogger) {
   };
 }
 
+/**
+ * Strip Ulysses-style editor comments (`%%` line / `++…++` span) from every
+ * author-supplied content stream just before it is concatenated into the
+ * system prompt (#201). Stored documents are never mutated — we work on
+ * copies in memory. Unbalanced `++` runs are left literal and logged.
+ */
+function stripPromptComments(
+  values: Required<Record<PromptSlot, string>>,
+  languageDocument: string | undefined,
+  logger: RequestLogger
+): { values: Required<Record<PromptSlot, string>>; languageDocument: string | undefined } {
+  const cleanedSlots = { ...values };
+  for (const slot of PROMPT_OVERRIDE_SLOTS) {
+    // eslint-disable-next-line security/detect-object-injection -- key from PROMPT_OVERRIDE_SLOTS
+    const { cleaned, hadUnbalancedSpan } = stripUlyssesComments(values[slot]);
+    if (hadUnbalancedSpan) {
+      logger.warn('ulysses_unbalanced_span', { source: `prompt_slot:${slot}` });
+    }
+    // eslint-disable-next-line security/detect-object-injection -- key from PROMPT_OVERRIDE_SLOTS
+    cleanedSlots[slot] = cleaned;
+  }
+  let cleanedLang = languageDocument;
+  if (languageDocument !== undefined) {
+    const { cleaned, hadUnbalancedSpan } = stripUlyssesComments(languageDocument);
+    if (hadUnbalancedSpan) {
+      logger.warn('ulysses_unbalanced_span', { source: 'language_document' });
+    }
+    cleanedLang = cleaned;
+  }
+  return { values: cleanedSlots, languageDocument: cleanedLang };
+}
+
 function createOrchestrationContext(
   userMessage: string,
   options: OrchestratorOptions,
   config: ReturnType<typeof parseEnvConfig>
 ): OrchestrationContext {
   const { env, catalog, history, preferences, orgConfig, logger, callbacks } = options;
-  const promptValues = options.resolvedPromptValues ?? DEFAULT_PROMPT_VALUES;
+  const rawPromptValues = options.resolvedPromptValues ?? DEFAULT_PROMPT_VALUES;
+  const { values: promptValues, languageDocument } = stripPromptComments(
+    rawPromptValues,
+    options.languageDocument,
+    logger
+  );
 
   // Use LLM limit from org config (default: 5)
   const llmMax = orgConfig?.max_history_llm ?? DEFAULT_ORG_CONFIG.max_history_llm;
@@ -888,7 +931,7 @@ function createOrchestrationContext(
     model: config.model,
     maxTokens: config.maxTokens,
     // prettier-ignore
-    systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument: options.languageDocument, unmatchedTriggers: options.unmatchedTriggers }),
+    systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument, unmatchedTriggers: options.unmatchedTriggers }),
     tools: buildAllTools(catalog, {
       hasModes: (options.modeContext?.availableModes.length ?? 0) > 0,
     }),
