@@ -66,6 +66,7 @@ import { createRequestLogger, RequestLogger, withEndpointLogging } from '../util
 import { applyTemplateVariables } from '../utils/template.js';
 import { createTimingContext, timePhase, TimingContext } from '../utils/timing.js';
 import { classifyTriggers, ClassifierResult } from '../services/classifier/index.js';
+import type { UnmatchedTrigger } from '../services/classifier/index.js';
 import { isAdminClient, validateChatBody } from '../utils/chat-validation.js';
 import { OrgLanguages } from '../types/languages.js';
 import { InternalQueueEntry } from '../types/queue.js';
@@ -78,14 +79,6 @@ const SELECTED_MODE_KEY = 'selected_mode';
 const PROCESSING_LOCK_KEY = '_processing_lock';
 const QUEUE_KEY = 'queue';
 const QUEUE_PROCESSING_KEY = 'queue_processing';
-
-/** Prepend soft warnings for unrecognized trigger tokens to the first response. */
-function prependTriggerWarnings(responses: string[], warnings: string[]): void {
-  if (warnings.length > 0 && responses.length > 0) {
-    const warningText = warnings.map((w) => `_${w}_`).join('\n');
-    responses[0] = `${warningText}\n\n${responses[0]}`;
-  }
-}
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 const LOCK_STALE_THRESHOLD_MS = 90_000; // 90 seconds
@@ -941,12 +934,11 @@ export class UserDO {
     const audioContext = this.buildAudioContext();
     const attachmentsContext = createAttachmentsContext();
     // prettier-ignore
-    const orchOpts = this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, triggerCtx.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, triggerCtx.activeModeName, audioContext, attachmentsContext, workerOrigin, logger, callbacks, groupContext, triggerCtx.languageDocument);
+    const orchOpts = this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, triggerCtx.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, triggerCtx.activeModeName, audioContext, attachmentsContext, workerOrigin, logger, callbacks, groupContext, triggerCtx.languageDocument, triggerCtx.unmatchedTriggers);
 
     const orchResult = await this.tracedPhase(ctx, 'orchestration', () =>
       this.runOrchestration(triggerCtx.messageText, orchOpts)
     );
-    prependTriggerWarnings(orchResult.responses, triggerCtx.warnings);
     const ttsResponses = this.extractTtsResponses(orchResult, logger);
 
     const voiceAudio = await this.tracedPhase(ctx, 'audio_generation', () =>
@@ -972,31 +964,33 @@ export class UserDO {
     loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
     logger: RequestLogger
   ) {
-    const classified = await classifyTriggers(loaded.messageText, {
-      apiKey: this.env.ANTHROPIC_API_KEY,
+    const classified = classifyTriggers(loaded.messageText, {
       availableModes: loaded.orgModes.modes
         .filter((m) => loaded.isAdmin || m.published === true)
         .map((m) => ({ name: m.name, label: m.label })),
       availableLanguages: loaded.orgLanguages.languages
         .filter((l) => loaded.isAdmin || l.published === true)
         .map((l) => ({ name: l.name, label: l.label })),
-      logger,
     });
 
     const result = await this.applyTriggerOverrides(body, loaded, classified);
 
+    const unmatchedKinds = [...new Set(classified.unmatchedTriggers.map((t) => t.kind))].sort();
     logger.log('trigger_classifier_result', {
-      classifier_ran: classified.classifierRan,
-      classifier_latency_ms: classified.classifierLatencyMs ?? null,
       requested_mode: classified.modeName ?? null,
       requested_language: classified.languageName ?? null,
       effective_mode: result.activeModeName ?? null,
       language_document_injected: !!result.languageDocument,
-      warnings: classified.warnings,
+      unmatched_count: classified.unmatchedTriggers.length,
+      unmatched_kinds: unmatchedKinds,
       message_stripped: classified.strippedMessage !== loaded.messageText,
     });
 
-    return { ...result, messageText: classified.strippedMessage, warnings: classified.warnings };
+    return {
+      ...result,
+      messageText: classified.strippedMessage,
+      unmatchedTriggers: classified.unmatchedTriggers,
+    };
   }
 
   /** Apply classifier results: resolve per-turn mode override and language document. */
@@ -1404,7 +1398,8 @@ export class UserDO {
     logger: RequestLogger,
     callbacks?: StreamCallbacks,
     groupContext?: GroupChatContext,
-    languageDocument?: string
+    languageDocument?: string,
+    unmatchedTriggers?: UnmatchedTrigger[]
   ): Parameters<typeof orchestrate>[1] {
     return {
       env: this.env,
@@ -1426,6 +1421,7 @@ export class UserDO {
       groupContext,
       isVoiceMessage: body.message_type === 'audio',
       languageDocument,
+      unmatchedTriggers,
       logger,
       callbacks,
     };

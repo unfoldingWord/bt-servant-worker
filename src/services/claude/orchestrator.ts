@@ -22,6 +22,7 @@ import {
   ValidationError,
 } from '../../utils/errors.js';
 import { redactToolInputForError, RequestLogger, summarizeToolInput } from '../../utils/logger.js';
+import { UnmatchedTrigger } from '../classifier/index.js';
 import { createMCPHostFunctions, executeCode } from '../code-execution/index.js';
 import {
   callMCPTool,
@@ -178,6 +179,10 @@ interface OrchestratorOptions {
   isVoiceMessage?: boolean | undefined;
   /** Per-turn language document to inject into the system prompt */
   languageDocument?: string | undefined;
+  /** Triggers from the user's leading `#<mode>` / `@<language>` tokens that
+   *  could not be resolved. Forwarded to the system prompt so the orchestrator
+   *  can compose a contextual "did you mean…" reply. */
+  unmatchedTriggers?: UnmatchedTrigger[] | undefined;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
 }
@@ -883,7 +888,7 @@ function createOrchestrationContext(
     model: config.model,
     maxTokens: config.maxTokens,
     // prettier-ignore
-    systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument: options.languageDocument }),
+    systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument: options.languageDocument, unmatchedTriggers: options.unmatchedTriggers }),
     tools: buildAllTools(catalog, {
       hasModes: (options.modeContext?.availableModes.length ?? 0) > 0,
     }),
