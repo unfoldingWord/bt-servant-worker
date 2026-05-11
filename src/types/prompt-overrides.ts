@@ -52,12 +52,29 @@ export const MAX_MODE_LABEL_LENGTH = 100;
 /** Maximum length for a mode description */
 export const MAX_MODE_DESCRIPTION_LENGTH = 500;
 
+/**
+ * Maximum length for a mode markdown document (Phase 1 of #200).
+ * Comfortably above the worst case of 7 × MAX_OVERRIDE_LENGTH plus heading
+ * overhead.
+ */
+export const MAX_MODE_DOCUMENT_LENGTH = 64_000;
+
 /** Valid mode name pattern: lowercase alphanumeric + hyphens, no leading/trailing hyphen */
 export const MODE_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 
 /**
  * A named mode — org-level preset of prompt overrides.
  * Modes sit between org and user in the override hierarchy.
+ *
+ * Storage shape: exactly one of `overrides` or `document` is present at a
+ * time (Phase 1 of issue #200). Legacy modes carry `overrides` (a slot map);
+ * modes saved through the new portal markdown editor carry `document` (a
+ * single markdown blob with H2 sections per slot). Phase 2 will backfill the
+ * remaining legacy records and drop the slot-map shape entirely.
+ *
+ * Chat-time consumers read `mode.overrides` indirectly via
+ * `getEffectiveOverrides()` (see `./mode-markdown.ts`) so they never need to
+ * care which shape is in storage.
  */
 export interface PromptMode {
   /** Unique slug identifier within the org (e.g., "mast-methodology") */
@@ -72,8 +89,10 @@ export interface PromptMode {
    * Admin endpoints always return all modes regardless of this flag.
    */
   published?: boolean;
-  /** The prompt overrides for this mode — same 7 slots */
-  overrides: PromptOverrides;
+  /** Legacy slot-map storage shape. Present iff this mode has not been migrated. */
+  overrides?: PromptOverrides;
+  /** Markdown storage shape (H2 per slot). Present iff this mode has been migrated. */
+  document?: string;
 }
 
 /**
@@ -251,8 +270,44 @@ function validateOptionalString(
   return null;
 }
 
+/** Validate the content portion (overrides vs document) of a mode payload. */
+function validateModeContentField(obj: Record<string, unknown>): string | null {
+  const hasOverrides = 'overrides' in obj;
+  const hasDocument = 'document' in obj;
+
+  if (hasOverrides && hasDocument) {
+    return 'Mode must specify either "document" or "overrides", not both';
+  }
+  if (!hasOverrides && !hasDocument) {
+    return 'Mode must include either a "document" string or an "overrides" object';
+  }
+
+  if (hasOverrides) {
+    const overridesError = validatePromptOverrides(obj.overrides);
+    return overridesError ? `Mode overrides invalid: ${overridesError}` : null;
+  }
+
+  // Inline document validation (avoid cross-module circular import by
+  // duplicating the small check; mode-markdown.ts has the canonical helper
+  // that admin handlers can also call for explicit-error paths).
+  const doc = obj.document;
+  if (typeof doc !== 'string') return 'Mode document must be a string';
+  if (doc.length > MAX_MODE_DOCUMENT_LENGTH) {
+    return `Mode document exceeds maximum length of ${MAX_MODE_DOCUMENT_LENGTH} characters (got ${doc.length})`;
+  }
+  return null;
+}
+
 /**
  * Validate a prompt mode object (for create/update requests).
+ *
+ * Accepts either of two shapes:
+ *   - Legacy: `{ ..., overrides: PromptOverrides }`
+ *   - Markdown (post-#200 portal): `{ ..., document: string }`
+ *
+ * Rejects bodies that include both fields (forces the caller to pick a
+ * shape — accepting both invites ambiguity about precedence) or neither.
+ *
  * Returns an error message if invalid, null if valid.
  */
 export function validatePromptMode(mode: unknown): string | null {
@@ -266,14 +321,7 @@ export function validatePromptMode(mode: unknown): string | null {
     validateOptionalBoolean(obj, 'published');
   if (scalarError) return scalarError;
 
-  if (!('overrides' in obj)) {
-    return 'Mode must include an "overrides" object';
-  }
-
-  const overridesError = validatePromptOverrides(obj.overrides);
-  if (overridesError) return `Mode overrides invalid: ${overridesError}`;
-
-  return null;
+  return validateModeContentField(obj);
 }
 
 // ─── Mode resolution ───────────────────────────────────────────────────────────
@@ -286,40 +334,9 @@ export function resolveActiveModeName(userSelectedMode: string | undefined): str
   return userSelectedMode;
 }
 
-/**
- * Resolve the effective mode for a request given a (possibly stale) selection.
- *
- * `effectiveModeName` is `undefined` whenever the requested mode is missing or
- * unpublished, so downstream tools (`list_modes`) never surface a draft as
- * "active." `modeOverrides` is the mode's overrides when applicable, otherwise
- * empty. `reason` distinguishes missing vs unpublished for log correlation.
- *
- * Admin-origin requests (identified server-side via `isAdminClient(client_id)`)
- * pass `options.includeUnpublished = true` so authors can test drafts from the
- * portal's test chat pane. For those requests a matched draft returns
- * `reason: 'ok'` — end-user requests keep the default filter.
- */
-export function resolveEffectiveMode(
-  orgModes: OrgModes,
-  requestedModeName: string | undefined,
-  options?: { includeUnpublished?: boolean }
-): {
-  effectiveModeName: string | undefined;
-  modeOverrides: PromptOverrides;
-  reason: 'ok' | 'none-requested' | 'missing' | 'unpublished';
-} {
-  if (!requestedModeName) {
-    return { effectiveModeName: undefined, modeOverrides: {}, reason: 'none-requested' };
-  }
-  const mode = orgModes.modes.find((m) => m.name === requestedModeName);
-  if (!mode) {
-    return { effectiveModeName: undefined, modeOverrides: {}, reason: 'missing' };
-  }
-  if (mode.published !== true && options?.includeUnpublished !== true) {
-    return { effectiveModeName: undefined, modeOverrides: {}, reason: 'unpublished' };
-  }
-  return { effectiveModeName: requestedModeName, modeOverrides: mode.overrides, reason: 'ok' };
-}
+// `resolveEffectiveMode` lives in `./mode-markdown.ts` because it needs to
+// parse the markdown storage shape back into slots on demand, and keeping it
+// there avoids a circular import between this file and `mode-markdown.ts`.
 
 /**
  * Type-safe merge of prompt override updates into an existing overrides object.

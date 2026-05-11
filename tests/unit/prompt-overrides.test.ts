@@ -10,11 +10,11 @@ import {
   validateModeName,
   validatePromptMode,
   resolveActiveModeName,
-  resolveEffectiveMode,
   MAX_MODE_NAME_LENGTH,
   MAX_MODE_LABEL_LENGTH,
   MAX_MODE_DESCRIPTION_LENGTH,
 } from '../../src/types/prompt-overrides.js';
+import { resolveEffectiveMode } from '../../src/types/mode-markdown.js';
 
 describe('validatePromptOverrides - valid inputs', () => {
   it('accepts valid overrides with string values', () => {
@@ -361,7 +361,7 @@ describe('validateModeName', () => {
   });
 });
 
-describe('validatePromptMode', () => {
+describe('validatePromptMode — accepts', () => {
   it('accepts valid mode with overrides only', () => {
     expect(validatePromptMode({ overrides: { identity: 'Custom' } })).toBeNull();
   });
@@ -380,21 +380,41 @@ describe('validatePromptMode', () => {
     expect(validatePromptMode({ overrides: {} })).toBeNull();
   });
 
+  it('accepts a markdown-shape mode with just document', () => {
+    expect(validatePromptMode({ document: '## Identity\n\nhello' })).toBeNull();
+  });
+});
+
+describe('validatePromptMode — content-field either/or', () => {
   it('rejects non-object input', () => {
     expect(validatePromptMode('string')).toContain('must be a JSON object');
     expect(validatePromptMode(null)).toContain('must be a JSON object');
     expect(validatePromptMode([])).toContain('must be a JSON object');
   });
 
-  it('rejects missing overrides', () => {
-    expect(validatePromptMode({ label: 'Test' })).toContain('must include an "overrides" object');
+  it('rejects when neither overrides nor document is present', () => {
+    expect(validatePromptMode({ label: 'Test' })).toContain(
+      'must include either a "document" string or an "overrides" object'
+    );
+  });
+
+  it('rejects when both overrides and document are present', () => {
+    expect(
+      validatePromptMode({ overrides: { identity: 'x' }, document: '## Identity\n\nx' })
+    ).toContain('not both');
+  });
+
+  it('rejects a non-string document', () => {
+    expect(validatePromptMode({ document: 42 })).toContain('must be a string');
   });
 
   it('rejects invalid overrides', () => {
     const result = validatePromptMode({ overrides: { unknown_slot: 'value' } });
     expect(result).toContain('Mode overrides invalid');
   });
+});
 
+describe('validatePromptMode — scalar field validation', () => {
   it('rejects non-string label', () => {
     expect(validatePromptMode({ label: 42, overrides: {} })).toContain('label must be a string');
   });

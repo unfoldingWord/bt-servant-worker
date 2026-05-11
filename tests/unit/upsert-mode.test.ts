@@ -132,3 +132,75 @@ describe('upsertMode - published flag preservation', () => {
     if (result.ok) expect(result.savedMode.published).toBeUndefined();
   });
 });
+
+// ─── Phase 1 of #200 — cross-shape upsert ──────────────────────────────────
+
+describe('upsertMode - storage shape: new and same-shape', () => {
+  it('persists a brand-new markdown-shape mode with its document field', () => {
+    const orgModes = makeOrgModes();
+    const result = upsertMode(orgModes, { name: 'new', document: '## Identity\n\nfresh\n' }, 'o');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.savedMode.document).toBe('## Identity\n\nfresh\n');
+      expect(result.savedMode.overrides).toBeUndefined();
+    }
+  });
+
+  it('wholesale-replaces an existing markdown-shape mode on document PUT', () => {
+    const orgModes = makeOrgModes({ name: 't', document: '## Identity\n\nold\n' });
+    const result = upsertMode(orgModes, { name: 't', document: '## Identity\n\nnew\n' }, 'o');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.savedMode.document).toBe('## Identity\n\nnew\n');
+      expect(result.savedMode.overrides).toBeUndefined();
+    }
+  });
+
+  it('strips control chars from incoming document on persist', () => {
+    const orgModes = makeOrgModes();
+    const result = upsertMode(
+      orgModes,
+      { name: 'new', document: '## Identity\n\nclean\x00here\n' },
+      'o'
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.savedMode.document).not.toContain('\x00');
+      expect(result.savedMode.document).toContain('cleanhere');
+    }
+  });
+});
+
+describe('upsertMode - storage shape: cross-shape transitions', () => {
+  it('migrates a legacy mode to markdown shape on first markdown PUT', () => {
+    const orgModes = makeOrgModes({
+      name: 't',
+      label: 'My Mode',
+      published: true,
+      overrides: { identity: 'old-slot' },
+    });
+    const result = upsertMode(
+      orgModes,
+      { name: 't', document: '## Identity\n\nfrom portal\n' },
+      'o'
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.savedMode.document).toBe('## Identity\n\nfrom portal\n');
+      expect(result.savedMode.overrides).toBeUndefined();
+      // Scalar fields preserved across the shape migration.
+      expect(result.savedMode.label).toBe('My Mode');
+      expect(result.savedMode.published).toBe(true);
+    }
+  });
+
+  it('reverts a markdown mode to legacy slot shape when a legacy PUT arrives', () => {
+    const orgModes = makeOrgModes({ name: 't', document: '## Identity\n\nmd\n' });
+    const result = upsertMode(orgModes, { name: 't', overrides: { identity: 'slotty' } }, 'o');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.savedMode.overrides).toEqual({ identity: 'slotty' });
+      expect(result.savedMode.document).toBeUndefined();
+    }
+  });
+});

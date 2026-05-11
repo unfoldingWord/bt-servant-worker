@@ -39,6 +39,8 @@ import {
   sanitizeScaffoldDocument,
   validateLanguageScaffold,
 } from './types/language-scaffold.js';
+import { synthesizeModeDocument } from './types/mode-markdown.js';
+import { stripControlChars } from './types/prompt-overrides.js';
 import { constantTimeCompare } from './utils/crypto.js';
 import { ValidationError } from './utils/errors.js';
 import { getAudio } from './services/audio/index.js';
@@ -509,7 +511,7 @@ app.get('/api/v1/admin/orgs/:org/modes', async (c) => {
     };
 
     logger.log('admin_action', { action: 'list_modes', org, mode_count: orgModes.modes.length });
-    return c.json({ org, ...orgModes });
+    return c.json({ org, modes: orgModes.modes.map(toMarkdownView) });
   } catch (error) {
     logger.error('admin_action', error, { action: 'list_modes', org });
     return c.json({ error: 'Failed to read modes from storage' }, 500);
@@ -536,7 +538,7 @@ app.get('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
     }
 
     logger.log('admin_action', { action: 'get_mode', org, mode_name: modeName });
-    return c.json({ org, mode });
+    return c.json({ org, mode: toMarkdownView(mode) });
   } catch (error) {
     logger.error('admin_action', error, { action: 'get_mode', org });
     return c.json({ error: 'Failed to read mode from storage' }, 500);
@@ -578,10 +580,10 @@ app.put('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
       org,
       mode_name: modeName,
       mode_count: orgModes.modes.length,
-      saved_overrides: result.savedMode.overrides,
+      saved_shape: result.savedMode.document !== undefined ? 'document' : 'overrides',
       published: result.savedMode.published === true,
     });
-    return c.json({ org, mode: result.savedMode, message: 'Mode saved' });
+    return c.json({ org, mode: toMarkdownView(result.savedMode), message: 'Mode saved' });
   } catch (error) {
     logger.error('admin_action', error, { action: 'upsert_mode', org });
     return c.json({ error: 'Failed to save mode to storage' }, 500);
@@ -617,7 +619,7 @@ app.delete('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
       mode_name: modeName,
       mode_count: orgModes.modes.length,
     });
-    return c.json({ org, modes: orgModes.modes, message: 'Mode deleted' });
+    return c.json({ org, modes: orgModes.modes.map(toMarkdownView), message: 'Mode deleted' });
   } catch (error) {
     logger.error('admin_action', error, { action: 'delete_mode', org });
     return c.json({ error: 'Failed to delete mode from storage' }, 500);
@@ -978,26 +980,93 @@ app.delete('/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/memory', (c
 
 export default app;
 
-/** Merge an incoming mode with an existing one, combining overrides and optional fields. */
-function mergeExistingMode(existing: PromptMode, incoming: PromptMode): PromptMode {
-  // published is rebuilt explicitly: incoming wins if present (publish/unpublish action),
-  // otherwise existing carries through. Without this, a PUT that omits `published`
-  // would silently strip the flag from a previously-published mode.
-  const publishedResolved = incoming.published ?? existing.published;
+/** Storage shape tag for log/diagnostic clarity. */
+type ModeShape = 'overrides' | 'document';
+
+function modeShape(mode: PromptMode): ModeShape {
+  return mode.document !== undefined ? 'document' : 'overrides';
+}
+
+/**
+ * Project a stored mode to the markdown-document admin response shape
+ * (Phase 1 of #200). Legacy modes carry their original overrides as
+ * `originalSlots` for one release — diagnostics + rollback safety net.
+ * Modes already stored as markdown pass their `document` through unchanged
+ * and omit `originalSlots`.
+ */
+function toMarkdownView(mode: PromptMode): {
+  name: string;
+  label?: string;
+  description?: string;
+  published?: boolean;
+  document: string;
+  format: 'markdown';
+  originalSlots?: PromptOverrides;
+} {
+  const isLegacy = mode.document === undefined;
+  const document = isLegacy ? synthesizeModeDocument(mode.overrides ?? {}) : mode.document!;
   return {
-    name: incoming.name,
-    overrides: mergePromptOverrides(existing.overrides, incoming.overrides),
-    ...((incoming.label ?? existing.label) ? { label: incoming.label ?? existing.label } : {}),
-    ...((incoming.description ?? existing.description)
-      ? { description: incoming.description ?? existing.description }
-      : {}),
-    ...(publishedResolved !== undefined ? { published: publishedResolved } : {}),
+    name: mode.name,
+    ...(mode.label !== undefined ? { label: mode.label } : {}),
+    ...(mode.description !== undefined ? { description: mode.description } : {}),
+    ...(mode.published !== undefined ? { published: mode.published } : {}),
+    document,
+    format: 'markdown' as const,
+    ...(isLegacy ? { originalSlots: mode.overrides ?? {} } : {}),
   };
 }
 
 /**
- * Upsert a mode into an OrgModes array, merging overrides with any existing mode.
+ * Compute the merged content field(s) for a mode upsert (Phase 1 of #200).
+ *
+ * Same-shape merge:
+ *  - both have `overrides` → slot-level merge (partial PUTs supported).
+ *  - both have `document` → wholesale replace document.
+ *
+ * Mismatched-shape merge: incoming wins wholesale. The stored
+ * counterpart-shape field is cleared.
+ */
+function mergeContentFields(
+  existing: PromptMode,
+  incoming: PromptMode
+): { overrides: PromptOverrides } | { document: string } {
+  if (incoming.document !== undefined) {
+    return { document: stripControlChars(incoming.document) };
+  }
+  // incoming has overrides (validated upstream). If existing had a document
+  // we drop it; if existing had overrides we slot-merge.
+  if (existing.document !== undefined) {
+    return { overrides: incoming.overrides ?? {} };
+  }
+  return { overrides: mergePromptOverrides(existing.overrides ?? {}, incoming.overrides ?? {}) };
+}
+
+/**
+ * Merge an incoming mode with an existing one (Phase 1 of #200).
+ *
+ * Scalar fields (label/description/published) follow the prior "incoming
+ * wins if present, otherwise existing carries through" rule unchanged.
+ * Content fields are resolved by `mergeContentFields` above.
+ */
+function mergeExistingMode(existing: PromptMode, incoming: PromptMode): PromptMode {
+  const publishedResolved = incoming.published ?? existing.published;
+  const labelResolved = incoming.label ?? existing.label;
+  const descriptionResolved = incoming.description ?? existing.description;
+  return {
+    name: incoming.name,
+    ...(labelResolved ? { label: labelResolved } : {}),
+    ...(descriptionResolved ? { description: descriptionResolved } : {}),
+    ...(publishedResolved !== undefined ? { published: publishedResolved } : {}),
+    ...mergeContentFields(existing, incoming),
+  };
+}
+
+/**
+ * Upsert a mode into an OrgModes array, merging with any existing mode.
  * Mutates orgModes.modes in-place (splice/push) and returns the result.
+ *
+ * Sanitizes the incoming document field (if any) by stripping control
+ * characters before persistence, mirroring the language scaffold pattern.
  */
 export function upsertMode(
   orgModes: OrgModes,
@@ -1012,8 +1081,8 @@ export function upsertMode(
       action: 'upsert_mode_before',
       org,
       mode_name: modeInput.name,
-      existing_overrides: orgModes.modes[existingIdx]!.overrides,
-      incoming_overrides: modeInput.overrides,
+      existing_shape: modeShape(orgModes.modes[existingIdx]!),
+      incoming_shape: modeShape(modeInput),
     });
     orgModes.modes.splice(existingIdx, 1, savedMode);
     return { ok: true, savedMode };
@@ -1022,15 +1091,22 @@ export function upsertMode(
   if (orgModes.modes.length >= MAX_MODES_PER_ORG) {
     return { ok: false, error: `Cannot have more than ${MAX_MODES_PER_ORG} modes per org` };
   }
+
+  // New mode: sanitize document field if present.
+  const newMode: PromptMode =
+    modeInput.document !== undefined
+      ? { ...modeInput, document: stripControlChars(modeInput.document) }
+      : modeInput;
+
   logger?.log('admin_action', {
     action: 'upsert_mode_before',
     org,
     mode_name: modeInput.name,
-    existing_overrides: null,
-    incoming_overrides: modeInput.overrides,
+    existing_shape: null,
+    incoming_shape: modeShape(modeInput),
   });
-  orgModes.modes.push(modeInput);
-  return { ok: true, savedMode: modeInput };
+  orgModes.modes.push(newMode);
+  return { ok: true, savedMode: newMode };
 }
 
 /** Merge an incoming language with an existing one. Document is replaced wholesale. */
