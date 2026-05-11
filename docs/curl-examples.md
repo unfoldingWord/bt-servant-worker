@@ -296,6 +296,96 @@ curl -X DELETE "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-serve
 
 ---
 
+## Admin: Mode Management — `spoken-mode` (STAGING ONLY)
+
+> ⚠️ **STAGING ONLY.** The procedure below pushes the assembled
+> `spoken-mode` mode document to the **staging** API. **Do not run this
+> against production** until the mode has been validated with a real
+> group on staging. Prod promotion is a separate manual step.
+>
+> Source of truth for the mode's behavior is
+> [`docs/spoken-mode-flow.md`](spoken-mode-flow.md). The assembled
+> mode document — what actually gets pushed below — is
+> [`docs/spoken-mode-document.md`](spoken-mode-document.md). If the
+> flow doc and the assembled document disagree, edit the assembled
+> document to match.
+
+### Prerequisite: verify MCP servers are registered on staging
+
+The mode's `tool_guidance` slot names `translation-helps` and `aquifer`
+explicitly. Confirm both are registered for `unfoldingWord` on staging
+before pushing the mode — otherwise Claude will be instructed to call
+servers that don't exist.
+
+```bash
+STAGING_BASE_URL="https://staging-api.btservant.ai"
+STAGING_ADMIN_KEY="<paste staging admin key>"
+
+curl -s "$STAGING_BASE_URL/api/v1/admin/orgs/unfoldingWord/mcp-servers" \
+  -H "Authorization: Bearer $STAGING_ADMIN_KEY" \
+  | jq '.servers[] | .id'
+```
+
+Expect both `"translation-helps"` and `"aquifer"` in the output. If
+either is missing, register it first (template above under "Add MCP
+Server").
+
+### Push the `spoken-mode` mode document to staging
+
+Uses the new `{ document }` storage shape per worker PR #200. The
+seven canonical H2 headings inside the document define the slot
+boundaries (`src/types/mode-markdown.ts`).
+
+```bash
+STAGING_BASE_URL="https://staging-api.btservant.ai"
+STAGING_ADMIN_KEY="<paste staging admin key>"
+
+# Read the assembled mode document and PUT it. jq -Rs reads the whole
+# file as a single JSON string so newlines and quoting are escaped
+# correctly inside the request body.
+DOC_JSON=$(jq -Rs '.' < docs/spoken-mode-document.md)
+
+cat <<EOF | curl -X PUT "$STAGING_BASE_URL/api/v1/admin/orgs/unfoldingWord/modes/spoken-mode" \
+  -H "Authorization: Bearer $STAGING_ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  --data-binary @-
+{
+  "label": "Spoken Mode",
+  "description": "Facilitator-coach for oral-preference Bible translation groups. Walks a group from story collection through community-checked oral draft for a single passage.",
+  "published": true,
+  "document": $DOC_JSON
+}
+EOF
+```
+
+### Verify the round-trip on staging
+
+Confirm the document round-trips through synthesize/parse cleanly (no
+slot lost, no orphaned content):
+
+```bash
+curl -s "$STAGING_BASE_URL/api/v1/admin/orgs/unfoldingWord/modes/spoken-mode" \
+  -H "Authorization: Bearer $STAGING_ADMIN_KEY" \
+  | jq '.mode | {name, label, published, document_length: (.document | length)}'
+```
+
+Then list all modes on staging and confirm `spoken-mode` appears with
+`published: true`:
+
+```bash
+curl -s "$STAGING_BASE_URL/api/v1/admin/orgs/unfoldingWord/modes" \
+  -H "Authorization: Bearer $STAGING_ADMIN_KEY" \
+  | jq '.modes[] | {name, published}'
+```
+
+### Smoke-test from the admin portal
+
+Once the mode is pushed, exercise it end-to-end via the portal's
+test-chat pane (per admin-portal PR #107: "wire test chat to active
+mode + language selection") before involving a real Telegram group.
+
+---
+
 ## Testing All E2E Scenarios
 
 ```bash

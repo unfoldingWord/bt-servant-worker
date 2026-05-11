@@ -224,6 +224,68 @@ export function buildPrepareUsfmSourceTool(): Anthropic.Tool {
 }
 
 /**
+ * Build read_r2_object tool definition.
+ *
+ * Lets Claude retrieve a previously-archived voice submission (or other
+ * org-scoped R2 object) and obtain a worker-relative URL the client can
+ * play. Required for spoken-mode replay flows where a participant asks
+ * the bot to play back another participant's stored story.
+ *
+ * Scoped: the orchestrator enforces that the `r2_key` belongs to the
+ * current org (prefix `voice-submissions/{org}/...`) before returning a
+ * URL.
+ */
+export function buildReadR2ObjectTool(): Anthropic.Tool {
+  return {
+    name: 'read_r2_object',
+    description:
+      'Resolve a stored R2 object key (e.g. an archived voice submission saved during spoken-mode story collection) to a worker-relative URL that the client can play. Scoped to the current org: the r2_key MUST start with `voice-submissions/<org>/`. Use when you need to inspect or refer back to a previously-stored audio object — but to actually deliver the audio to the user as a response attachment, call `attach_audio` instead.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        r2_key: {
+          type: 'string',
+          description:
+            'The R2 object key. Must start with `voice-submissions/<org>/` where <org> is the current org. Other prefixes (e.g. `audio/`) are rejected.',
+        },
+      },
+      required: ['r2_key'],
+    },
+  };
+}
+
+/**
+ * Build attach_audio tool definition.
+ *
+ * Lets Claude attach a stored audio object to the response so the client
+ * renders it as audio playback alongside (or instead of) freshly-synthesized
+ * TTS. The typical case is spoken-mode replaying a participant's original
+ * voice story when asked "play me Amara's story."
+ *
+ * Scoped the same way as `read_r2_object`. The tool pushes an
+ * AudioAttachment onto the request's attachmentsContext; the worker
+ * surfaces it on ChatResponse.attachments.
+ */
+export function buildAttachAudioTool(): Anthropic.Tool {
+  return {
+    name: 'attach_audio',
+    description:
+      'Attach a stored audio object to the response so the client plays it back to the user. Use when the user asks to hear a previously-recorded voice submission (e.g. "play me Amara’s story"). Coexists with TTS: you may say a short text intro ("Here is Amara’s story") and call this tool to attach the actual recording. Scoped to the current org: the r2_key MUST start with `voice-submissions/<org>/`. Other prefixes (e.g. `audio/` for TTS output) are rejected.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        r2_key: {
+          type: 'string',
+          description:
+            'The R2 object key of the audio to attach. Must start with `voice-submissions/<org>/` where <org> is the current org.',
+        },
+      },
+      required: ['r2_key'],
+    },
+  };
+}
+
+/**
  * Build list_modes tool definition
  */
 export function buildListModesTool(): Anthropic.Tool {
@@ -286,6 +348,8 @@ export function buildAllTools(
     buildRequestAudioTool(), // Always available — TTS is a platform capability, not org-gated
     buildGenerateScripturePdfTool(), // Always available — short-circuits to error if ptxprint-mcp not registered for the org
     buildPrepareUsfmSourceTool(),
+    buildReadR2ObjectTool(), // Always available — scope-guarded to the request's org
+    buildAttachAudioTool(), // Always available — scope-guarded to the request's org
   ];
 
   if (opts?.hasModes) {
@@ -298,18 +362,28 @@ export function buildAllTools(
 /**
  * Check if a tool is a built-in tool (not an MCP tool)
  */
+/**
+ * Names of every built-in (non-MCP) tool. Used to distinguish worker-side
+ * tool dispatch from MCP server forwarding. Kept as a frozen Set so new
+ * built-ins can be added without growing the cyclomatic complexity of the
+ * predicate.
+ */
+const BUILT_IN_TOOL_NAMES: ReadonlySet<string> = new Set([
+  'execute_code',
+  'get_tool_definitions',
+  'read_memory',
+  'update_memory',
+  'request_audio',
+  'list_modes',
+  'switch_mode',
+  'generate_scripture_pdf',
+  'prepare_usfm_source',
+  'read_r2_object',
+  'attach_audio',
+]);
+
 export function isBuiltInTool(toolName: string): boolean {
-  return (
-    toolName === 'execute_code' ||
-    toolName === 'get_tool_definitions' ||
-    toolName === 'read_memory' ||
-    toolName === 'update_memory' ||
-    toolName === 'request_audio' ||
-    toolName === 'list_modes' ||
-    toolName === 'switch_mode' ||
-    toolName === 'generate_scripture_pdf' ||
-    toolName === 'prepare_usfm_source'
-  );
+  return BUILT_IN_TOOL_NAMES.has(toolName);
 }
 
 /** Maximum number of sections in a single read_memory request */
@@ -373,6 +447,20 @@ export function isSwitchModeInput(input: unknown): input is { mode: string | nul
   if (!('mode' in input)) return false;
   const mode = (input as { mode: unknown }).mode;
   return mode === null || (typeof mode === 'string' && mode.length > 0);
+}
+
+/** Maximum length for an R2 key on read_r2_object / attach_audio. Generous cap — real keys are ~120 chars. */
+const MAX_R2_KEY_LENGTH = 512;
+
+/**
+ * Type guard for read_r2_object / attach_audio input (same shape).
+ * r2_key is required, non-empty, length-capped.
+ */
+export function isR2KeyInput(input: unknown): input is { r2_key: string } {
+  if (typeof input !== 'object' || input === null) return false;
+  if (!('r2_key' in input)) return false;
+  const key = (input as { r2_key: unknown }).r2_key;
+  return typeof key === 'string' && key.length > 0 && key.length <= MAX_R2_KEY_LENGTH;
 }
 
 /**
