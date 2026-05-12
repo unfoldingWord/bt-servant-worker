@@ -191,9 +191,9 @@ interface OrchestratorOptions {
    *  can compose a contextual "did you mean…" reply. */
   unmatchedTriggers?: UnmatchedTrigger[] | undefined;
   /** Whether the inbound message was directly addressed to the bot. Gateway-supplied.
-   *  When explicitly `false`, the system prompt notes that the message was ambient
-   *  group chatter and defers the response decision to the mode's client_instructions.
-   *  Absent or `true` → no behavioral change vs. existing modes. */
+   *  Text turns with `false` are short-circuited before orchestration; only audio
+   *  turns can reach here with `false`.  Forwarded to the system prompt so the mode
+   *  can decide how to handle ambient voice (e.g. story submission vs. ignore). */
   addressedToBot?: boolean | undefined;
   /** R2 key under `voice-submissions/...` for the inbound voice message that produced this turn's text
    *  via transcription. Surfaced to the prompt so the active mode can index the submission in memory. */

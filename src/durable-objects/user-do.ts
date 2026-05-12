@@ -951,6 +951,9 @@ export class UserDO {
 
     const loaded = await this.loadChatContext(body, ctx, callbacks);
 
+    const ambient = await this.maybeShortCircuitAmbient(body, loaded, logger);
+    if (ambient) return ambient;
+
     // Extract #mode/@language trigger tokens and resolve per-turn overrides
     const triggerCtx = await this.classifyAndResolveTriggers(body, loaded, logger);
 
@@ -1446,6 +1449,44 @@ export class UserDO {
     } finally {
       if (keepalive) clearInterval(keepalive.interval);
     }
+  }
+
+  // ── Ambient short-circuit ────────────────────────────────────────────────────
+
+  /**
+   * Short-circuit ambient text chatter: archive the message to history (so
+   * Claude has group context on future turns) and return an empty response
+   * without ever calling the LLM.  Audio with addressed_to_bot=false still
+   * flows through — spoken-mode treats ambient voice during Step 0 as story
+   * submissions.  Returns `null` when the message should proceed normally.
+   */
+  private async maybeShortCircuitAmbient(
+    body: ChatRequest,
+    loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
+    logger: RequestLogger
+  ): Promise<ChatResponse | null> {
+    if (body.addressed_to_bot !== false || body.message_type === 'audio') return null;
+
+    logger.log('ambient_text_short_circuit', {
+      message_type: body.message_type,
+      speaker: body.speaker,
+    });
+    await this.saveConversation(
+      loaded.messageText,
+      [],
+      loaded.preferences,
+      body._org_config ?? {},
+      {
+        logger,
+        speaker: body.speaker,
+      }
+    );
+    return {
+      responses: [],
+      response_language: loaded.preferences.response_language,
+      voice_audio_base64: null,
+      voice_audio_url: null,
+    };
   }
 
   // ── Orchestration helpers ─────────────────────────────────────────────────────

@@ -35,7 +35,8 @@ interface SystemPromptOptions {
   unmatchedTriggers?: UnmatchedTrigger[] | undefined;
   /** Whether the inbound message was directly addressed to the bot. Gateway-supplied;
    *  absent or `true` → behavior unchanged. Explicit `false` injects an Addressed Status
-   *  section that defers the response decision to the mode's client_instructions. */
+   *  section so the mode can handle ambient voice turns (e.g. story submissions).
+   *  Text turns with `false` are short-circuited before reaching the prompt. */
   addressedToBot?: boolean | undefined;
   /** R2 key of the inbound voice message (if any) for this turn. Surfaced to the
    *  prompt so the active mode can index the submission in memory. */
@@ -326,27 +327,25 @@ export function buildSystemPrompt(
 
 /**
  * Inject an `## Addressed Status` section ONLY when the gateway explicitly
- * marked the inbound message as not addressed to the bot. Default behavior
- * (field absent or `true`) emits no section — existing modes are unaffected.
- *
- * The directive defers the response decision to the mode's
- * `client_instructions`. Modes like `spoken-mode` use this to stay silent
- * during ambient group chatter; modes that don't reference it just respond
- * normally.
+ * marked the inbound message as not addressed to the bot.  After the
+ * ambient-text short-circuit in processChat(), only audio turns can reach
+ * this point with `addressedToBot === false`.  The section lets the mode
+ * decide how to handle ambient voice (e.g. spoken-mode treats it as a story
+ * submission during Step 0 but ignores it in later phases).
  */
 function pushAddressedStatusSection(sections: string[], addressedToBot: boolean | undefined): void {
   if (addressedToBot !== false) return;
-  sections.push(
+  const text =
     '## Addressed Status\n\n' +
-      'This message was NOT directly addressed to you (it is ambient group ' +
-      'chatter). Defer to the mode’s `client_instructions` for whether and ' +
-      'how to respond. If the mode instructs you to stay silent for ' +
-      'non-addressed turns, produce an empty response.'
-  );
+    'This message was NOT directly addressed to you (it is ambient group ' +
+    "chatter). Defer to the mode's `client_instructions` for whether and " +
+    'how to respond. If the mode instructs you to stay silent for ' +
+    'non-addressed turns, produce an empty response.';
+  sections.push(text);
 }
 
 /**
- * Inject an `## Inbound Voice Submission` section when this turn's
+ * Inject an `## Inbound Voice Submission` section when this turn’s
  * `user_message` came from a transcribed voice message that we archived in
  * R2. Surfaces the R2 key so the active mode can record it (e.g.
  * spoken-mode’s `## Story Submissions` index).
