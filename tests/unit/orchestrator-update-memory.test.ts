@@ -24,7 +24,7 @@ describe('coerceStringifiedSections — parse success', () => {
     expect(result).toEqual({ sections: { 'UTC Progress': '## UTC Progress\n- done' } });
     expect(logger.warn).toHaveBeenCalledWith(
       'update_memory_sections_coerced_from_string',
-      expect.objectContaining({ raw_length: stringified.length })
+      expect.objectContaining({ raw_length: stringified.length, recovery: 'raw' })
     );
     expect(isUpdateMemoryInput(result)).toBe(true);
   });
@@ -40,6 +40,48 @@ describe('coerceStringifiedSections — parse success', () => {
 
     expect(result).toEqual({ sections: { A: 'new' }, pin: ['A'], unpin: ['B'] });
     expect(isUpdateMemoryInput(result)).toBe(true);
+  });
+});
+
+describe('coerceStringifiedSections — trailing-brace recovery', () => {
+  it('recovers from one extra trailing brace (model brace-depth drift)', () => {
+    const logger = createMockLogger();
+    const valid = { '## Passage': 'Phase: exegesis\nSelected on: 2025-01-30' };
+    const withExtraBrace = JSON.stringify(valid) + '}';
+
+    const result = coerceStringifiedSections({ sections: withExtraBrace }, logger);
+
+    expect(result).toEqual({ sections: valid });
+    expect(logger.warn).toHaveBeenCalledWith(
+      'update_memory_sections_coerced_from_string',
+      expect.objectContaining({ recovery: 'strip_trailing_brace_1' })
+    );
+    expect(isUpdateMemoryInput(result)).toBe(true);
+  });
+
+  it('recovers from two extra trailing braces', () => {
+    const logger = createMockLogger();
+    const valid = { '## A': 'content' };
+    const withExtraBraces = JSON.stringify(valid) + '}}';
+
+    const result = coerceStringifiedSections({ sections: withExtraBraces }, logger);
+
+    expect(result).toEqual({ sections: valid });
+    expect(logger.warn).toHaveBeenCalledWith(
+      'update_memory_sections_coerced_from_string',
+      expect.objectContaining({ recovery: 'strip_trailing_brace_2' })
+    );
+  });
+
+  it('recovers from trailing whitespace + extra brace', () => {
+    const logger = createMockLogger();
+    const valid = { '## A': 'content' };
+    const withTrailingJunk = JSON.stringify(valid) + '} \n';
+
+    const result = coerceStringifiedSections({ sections: withTrailingJunk }, logger);
+
+    expect(result).toEqual({ sections: valid });
+    expect(logger.warn).toHaveBeenCalled();
   });
 });
 
@@ -111,15 +153,13 @@ describe('coerceStringifiedSections — passthrough cases', () => {
 });
 
 describe('coerceStringifiedSections — downstream-validator interaction', () => {
-  it('coerces even when the parsed value would fail strict validation', () => {
-    // The helper's job is to parse; the downstream validator decides shape.
+  it('rejects stringified arrays (only objects are valid sections)', () => {
+    // Arrays are valid JSON but not valid sections; coercion should not accept them.
     const logger = createMockLogger();
     const stringified = JSON.stringify(['not', 'an', 'object']);
 
-    const result = coerceStringifiedSections({ sections: stringified }, logger);
-
-    expect(result).toEqual({ sections: ['not', 'an', 'object'] });
-    expect(logger.warn).toHaveBeenCalledOnce();
-    expect(isUpdateMemoryInput(result)).toBe(false);
+    expect(() => coerceStringifiedSections({ sections: stringified }, logger)).toThrow(
+      ValidationError
+    );
   });
 });
