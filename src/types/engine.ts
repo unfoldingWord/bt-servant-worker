@@ -112,12 +112,17 @@ export interface PdfAttachment {
  * `AudioAttachment` lets Claude surface a previously-recorded audio object —
  * for example, replaying a participant's original story recording — alongside
  * (or instead of) TTS narration.
+ *
+ * `mime_type` carries the **actual stored R2 content-type** of the object
+ * (e.g. `audio/ogg`, `audio/mpeg`, `audio/webm`, …), looked up at
+ * attach-time so consumers can pick the right player. Defaults to
+ * `audio/ogg` only when the R2 HEAD lookup fails or returns no content-type.
  */
 export interface AudioAttachment {
   type: 'audio';
   url: string;
   r2_key: string;
-  mime_type: 'audio/ogg';
+  mime_type: string;
 }
 
 export type Attachment = PdfAttachment | AudioAttachment;

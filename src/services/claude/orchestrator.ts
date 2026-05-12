@@ -1351,7 +1351,7 @@ function handleReadR2Object(input: unknown, ctx: OrchestrationContext): unknown 
   return { url, r2_key: input.r2_key };
 }
 
-function handleAttachAudio(input: unknown, ctx: OrchestrationContext): unknown {
+async function handleAttachAudio(input: unknown, ctx: OrchestrationContext): Promise<unknown> {
   if (!isR2KeyInput(input)) {
     throw new ValidationError(
       `Invalid input for attach_audio: expected { r2_key: string }, got ${truncateInput(input)}`
@@ -1370,19 +1370,66 @@ function handleAttachAudio(input: unknown, ctx: OrchestrationContext): unknown {
     };
   }
   const url = voiceSubmissionKeyToUrl(input.r2_key, ctx.workerOrigin);
+  const mimeType = await lookupVoiceSubmissionMimeType(input.r2_key, ctx);
   ctx.attachmentsContext.add({
     type: 'audio',
     url,
     r2_key: input.r2_key,
-    mime_type: 'audio/ogg',
+    mime_type: mimeType,
   });
-  ctx.logger.log('attach_audio_tool_called', { r2_key: input.r2_key, url });
+  ctx.logger.log('attach_audio_tool_called', { r2_key: input.r2_key, url, mime_type: mimeType });
   return {
     attached: true,
     url,
     r2_key: input.r2_key,
+    mime_type: mimeType,
     note: 'The audio object has been attached to the response and will be delivered to the user alongside any text/TTS output.',
   };
+}
+
+/**
+ * Look up the actual content-type stored alongside a voice-submission R2
+ * object so the AudioAttachment carries the real MIME instead of a hardcoded
+ * default. Inbound voice messages can arrive in several supported formats
+ * (`ogg`, `mp3`, `wav`, `webm`, `flac`, `m4a`) and the archival path stores
+ * each with the source content-type — we must surface that to the client so
+ * downstream players pick the right decoder.
+ *
+ * Falls back to `audio/ogg` only when the HEAD fails, the object is missing,
+ * or the stored content-type is empty. Each fallback logs a WARN per
+ * CLAUDE.md "no silent swallow."
+ */
+async function lookupVoiceSubmissionMimeType(
+  r2Key: string,
+  ctx: OrchestrationContext
+): Promise<string> {
+  const fallback = 'audio/ogg';
+  try {
+    const head = await ctx.env.AUDIO_BUCKET.head(r2Key);
+    if (!head) {
+      ctx.logger.warn('attach_audio_r2_head_miss', {
+        r2_key: r2Key,
+        reason: 'object not found; falling back to audio/ogg',
+      });
+      return fallback;
+    }
+    const contentType = head.httpMetadata?.contentType;
+    if (typeof contentType !== 'string' || contentType.length === 0) {
+      ctx.logger.warn('attach_audio_r2_head_no_content_type', {
+        r2_key: r2Key,
+        reason: 'object stored without contentType metadata; falling back to audio/ogg',
+      });
+      return fallback;
+    }
+    return contentType;
+  } catch (error) {
+    ctx.logger.warn('attach_audio_r2_head_failed', {
+      r2_key: r2Key,
+      error: error instanceof Error ? error.message : String(error),
+      reason: 'R2 HEAD threw; falling back to audio/ogg',
+    });
+    return fallback;
+  }
 }
 
 function handleRequestAudio(ctx: OrchestrationContext): unknown {
