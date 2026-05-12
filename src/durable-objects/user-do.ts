@@ -951,6 +951,32 @@ export class UserDO {
 
     const loaded = await this.loadChatContext(body, ctx, callbacks);
 
+    // Short-circuit: ambient text chatter → archive to history, return empty.
+    // Audio with addressed_to_bot=false still flows through (spoken-mode
+    // treats ambient voice during Step 0 as story submissions).
+    if (body.addressed_to_bot === false && body.message_type !== 'audio') {
+      logger.log('ambient_text_short_circuit', {
+        message_type: body.message_type,
+        speaker: body.speaker,
+      });
+      await this.saveConversation(
+        loaded.messageText,
+        [],
+        loaded.preferences,
+        body._org_config ?? {},
+        {
+          logger,
+          speaker: body.speaker,
+        }
+      );
+      return {
+        responses: [],
+        response_language: loaded.preferences.response_language,
+        voice_audio_base64: null,
+        voice_audio_url: null,
+      };
+    }
+
     // Extract #mode/@language trigger tokens and resolve per-turn overrides
     const triggerCtx = await this.classifyAndResolveTriggers(body, loaded, logger);
 
@@ -1515,7 +1541,6 @@ export class UserDO {
       isVoiceMessage: body.message_type === 'audio',
       languageDocument,
       unmatchedTriggers,
-      addressedToBot: body.addressed_to_bot,
       inboundVoiceKey,
       org: body.org ?? body.org_id ?? this.env.DEFAULT_ORG,
       logger,

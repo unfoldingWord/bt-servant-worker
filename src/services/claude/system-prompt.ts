@@ -33,10 +33,6 @@ interface SystemPromptOptions {
    *  could not be resolved. When non-empty, the orchestrator is instructed to
    *  compose a contextual "did you mean…" reply. */
   unmatchedTriggers?: UnmatchedTrigger[] | undefined;
-  /** Whether the inbound message was directly addressed to the bot. Gateway-supplied;
-   *  absent or `true` → behavior unchanged. Explicit `false` injects an Addressed Status
-   *  section that defers the response decision to the mode's client_instructions. */
-  addressedToBot?: boolean | undefined;
   /** R2 key of the inbound voice message (if any) for this turn. Surfaced to the
    *  prompt so the active mode can index the submission in memory. */
   inboundVoiceKey?: string | undefined;
@@ -310,7 +306,6 @@ export function buildSystemPrompt(
   if (groupSection) sections.push(groupSection);
 
   pushLanguageSection(sections, options?.languageDocument);
-  pushAddressedStatusSection(sections, options?.addressedToBot);
   pushInboundVoiceSection(sections, options?.inboundVoiceKey);
   pushUnmatchedTriggersSection(sections, options?.unmatchedTriggers);
 
@@ -322,27 +317,6 @@ export function buildSystemPrompt(
   sections.push(resolvedPromptValues.closing);
 
   return sections.join('\n\n');
-}
-
-/**
- * Inject an `## Addressed Status` section ONLY when the gateway explicitly
- * marked the inbound message as not addressed to the bot. Default behavior
- * (field absent or `true`) emits no section — existing modes are unaffected.
- *
- * The directive defers the response decision to the mode's
- * `client_instructions`. Modes like `spoken-mode` use this to stay silent
- * during ambient group chatter; modes that don't reference it just respond
- * normally.
- */
-function pushAddressedStatusSection(sections: string[], addressedToBot: boolean | undefined): void {
-  if (addressedToBot !== false) return;
-  sections.push(
-    '## Addressed Status\n\n' +
-      'This message was NOT directly addressed to you (it is ambient group ' +
-      'chatter). Defer to the mode’s `client_instructions` for whether and ' +
-      'how to respond. If the mode instructs you to stay silent for ' +
-      'non-addressed turns, produce an empty response.'
-  );
 }
 
 /**
