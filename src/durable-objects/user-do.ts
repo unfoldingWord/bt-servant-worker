@@ -1556,6 +1556,7 @@ export class UserDO {
       isVoiceMessage: body.message_type === 'audio',
       languageDocument,
       unmatchedTriggers,
+      addressedToBot: body.addressed_to_bot,
       inboundVoiceKey,
       org: body.org ?? body.org_id ?? this.env.DEFAULT_ORG,
       logger,

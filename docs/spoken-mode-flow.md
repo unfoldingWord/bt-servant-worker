@@ -66,8 +66,8 @@ c. **Collects short stories via voice messages from group members.**
 - After each acknowledgement, Claude prompts the group: "Does anyone
   else have a story to share, or are we ready to move on?"
 - Text chatter from group members during this phase (e.g. "nice story
-  Amara!") arrives with `addressed_to_bot=false` — Claude stays silent
-  and lets the group converse.
+  Amara!") is filtered by the worker and never reaches Claude — group
+  context is preserved in chat history automatically.
 
 d. **Proceeds to Step 1 once gating is satisfied** (see "Phase
 transitions and gating" below: leader confirmation OR clear group

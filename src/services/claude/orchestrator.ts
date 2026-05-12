@@ -190,6 +190,11 @@ interface OrchestratorOptions {
    *  could not be resolved. Forwarded to the system prompt so the orchestrator
    *  can compose a contextual "did you mean…" reply. */
   unmatchedTriggers?: UnmatchedTrigger[] | undefined;
+  /** Whether the inbound message was directly addressed to the bot. Gateway-supplied.
+   *  Text turns with `false` are short-circuited before orchestration; only audio
+   *  turns can reach here with `false`.  Forwarded to the system prompt so the mode
+   *  can decide how to handle ambient voice (e.g. story submission vs. ignore). */
+  addressedToBot?: boolean | undefined;
   /** R2 key under `voice-submissions/...` for the inbound voice message that produced this turn's text
    *  via transcription. Surfaced to the prompt so the active mode can index the submission in memory. */
   inboundVoiceKey?: string | undefined;
@@ -956,7 +961,7 @@ function createOrchestrationContext(
     model: config.model,
     maxTokens: config.maxTokens,
     // prettier-ignore
-    systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument, unmatchedTriggers: options.unmatchedTriggers, inboundVoiceKey: options.inboundVoiceKey }),
+    systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument, unmatchedTriggers: options.unmatchedTriggers, addressedToBot: options.addressedToBot, inboundVoiceKey: options.inboundVoiceKey }),
     tools: buildAllTools(catalog, {
       hasModes: (options.modeContext?.availableModes.length ?? 0) > 0,
     }),
