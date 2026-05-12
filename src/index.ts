@@ -1008,6 +1008,9 @@ app.get('/api/v1/admin/orgs/:org/groups/:chatId/memory', (c) => handleGroupReque
 app.delete('/api/v1/admin/orgs/:org/groups/:chatId/memory', (c) =>
   handleGroupRequest(c, '/memory')
 );
+app.get('/api/v1/admin/orgs/:org/groups/:chatId/mode', (c) => handleGroupRequest(c, '/mode'));
+app.put('/api/v1/admin/orgs/:org/groups/:chatId/mode', (c) => handleGroupRequest(c, '/mode'));
+app.delete('/api/v1/admin/orgs/:org/groups/:chatId/mode', (c) => handleGroupRequest(c, '/mode'));
 
 // ── Thread admin endpoints (routed to thread-specific DO) ───────────────────────
 
