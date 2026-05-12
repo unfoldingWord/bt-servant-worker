@@ -1,6 +1,15 @@
 export { transcribeAudio } from './cloudflare-stt.js';
 export { synthesizeSpeech } from './openai-tts.js';
-export { generateAudioKey, audioKeyToUrl, uploadAudio, getAudio } from './r2-storage.js';
+export {
+  generateAudioKey,
+  audioKeyToUrl,
+  uploadAudio,
+  getAudio,
+  generateVoiceSubmissionKey,
+  voiceSubmissionKeyToUrl,
+  uploadVoiceSubmission,
+  VOICE_SUBMISSION_PREFIX,
+} from './r2-storage.js';
 export type {
   TranscriptionResult,
   SpeechSynthesisResult,

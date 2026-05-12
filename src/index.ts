@@ -43,7 +43,7 @@ import { synthesizeModeDocument } from './types/mode-markdown.js';
 import { stripControlChars } from './types/prompt-overrides.js';
 import { constantTimeCompare } from './utils/crypto.js';
 import { ValidationError } from './utils/errors.js';
-import { getAudio } from './services/audio/index.js';
+import { getAudio, VOICE_SUBMISSION_PREFIX } from './services/audio/index.js';
 import { createRequestLogger } from './utils/logger.js';
 import { createTimingContext, timePhase } from './utils/timing.js';
 import {
@@ -170,6 +170,58 @@ app.get('/api/v1/audio/*', async (c) => {
   } catch (error) {
     logger.error('audio_get_error', error, { audio_key: audioKey, total_ms: Date.now() - start });
     return c.json({ error: 'Failed to retrieve audio' }, 500);
+  }
+});
+
+// Voice-submission serving endpoint — serves archived inbound voice messages
+// from R2. Separate from the TTS audio route so we can diverge on auth/cache
+// policy later without entangling the two. R2 keys are unguessable UUIDs,
+// but this route still sits behind the global `/api/*` Bearer middleware
+// above (line 83) — same posture as the existing `/api/v1/audio/*` route.
+//
+// Consumers (web client, Telegram gateway) MUST send `Authorization: Bearer
+// $ENGINE_API_KEY` to fetch these objects. URLs handed to clients via
+// `AudioAttachment.url` cannot be embedded directly in a `<audio src>` tag
+// from a browser context that cannot inject auth headers — fetch as a blob
+// with auth and pass an object URL to the player, or have a server-side
+// integration (gateway) download-with-auth and re-deliver. This matches
+// how TTS audio at `/api/v1/audio/*` is consumed today.
+app.get('/api/v1/voice-submissions/*', async (c) => {
+  const start = Date.now();
+  const key = c.req.path.replace('/api/v1/voice-submissions/', '');
+  if (!key || !key.startsWith(`${VOICE_SUBMISSION_PREFIX}/`)) {
+    return c.json({ error: 'Invalid voice-submission key' }, 400);
+  }
+
+  const logger = createRequestLogger(crypto.randomUUID());
+  try {
+    const object = await getAudio(c.env.AUDIO_BUCKET, key, logger);
+    if (!object) {
+      logger.log('voice_submission_serve_miss', {
+        voice_submission_key: key,
+        total_ms: Date.now() - start,
+      });
+      return c.json({ error: 'Voice submission not found' }, 404);
+    }
+
+    logger.log('voice_submission_serve_hit', {
+      voice_submission_key: key,
+      size_bytes: object.size,
+      total_ms: Date.now() - start,
+    });
+
+    const headers = new Headers();
+    headers.set('Content-Type', object.httpMetadata?.contentType ?? 'audio/ogg');
+    headers.set('Content-Length', String(object.size));
+    headers.set('Cache-Control', 'private, max-age=86400');
+
+    return new Response(object.body, { headers });
+  } catch (error) {
+    logger.error('voice_submission_get_error', error, {
+      voice_submission_key: key,
+      total_ms: Date.now() - start,
+    });
+    return c.json({ error: 'Failed to retrieve voice submission' }, 500);
   }
 });
 

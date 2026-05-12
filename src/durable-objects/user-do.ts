@@ -59,6 +59,9 @@ import {
   generateAudioKey,
   audioKeyToUrl,
   uploadAudio,
+  generateVoiceSubmissionKey,
+  uploadVoiceSubmission,
+  voiceSubmissionKeyToUrl,
 } from '../services/audio/index.js';
 import { AttachmentsContext, createAttachmentsContext } from '../services/ptxprint/index.js';
 import { AppError, AudioTranscriptionError, ValidationError } from '../utils/errors.js';
@@ -115,6 +118,32 @@ function storageErrorResponse(err: unknown): Response {
   const msg = err instanceof Error ? err.message : String(err);
   return createErrorResponse('Storage error', 'INTERNAL_ERROR', msg, 500);
 }
+
+/** Decode a base64 string to a Uint8Array. Throws on invalid input. */
+function decodeBase64(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const len = binary.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+/** Map an inbound audio format ID to its IANA MIME type. Unknown formats fall back to a generic octet-stream. */
+function audioFormatToMime(format: string): string {
+  // eslint-disable-next-line security/detect-object-injection -- map of fixed string keys
+  return AUDIO_FORMAT_MIME_MAP[format] ?? 'application/octet-stream';
+}
+
+const AUDIO_FORMAT_MIME_MAP: Readonly<Record<string, string>> = Object.freeze({
+  ogg: 'audio/ogg',
+  mp3: 'audio/mpeg',
+  wav: 'audio/wav',
+  webm: 'audio/webm',
+  flac: 'audio/flac',
+  m4a: 'audio/mp4',
+});
 
 export class UserDO {
   private state: DurableObjectState;
@@ -934,7 +963,7 @@ export class UserDO {
     const audioContext = this.buildAudioContext();
     const attachmentsContext = createAttachmentsContext();
     // prettier-ignore
-    const orchOpts = this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, triggerCtx.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, triggerCtx.activeModeName, audioContext, attachmentsContext, workerOrigin, logger, callbacks, groupContext, triggerCtx.languageDocument, triggerCtx.unmatchedTriggers);
+    const orchOpts = this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, triggerCtx.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, triggerCtx.activeModeName, audioContext, attachmentsContext, workerOrigin, logger, callbacks, groupContext, triggerCtx.languageDocument, triggerCtx.unmatchedTriggers, loaded.inboundVoiceKey);
 
     const orchResult = await this.tracedPhase(ctx, 'orchestration', () =>
       this.runOrchestration(triggerCtx.messageText, orchOpts)
@@ -948,7 +977,7 @@ export class UserDO {
 
     // prettier-ignore
     await this.tracedPhase(ctx, 'save_conversation', () =>
-      this.saveConversation(triggerCtx.messageText, orchResult.responses, loaded.preferences, body._org_config ?? {}, { logger, audioKey, speaker: body.speaker, attachments: attachmentsContext.list() })
+      this.saveConversation(triggerCtx.messageText, orchResult.responses, loaded.preferences, body._org_config ?? {}, { logger, audioKey, inboundVoiceKey: loaded.inboundVoiceKey, speaker: body.speaker, attachments: attachmentsContext.list() })
     );
 
     // prettier-ignore
@@ -1032,7 +1061,7 @@ export class UserDO {
     callbacks?: StreamCallbacks
   ) {
     const { logger } = ctx;
-    const messageText = await this.tracedPhase(ctx, 'resolve_message', () =>
+    const resolved_message = await this.tracedPhase(ctx, 'resolve_message', () =>
       this.resolveMessageText(body, logger, callbacks)
     );
     const { preferences, history } = await this.tracedPhase(ctx, 'load_user_context', () =>
@@ -1051,7 +1080,8 @@ export class UserDO {
     );
     const orgLanguages: OrgLanguages = body._org_languages ?? { languages: [] };
     return {
-      messageText,
+      messageText: resolved_message.text,
+      inboundVoiceKey: resolved_message.inboundVoiceKey,
       preferences,
       history,
       catalog,
@@ -1069,54 +1099,114 @@ export class UserDO {
     body: ChatRequest,
     logger: RequestLogger,
     callbacks?: StreamCallbacks
-  ): Promise<string> {
+  ): Promise<{ text: string; inboundVoiceKey?: string }> {
     if (body.message_type === 'audio') {
       return this.transcribeAudioMessage(body, logger, callbacks);
     }
     if (!body.message?.trim()) {
       throw new ValidationError('Message is required');
     }
-    return body.message;
+    return { text: body.message };
   }
 
   private async transcribeAudioMessage(
     body: ChatRequest,
     logger: RequestLogger,
     callbacks?: StreamCallbacks
-  ): Promise<string> {
+  ): Promise<{ text: string; inboundVoiceKey?: string }> {
     const sttFlowStart = Date.now();
+    const { audio_base64, audio_format } = this.requireAudioFields(body, logger);
+    await callbacks?.onStatus?.('Transcribing audio...');
+
+    // Run transcription and R2 archival in parallel. Whisper consumes the
+    // base64 string directly; archival needs the decoded bytes. Both kick
+    // off together so archival latency doesn't gate the assistant response.
+    // Archival failures must NEVER block transcription — the user-facing
+    // turn must still complete even if R2 hiccups, so the archival promise
+    // catches its own errors and resolves to `undefined`.
+    const archivalPromise = this.archiveInboundVoice(body, audio_base64, audio_format, logger);
+    const transcription = await transcribeAudio(this.env.AI, audio_base64, audio_format, logger);
+
+    if (!transcription.text) {
+      // Wait for archival to settle even on transcription failure so we
+      // don't leave a half-finished R2 upload running past the request.
+      const archivedKey = await archivalPromise;
+      logger.log('audio_flow_stt_empty_text', { archived_key: archivedKey ?? null });
+      throw new AudioTranscriptionError('Transcription returned empty text');
+    }
+
+    const inboundVoiceKey = await archivalPromise;
+    logger.log('audio_flow_stt_complete', {
+      original_format: audio_format,
+      transcribed_length: transcription.text.length,
+      transcription_ms: transcription.duration_ms,
+      stt_flow_total_ms: Date.now() - sttFlowStart,
+      text_preview: transcription.text.slice(0, 200),
+      inbound_voice_archived: inboundVoiceKey !== undefined,
+      inbound_voice_key: inboundVoiceKey ?? null,
+    });
+    return inboundVoiceKey === undefined
+      ? { text: transcription.text }
+      : { text: transcription.text, inboundVoiceKey };
+  }
+
+  /**
+   * Validate audio input fields on a ChatRequest and log the STT-begin
+   * trace. Returns the non-null audio fields for the caller to use without
+   * having to re-narrow them.
+   */
+  private requireAudioFields(
+    body: ChatRequest,
+    logger: RequestLogger
+  ): { audio_base64: string; audio_format: string } {
     logger.log('audio_flow_stt_begin', {
       has_audio_base64: !!body.audio_base64,
       audio_base64_length: body.audio_base64?.length ?? 0,
       audio_format: body.audio_format,
     });
-
     if (!body.audio_base64 || !body.audio_format) {
       throw new ValidationError(
         'audio_base64 and audio_format are required when message_type is audio'
       );
     }
+    return { audio_base64: body.audio_base64, audio_format: body.audio_format };
+  }
 
-    await callbacks?.onStatus?.('Transcribing audio...');
-    const transcription = await transcribeAudio(
-      this.env.AI,
-      body.audio_base64,
-      body.audio_format,
-      logger
-    );
-
-    if (!transcription.text) {
-      throw new AudioTranscriptionError('Transcription returned empty text');
+  /**
+   * Archive an inbound voice message to R2 under the
+   * `voice-submissions/{org}/{chat-scope}/{speaker-scope}/{uuid}.ogg` prefix.
+   *
+   * Best-effort: any error inside is logged and swallowed so the parent
+   * STT flow continues. The user-visible turn (transcription + response)
+   * must never fail because an archival upload fizzled. Returns the R2
+   * key on success, `undefined` on failure (including invalid base64).
+   */
+  private async archiveInboundVoice(
+    body: ChatRequest,
+    audioBase64: string,
+    audioFormat: string,
+    logger: RequestLogger
+  ): Promise<string | undefined> {
+    const start = Date.now();
+    const org = body.org ?? body.org_id ?? this.env.DEFAULT_ORG;
+    const isGroup = body.chat_type === 'group' || body.chat_type === 'supergroup';
+    const chatScope = isGroup && body.chat_id ? body.chat_id : body.user_id;
+    const speakerScope = body.speaker?.trim() ? body.speaker : body.user_id;
+    const key = generateVoiceSubmissionKey(org, chatScope, speakerScope);
+    const mimeType = audioFormatToMime(audioFormat);
+    try {
+      const bytes = decodeBase64(audioBase64);
+      await uploadVoiceSubmission(this.env.AUDIO_BUCKET, key, bytes, mimeType, logger);
+      return key;
+    } catch (error) {
+      logger.warn('inbound_voice_archive_failed', {
+        key,
+        mime_type: mimeType,
+        elapsed_ms: Date.now() - start,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return undefined;
     }
-
-    logger.log('audio_flow_stt_complete', {
-      original_format: body.audio_format,
-      transcribed_length: transcription.text.length,
-      transcription_ms: transcription.duration_ms,
-      stt_flow_total_ms: Date.now() - sttFlowStart,
-      text_preview: transcription.text.slice(0, 200),
-    });
-    return transcription.text;
   }
 
   private async resolvePrompts(body: ChatRequest, logger: RequestLogger) {
@@ -1206,11 +1296,12 @@ export class UserDO {
     opts: {
       logger: RequestLogger;
       audioKey?: string | null;
+      inboundVoiceKey?: string | undefined;
       speaker?: string | undefined;
       attachments?: Attachment[];
     }
   ) {
-    const { logger, audioKey, speaker, attachments } = opts;
+    const { logger, audioKey, inboundVoiceKey, speaker, attachments } = opts;
     const startTime = Date.now();
     const storageMax = orgConfig.max_history_storage ?? DEFAULT_ORG_CONFIG.max_history_storage;
     const hasAttachments = !!attachments && attachments.length > 0;
@@ -1220,6 +1311,7 @@ export class UserDO {
         assistant_response: responses.join('\n'),
         timestamp: Date.now(),
         ...(audioKey ? { voice_audio_key: audioKey } : {}),
+        ...(inboundVoiceKey ? { inbound_voice_audio_key: inboundVoiceKey } : {}),
         ...(speaker ? { speaker } : {}),
         ...(hasAttachments ? { attachments } : {}),
       },
@@ -1399,7 +1491,8 @@ export class UserDO {
     callbacks?: StreamCallbacks,
     groupContext?: GroupChatContext,
     languageDocument?: string,
-    unmatchedTriggers?: UnmatchedTrigger[]
+    unmatchedTriggers?: UnmatchedTrigger[],
+    inboundVoiceKey?: string | undefined
   ): Parameters<typeof orchestrate>[1] {
     return {
       env: this.env,
@@ -1422,6 +1515,9 @@ export class UserDO {
       isVoiceMessage: body.message_type === 'audio',
       languageDocument,
       unmatchedTriggers,
+      addressedToBot: body.addressed_to_bot,
+      inboundVoiceKey,
+      org: body.org ?? body.org_id ?? this.env.DEFAULT_ORG,
       logger,
       callbacks,
     };
@@ -1457,7 +1553,7 @@ export class UserDO {
     const voiceAudioUrl = audioKey ? audioKeyToUrl(audioKey, workerOrigin) : null;
     const attachments = attachmentsContext.list();
     // prettier-ignore
-    logger.log('process_chat_complete', { total_ms: Date.now() - startTime, response_count: responses.length, has_voice_audio: voiceAudioUrl !== null, voice_audio_key: audioKey, total_response_chars: responses.join('').length, attachment_count: attachments.length, attachment_summary: attachments.map((a) => ({ type: a.type, filename: a.filename, size_bytes: a.size_bytes })), response: responses.join('\n') });
+    logger.log('process_chat_complete', { total_ms: Date.now() - startTime, response_count: responses.length, has_voice_audio: voiceAudioUrl !== null, voice_audio_key: audioKey, total_response_chars: responses.join('').length, attachment_count: attachments.length, attachment_summary: attachments.map((a) => a.type === 'pdf' ? ({ type: a.type, filename: a.filename, size_bytes: a.size_bytes }) : ({ type: a.type, r2_key: a.r2_key, mime_type: a.mime_type })), response: responses.join('\n') });
     return {
       responses,
       response_language: effectivePreferences.response_language,
@@ -1555,6 +1651,9 @@ export class UserDO {
         ...e,
         created_at: e.timestamp ? new Date(e.timestamp).toISOString() : null,
         voice_audio_url: e.voice_audio_key ? audioKeyToUrl(e.voice_audio_key, url.origin) : null,
+        inbound_voice_audio_url: e.inbound_voice_audio_key
+          ? voiceSubmissionKeyToUrl(e.inbound_voice_audio_key, url.origin)
+          : null,
       }));
 
       const response: ChatHistoryResponse = {

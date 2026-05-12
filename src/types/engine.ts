@@ -57,6 +57,21 @@ export interface ChatRequest {
   /** Telegram topic/thread ID within a supergroup. */
   thread_id?: string;
 
+  /**
+   * Whether the inbound message was directly addressed to the bot.
+   *
+   * Set by the gateway (e.g. Telegram gateway sets `true` when the message
+   * mentions `@bt_servant` or is a reply to a bot message, `false` for
+   * ambient group chatter not directed at the bot). Defaults to `true` when
+   * absent — i.e. existing clients are unchanged.
+   *
+   * The orchestrator surfaces this to Claude via a small `## Addressed
+   * Status` section in the system prompt when `false`; modes whose
+   * `client_instructions` choose to stay silent for non-addressed turns
+   * can do so. Modes that don't reference it are unaffected.
+   */
+  addressed_to_bot?: boolean;
+
   /** Gateway-provided language hint. Overrides stored preference for this request. */
   response_language_hint?: string;
 
@@ -90,7 +105,27 @@ export interface PdfAttachment {
   mime_type: 'application/pdf';
 }
 
-export type Attachment = PdfAttachment;
+/**
+ * A stored audio object (e.g. an archived voice submission) attached to the
+ * response. Distinct from `ChatResponse.voice_audio_url`, which carries
+ * freshly-synthesized TTS audio of the assistant's text response. An
+ * `AudioAttachment` lets Claude surface a previously-recorded audio object —
+ * for example, replaying a participant's original story recording — alongside
+ * (or instead of) TTS narration.
+ *
+ * `mime_type` carries the **actual stored R2 content-type** of the object
+ * (e.g. `audio/ogg`, `audio/mpeg`, `audio/webm`, …), looked up at
+ * attach-time so consumers can pick the right player. Defaults to
+ * `audio/ogg` only when the R2 HEAD lookup fails or returns no content-type.
+ */
+export interface AudioAttachment {
+  type: 'audio';
+  url: string;
+  r2_key: string;
+  mime_type: string;
+}
+
+export type Attachment = PdfAttachment | AudioAttachment;
 
 export interface ChatResponse {
   /**
@@ -137,8 +172,22 @@ export interface ChatHistoryEntry {
   assistant_response: string;
   timestamp: number;
   created_at?: string | null;
-  /** R2 object key for the voice audio associated with this entry */
+  /**
+   * R2 object key for the TTS-synthesized audio of `assistant_response`
+   * (assistant → user). Stored under the `audio/{org}/{user_id}/{uuid}.opus`
+   * prefix. Present only when TTS ran for this turn.
+   */
   voice_audio_key?: string | null;
+  /**
+   * R2 object key for the inbound voice submission that produced
+   * `user_message` via transcription (user → assistant). Stored under the
+   * `voice-submissions/{org}/{chatId|user_id}/{speaker|user_id}/{uuid}.ogg`
+   * prefix. Present only when the inbound message was a voice message.
+   *
+   * Independent of `voice_audio_key` — a single turn may carry both keys
+   * (voice in, TTS out) or either alone.
+   */
+  inbound_voice_audio_key?: string | null;
   /** Display name of the speaker (group chats only). */
   speaker?: string;
   /**
@@ -152,8 +201,10 @@ export interface ChatHistoryEntry {
 
 /** History entry as returned by the API (includes computed fields). */
 export interface ChatHistoryResponseEntry extends ChatHistoryEntry {
-  /** URL to fetch the voice audio from R2, or null if no audio was generated */
+  /** URL to fetch the TTS-output audio from R2, or null if no audio was generated */
   voice_audio_url?: string | null;
+  /** URL to fetch the inbound voice submission from R2, or null if the inbound message was text */
+  inbound_voice_audio_url?: string | null;
 }
 
 /**

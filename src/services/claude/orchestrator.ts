@@ -10,7 +10,7 @@
 
 import Anthropic from '@anthropic-ai/sdk';
 import { Env } from '../../config/types.js';
-import { AudioContext } from '../audio/index.js';
+import { AudioContext, VOICE_SUBMISSION_PREFIX, voiceSubmissionKeyToUrl } from '../audio/index.js';
 import { ChatHistoryEntry, StreamCallbacks } from '../../types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig } from '../../types/org-config.js';
 import {
@@ -57,6 +57,7 @@ import {
 import {
   buildAllTools,
   getToolDefinitions,
+  isR2KeyInput,
   isReadMemoryInput,
   isSwitchModeInput,
   isUpdateMemoryInput,
@@ -189,6 +190,17 @@ interface OrchestratorOptions {
    *  could not be resolved. Forwarded to the system prompt so the orchestrator
    *  can compose a contextual "did you mean…" reply. */
   unmatchedTriggers?: UnmatchedTrigger[] | undefined;
+  /** Whether the inbound message was directly addressed to the bot. Gateway-supplied.
+   *  When explicitly `false`, the system prompt notes that the message was ambient
+   *  group chatter and defers the response decision to the mode's client_instructions.
+   *  Absent or `true` → no behavioral change vs. existing modes. */
+  addressedToBot?: boolean | undefined;
+  /** R2 key under `voice-submissions/...` for the inbound voice message that produced this turn's text
+   *  via transcription. Surfaced to the prompt so the active mode can index the submission in memory. */
+  inboundVoiceKey?: string | undefined;
+  /** The org for this request. Used by tools like `read_r2_object` / `attach_audio`
+   *  to scope-check that the requested R2 key belongs to this org. */
+  org?: string | undefined;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
 }
@@ -281,6 +293,9 @@ interface OrchestrationContext {
   audioContext: AudioContext | undefined;
   attachmentsContext: AttachmentsContext | undefined;
   workerOrigin: string;
+  /** The org scope for this request. Used by `read_r2_object` / `attach_audio` to
+   *  enforce that requested R2 keys belong to this org. */
+  org: string;
   env: Env;
 }
 
@@ -909,6 +924,23 @@ function stripPromptComments(
   return { values: cleanedSlots, languageDocument: cleanedLang };
 }
 
+/** Build the seed `messages` array for an orchestration run. */
+function buildSeedMessages(
+  userMessage: string,
+  options: OrchestratorOptions,
+  llmMax: number
+): Anthropic.MessageParam[] {
+  return [
+    ...historyToMessages(options.history, llmMax),
+    {
+      role: 'user',
+      content: options.groupContext?.currentSpeaker
+        ? `[${sanitizeSpeaker(options.groupContext.currentSpeaker)}]: ${userMessage}`
+        : userMessage,
+    },
+  ];
+}
+
 function createOrchestrationContext(
   userMessage: string,
   options: OrchestratorOptions,
@@ -921,8 +953,6 @@ function createOrchestrationContext(
     options.languageDocument,
     logger
   );
-
-  // Use LLM limit from org config (default: 5)
   const llmMax = orgConfig?.max_history_llm ?? DEFAULT_ORG_CONFIG.max_history_llm;
 
   return {
@@ -931,19 +961,11 @@ function createOrchestrationContext(
     model: config.model,
     maxTokens: config.maxTokens,
     // prettier-ignore
-    systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument, unmatchedTriggers: options.unmatchedTriggers }),
+    systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument, unmatchedTriggers: options.unmatchedTriggers, addressedToBot: options.addressedToBot, inboundVoiceKey: options.inboundVoiceKey }),
     tools: buildAllTools(catalog, {
       hasModes: (options.modeContext?.availableModes.length ?? 0) > 0,
     }),
-    messages: [
-      ...historyToMessages(history, llmMax),
-      {
-        role: 'user',
-        content: options.groupContext?.currentSpeaker
-          ? `[${sanitizeSpeaker(options.groupContext.currentSpeaker)}]: ${userMessage}`
-          : userMessage,
-      },
-    ],
+    messages: buildSeedMessages(userMessage, options, llmMax),
     responses: [],
     lastIterationStartIndex: 0,
     codeExecTimeout: config.codeExecTimeout,
@@ -960,6 +982,7 @@ function createOrchestrationContext(
     audioContext: options.audioContext,
     attachmentsContext: options.attachmentsContext,
     workerOrigin: options.workerOrigin ?? '',
+    org: options.org ?? options.env.DEFAULT_ORG,
     env: options.env,
   };
 }
@@ -1128,6 +1151,8 @@ function dispatchSimpleInternalTool(
   if (toolCall.name === 'request_audio') return handleRequestAudio(ctx);
   if (toolCall.name === 'list_modes') return handleListModes(ctx);
   if (toolCall.name === 'switch_mode') return handleSwitchMode(toolCall.input, ctx);
+  if (toolCall.name === 'read_r2_object') return handleReadR2Object(toolCall.input, ctx);
+  if (toolCall.name === 'attach_audio') return handleAttachAudio(toolCall.input, ctx);
   return null;
 }
 
@@ -1280,6 +1305,131 @@ async function handleUpdateMemory(input: unknown, ctx: OrchestrationContext): Pr
   });
 
   return result;
+}
+
+/**
+ * Verify that an R2 key passed to `read_r2_object` / `attach_audio` belongs
+ * to the current org's voice-submissions namespace. Returns `null` when the
+ * key is in scope; otherwise returns an error envelope (logged at WARN per
+ * CLAUDE.md "no silent swallow"). Cross-org reads are rejected here; reads
+ * of TTS-output keys (`audio/...`) are also rejected — those aren't voice
+ * submissions, they're synthesized response audio, and there's no current
+ * use case for Claude to fetch them.
+ */
+function checkVoiceSubmissionScope(
+  toolName: string,
+  r2Key: string,
+  ctx: OrchestrationContext
+): { error: string } | null {
+  const expectedPrefix = `${VOICE_SUBMISSION_PREFIX}/${ctx.org}/`;
+  if (!r2Key.startsWith(expectedPrefix)) {
+    ctx.logger.warn('r2_key_out_of_scope', {
+      tool: toolName,
+      r2_key: r2Key,
+      org: ctx.org,
+      reason: !r2Key.startsWith(`${VOICE_SUBMISSION_PREFIX}/`)
+        ? 'not-a-voice-submission-prefix'
+        : 'wrong-org',
+    });
+    return {
+      error: `r2_key is out of scope for this request. Keys must begin with \`${expectedPrefix}\`.`,
+    };
+  }
+  return null;
+}
+
+function handleReadR2Object(input: unknown, ctx: OrchestrationContext): unknown {
+  if (!isR2KeyInput(input)) {
+    throw new ValidationError(
+      `Invalid input for read_r2_object: expected { r2_key: string }, got ${truncateInput(input)}`
+    );
+  }
+  const scopeError = checkVoiceSubmissionScope('read_r2_object', input.r2_key, ctx);
+  if (scopeError) return scopeError;
+  const url = voiceSubmissionKeyToUrl(input.r2_key, ctx.workerOrigin);
+  ctx.logger.log('read_r2_object_tool_called', { r2_key: input.r2_key });
+  return { url, r2_key: input.r2_key };
+}
+
+async function handleAttachAudio(input: unknown, ctx: OrchestrationContext): Promise<unknown> {
+  if (!isR2KeyInput(input)) {
+    throw new ValidationError(
+      `Invalid input for attach_audio: expected { r2_key: string }, got ${truncateInput(input)}`
+    );
+  }
+  const scopeError = checkVoiceSubmissionScope('attach_audio', input.r2_key, ctx);
+  if (scopeError) return scopeError;
+  if (!ctx.attachmentsContext) {
+    ctx.logger.warn('attach_audio_no_attachments_context', {
+      reason: 'attachmentsContext is undefined; audio cannot be surfaced on ChatResponse',
+      r2_key: input.r2_key,
+    });
+    return {
+      error:
+        'Audio attachments are not available for this session — the request context is missing the attachments side-channel.',
+    };
+  }
+  const url = voiceSubmissionKeyToUrl(input.r2_key, ctx.workerOrigin);
+  const mimeType = await lookupVoiceSubmissionMimeType(input.r2_key, ctx);
+  ctx.attachmentsContext.add({
+    type: 'audio',
+    url,
+    r2_key: input.r2_key,
+    mime_type: mimeType,
+  });
+  ctx.logger.log('attach_audio_tool_called', { r2_key: input.r2_key, url, mime_type: mimeType });
+  return {
+    attached: true,
+    url,
+    r2_key: input.r2_key,
+    mime_type: mimeType,
+    note: 'The audio object has been attached to the response and will be delivered to the user alongside any text/TTS output.',
+  };
+}
+
+/**
+ * Look up the actual content-type stored alongside a voice-submission R2
+ * object so the AudioAttachment carries the real MIME instead of a hardcoded
+ * default. Inbound voice messages can arrive in several supported formats
+ * (`ogg`, `mp3`, `wav`, `webm`, `flac`, `m4a`) and the archival path stores
+ * each with the source content-type — we must surface that to the client so
+ * downstream players pick the right decoder.
+ *
+ * Falls back to `audio/ogg` only when the HEAD fails, the object is missing,
+ * or the stored content-type is empty. Each fallback logs a WARN per
+ * CLAUDE.md "no silent swallow."
+ */
+async function lookupVoiceSubmissionMimeType(
+  r2Key: string,
+  ctx: OrchestrationContext
+): Promise<string> {
+  const fallback = 'audio/ogg';
+  try {
+    const head = await ctx.env.AUDIO_BUCKET.head(r2Key);
+    if (!head) {
+      ctx.logger.warn('attach_audio_r2_head_miss', {
+        r2_key: r2Key,
+        reason: 'object not found; falling back to audio/ogg',
+      });
+      return fallback;
+    }
+    const contentType = head.httpMetadata?.contentType;
+    if (typeof contentType !== 'string' || contentType.length === 0) {
+      ctx.logger.warn('attach_audio_r2_head_no_content_type', {
+        r2_key: r2Key,
+        reason: 'object stored without contentType metadata; falling back to audio/ogg',
+      });
+      return fallback;
+    }
+    return contentType;
+  } catch (error) {
+    ctx.logger.warn('attach_audio_r2_head_failed', {
+      r2_key: r2Key,
+      error: error instanceof Error ? error.message : String(error),
+      reason: 'R2 HEAD threw; falling back to audio/ogg',
+    });
+    return fallback;
+  }
 }
 
 function handleRequestAudio(ctx: OrchestrationContext): unknown {

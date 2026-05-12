@@ -19,7 +19,7 @@
  */
 
 import { Env } from '../../config/types.js';
-import { Attachment } from '../../types/engine.js';
+import { PdfAttachment } from '../../types/engine.js';
 import { RequestLogger } from '../../utils/logger.js';
 import { callMCPTool } from '../mcp/discovery.js';
 import { ToolCatalog } from '../mcp/types.js';
@@ -407,7 +407,11 @@ async function doMirror(
   }
 }
 
-function registerAttachment(ctx: PtxprintToolContext, attachment: Attachment, jobId: string): void {
+function registerAttachment(
+  ctx: PtxprintToolContext,
+  attachment: PdfAttachment,
+  jobId: string
+): void {
   const { logger } = ctx;
   if (ctx.attachmentsContext) {
     ctx.attachmentsContext.add(attachment);
@@ -436,7 +440,7 @@ async function finalizePdf(
   if ('status' in mirrorResult) return mirrorResult;
 
   const filename = `${translation}-${book}-${presetId}.pdf`;
-  const attachment: Attachment = {
+  const attachment: PdfAttachment = {
     type: 'pdf',
     url: mirrorResult.url,
     filename,
