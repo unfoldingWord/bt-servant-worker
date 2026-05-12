@@ -28,8 +28,8 @@ PATTERN:
 const result = await tool_name({ param: "value" });
 __result__ = result;
 
-AVAILABLE: console.log/info/warn/error, JSON, all MCP tool functions
-NOT AVAILABLE: fetch, require, import, process, eval, Function constructor
+AVAILABLE: console.log/info/warn/error, JSON, all MCP tool functions (e.g. fetch_scripture, search_resources)
+NOT AVAILABLE: fetch, require, import, process, eval, Function constructor, internal tools (update_memory, read_memory, attach_audio, request_audio, read_r2_object — call these directly as tool calls, never from inside execute_code)
 
 RESOURCE LIMITS:
 - Maximum 10 MCP tool calls per execute_code invocation (hard limit - execution fails if exceeded)

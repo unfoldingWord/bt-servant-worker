@@ -1257,6 +1257,27 @@ async function handleReadMemory(input: unknown, ctx: OrchestrationContext): Prom
  * Exported for unit testing. Takes only the logger so tests don't need to
  * construct a full OrchestrationContext.
  */
+/**
+ * Build recovery attempts for a stringified JSON sections value.
+ * The model commonly: (a) stringifies correctly, (b) appends trailing whitespace,
+ * or (c) loses brace-depth and adds 1-3 extra trailing `}` characters.
+ */
+function buildJsonRecoveryAttempts(raw: string): Array<{ label: string; value: string }> {
+  const attempts: Array<{ label: string; value: string }> = [
+    { label: 'raw', value: raw },
+    { label: 'trimmed', value: raw.trim() },
+  ];
+  let stripped = raw.trim();
+  for (let i = 0; i < 3 && stripped.endsWith('}'); i++) {
+    const candidate = stripped.slice(0, -1);
+    if (candidate.includes('}')) {
+      attempts.push({ label: `strip_trailing_brace_${i + 1}`, value: candidate });
+    }
+    stripped = candidate;
+  }
+  return attempts;
+}
+
 export function coerceStringifiedSections(input: unknown, logger: RequestLogger): unknown {
   if (
     typeof input !== 'object' ||
@@ -1267,22 +1288,30 @@ export function coerceStringifiedSections(input: unknown, logger: RequestLogger)
     return input;
   }
   const rawSections = (input as { sections: string }).sections;
-  try {
-    const parsed: unknown = JSON.parse(rawSections);
-    logger.warn('update_memory_sections_coerced_from_string', {
-      reason: 'model sent sections as JSON string; auto-parsed before validation',
-      raw_length: rawSections.length,
-    });
-    return { ...(input as object), sections: parsed };
-  } catch (parseError) {
-    logger.log('update_memory_sections_coerce_parse_failed', {
-      error: parseError instanceof Error ? parseError.message : 'unknown',
-      raw_length: rawSections.length,
-    });
-    throw new ValidationError(
-      'Invalid input for update_memory: `sections` must be a JSON object, not a JSON string. Pass the object directly; do not call JSON.stringify on it.'
-    );
+
+  for (const { label, value } of buildJsonRecoveryAttempts(rawSections)) {
+    try {
+      const parsed: unknown = JSON.parse(value);
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        logger.warn('update_memory_sections_coerced_from_string', {
+          reason: 'model sent sections as JSON string; auto-parsed before validation',
+          raw_length: rawSections.length,
+          recovery: label,
+        });
+        return { ...(input as object), sections: parsed };
+      }
+    } catch {
+      // try next strategy
+    }
   }
+
+  logger.log('update_memory_sections_coerce_parse_failed', {
+    error: 'all recovery strategies failed',
+    raw_length: rawSections.length,
+  });
+  throw new ValidationError(
+    'Invalid input for update_memory: `sections` must be a JSON object, not a JSON string. Pass the object directly; do not call JSON.stringify on it.'
+  );
 }
 
 async function handleUpdateMemory(input: unknown, ctx: OrchestrationContext): Promise<unknown> {
