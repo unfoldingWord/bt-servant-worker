@@ -145,6 +145,29 @@ const AUDIO_FORMAT_MIME_MAP: Readonly<Record<string, string>> = Object.freeze({
   m4a: 'audio/mp4',
 });
 
+export type ModePersistenceAction =
+  | { kind: 'put'; mode: string }
+  | { kind: 'delete' }
+  | { kind: 'none' };
+
+/**
+ * Decide whether a classifier turn should persist or clear the user's selected
+ * mode in DO storage. Pure: no I/O, no logging — caller dispatches the action.
+ */
+export function decideModePersistence(
+  classified: { clearMode: boolean },
+  priorActiveModeName: string | undefined,
+  newEffectiveModeName: string | undefined
+): ModePersistenceAction {
+  if (classified.clearMode) {
+    return priorActiveModeName ? { kind: 'delete' } : { kind: 'none' };
+  }
+  if (newEffectiveModeName && newEffectiveModeName !== priorActiveModeName) {
+    return { kind: 'put', mode: newEffectiveModeName };
+  }
+  return { kind: 'none' };
+}
+
 export class UserDO {
   private state: DurableObjectState;
   private env: Env;
@@ -1017,6 +1040,18 @@ export class UserDO {
       unmatched_kinds: unmatchedKinds,
       message_stripped: classified.strippedMessage !== loaded.messageText,
     });
+    if (result.persistence.kind === 'put') {
+      logger.log('mode_persisted_from_hashtag', {
+        prior_mode: loaded.activeModeName ?? null,
+        new_mode: result.persistence.mode,
+        source: 'hashtag',
+      });
+    } else if (result.persistence.kind === 'delete') {
+      logger.log('mode_cleared_from_hashtag', {
+        prior_mode: loaded.activeModeName ?? null,
+        source: 'hashtag',
+      });
+    }
 
     return {
       ...result,
@@ -1025,7 +1060,15 @@ export class UserDO {
     };
   }
 
-  /** Apply classifier results: resolve per-turn mode override and language document. */
+  /**
+   * Apply classifier results: resolve per-turn mode override and language
+   * document, and persist the user's selected mode to DO storage when the
+   * classifier signals an explicit activation (matched `#mode-name`) or a
+   * reserved clear-intent hashtag (`#default` / `#none` / `#clear`). The
+   * persisted selection is read back by `getSelectedMode()` on subsequent
+   * requests, so the active mode survives chat-history rolloff and DO
+   * eviction.
+   */
   private async applyTriggerOverrides(
     body: ChatRequest,
     loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
@@ -1033,6 +1076,7 @@ export class UserDO {
   ) {
     let resolved = loaded.resolved;
     let activeModeName = loaded.activeModeName;
+    let newEffectiveModeName: string | undefined;
 
     if (classified.modeName && classified.modeName !== loaded.activeModeName) {
       const mode = resolveEffectiveMode(loaded.orgModes, classified.modeName, {
@@ -1040,6 +1084,7 @@ export class UserDO {
       });
       if (mode.effectiveModeName) {
         activeModeName = mode.effectiveModeName;
+        newEffectiveModeName = mode.effectiveModeName;
         const orgOverrides = body._org_prompt_overrides ?? {};
         const userOverrides = await this.getPromptOverrides();
         resolved = applyTemplateVariables(
@@ -1054,7 +1099,25 @@ export class UserDO {
       if (lang) languageDocument = lang.document;
     }
 
-    return { resolved, activeModeName, languageDocument };
+    const persistence = decideModePersistence(
+      classified,
+      loaded.activeModeName,
+      newEffectiveModeName
+    );
+    if (persistence.kind === 'put') {
+      await this.state.storage.put(SELECTED_MODE_KEY, persistence.mode);
+    } else if (persistence.kind === 'delete') {
+      await this.state.storage.delete(SELECTED_MODE_KEY);
+      activeModeName = undefined;
+      // Recompute per-turn resolved without mode overrides so the current
+      // turn answers in default — `loaded.resolved` was computed from the
+      // now-cleared persisted mode at request start.
+      const orgOverrides = body._org_prompt_overrides ?? {};
+      const userOverrides = await this.getPromptOverrides();
+      resolved = applyTemplateVariables(resolvePromptOverrides(orgOverrides, {}, userOverrides));
+    }
+
+    return { resolved, activeModeName, languageDocument, persistence };
   }
 
   /** Load all context needed for orchestration. */
