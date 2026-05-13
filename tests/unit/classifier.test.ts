@@ -337,6 +337,68 @@ describe('classifyTriggers — clear-mode reserved hashtags', () => {
   });
 });
 
+// ─── Leading punctuation tolerance between trigger tokens ───────────────────
+
+describe('classifyTriggers — leading punctuation tolerance', () => {
+  it.each([',', ':', ';'])(
+    'tolerates space-`%s`-space between a leading bot mention and a #mode hashtag',
+    (sep) => {
+      // Telegram autocomplete commonly inserts a comma after a bot mention,
+      // producing `@bot , #mode` (space-comma-space). Without the tolerance,
+      // the loop bails at the comma and #mode is never seen.
+      const result = classifyTriggers(`@bt_servant_qa_bot ${sep} #spoken hi`, buildCtx());
+      expect(result.modeName).toBe('spoken');
+      // The bot mention is still recorded as an unmatched language token —
+      // only the separator handling changed, not the matching cascade.
+      expect(result.unmatchedTriggers.map((t) => t.kind)).toEqual(['language']);
+      expect(result.strippedMessage).toBe('@bt_servant_qa_bot hi');
+    }
+  );
+
+  it('resolves both #mode and @language with a separator before the mode token', () => {
+    const result = classifyTriggers('@bt_servant_qa_bot ; #spoken @english hi', buildCtx());
+    expect(result.modeName).toBe('spoken');
+    expect(result.languageName).toBe('english');
+    expect(result.strippedMessage).toBe('@bt_servant_qa_bot hi');
+  });
+
+  it('handles a separator with no whitespace after it', () => {
+    const result = classifyTriggers('@bt_servant_qa_bot ,#spoken hi', buildCtx());
+    expect(result.modeName).toBe('spoken');
+  });
+
+  it('does not chain across multiple separators — `,,` blocks the lookahead', () => {
+    // The strip is gated by a `(?=[#@])` lookahead, so `,, #spoken` does not
+    // qualify (the char after the first `,` is `,`, not `#`/`@`). The loop
+    // bails at the first comma and the entire tail — both commas included —
+    // is preserved in the stripped message.
+    const result = classifyTriggers('@bt_servant_qa_bot ,, #spoken hi', buildCtx());
+    expect(result.modeName).toBeUndefined();
+    expect(result.strippedMessage).toBe('@bt_servant_qa_bot ,, #spoken hi');
+  });
+
+  it('does NOT strip a separator when ordinary text follows (preserves user content)', () => {
+    // Codex review caught a regression where the separator was stripped
+    // unconditionally. The classifier's existing policy preserves unmatched
+    // content; if the user wrote `@bot , please help`, the comma is part
+    // of their message and must survive into strippedMessage.
+    const result = classifyTriggers('@bt_servant_qa_bot , please help', buildCtx());
+    expect(result.modeName).toBeUndefined();
+    expect(result.strippedMessage).toBe('@bt_servant_qa_bot , please help');
+  });
+
+  it('does not tolerate a period as a separator (control: email-like fragments untouched)', () => {
+    // `@user.name` is a single token (no whitespace inside), so the period
+    // ends up inside the token's raw text — it is not a separator at all.
+    // This test pins the existing behaviour so a future change to the
+    // separator set does not silently restructure email-like input.
+    const result = classifyTriggers('@user.name #spoken hi', buildCtx());
+    expect(result.modeName).toBe('spoken');
+    expect(result.unmatchedTriggers.map((t) => t.rawToken)).toEqual(['user.name']);
+    expect(result.strippedMessage).toBe('@user.name hi');
+  });
+});
+
 // ─── No network call ────────────────────────────────────────────────────────
 
 describe('classifyTriggers — synchronous, no I/O', () => {

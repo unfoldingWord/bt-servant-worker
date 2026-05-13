@@ -78,6 +78,12 @@ interface ParsedToken {
  * Returns the tokens (in order) and the remainder of the message with the
  * tokens stripped and leading whitespace trimmed. Stops at the first
  * non-sigil-prefixed word — head-of-message scope only.
+ *
+ * Tolerates a single `,` / `:` / `;` separator (and any following whitespace)
+ * between consecutive tokens, so `@bot, #spoken-mode` and `@bot: #spoken-mode`
+ * still resolve `#spoken-mode`. Telegram autocomplete commonly inserts a
+ * comma after a bot mention. Period (`.`) is intentionally NOT tolerated to
+ * avoid restructuring email-like fragments.
  */
 function extractLeadingTokens(message: string): { tokens: ParsedToken[]; stripped: string } {
   const tokens: ParsedToken[] = [];
@@ -97,6 +103,11 @@ function extractLeadingTokens(message: string): { tokens: ParsedToken[]; strippe
 
     tokens.push({ sigil: ch, raw });
     remaining = spaceIdx === -1 ? '' : remaining.slice(spaceIdx).trimStart();
+    // Only strip the separator when ANOTHER trigger follows it. Without the
+    // lookahead, ordinary content like `@bot , please help` would silently
+    // lose the comma — violating the classifier's preserve-unmatched-content
+    // policy.
+    remaining = remaining.replace(/^[,;:]\s*(?=[#@])/, '');
   }
 
   return { tokens, stripped: remaining };
