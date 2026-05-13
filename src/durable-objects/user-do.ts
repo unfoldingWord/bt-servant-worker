@@ -62,6 +62,7 @@ import {
   generateVoiceSubmissionKey,
   uploadVoiceSubmission,
   voiceSubmissionKeyToUrl,
+  normalizeAudioFormat,
 } from '../services/audio/index.js';
 import { AttachmentsContext, createAttachmentsContext } from '../services/ptxprint/index.js';
 import { AppError, AudioTranscriptionError, ValidationError } from '../utils/errors.js';
@@ -130,10 +131,18 @@ function decodeBase64(base64: string): Uint8Array {
   return bytes;
 }
 
-/** Map an inbound audio format ID to its IANA MIME type. Unknown formats fall back to a generic octet-stream. */
+/**
+ * Map an inbound audio format ID to its IANA MIME type. Accepts both bare
+ * extension form (`ogg`) and MIME form (`audio/ogg`) so the Telegram gateway
+ * (which sends MIME) and any future bare-extension caller both produce the
+ * right content-type for R2 archival. Unknown formats fall back to a generic
+ * octet-stream.
+ */
 function audioFormatToMime(format: string): string {
-  // eslint-disable-next-line security/detect-object-injection -- map of fixed string keys
-  return AUDIO_FORMAT_MIME_MAP[format] ?? 'application/octet-stream';
+  const normalized = normalizeAudioFormat(format);
+  if (normalized === null) return 'application/octet-stream';
+  // eslint-disable-next-line security/detect-object-injection -- normalized is constrained to AudioFormat
+  return AUDIO_FORMAT_MIME_MAP[normalized] ?? 'application/octet-stream';
 }
 
 const AUDIO_FORMAT_MIME_MAP: Readonly<Record<string, string>> = Object.freeze({

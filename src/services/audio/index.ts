@@ -16,4 +16,9 @@ export type {
   AudioFormat,
   AudioContext,
 } from './types.js';
-export { SUPPORTED_AUDIO_FORMATS, MAX_AUDIO_SIZE_BYTES, MAX_TTS_INPUT_CHARS } from './types.js';
+export {
+  SUPPORTED_AUDIO_FORMATS,
+  MAX_AUDIO_SIZE_BYTES,
+  MAX_TTS_INPUT_CHARS,
+  normalizeAudioFormat,
+} from './types.js';
