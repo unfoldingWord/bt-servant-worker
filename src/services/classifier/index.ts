@@ -103,7 +103,11 @@ function extractLeadingTokens(message: string): { tokens: ParsedToken[]; strippe
 
     tokens.push({ sigil: ch, raw });
     remaining = spaceIdx === -1 ? '' : remaining.slice(spaceIdx).trimStart();
-    remaining = remaining.replace(/^[,;:]\s*/, '');
+    // Only strip the separator when ANOTHER trigger follows it. Without the
+    // lookahead, ordinary content like `@bot , please help` would silently
+    // lose the comma — violating the classifier's preserve-unmatched-content
+    // policy.
+    remaining = remaining.replace(/^[,;:]\s*(?=[#@])/, '');
   }
 
   return { tokens, stripped: remaining };

@@ -367,12 +367,24 @@ describe('classifyTriggers — leading punctuation tolerance', () => {
     expect(result.modeName).toBe('spoken');
   });
 
-  it('only swallows one separator — a second consecutive separator still bails', () => {
+  it('does not chain across multiple separators — `,,` blocks the lookahead', () => {
+    // The strip is gated by a `(?=[#@])` lookahead, so `,, #spoken` does not
+    // qualify (the char after the first `,` is `,`, not `#`/`@`). The loop
+    // bails at the first comma and the entire tail — both commas included —
+    // is preserved in the stripped message.
     const result = classifyTriggers('@bt_servant_qa_bot ,, #spoken hi', buildCtx());
     expect(result.modeName).toBeUndefined();
-    // After eating the first `,`, the loop sees `, #spoken hi` and bails at
-    // the second comma, leaving the rest of the message intact.
-    expect(result.strippedMessage).toBe('@bt_servant_qa_bot ' + ', #spoken hi');
+    expect(result.strippedMessage).toBe('@bt_servant_qa_bot ,, #spoken hi');
+  });
+
+  it('does NOT strip a separator when ordinary text follows (preserves user content)', () => {
+    // Codex review caught a regression where the separator was stripped
+    // unconditionally. The classifier's existing policy preserves unmatched
+    // content; if the user wrote `@bot , please help`, the comma is part
+    // of their message and must survive into strippedMessage.
+    const result = classifyTriggers('@bt_servant_qa_bot , please help', buildCtx());
+    expect(result.modeName).toBeUndefined();
+    expect(result.strippedMessage).toBe('@bt_servant_qa_bot , please help');
   });
 
   it('does not tolerate a period as a separator (control: email-like fragments untouched)', () => {
