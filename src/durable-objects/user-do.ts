@@ -1068,6 +1068,63 @@ export class UserDO {
    * persisted selection is read back by `getSelectedMode()` on subsequent
    * requests, so the active mode survives chat-history rolloff and DO
    * eviction.
+   *
+   * Clear-intent is processed BEFORE mode activation so that a combined
+   * message like `#default #spoken hi` runs the current turn in default
+   * regardless of whether a prior mode was persisted. Without this order,
+   * the modeName branch would override the per-turn resolved prompts and
+   * `decideModePersistence` would return 'none' (nothing to delete) when
+   * no prior mode existed, leaving the current turn in the new mode.
+   */
+  /**
+   * Resolve the per-turn `resolved` prompt overrides for a hashtag-activated
+   * mode. Returns null when the mode could not be resolved (missing or
+   * unpublished and the caller is not admin), in which case the caller
+   * leaves the existing `loaded.resolved` in place.
+   */
+  private async resolveModeOverride(
+    body: ChatRequest,
+    loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
+    modeName: string
+  ) {
+    const mode = resolveEffectiveMode(loaded.orgModes, modeName, {
+      includeUnpublished: loaded.isAdmin,
+    });
+    if (!mode.effectiveModeName) return null;
+    const orgOverrides = body._org_prompt_overrides ?? {};
+    const userOverrides = await this.getPromptOverrides();
+    const resolved = applyTemplateVariables(
+      resolvePromptOverrides(orgOverrides, mode.modeOverrides, userOverrides)
+    );
+    return { resolved, effectiveModeName: mode.effectiveModeName };
+  }
+
+  /**
+   * Resolve the per-turn `resolved` prompt overrides for a clear-intent
+   * hashtag — same as the no-mode default, computed by passing an empty
+   * `modeOverrides` map to the resolver.
+   */
+  private async resolveClearedOverride(body: ChatRequest) {
+    const orgOverrides = body._org_prompt_overrides ?? {};
+    const userOverrides = await this.getPromptOverrides();
+    return applyTemplateVariables(resolvePromptOverrides(orgOverrides, {}, userOverrides));
+  }
+
+  /**
+   * Apply classifier results: resolve per-turn mode override and language
+   * document, and persist the user's selected mode to DO storage when the
+   * classifier signals an explicit activation (matched `#mode-name`) or a
+   * reserved clear-intent hashtag (`#default` / `#none` / `#clear`). The
+   * persisted selection is read back by `getSelectedMode()` on subsequent
+   * requests, so the active mode survives chat-history rolloff and DO
+   * eviction.
+   *
+   * Clear-intent is processed BEFORE mode activation so a combined message
+   * like `#default #spoken hi` runs the current turn in default regardless
+   * of whether a prior mode was persisted. Without this order, the modeName
+   * branch would override the per-turn resolved prompts and
+   * `decideModePersistence` would return 'none' (nothing to delete) when
+   * no prior mode existed, leaving the current turn in the new mode.
    */
   private async applyTriggerOverrides(
     body: ChatRequest,
@@ -1078,18 +1135,15 @@ export class UserDO {
     let activeModeName = loaded.activeModeName;
     let newEffectiveModeName: string | undefined;
 
-    if (classified.modeName && classified.modeName !== loaded.activeModeName) {
-      const mode = resolveEffectiveMode(loaded.orgModes, classified.modeName, {
-        includeUnpublished: loaded.isAdmin,
-      });
-      if (mode.effectiveModeName) {
-        activeModeName = mode.effectiveModeName;
-        newEffectiveModeName = mode.effectiveModeName;
-        const orgOverrides = body._org_prompt_overrides ?? {};
-        const userOverrides = await this.getPromptOverrides();
-        resolved = applyTemplateVariables(
-          resolvePromptOverrides(orgOverrides, mode.modeOverrides, userOverrides)
-        );
+    if (classified.clearMode) {
+      activeModeName = undefined;
+      resolved = await this.resolveClearedOverride(body);
+    } else if (classified.modeName && classified.modeName !== loaded.activeModeName) {
+      const result = await this.resolveModeOverride(body, loaded, classified.modeName);
+      if (result) {
+        activeModeName = result.effectiveModeName;
+        newEffectiveModeName = result.effectiveModeName;
+        resolved = result.resolved;
       }
     }
 
@@ -1108,13 +1162,6 @@ export class UserDO {
       await this.state.storage.put(SELECTED_MODE_KEY, persistence.mode);
     } else if (persistence.kind === 'delete') {
       await this.state.storage.delete(SELECTED_MODE_KEY);
-      activeModeName = undefined;
-      // Recompute per-turn resolved without mode overrides so the current
-      // turn answers in default — `loaded.resolved` was computed from the
-      // now-cleared persisted mode at request start.
-      const orgOverrides = body._org_prompt_overrides ?? {};
-      const userOverrides = await this.getPromptOverrides();
-      resolved = applyTemplateVariables(resolvePromptOverrides(orgOverrides, {}, userOverrides));
     }
 
     return { resolved, activeModeName, languageDocument, persistence };

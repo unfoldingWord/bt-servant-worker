@@ -44,4 +44,15 @@ describe('decideModePersistence', () => {
     const action = decideModePersistence({ clearMode: true }, 'fia-coach', 'spoken-mode');
     expect(action).toEqual({ kind: 'delete' });
   });
+
+  it('clearMode + no prior + same-message mode activation → none (per-turn reset is the callers job)', () => {
+    // Combined message like `#default #spoken hi` with no prior persisted mode:
+    // the helper returns 'none' because there is nothing to delete from storage,
+    // but the calling code (applyTriggerOverrides) MUST still reset the per-turn
+    // resolved/activeModeName so the current turn answers in default. Codex
+    // review caught a regression here where mode activation ran first and the
+    // helper returning 'none' left the current turn in the new mode.
+    const action = decideModePersistence({ clearMode: true }, undefined, 'spoken-mode');
+    expect(action).toEqual({ kind: 'none' });
+  });
 });
