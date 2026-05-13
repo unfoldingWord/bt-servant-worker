@@ -38,6 +38,7 @@ describe('classifyTriggers — no triggers in message', () => {
       languageName: undefined,
       strippedMessage: 'How do I translate Genesis 1:1?',
       unmatchedTriggers: [],
+      clearMode: false,
     });
   });
 
@@ -283,6 +284,56 @@ describe('classifyTriggers — coincidental leading sigils preserve user content
     const result = classifyTriggers('@GMAIL.com check this out', buildCtx());
     expect(result.unmatchedTriggers[0].rawToken).toBe('GMAIL.com');
     expect(result.strippedMessage).toBe('@GMAIL.com check this out');
+  });
+});
+
+// ─── Clear-mode reserved hashtags ───────────────────────────────────────────
+
+describe('classifyTriggers — clear-mode reserved hashtags', () => {
+  it.each(['#default', '#none', '#clear'])(
+    '%s sets clearMode=true and strips the token',
+    (token) => {
+      const result = classifyTriggers(`${token} please`, buildCtx());
+      expect(result.clearMode).toBe(true);
+      expect(result.modeName).toBeUndefined();
+      expect(result.unmatchedTriggers).toEqual([]);
+      expect(result.strippedMessage).toBe('please');
+    }
+  );
+
+  it('clear-mode tokens are case-insensitive', () => {
+    const result = classifyTriggers('#DEFAULT please', buildCtx());
+    expect(result.clearMode).toBe(true);
+    expect(result.strippedMessage).toBe('please');
+  });
+
+  it('clear-mode token combined with a language token works for both', () => {
+    const result = classifyTriggers('#default @english hi', buildCtx());
+    expect(result.clearMode).toBe(true);
+    expect(result.modeName).toBeUndefined();
+    expect(result.languageName).toBe('english');
+    expect(result.strippedMessage).toBe('hi');
+  });
+
+  it('clear-mode shadows a published mode named "default" (reserved tokens win)', () => {
+    const ctx = buildCtx({
+      availableModes: [...modes, { name: 'default', label: 'Default' }],
+    });
+    const result = classifyTriggers('#default hi', ctx);
+    expect(result.clearMode).toBe(true);
+    expect(result.modeName).toBeUndefined();
+  });
+
+  it('non-leading clear-mode token is not recognised (head-of-message scope)', () => {
+    const result = classifyTriggers('please #default', buildCtx());
+    expect(result.clearMode).toBe(false);
+    expect(result.strippedMessage).toBe('please #default');
+  });
+
+  it('clearMode defaults to false when no clear-mode token is present', () => {
+    const result = classifyTriggers('#fia-coach hi', buildCtx());
+    expect(result.clearMode).toBe(false);
+    expect(result.modeName).toBe('fia-coach');
   });
 });
 

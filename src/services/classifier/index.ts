@@ -45,7 +45,19 @@ export interface ClassifierResult {
   strippedMessage: string;
   /** Triggers that could not be resolved; surfaced to the orchestrator for disambiguation */
   unmatchedTriggers: UnmatchedTrigger[];
+  /**
+   * True when the user typed a reserved clear-mode hashtag (e.g. `#default`,
+   * `#none`, `#clear`). Mutually exclusive with `modeName` for the same token.
+   */
+  clearMode: boolean;
 }
+
+/**
+ * Reserved hashtag tokens that signal "clear the active mode" rather than
+ * activating a named mode. Recognised before the matching cascade so they
+ * cannot be shadowed by a published mode named `default`/`none`/`clear`.
+ */
+const CLEAR_MODE_TOKENS: ReadonlySet<string> = new Set(['default', 'none', 'clear']);
 
 export interface ClassifierContext {
   availableModes: AvailableOption[];
@@ -210,6 +222,30 @@ function matchToken(raw: string, options: AvailableOption[]): string | null {
  * unmatched tokens via the `unmatchedTriggers` system-prompt section so it
  * can choose to acknowledge them when the user clearly was trying to route.
  */
+type TokenOutcome =
+  | { kind: 'clear-mode' }
+  | { kind: 'matched'; sigil: '#' | '@'; name: string }
+  | { kind: 'unmatched'; trigger: UnmatchedTrigger; tokenText: string };
+
+/** Classify a single leading token. Pure: no shared state. */
+function classifyToken(token: ParsedToken, ctx: ClassifierContext): TokenOutcome {
+  const isMode = token.sigil === '#';
+  const options = isMode ? ctx.availableModes : ctx.availableLanguages;
+  if (isMode && CLEAR_MODE_TOKENS.has(token.raw.toLowerCase())) {
+    return { kind: 'clear-mode' };
+  }
+  const matched = matchToken(token.raw, options);
+  if (matched !== null) {
+    return { kind: 'matched', sigil: token.sigil, name: matched };
+  }
+  const triggerKind: TriggerKind = isMode ? 'mode' : 'language';
+  return {
+    kind: 'unmatched',
+    trigger: { kind: triggerKind, rawToken: token.raw, availableOptions: options },
+    tokenText: `${token.sigil}${token.raw}`,
+  };
+}
+
 export function classifyTriggers(messageText: string, ctx: ClassifierContext): ClassifierResult {
   const { tokens, stripped: postTokens } = extractLeadingTokens(messageText);
 
@@ -219,26 +255,26 @@ export function classifyTriggers(messageText: string, ctx: ClassifierContext): C
       languageName: undefined,
       strippedMessage: messageText,
       unmatchedTriggers: [],
+      clearMode: false,
     };
   }
 
   let modeName: string | undefined;
   let languageName: string | undefined;
+  let clearMode = false;
   const unmatchedTriggers: UnmatchedTrigger[] = [];
   const unmatchedTokenTexts: string[] = [];
 
   for (const token of tokens) {
-    const isMode = token.sigil === '#';
-    const options = isMode ? ctx.availableModes : ctx.availableLanguages;
-    const kind: TriggerKind = isMode ? 'mode' : 'language';
-
-    const matched = matchToken(token.raw, options);
-    if (matched !== null) {
-      if (isMode) modeName = matched;
-      else languageName = matched;
+    const outcome = classifyToken(token, ctx);
+    if (outcome.kind === 'clear-mode') {
+      clearMode = true;
+    } else if (outcome.kind === 'matched') {
+      if (outcome.sigil === '#') modeName = outcome.name;
+      else languageName = outcome.name;
     } else {
-      unmatchedTriggers.push({ kind, rawToken: token.raw, availableOptions: options });
-      unmatchedTokenTexts.push(`${token.sigil}${token.raw}`);
+      unmatchedTriggers.push(outcome.trigger);
+      unmatchedTokenTexts.push(outcome.tokenText);
     }
   }
 
@@ -252,5 +288,6 @@ export function classifyTriggers(messageText: string, ctx: ClassifierContext): C
     languageName,
     strippedMessage,
     unmatchedTriggers,
+    clearMode,
   };
 }

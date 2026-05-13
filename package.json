@@ -1,6 +1,6 @@
 {
   "name": "bt-servant-worker",
-  "version": "2.24.3",
+  "version": "2.24.5",
   "private": true,
   "type": "module",
   "scripts": {
