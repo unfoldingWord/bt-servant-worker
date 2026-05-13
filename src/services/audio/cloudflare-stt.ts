@@ -7,15 +7,15 @@
 import { AudioTranscriptionError } from '../../utils/errors.js';
 import { RequestLogger } from '../../utils/logger.js';
 import {
-  AudioFormat,
   MAX_AUDIO_SIZE_BYTES,
   SUPPORTED_AUDIO_FORMATS,
   TranscriptionResult,
+  normalizeAudioFormat,
 } from './types.js';
 
 /** Validate audio input and return the estimated decoded size in bytes. */
 function validateAudioInput(audioBase64: string, audioFormat: string): number {
-  if (!SUPPORTED_AUDIO_FORMATS.includes(audioFormat as AudioFormat)) {
+  if (normalizeAudioFormat(audioFormat) === null) {
     throw new AudioTranscriptionError(
       `Unsupported audio format: ${audioFormat}. Supported: ${SUPPORTED_AUDIO_FORMATS.join(', ')}`
     );

@@ -6,6 +6,7 @@ import {
   MAX_AUDIO_SIZE_BYTES,
   MAX_TTS_INPUT_CHARS,
   AudioContext,
+  normalizeAudioFormat,
 } from '../../src/services/audio/types.js';
 import { createRequestLogger } from '../../src/utils/logger.js';
 
@@ -110,6 +111,23 @@ describe('transcribeAudio - validation and errors', () => {
     );
   });
 
+  it('accepts MIME-form audio_format like `audio/ogg` (gateway sends this)', async () => {
+    // Telegram gateway sends the full IANA MIME, not the bare extension.
+    // Issue #227: the original whitelist did a direct .includes() and rejected
+    // `audio/ogg`, causing every group voice message to 400.
+    const audio = makeBase64(100);
+    await expect(
+      transcribeAudio(createMockAi({ text: 'hi' }), audio, 'audio/ogg', logger)
+    ).resolves.toEqual(expect.objectContaining({ text: 'hi' }));
+  });
+
+  it('rejects MIME-form with an unsupported subtype', async () => {
+    const audio = makeBase64(100);
+    await expect(transcribeAudio(createMockAi(), audio, 'audio/aac', logger)).rejects.toThrow(
+      /Unsupported audio format/
+    );
+  });
+
   it('rejects oversized audio via arithmetic size check', async () => {
     const oversizedChars = Math.ceil(((MAX_AUDIO_SIZE_BYTES + 4) * 4) / 3);
     const oversizedBase64 = 'A'.repeat(oversizedChars);
@@ -168,6 +186,47 @@ describe('AudioContext', () => {
     ctx.requestAudio();
     ctx.requestAudio();
     expect(ctx.audioRequested).toBe(true);
+  });
+});
+
+// ─── normalizeAudioFormat ──────────────────────────────────────────────────
+
+describe('normalizeAudioFormat', () => {
+  it.each(['ogg', 'mp3', 'wav', 'webm', 'flac', 'm4a'])(
+    'passes bare-extension `%s` through unchanged',
+    (fmt) => {
+      expect(normalizeAudioFormat(fmt)).toBe(fmt);
+    }
+  );
+
+  it.each([
+    ['audio/ogg', 'ogg'],
+    ['audio/mp3', 'mp3'],
+    ['audio/wav', 'wav'],
+    ['audio/webm', 'webm'],
+    ['audio/flac', 'flac'],
+    ['audio/m4a', 'm4a'],
+  ])('strips `audio/` prefix from `%s` → `%s`', (mime, bare) => {
+    expect(normalizeAudioFormat(mime)).toBe(bare);
+  });
+
+  it('returns null for unsupported bare extensions', () => {
+    expect(normalizeAudioFormat('aac')).toBeNull();
+    expect(normalizeAudioFormat('opus')).toBeNull();
+  });
+
+  it('returns null for unsupported MIME types', () => {
+    expect(normalizeAudioFormat('audio/aac')).toBeNull();
+    expect(normalizeAudioFormat('audio/mpeg')).toBeNull(); // mp3 lives under `mp3`, not `mpeg`
+  });
+
+  it('returns null for non-audio MIME prefixes (no false matches)', () => {
+    expect(normalizeAudioFormat('video/ogg')).toBeNull();
+    expect(normalizeAudioFormat('application/ogg')).toBeNull();
+  });
+
+  it('returns null for empty string', () => {
+    expect(normalizeAudioFormat('')).toBeNull();
   });
 });
 
