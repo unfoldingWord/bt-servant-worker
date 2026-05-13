@@ -8,7 +8,8 @@ compatibility_date = "2024-01-01"
 # Must be a top-level field — TOML scoping makes it part of the previous
 # table if placed after a [section], so keep it above [observability].
 tail_consumers = [
-  { service = "bt-servant-tail" }
+  { service = "bt-servant-tail" },
+  { service = "bt-servant-telemetry-production" }
 ]
 
 [observability]
@@ -92,7 +93,8 @@ deleted_classes = ["UserQueue"]
 [env.staging]
 name = "bt-servant-worker-staging"
 tail_consumers = [
-  { service = "bt-servant-tail-staging" }
+  { service = "bt-servant-tail-staging" },
+  { service = "bt-servant-telemetry-dev" }
 ]
 
 [env.staging.limits]
