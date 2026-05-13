@@ -200,14 +200,32 @@ describe('normalizeAudioFormat', () => {
   );
 
   it.each([
+    // Canonical IANA MIME types
     ['audio/ogg', 'ogg'],
-    ['audio/mp3', 'mp3'],
+    ['audio/mpeg', 'mp3'], // canonical MIME for mp3 — subtype is "mpeg", not "mp3"
+    ['audio/mp4', 'm4a'], // canonical MIME for m4a — subtype is "mp4", not "m4a"
     ['audio/wav', 'wav'],
     ['audio/webm', 'webm'],
     ['audio/flac', 'flac'],
-    ['audio/m4a', 'm4a'],
-  ])('strips `audio/` prefix from `%s` → `%s`', (mime, bare) => {
+  ])('maps canonical IANA MIME `%s` → `%s`', (mime, bare) => {
     expect(normalizeAudioFormat(mime)).toBe(bare);
+  });
+
+  it.each([
+    // Non-canonical but widely-seen variants
+    ['audio/mp3', 'mp3'],
+    ['audio/x-wav', 'wav'],
+    ['audio/wave', 'wav'],
+    ['audio/x-flac', 'flac'],
+    ['audio/x-m4a', 'm4a'],
+  ])('maps common MIME variant `%s` → `%s`', (mime, bare) => {
+    expect(normalizeAudioFormat(mime)).toBe(bare);
+  });
+
+  it('is case-insensitive per RFC 6838', () => {
+    expect(normalizeAudioFormat('AUDIO/OGG')).toBe('ogg');
+    expect(normalizeAudioFormat('Audio/Mpeg')).toBe('mp3');
+    expect(normalizeAudioFormat('OGG')).toBe('ogg');
   });
 
   it('returns null for unsupported bare extensions', () => {
@@ -217,12 +235,13 @@ describe('normalizeAudioFormat', () => {
 
   it('returns null for unsupported MIME types', () => {
     expect(normalizeAudioFormat('audio/aac')).toBeNull();
-    expect(normalizeAudioFormat('audio/mpeg')).toBeNull(); // mp3 lives under `mp3`, not `mpeg`
+    expect(normalizeAudioFormat('audio/opus')).toBeNull();
   });
 
   it('returns null for non-audio MIME prefixes (no false matches)', () => {
     expect(normalizeAudioFormat('video/ogg')).toBeNull();
     expect(normalizeAudioFormat('application/ogg')).toBeNull();
+    expect(normalizeAudioFormat('video/mp4')).toBeNull();
   });
 
   it('returns null for empty string', () => {
