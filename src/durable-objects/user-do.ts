@@ -72,7 +72,7 @@ import { createTimingContext, timePhase, TimingContext } from '../utils/timing.j
 import { classifyTriggers, ClassifierResult } from '../services/classifier/index.js';
 import type { UnmatchedTrigger } from '../services/classifier/index.js';
 import { isAdminClient, validateChatBody } from '../utils/chat-validation.js';
-import { OrgLanguages } from '../types/languages.js';
+import { OrgLanguages, resolveEffectiveLanguage } from '../types/languages.js';
 import { InternalQueueEntry } from '../types/queue.js';
 
 // ── Storage keys ───────────────────────────────────────────────────────────────
@@ -80,6 +80,7 @@ const HISTORY_KEY = 'history';
 const PREFERENCES_KEY = 'preferences';
 const PROMPT_OVERRIDES_KEY = 'prompt_overrides';
 const SELECTED_MODE_KEY = 'selected_mode';
+const SELECTED_LANGUAGE_KEY = 'selected_language';
 const PROCESSING_LOCK_KEY = '_processing_lock';
 const QUEUE_KEY = 'queue';
 const QUEUE_PROCESSING_KEY = 'queue_processing';
@@ -175,6 +176,71 @@ export function decideModePersistence(
     return { kind: 'put', mode: newEffectiveModeName };
   }
   return { kind: 'none' };
+}
+
+export type LanguagePersistenceAction =
+  | { kind: 'put'; language: string }
+  | { kind: 'delete' }
+  | { kind: 'none' };
+
+/**
+ * Decide whether a classifier turn should persist or clear the user's selected
+ * language in DO storage. Pure: no I/O, no logging — caller dispatches the
+ * action. Parallel to `decideModePersistence`; kept as a sibling function
+ * rather than a shared abstraction because mode and language flows diverge
+ * downstream (mode short-circuits resolution when the trigger matches the
+ * persisted mode; language always re-resolves to materialise the document).
+ */
+export function decideLanguagePersistence(
+  classified: { clearLanguage: boolean },
+  priorActiveLanguageName: string | undefined,
+  newEffectiveLanguageName: string | undefined
+): LanguagePersistenceAction {
+  if (classified.clearLanguage) {
+    return priorActiveLanguageName ? { kind: 'delete' } : { kind: 'none' };
+  }
+  if (newEffectiveLanguageName && newEffectiveLanguageName !== priorActiveLanguageName) {
+    return { kind: 'put', language: newEffectiveLanguageName };
+  }
+  return { kind: 'none' };
+}
+
+function logModePersistenceChange(
+  logger: RequestLogger,
+  action: ModePersistenceAction,
+  priorMode: string | undefined
+): void {
+  if (action.kind === 'put') {
+    logger.log('mode_persisted_from_hashtag', {
+      prior_mode: priorMode ?? null,
+      new_mode: action.mode,
+      source: 'hashtag',
+    });
+  } else if (action.kind === 'delete') {
+    logger.log('mode_cleared_from_hashtag', {
+      prior_mode: priorMode ?? null,
+      source: 'hashtag',
+    });
+  }
+}
+
+function logLanguagePersistenceChange(
+  logger: RequestLogger,
+  action: LanguagePersistenceAction,
+  priorLanguage: string | undefined
+): void {
+  if (action.kind === 'put') {
+    logger.log('language_persisted_from_trigger', {
+      prior_language: priorLanguage ?? null,
+      new_language: action.language,
+      source: 'trigger',
+    });
+  } else if (action.kind === 'delete') {
+    logger.log('language_cleared_from_trigger', {
+      prior_language: priorLanguage ?? null,
+      source: 'trigger',
+    });
+  }
 }
 
 export class UserDO {
@@ -1038,29 +1104,7 @@ export class UserDO {
     });
 
     const result = await this.applyTriggerOverrides(body, loaded, classified);
-
-    const unmatchedKinds = [...new Set(classified.unmatchedTriggers.map((t) => t.kind))].sort();
-    logger.log('trigger_classifier_result', {
-      requested_mode: classified.modeName ?? null,
-      requested_language: classified.languageName ?? null,
-      effective_mode: result.activeModeName ?? null,
-      language_document_injected: !!result.languageDocument,
-      unmatched_count: classified.unmatchedTriggers.length,
-      unmatched_kinds: unmatchedKinds,
-      message_stripped: classified.strippedMessage !== loaded.messageText,
-    });
-    if (result.persistence.kind === 'put') {
-      logger.log('mode_persisted_from_hashtag', {
-        prior_mode: loaded.activeModeName ?? null,
-        new_mode: result.persistence.mode,
-        source: 'hashtag',
-      });
-    } else if (result.persistence.kind === 'delete') {
-      logger.log('mode_cleared_from_hashtag', {
-        prior_mode: loaded.activeModeName ?? null,
-        source: 'hashtag',
-      });
-    }
+    this.logTriggerOutcome(loaded, classified, result, logger);
 
     return {
       ...result,
@@ -1069,22 +1113,28 @@ export class UserDO {
     };
   }
 
-  /**
-   * Apply classifier results: resolve per-turn mode override and language
-   * document, and persist the user's selected mode to DO storage when the
-   * classifier signals an explicit activation (matched `#mode-name`) or a
-   * reserved clear-intent hashtag (`#default` / `#none` / `#clear`). The
-   * persisted selection is read back by `getSelectedMode()` on subsequent
-   * requests, so the active mode survives chat-history rolloff and DO
-   * eviction.
-   *
-   * Clear-intent is processed BEFORE mode activation so that a combined
-   * message like `#default #spoken hi` runs the current turn in default
-   * regardless of whether a prior mode was persisted. Without this order,
-   * the modeName branch would override the per-turn resolved prompts and
-   * `decideModePersistence` would return 'none' (nothing to delete) when
-   * no prior mode existed, leaving the current turn in the new mode.
-   */
+  /** Emit the classifier-result + persistence telemetry for one chat turn. */
+  private logTriggerOutcome(
+    loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
+    classified: ClassifierResult,
+    result: Awaited<ReturnType<UserDO['applyTriggerOverrides']>>,
+    logger: RequestLogger
+  ): void {
+    const unmatchedKinds = [...new Set(classified.unmatchedTriggers.map((t) => t.kind))].sort();
+    logger.log('trigger_classifier_result', {
+      requested_mode: classified.modeName ?? null,
+      requested_language: classified.languageName ?? null,
+      effective_mode: result.activeModeName ?? null,
+      effective_language: result.activeLanguageName ?? null,
+      language_document_injected: !!result.languageDocument,
+      unmatched_count: classified.unmatchedTriggers.length,
+      unmatched_kinds: unmatchedKinds,
+      message_stripped: classified.strippedMessage !== loaded.messageText,
+    });
+    logModePersistenceChange(logger, result.modePersistence, loaded.activeModeName);
+    logLanguagePersistenceChange(logger, result.languagePersistence, loaded.selectedLanguageName);
+  }
+
   /**
    * Resolve the per-turn `resolved` prompt overrides for a hashtag-activated
    * mode. Returns null when the mode could not be resolved (missing or
@@ -1120,20 +1170,22 @@ export class UserDO {
   }
 
   /**
-   * Apply classifier results: resolve per-turn mode override and language
-   * document, and persist the user's selected mode to DO storage when the
-   * classifier signals an explicit activation (matched `#mode-name`) or a
-   * reserved clear-intent hashtag (`#default` / `#none` / `#clear`). The
-   * persisted selection is read back by `getSelectedMode()` on subsequent
-   * requests, so the active mode survives chat-history rolloff and DO
-   * eviction.
+   * Apply classifier results: resolve the per-turn mode override and language
+   * document, and persist the user's selected mode AND language to DO storage
+   * when the classifier signals an explicit activation (matched `#mode-name`
+   * or `@language-name`) or a reserved clear-intent token (`#default` /
+   * `#none` / `#clear` for mode; `@default` / `@none` / `@clear` for
+   * language). Persisted selections are read back by `getSelectedMode` /
+   * `getSelectedLanguage` on subsequent requests, so the active selections
+   * survive chat-history rolloff and DO eviction.
    *
-   * Clear-intent is processed BEFORE mode activation so a combined message
-   * like `#default #spoken hi` runs the current turn in default regardless
-   * of whether a prior mode was persisted. Without this order, the modeName
-   * branch would override the per-turn resolved prompts and
-   * `decideModePersistence` would return 'none' (nothing to delete) when
-   * no prior mode existed, leaving the current turn in the new mode.
+   * Clear-intent is processed BEFORE activation so that a combined message
+   * like `#default #spoken hi` (or `@default @arabic hi`) runs the current
+   * turn in default regardless of whether a prior selection was persisted.
+   * Without this order, the activation branch would override the per-turn
+   * resolved prompts and the persistence decider would return 'none'
+   * (nothing to delete) when no prior selection existed, leaving the
+   * current turn in the new selection.
    */
   private async applyTriggerOverrides(
     body: ChatRequest,
@@ -1156,24 +1208,89 @@ export class UserDO {
       }
     }
 
-    let languageDocument: string | undefined;
-    if (classified.languageName) {
-      const lang = loaded.orgLanguages.languages.find((l) => l.name === classified.languageName);
-      if (lang) languageDocument = lang.document;
-    }
+    const language = this.resolveLanguageForTurn(loaded, classified);
 
-    const persistence = decideModePersistence(
+    const modePersistence = decideModePersistence(
       classified,
       loaded.activeModeName,
       newEffectiveModeName
     );
-    if (persistence.kind === 'put') {
-      await this.state.storage.put(SELECTED_MODE_KEY, persistence.mode);
-    } else if (persistence.kind === 'delete') {
+    if (modePersistence.kind === 'put') {
+      await this.state.storage.put(SELECTED_MODE_KEY, modePersistence.mode);
+    } else if (modePersistence.kind === 'delete') {
       await this.state.storage.delete(SELECTED_MODE_KEY);
     }
 
-    return { resolved, activeModeName, languageDocument, persistence };
+    const languagePersistence = decideLanguagePersistence(
+      classified,
+      loaded.selectedLanguageName,
+      language.newEffectiveLanguageName
+    );
+    if (languagePersistence.kind === 'put') {
+      await this.state.storage.put(SELECTED_LANGUAGE_KEY, languagePersistence.language);
+    } else if (languagePersistence.kind === 'delete') {
+      await this.state.storage.delete(SELECTED_LANGUAGE_KEY);
+    }
+
+    return {
+      resolved,
+      activeModeName,
+      languageDocument: language.languageDocument,
+      activeLanguageName: language.activeLanguageName,
+      modePersistence,
+      languagePersistence,
+    };
+  }
+
+  /**
+   * Determine which language applies to this turn and resolve its document.
+   *
+   * Single-place resolution: this is the only site that materialises the
+   * language document for the current turn. `loadChatContext` reads only the
+   * persisted name; everything else — trigger override, persisted fallback,
+   * published-filter stale-masking — happens here.
+   *
+   * `newEffectiveLanguageName` is set ONLY when the current turn's `@`-trigger
+   * resolved to a language. A persisted-fallback resolve does NOT bump this
+   * field, so the persistence decider never re-`put`s the same name. A
+   * stale-masked trigger (unpublished/missing, non-admin) also leaves the
+   * field undefined so persistence never writes a name we can't resolve.
+   */
+  private resolveLanguageForTurn(
+    loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
+    classified: ClassifierResult
+  ): {
+    activeLanguageName: string | undefined;
+    languageDocument: string | undefined;
+    newEffectiveLanguageName: string | undefined;
+  } {
+    if (classified.clearLanguage) {
+      return {
+        activeLanguageName: undefined,
+        languageDocument: undefined,
+        newEffectiveLanguageName: undefined,
+      };
+    }
+    const requestedName = classified.languageName ?? loaded.selectedLanguageName;
+    const triggerActivated = classified.languageName !== undefined;
+    const resolution = resolveEffectiveLanguage(loaded.orgLanguages, requestedName, {
+      includeUnpublished: loaded.isAdmin,
+    });
+    if (resolution.reason === 'missing' || resolution.reason === 'unpublished') {
+      this.getLogger().warn('language_not_found', {
+        active_language: requestedName ?? null,
+        available_languages: loaded.isAdmin
+          ? loaded.orgLanguages.languages.map((l) => l.name)
+          : loaded.orgLanguages.languages.filter((l) => l.published === true).map((l) => l.name),
+        reason: resolution.reason,
+        source: triggerActivated ? 'trigger' : 'persisted',
+      });
+    }
+    return {
+      activeLanguageName: resolution.effectiveLanguageName,
+      languageDocument: resolution.languageDocument,
+      newEffectiveLanguageName: triggerActivated ? resolution.effectiveLanguageName : undefined,
+    };
   }
 
   /** Load all context needed for orchestration. */
@@ -1201,6 +1318,7 @@ export class UserDO {
       this.loadMemoryContext(logger)
     );
     const orgLanguages: OrgLanguages = body._org_languages ?? { languages: [] };
+    const selectedLanguageName = await this.getSelectedLanguage();
     return {
       messageText: resolved_message.text,
       inboundVoiceKey: resolved_message.inboundVoiceKey,
@@ -1212,6 +1330,7 @@ export class UserDO {
       activeModeName,
       isAdmin,
       orgLanguages,
+      selectedLanguageName,
       memoryStore,
       formattedTOC,
     };
@@ -1938,6 +2057,10 @@ export class UserDO {
 
   private async getSelectedMode(): Promise<string | undefined> {
     return this.state.storage.get<string>(SELECTED_MODE_KEY);
+  }
+
+  private async getSelectedLanguage(): Promise<string | undefined> {
+    return this.state.storage.get<string>(SELECTED_LANGUAGE_KEY);
   }
 
   private async getPromptOverrides(): Promise<PromptOverrides> {

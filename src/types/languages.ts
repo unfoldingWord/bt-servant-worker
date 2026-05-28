@@ -143,3 +143,60 @@ export function validateLanguage(language: unknown): string | null {
 export function sanitizeLanguageDocument(document: string): string {
   return stripControlChars(document);
 }
+
+// ─── Effective-language resolution ────────────────────────────────────────────
+
+/**
+ * Resolve the effective language for a request given a (possibly stale)
+ * requested language name. Mirrors `resolveEffectiveMode` so the stale-masking
+ * rules stay symmetric across the two surfaces.
+ *
+ * `effectiveLanguageName` is `undefined` whenever the requested language is
+ * missing or unpublished (under the default filter), so downstream consumers
+ * never inject a draft document as "active." `languageDocument` is the
+ * resolved document when applicable, otherwise `undefined`. `reason`
+ * distinguishes missing vs unpublished for log correlation.
+ *
+ * Admin-origin requests (identified server-side via `isAdminClient(client_id)`)
+ * pass `options.includeUnpublished = true` so authors can test draft languages
+ * from the portal's test chat pane. For those requests a matched draft
+ * returns `reason: 'ok'` — end-user requests keep the default filter.
+ *
+ * Pure: no I/O, no logging. The caller is responsible for emitting any
+ * `language_not_found`-style warn log when `reason` is `missing` or
+ * `unpublished`, which lets the warning include request-scoped context
+ * (request id, isAdmin, etc.).
+ */
+export function resolveEffectiveLanguage(
+  orgLanguages: OrgLanguages,
+  requestedLanguageName: string | undefined,
+  options?: { includeUnpublished?: boolean }
+): {
+  effectiveLanguageName: string | undefined;
+  languageDocument: string | undefined;
+  reason: 'ok' | 'none-requested' | 'missing' | 'unpublished';
+} {
+  if (!requestedLanguageName) {
+    return {
+      effectiveLanguageName: undefined,
+      languageDocument: undefined,
+      reason: 'none-requested',
+    };
+  }
+  const lang = orgLanguages.languages.find((l) => l.name === requestedLanguageName);
+  if (!lang) {
+    return { effectiveLanguageName: undefined, languageDocument: undefined, reason: 'missing' };
+  }
+  if (lang.published !== true && options?.includeUnpublished !== true) {
+    return {
+      effectiveLanguageName: undefined,
+      languageDocument: undefined,
+      reason: 'unpublished',
+    };
+  }
+  return {
+    effectiveLanguageName: requestedLanguageName,
+    languageDocument: lang.document,
+    reason: 'ok',
+  };
+}

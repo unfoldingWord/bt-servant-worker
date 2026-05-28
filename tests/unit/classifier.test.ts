@@ -39,6 +39,7 @@ describe('classifyTriggers — no triggers in message', () => {
       strippedMessage: 'How do I translate Genesis 1:1?',
       unmatchedTriggers: [],
       clearMode: false,
+      clearLanguage: false,
     });
   });
 
@@ -334,6 +335,74 @@ describe('classifyTriggers — clear-mode reserved hashtags', () => {
     const result = classifyTriggers('#fia-coach hi', buildCtx());
     expect(result.clearMode).toBe(false);
     expect(result.modeName).toBe('fia-coach');
+  });
+});
+
+// ─── Clear-language reserved @-tokens ───────────────────────────────────────
+
+describe('classifyTriggers — clear-language reserved @-tokens', () => {
+  it.each(['@default', '@none', '@clear'])(
+    '%s sets clearLanguage=true and strips the token',
+    (token) => {
+      const result = classifyTriggers(`${token} please`, buildCtx());
+      expect(result.clearLanguage).toBe(true);
+      expect(result.languageName).toBeUndefined();
+      expect(result.unmatchedTriggers).toEqual([]);
+      expect(result.strippedMessage).toBe('please');
+    }
+  );
+
+  it('clear-language tokens are case-insensitive', () => {
+    const result = classifyTriggers('@DEFAULT please', buildCtx());
+    expect(result.clearLanguage).toBe(true);
+    expect(result.strippedMessage).toBe('please');
+  });
+
+  it('clear-language shadows a language named "default" (reserved tokens win)', () => {
+    // Intentional acceptance per the design lock: a language literally named
+    // `default`/`none`/`clear` cannot be selected via the @-trigger. Mirrors
+    // the `#default` precedent for modes.
+    const ctx = buildCtx({
+      availableLanguages: [...languages, { name: 'default', label: 'Default' }],
+    });
+    const result = classifyTriggers('@default hi', ctx);
+    expect(result.clearLanguage).toBe(true);
+    expect(result.languageName).toBeUndefined();
+  });
+
+  it('non-leading clear-language token is not recognised (head-of-message scope)', () => {
+    const result = classifyTriggers('please @default', buildCtx());
+    expect(result.clearLanguage).toBe(false);
+    expect(result.strippedMessage).toBe('please @default');
+  });
+
+  it('clearLanguage defaults to false when no clear-language token is present', () => {
+    const result = classifyTriggers('@english hi', buildCtx());
+    expect(result.clearLanguage).toBe(false);
+    expect(result.languageName).toBe('english');
+  });
+});
+
+// ─── Clear-mode vs clear-language orthogonality ─────────────────────────────
+
+describe('classifyTriggers — clear-mode vs clear-language orthogonality', () => {
+  it('#default clears mode only (not language)', () => {
+    const result = classifyTriggers('#default hi', buildCtx());
+    expect(result.clearMode).toBe(true);
+    expect(result.clearLanguage).toBe(false);
+  });
+
+  it('@default clears language only (not mode)', () => {
+    const result = classifyTriggers('@default hi', buildCtx());
+    expect(result.clearLanguage).toBe(true);
+    expect(result.clearMode).toBe(false);
+  });
+
+  it('combined #default @default clears both', () => {
+    const result = classifyTriggers('#default @default hi', buildCtx());
+    expect(result.clearMode).toBe(true);
+    expect(result.clearLanguage).toBe(true);
+    expect(result.strippedMessage).toBe('hi');
   });
 });
 
