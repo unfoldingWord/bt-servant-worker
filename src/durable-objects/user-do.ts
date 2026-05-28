@@ -1103,7 +1103,7 @@ export class UserDO {
         .map((l) => ({ name: l.name, label: l.label })),
     });
 
-    const result = await this.applyTriggerOverrides(body, loaded, classified);
+    const result = await this.applyTriggerOverrides(body, loaded, classified, logger);
     this.logTriggerOutcome(loaded, classified, result, logger);
 
     return {
@@ -1190,7 +1190,8 @@ export class UserDO {
   private async applyTriggerOverrides(
     body: ChatRequest,
     loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
-    classified: ClassifierResult
+    classified: ClassifierResult,
+    logger: RequestLogger
   ) {
     let resolved = loaded.resolved;
     let activeModeName = loaded.activeModeName;
@@ -1208,7 +1209,7 @@ export class UserDO {
       }
     }
 
-    const language = this.resolveLanguageForTurn(loaded, classified);
+    const language = this.resolveLanguageForTurn(loaded, classified, logger);
 
     const modePersistence = decideModePersistence(
       classified,
@@ -1258,7 +1259,8 @@ export class UserDO {
    */
   private resolveLanguageForTurn(
     loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
-    classified: ClassifierResult
+    classified: ClassifierResult,
+    logger: RequestLogger
   ): {
     activeLanguageName: string | undefined;
     languageDocument: string | undefined;
@@ -1277,7 +1279,7 @@ export class UserDO {
       includeUnpublished: loaded.isAdmin,
     });
     if (resolution.reason === 'missing' || resolution.reason === 'unpublished') {
-      this.getLogger().warn('language_not_found', {
+      logger.warn('language_not_found', {
         active_language: requestedName ?? null,
         available_languages: loaded.isAdmin
           ? loaded.orgLanguages.languages.map((l) => l.name)

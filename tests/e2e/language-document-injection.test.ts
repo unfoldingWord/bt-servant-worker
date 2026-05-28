@@ -111,12 +111,24 @@ function setupAnthropicFetchCapture(): {
 
   // Capture warn-level logs from the request logger so stale-mask assertions
   // can pin both the absence of the document AND the operator-visible signal.
-  vi.spyOn(console, 'warn').mockImplementation((event: unknown, payload?: unknown) => {
-    warnLogs.push({
-      event: typeof event === 'string' ? event : JSON.stringify(event),
-      payload:
-        payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : undefined,
-    });
+  // The request logger emits a single JSON-stringified entry per call
+  // (src/utils/logger.ts:43), so we parse it back into structured form. A
+  // non-JSON call (raw console.warn from somewhere else) is preserved as a
+  // free-text event without a payload.
+  vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+    const raw = args[0];
+    if (typeof raw === 'string') {
+      try {
+        const parsed = JSON.parse(raw) as Record<string, unknown>;
+        const event = typeof parsed.event === 'string' ? parsed.event : raw;
+        warnLogs.push({ event, payload: parsed });
+        return;
+      } catch {
+        warnLogs.push({ event: raw, payload: undefined });
+        return;
+      }
+    }
+    warnLogs.push({ event: String(raw), payload: undefined });
   });
 
   return { calls, warnLogs };
@@ -180,25 +192,79 @@ describe('Language document injection — end-to-end through UserDO', () => {
     expect(captured.calls[2].system).not.toContain('## Language Guidance');
   });
 
-  it('non-admin caller cannot select a draft language: trigger is masked + warn-logged', async () => {
-    const { status } = await postChatFinal(
+  it('stale-mask: persisted language that has since been unpublished is masked + warn-logged for non-admin', async () => {
+    // Turn 1: testlang is published, user persists it via @-trigger.
+    await postChatFinal(stub, buildBody({ message: '@testlang first turn' }));
+    expect(captured.calls[0].system).toContain(TEST_LANG_MARKER);
+
+    // Turn 2: the curator has since unpublished testlang. The persisted
+    // selection in DO storage is intentionally untouched (it may come back if
+    // republished), but the resolver must mask the document for non-admin
+    // callers AND emit `language_not_found` so operators can see the divergence.
+    const stale: OrgLanguages = {
+      languages: [
+        {
+          name: 'testlang',
+          label: 'Test Language',
+          document: `## Tone\nUse formal register. ${TEST_LANG_MARKER}`,
+          published: false,
+        },
+      ],
+    };
+    await postChatFinal(
       stub,
-      buildBody({ client_id: 'web-client', message: '@draftlang please answer' })
+      buildBody({ message: 'second turn no trigger', _org_languages: stale })
     );
-    expect(status).toBe(200);
-    expect(captured.calls.length).toBe(1);
-    expect(captured.calls[0].system).not.toContain(DRAFT_LANG_MARKER);
-    expect(captured.calls[0].system).not.toContain('## Language Guidance');
+
+    expect(captured.calls.length).toBe(2);
+    expect(captured.calls[1].system).not.toContain(TEST_LANG_MARKER);
+    expect(captured.calls[1].system).not.toContain('## Language Guidance');
+
+    const staleMaskWarn = captured.warnLogs.find(
+      (w) =>
+        w.event === 'language_not_found' &&
+        w.payload?.active_language === 'testlang' &&
+        w.payload?.reason === 'unpublished' &&
+        w.payload?.source === 'persisted'
+    );
+    expect(staleMaskWarn).toBeDefined();
   });
 
-  it('admin caller bypasses the published filter and the draft language injects', async () => {
-    const { status } = await postChatFinal(
+  it('admin caller bypasses the published filter and the persisted draft language still injects', async () => {
+    // Turn 1: admin persists testlang while it is published.
+    await postChatFinal(
       stub,
-      buildBody({ client_id: 'admin-portal', message: '@draftlang please answer' })
+      buildBody({ client_id: 'admin-portal', message: '@testlang first turn' })
     );
-    expect(status).toBe(200);
-    expect(captured.calls.length).toBe(1);
-    expect(captured.calls[0].system).toContain(DRAFT_LANG_MARKER);
-    expect(captured.calls[0].system).toContain('## Language Guidance');
+    expect(captured.calls[0].system).toContain(TEST_LANG_MARKER);
+
+    // Turn 2: testlang has been unpublished, but the admin client's
+    // includeUnpublished flag flows through so the document still injects.
+    const stale: OrgLanguages = {
+      languages: [
+        {
+          name: 'testlang',
+          label: 'Test Language',
+          document: `## Tone\nUse formal register. ${TEST_LANG_MARKER}`,
+          published: false,
+        },
+      ],
+    };
+    await postChatFinal(
+      stub,
+      buildBody({
+        client_id: 'admin-portal',
+        message: 'second turn no trigger',
+        _org_languages: stale,
+      })
+    );
+
+    expect(captured.calls.length).toBe(2);
+    expect(captured.calls[1].system).toContain(TEST_LANG_MARKER);
+    expect(captured.calls[1].system).toContain('## Language Guidance');
+
+    // No `language_not_found` warn should fire for the admin bypass.
+    const anyStaleMaskWarn = captured.warnLogs.find((w) => w.event === 'language_not_found');
+    expect(anyStaleMaskWarn).toBeUndefined();
   });
 });
