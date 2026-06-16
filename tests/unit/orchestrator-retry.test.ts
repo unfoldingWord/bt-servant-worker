@@ -190,7 +190,9 @@ describe('fetchAnthropicWithRetry — terminal failures', () => {
     expect(errorEvents(logger)).not.toContain('claude_api_retry_exhausted');
     expect(errorEvents(logger)).toContain('claude_fetch_http_error');
   });
+});
 
+describe('fetchAnthropicWithRetry — window and abort terminals', () => {
   it('stops early when the next backoff would exceed the overall window', async () => {
     const logger = createMockLogger();
     vi.spyOn(globalThis, 'fetch').mockImplementation(async () => jsonResponse(429));
@@ -225,5 +227,35 @@ describe('fetchAnthropicWithRetry — terminal failures', () => {
     expect(globalThis.fetch).toHaveBeenCalledTimes(1);
     expect(clock.sleep).not.toHaveBeenCalled();
     expect(errorEvents(logger)).toContain('claude_fetch_aborted');
+  });
+});
+
+describe('fetchAnthropicWithRetry — terminal abort-guard lifecycle', () => {
+  // Regression: the terminal HTTP-error path reads response.text(); the per-attempt
+  // abort guard must stay live until that read completes, so a stalled error body is
+  // bounded by the 90s timeout instead of hanging after cleanup.
+  it('reads the terminal error body before clearing the abort guard', async () => {
+    const logger = createMockLogger();
+    let guardCleared = false;
+    let bodyReadWhileGuardLive: boolean | null = null;
+    const realClearTimeout = globalThis.clearTimeout;
+    vi.spyOn(globalThis, 'clearTimeout').mockImplementation(((
+      id?: Parameters<typeof clearTimeout>[0]
+    ) => {
+      guardCleared = true;
+      return realClearTimeout(id);
+    }) as typeof clearTimeout);
+    const realText = Response.prototype.text;
+    vi.spyOn(Response.prototype, 'text').mockImplementation(async function (this: Response) {
+      bodyReadWhileGuardLive = !guardCleared;
+      return realText.call(this);
+    });
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => jsonResponse(400, '{"e":1}'));
+
+    await expect(
+      fetchAnthropicWithRetry(makeCtx(logger), '{}', false, makeClock())
+    ).rejects.toThrow();
+
+    expect(bodyReadWhileGuardLive).toBe(true);
   });
 });

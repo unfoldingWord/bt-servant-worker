@@ -627,8 +627,13 @@ function logAnthropicRetry(
 }
 
 /**
- * Give up on a failed attempt: clean up, log exhaustion when `reason` is set (i.e. the
- * failure was retryable but we ran out of attempts or window), then surface the error.
+ * Give up on a failed attempt: log exhaustion when `reason` is set (i.e. the failure was
+ * retryable but we ran out of attempts or window), then surface the error.
+ *
+ * Cleanup runs in `finally`, AFTER the terminal error is surfaced — `throwAnthropicHttpError`
+ * reads `response.text()`, and clearing the per-attempt abort guard first would let a stalled
+ * error body hang indefinitely. Keeping the guard live means a stalled read aborts at the
+ * 90s timeout instead (mirrors the retry path, which also drains the body before cleanup).
  */
 async function exhaustAnthropicRetries(
   ctx: OrchestrationContext,
@@ -637,7 +642,6 @@ async function exhaustAnthropicRetries(
   failure: AnthropicAttemptFailure,
   reason: 'max_attempts' | 'overall_window_exceeded' | null
 ): Promise<never> {
-  failure.cleanup();
   if (reason) {
     ctx.logger.error('claude_api_retry_exhausted', failure.networkError ?? null, {
       streaming,
@@ -646,8 +650,11 @@ async function exhaustAnthropicRetries(
       reason,
     });
   }
-  await failAnthropicTerminally(ctx, streaming, failure);
-  throw new Error('exhaustAnthropicRetries: unreachable'); // failAnthropicTerminally always throws
+  try {
+    return await failAnthropicTerminally(ctx, streaming, failure);
+  } finally {
+    failure.cleanup();
+  }
 }
 
 export async function fetchAnthropicWithRetry(
