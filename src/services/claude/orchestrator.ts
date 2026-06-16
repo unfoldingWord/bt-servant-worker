@@ -351,6 +351,89 @@ function buildMessageBody(ctx: OrchestrationContext, stream: boolean): string {
  */
 const CLAUDE_REQUEST_TIMEOUT_MS = 90_000;
 
+/**
+ * Retry/backoff policy for transient Anthropic API failures (issue #248).
+ *
+ * We bypass the Anthropic SDK's HTTP layer (PR #104), so we also lost its built-in
+ * retry/backoff. These constants restore jittered exponential backoff for rate limits
+ * (429) and transient 5xx, honoring `Retry-After`. Each attempt gets its own fresh
+ * {@link CLAUDE_REQUEST_TIMEOUT_MS} hang-guard; the sum of attempts + backoff waits is
+ * bounded by {@link CLAUDE_OVERALL_RETRY_WINDOW_MS} so a retry storm can't run for minutes.
+ */
+const CLAUDE_MAX_ATTEMPTS = 4; // 1 initial + 3 retries
+const CLAUDE_RETRY_BASE_MS = 1_000;
+const CLAUDE_RETRY_DELAY_CAP_MS = 30_000; // per-delay cap
+const CLAUDE_OVERALL_RETRY_WINDOW_MS = 180_000; // wall-clock cap across all attempts
+
+/** HTTP statuses worth retrying: rate limit, transient 5xx, and Anthropic `overloaded_error`. */
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504, 529]);
+
+/**
+ * Injectable clock seam so tests resolve backoff delays instantly and control the
+ * jitter/elapsed-time inputs deterministically. Production uses {@link REAL_CLOCK}.
+ */
+export interface RetryClock {
+  sleep(ms: number): Promise<void>;
+  now(): number;
+  random(): number;
+}
+
+async function realSleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const REAL_CLOCK: RetryClock = {
+  sleep: realSleep,
+  now: () => Date.now(),
+  random: () => Math.random(),
+};
+
+/** Whether an Anthropic HTTP status should be retried. */
+export function isRetryableStatus(status: number): boolean {
+  return RETRYABLE_STATUSES.has(status);
+}
+
+/**
+ * Full-jitter exponential backoff: `random(0, min(cap, base * 2^(attempt-1)))`.
+ * `attempt` is 1-based (the attempt that just failed).
+ */
+export function computeBackoffDelay(attempt: number, random: () => number): number {
+  const bound = Math.min(CLAUDE_RETRY_DELAY_CAP_MS, CLAUDE_RETRY_BASE_MS * 2 ** (attempt - 1));
+  return Math.round(random() * bound);
+}
+
+/**
+ * Parse a `Retry-After` header into milliseconds. Supports delta-seconds and HTTP-date
+ * forms; clamps negatives to 0; returns null when the header is absent/unparseable.
+ */
+export function parseRetryAfter(headers: Headers, now: () => number): number | null {
+  const raw = headers.get('retry-after');
+  if (!raw) return null;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds)) return Math.max(0, Math.round(seconds * 1000));
+  const dateMs = Date.parse(raw);
+  if (Number.isNaN(dateMs)) return null;
+  return Math.max(0, dateMs - now());
+}
+
+/** Collect `anthropic-ratelimit-*` and `retry-after` response headers for diagnostics. */
+function extractRatelimitHeaders(headers: Headers): Record<string, string> {
+  const out: Record<string, string> = {};
+  headers.forEach((value, key) => {
+    if (key.startsWith('anthropic-ratelimit-') || key === 'retry-after') out[key] = value;
+  });
+  return out;
+}
+
+/**
+ * True when a rejected `fetch` is our own deliberate timeout abort (the per-attempt
+ * hang-guard). Those already consumed the full request timeout, so we never retry them.
+ * Genuine network rejections (e.g. `TypeError`) ARE retried.
+ */
+function isOurTimeoutAbort(error: unknown): boolean {
+  return (error as Error | undefined)?.name === 'AbortError';
+}
+
 function buildClaudeAbortSignal(timeoutMs: number): {
   signal: AbortSignal;
   cleanup: () => void;
@@ -422,21 +505,198 @@ function logFetchAborted(
   });
 }
 
-async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message> {
-  if (ctx.callbacks) return streamClaudeResponse(ctx);
-  const body = buildMessageBody(ctx, false);
-  assertRequestBodyWithinLimit(body, ctx);
-  logFetchCommencement(ctx, body, false);
+/** A successful Anthropic fetch plus the resources the caller must manage. */
+export interface AnthropicFetchResult {
+  /** A response with `ok === true`, body NOT yet consumed (ready for json()/SSE). */
+  response: Response;
+  /** Abort signal of the successful attempt; governs the body read until {@link cleanup}. */
+  signal: AbortSignal;
+  /** Clears the successful attempt's hang-guard timer. Caller must invoke after reading. */
+  cleanup: () => void;
+  /** Start timestamp of the successful attempt, for `claude_fetch_complete` duration. */
+  fetchStart: number;
+}
+
+/**
+ * POST to the Anthropic Messages API with jittered exponential backoff (issue #248).
+ *
+ * Retries on {@link RETRYABLE_STATUSES} and transient network rejections, honoring
+ * `Retry-After`. Each attempt gets a fresh {@link CLAUDE_REQUEST_TIMEOUT_MS} hang-guard;
+ * the total is bounded by {@link CLAUDE_OVERALL_RETRY_WINDOW_MS}. Retries happen strictly
+ * BEFORE the response body is consumed, so the streaming caller can only ever retry
+ * pre-first-byte — a mid-stream failure is out of scope here (handled by the caller).
+ *
+ * Returns a successful (`ok`) response with its still-open abort signal and a `cleanup`
+ * the caller MUST invoke once it has finished reading the body. Throws via
+ * {@link throwAnthropicHttpError} (HTTP error) or rethrows the network error otherwise.
+ */
+/** A failed attempt — either an HTTP error response or a thrown network error. */
+interface AnthropicAttemptFailure {
+  response?: Response;
+  networkError?: unknown;
+  cleanup: () => void;
+  fetchStart: number;
+}
+
+type AnthropicAttemptOutcome =
+  | { ok: true; result: AnthropicFetchResult }
+  | ({ ok: false } & AnthropicAttemptFailure);
+
+/** Perform a single Anthropic fetch attempt with its own hang-guard signal. */
+async function attemptAnthropicFetch(
+  ctx: OrchestrationContext,
+  body: string,
+  streaming: boolean,
+  attempt: number
+): Promise<AnthropicAttemptOutcome> {
   const { signal, cleanup } = buildClaudeAbortSignal(CLAUDE_REQUEST_TIMEOUT_MS);
   const fetchStart = Date.now();
   try {
     const response = await postToAnthropic(body, signal, ctx.apiKey);
     ctx.logger.log('claude_fetch_response_received', {
-      streaming: false,
+      streaming,
       status: response.status,
+      attempt,
+      has_body: !!response.body,
       duration_ms: Date.now() - fetchStart,
     });
-    if (!response.ok) await throwAnthropicHttpError(ctx, response, false, fetchStart);
+    if (response.ok) return { ok: true, result: { response, signal, cleanup, fetchStart } };
+    return { ok: false, response, cleanup, fetchStart };
+  } catch (networkError) {
+    return { ok: false, networkError, cleanup, fetchStart };
+  }
+}
+
+/** Whether a failed attempt is worth retrying (excludes our own timeout abort). */
+function isAttemptRetryable(failure: AnthropicAttemptFailure): boolean {
+  return failure.networkError
+    ? !isOurTimeoutAbort(failure.networkError)
+    : isRetryableStatus(failure.response!.status);
+}
+
+/**
+ * Surface a failed attempt as its terminal error (network rethrow or HTTP error).
+ * Uses `await` rather than `return <promise>` so the rejection handler attaches in the
+ * caller's await chain immediately — a bare `return` defers attachment by a microtask,
+ * which the test runner can flag as a transient unhandled rejection.
+ */
+async function failAnthropicTerminally(
+  ctx: OrchestrationContext,
+  streaming: boolean,
+  failure: AnthropicAttemptFailure
+): Promise<never> {
+  if (failure.networkError) {
+    logFetchAborted(ctx, failure.networkError, streaming, failure.fetchStart);
+    throw failure.networkError;
+  }
+  await throwAnthropicHttpError(ctx, failure.response!, streaming, failure.fetchStart);
+  throw new Error('failAnthropicTerminally: unreachable'); // throwAnthropicHttpError always throws
+}
+
+/** The backoff wait for a failed attempt: max(jittered exponential, Retry-After). */
+function computeRetryDelay(
+  attempt: number,
+  failure: AnthropicAttemptFailure,
+  clock: RetryClock
+): { delayMs: number; retryAfterMs: number } {
+  const retryAfterMs = failure.response
+    ? (parseRetryAfter(failure.response.headers, clock.now) ?? 0)
+    : 0;
+  const delayMs = Math.max(computeBackoffDelay(attempt, clock.random), retryAfterMs);
+  return { delayMs, retryAfterMs };
+}
+
+function logAnthropicRetry(
+  ctx: OrchestrationContext,
+  streaming: boolean,
+  failure: AnthropicAttemptFailure,
+  retry: { attempt: number; delayMs: number; retryAfterMs: number }
+): void {
+  ctx.logger.warn('claude_api_retry', {
+    attempt: retry.attempt,
+    max_attempts: CLAUDE_MAX_ATTEMPTS,
+    status: failure.response?.status,
+    delay_ms: retry.delayMs,
+    retry_after_ms: retry.retryAfterMs || undefined,
+    anthropic_ratelimit_headers: failure.response
+      ? extractRatelimitHeaders(failure.response.headers)
+      : undefined,
+    streaming,
+    network_error: failure.networkError ? (failure.networkError as Error).message : undefined,
+  });
+}
+
+/**
+ * Give up on a failed attempt: log exhaustion when `reason` is set (i.e. the failure was
+ * retryable but we ran out of attempts or window), then surface the error.
+ *
+ * Cleanup runs in `finally`, AFTER the terminal error is surfaced — `throwAnthropicHttpError`
+ * reads `response.text()`, and clearing the per-attempt abort guard first would let a stalled
+ * error body hang indefinitely. Keeping the guard live means a stalled read aborts at the
+ * 90s timeout instead (mirrors the retry path, which also drains the body before cleanup).
+ */
+async function exhaustAnthropicRetries(
+  ctx: OrchestrationContext,
+  streaming: boolean,
+  attempt: number,
+  failure: AnthropicAttemptFailure,
+  reason: 'max_attempts' | 'overall_window_exceeded' | null
+): Promise<never> {
+  if (reason) {
+    ctx.logger.error('claude_api_retry_exhausted', failure.networkError ?? null, {
+      streaming,
+      attempts: attempt,
+      status: failure.response?.status,
+      reason,
+    });
+  }
+  try {
+    return await failAnthropicTerminally(ctx, streaming, failure);
+  } finally {
+    failure.cleanup();
+  }
+}
+
+export async function fetchAnthropicWithRetry(
+  ctx: OrchestrationContext,
+  body: string,
+  streaming: boolean,
+  clock: RetryClock = REAL_CLOCK
+): Promise<AnthropicFetchResult> {
+  const overallStart = clock.now();
+  for (let attempt = 1; attempt <= CLAUDE_MAX_ATTEMPTS; attempt++) {
+    const outcome = await attemptAnthropicFetch(ctx, body, streaming, attempt);
+    if (outcome.ok) return outcome.result;
+
+    const isLast = attempt >= CLAUDE_MAX_ATTEMPTS;
+    const retryable = isAttemptRetryable(outcome);
+    const { delayMs, retryAfterMs } = computeRetryDelay(attempt, outcome, clock);
+    const windowExceeded = clock.now() - overallStart + delayMs > CLAUDE_OVERALL_RETRY_WINDOW_MS;
+
+    if (!retryable || isLast || windowExceeded) {
+      const reason = isLast ? 'max_attempts' : 'overall_window_exceeded';
+      await exhaustAnthropicRetries(ctx, streaming, attempt, outcome, retryable ? reason : null);
+    }
+
+    logAnthropicRetry(ctx, streaming, outcome, { attempt, delayMs, retryAfterMs });
+    // Drain the error body so the connection is freed before we back off.
+    if (outcome.response) await outcome.response.text().catch(() => undefined);
+    outcome.cleanup();
+    await clock.sleep(delayMs);
+  }
+  // Unreachable: every iteration either returns or throws.
+  throw new Error('fetchAnthropicWithRetry: exhausted loop without resolution');
+}
+
+async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message> {
+  if (ctx.callbacks) return streamClaudeResponse(ctx);
+  const body = buildMessageBody(ctx, false);
+  assertRequestBodyWithinLimit(body, ctx);
+  logFetchCommencement(ctx, body, false);
+  // signal omitted: the body read below is governed by the fetch's signal regardless;
+  // cleanup (in finally) keeps the hang-guard timer live until the read completes.
+  const { response, cleanup, fetchStart } = await fetchAnthropicWithRetry(ctx, body, false);
+  try {
     const parsed = (await response.json()) as Anthropic.Message;
     ctx.logger.log('claude_fetch_complete', {
       streaming: false,
@@ -457,19 +717,9 @@ async function streamClaudeResponse(ctx: OrchestrationContext): Promise<Anthropi
   const body = buildMessageBody(ctx, true);
   assertRequestBodyWithinLimit(body, ctx);
   logFetchCommencement(ctx, body, true);
-  const { signal, cleanup } = buildClaudeAbortSignal(CLAUDE_REQUEST_TIMEOUT_MS);
-  const fetchStart = Date.now();
+  const { response, signal, cleanup, fetchStart } = await fetchAnthropicWithRetry(ctx, body, true);
   try {
-    const response = await postToAnthropic(body, signal, ctx.apiKey);
-    ctx.logger.log('claude_fetch_response_received', {
-      streaming: true,
-      status: response.status,
-      has_body: !!response.body,
-      duration_ms: Date.now() - fetchStart,
-    });
-    if (!response.ok || !response.body) {
-      await throwAnthropicHttpError(ctx, response, true, fetchStart);
-    }
+    if (!response.body) await throwAnthropicHttpError(ctx, response, true, fetchStart);
     const parsed = await parseSSEStream(response.body!, ctx.logger, ctx.callbacks, signal);
     ctx.logger.log('claude_fetch_complete', {
       streaming: true,
