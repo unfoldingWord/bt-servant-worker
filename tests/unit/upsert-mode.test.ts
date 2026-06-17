@@ -133,6 +133,43 @@ describe('upsertMode - published flag preservation', () => {
   });
 });
 
+describe('upsertMode - requires_group flag preservation', () => {
+  it('preserves existing requires_group: true when caller omits the field', () => {
+    const orgModes = makeOrgModes({ name: 't', requires_group: true, overrides: {} });
+    const result = upsertMode(orgModes, { name: 't', overrides: { identity: 'X' } }, 'o');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.savedMode.requires_group).toBe(true);
+  });
+
+  it('preserves existing requires_group: false when caller omits the field', () => {
+    const orgModes = makeOrgModes({ name: 't', requires_group: false, overrides: {} });
+    const result = upsertMode(orgModes, { name: 't', overrides: { identity: 'X' } }, 'o');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.savedMode.requires_group).toBe(false);
+  });
+
+  it('updates requires_group when caller provides it', () => {
+    const orgModes = makeOrgModes({ name: 't', requires_group: false, overrides: {} });
+    const result = upsertMode(orgModes, { name: 't', requires_group: true, overrides: {} }, 'o');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.savedMode.requires_group).toBe(true);
+  });
+
+  it('persists requires_group on a brand-new mode', () => {
+    const orgModes = makeOrgModes();
+    const result = upsertMode(orgModes, { name: 'new', requires_group: true, overrides: {} }, 'o');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.savedMode.requires_group).toBe(true);
+  });
+
+  it('omits requires_group key on new mode when not supplied', () => {
+    const orgModes = makeOrgModes();
+    const result = upsertMode(orgModes, { name: 'new', overrides: {} }, 'o');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.savedMode.requires_group).toBeUndefined();
+  });
+});
+
 // ─── Phase 1 of #200 — cross-shape upsert ──────────────────────────────────
 
 describe('upsertMode - storage shape: new and same-shape', () => {

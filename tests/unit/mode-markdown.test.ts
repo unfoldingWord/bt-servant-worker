@@ -269,3 +269,33 @@ describe('resolveEffectiveMode', () => {
     expect(r.modeOverrides).toEqual({ identity: 'x' });
   });
 });
+
+describe('resolveEffectiveMode — requires_group gating', () => {
+  function groupMode(): OrgModes {
+    return {
+      modes: [{ name: 'a', published: true, requires_group: true, overrides: { identity: 'x' } }],
+    };
+  }
+
+  it('returns requires-group for a group-only mode applied in a non-group chat', () => {
+    const r = resolveEffectiveMode(groupMode(), 'a', { isGroupChat: false });
+    expect(r.reason).toBe('requires-group');
+    expect(r.effectiveModeName).toBeUndefined();
+    expect(r.modeOverrides).toEqual({});
+  });
+
+  it('applies a group-only mode in a group chat', () => {
+    const r = resolveEffectiveMode(groupMode(), 'a', { isGroupChat: true });
+    expect(r.reason).toBe('ok');
+    expect(r.modeOverrides).toEqual({ identity: 'x' });
+  });
+
+  it('applies a group-only mode for an admin even in a non-group chat', () => {
+    const r = resolveEffectiveMode(groupMode(), 'a', {
+      isGroupChat: false,
+      includeUnpublished: true,
+    });
+    expect(r.reason).toBe('ok');
+    expect(r.modeOverrides).toEqual({ identity: 'x' });
+  });
+});

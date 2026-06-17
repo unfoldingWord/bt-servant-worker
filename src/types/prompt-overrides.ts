@@ -89,6 +89,15 @@ export interface PromptMode {
    * Admin endpoints always return all modes regardless of this flag.
    */
   published?: boolean;
+  /**
+   * Whether this mode requires a group chat (Telegram group/supergroup) to
+   * function. Group-only modes depend on multi-speaker attribution, ambient
+   * voice capture, and leader gating that do not exist in 1:1 chats. When
+   * `true`, the mode is hidden from list_modes / the `#`-trigger and is not
+   * applied at chat time for non-group, non-admin requests. Absent/`false`
+   * => available everywhere (unchanged behavior).
+   */
+  requires_group?: boolean;
   /** Legacy slot-map storage shape. Present iff this mode has not been migrated. */
   overrides?: PromptOverrides;
   /** Markdown storage shape (H2 per slot). Present iff this mode has been migrated. */
@@ -318,10 +327,30 @@ export function validatePromptMode(mode: unknown): string | null {
     ('name' in obj ? validateModeName(obj.name) : null) ??
     validateOptionalString(obj, 'label', MAX_MODE_LABEL_LENGTH) ??
     validateOptionalString(obj, 'description', MAX_MODE_DESCRIPTION_LENGTH) ??
-    validateOptionalBoolean(obj, 'published');
+    validateOptionalBoolean(obj, 'published') ??
+    validateOptionalBoolean(obj, 'requires_group');
   if (scalarError) return scalarError;
 
   return validateModeContentField(obj);
+}
+
+/**
+ * Whether a mode should be visible to (and usable by) the caller in the
+ * current chat context. Single source of truth shared by list_modes /
+ * switch_mode (`buildModeContext`), the `#`-trigger classifier, and
+ * active-mode application (`resolveEffectiveMode`).
+ *
+ * - Admins (admin-origin client) see every mode regardless of context.
+ * - Otherwise the mode must be published AND, if it requires a group chat,
+ *   the current chat must be a group.
+ */
+export function isModeVisible(
+  mode: Pick<PromptMode, 'published' | 'requires_group'>,
+  opts: { isGroupChat: boolean; isAdmin: boolean }
+): boolean {
+  if (opts.isAdmin) return true;
+  if (mode.published !== true) return false;
+  return mode.requires_group !== true || opts.isGroupChat;
 }
 
 // ─── Mode resolution ───────────────────────────────────────────────────────────

@@ -9,6 +9,7 @@ import {
   PromptOverrides,
   validateModeName,
   validatePromptMode,
+  isModeVisible,
   resolveActiveModeName,
   MAX_MODE_NAME_LENGTH,
   MAX_MODE_LABEL_LENGTH,
@@ -382,6 +383,54 @@ describe('validatePromptMode — accepts', () => {
 
   it('accepts a markdown-shape mode with just document', () => {
     expect(validatePromptMode({ document: '## Identity\n\nhello' })).toBeNull();
+  });
+
+  it('accepts requires_group as a boolean', () => {
+    expect(validatePromptMode({ requires_group: true, document: '## Identity\n\nx' })).toBeNull();
+    expect(validatePromptMode({ requires_group: false, overrides: {} })).toBeNull();
+  });
+
+  it('rejects a non-boolean requires_group', () => {
+    expect(validatePromptMode({ requires_group: 'yes', overrides: {} })).toContain(
+      'requires_group must be a boolean'
+    );
+  });
+});
+
+describe('isModeVisible', () => {
+  const G = (over: { published?: boolean; requires_group?: boolean }) => over;
+
+  it('admins see every mode regardless of context', () => {
+    for (const isGroupChat of [true, false]) {
+      expect(isModeVisible(G({ published: false }), { isGroupChat, isAdmin: true })).toBe(true);
+      expect(
+        isModeVisible(G({ published: false, requires_group: true }), { isGroupChat, isAdmin: true })
+      ).toBe(true);
+    }
+  });
+
+  it('non-admins never see unpublished modes', () => {
+    expect(isModeVisible(G({ published: false }), { isGroupChat: true, isAdmin: false })).toBe(
+      false
+    );
+  });
+
+  it('published non-group modes are visible everywhere for non-admins', () => {
+    expect(isModeVisible(G({ published: true }), { isGroupChat: false, isAdmin: false })).toBe(
+      true
+    );
+    expect(isModeVisible(G({ published: true }), { isGroupChat: true, isAdmin: false })).toBe(true);
+  });
+
+  it('published requires_group modes are hidden in non-group chats but shown in group chats', () => {
+    const mode = G({ published: true, requires_group: true });
+    expect(isModeVisible(mode, { isGroupChat: false, isAdmin: false })).toBe(false);
+    expect(isModeVisible(mode, { isGroupChat: true, isAdmin: false })).toBe(true);
+  });
+
+  it('requires_group: false behaves like a normal published mode', () => {
+    const mode = G({ published: true, requires_group: false });
+    expect(isModeVisible(mode, { isGroupChat: false, isAdmin: false })).toBe(true);
   });
 });
 
