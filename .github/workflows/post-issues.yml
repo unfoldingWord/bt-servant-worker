@@ -1,0 +1,55 @@
+name: Post meeting issues (central)
+
+# Runs from THIS central repo, posts issues into any unfoldingWord repo you pick.
+# Auth: a fine-grained PAT stored as the secret ISSUE_POSTER_TOKEN (see README).
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: "Target repo to post into (owner/name)"
+        required: true
+        default: "unfoldingWord/bt-servant-worker"
+      marker:
+        description: "Dedup marker for this batch (e.g. sync-2026-07-01)"
+        required: true
+        default: "meeting-issues"
+      dry_run:
+        description: "Dry run? (true = preview only, post nothing)"
+        required: true
+        type: boolean
+        default: true
+      labels_on:
+        description: "Apply labels from issue files? (labels must already exist in target repo)"
+        required: true
+        type: boolean
+        default: false
+
+# This workflow does NOT use the built-in GITHUB_TOKEN to post (that can't
+# write to other repos). It uses the PAT secret instead. contents:read is
+# only to check out this central repo.
+permissions:
+  contents: read
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@v4
+
+      - name: Post issues to target repo
+        env:
+          # Fine-grained PAT with Issues: write on the unfoldingWord repos.
+          GH_TOKEN: ${{ secrets.ISSUE_POSTER_TOKEN }}
+          REPO: ${{ github.event.inputs.target_repo }}
+          MARKER: ${{ github.event.inputs.marker }}
+          DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
+          LABELS_ON: ${{ github.event.inputs.labels_on == 'true' && '1' || '0' }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "ERROR: secret ISSUE_POSTER_TOKEN is empty. Add it in Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          chmod +x meeting-issues/post-issues.sh
+          ./meeting-issues/post-issues.sh
