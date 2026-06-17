@@ -1054,6 +1054,7 @@ function toMarkdownView(mode: PromptMode): {
   label?: string;
   description?: string;
   published?: boolean;
+  requires_group?: boolean;
   document: string;
   format: 'markdown';
   originalSlots?: PromptOverrides;
@@ -1065,6 +1066,7 @@ function toMarkdownView(mode: PromptMode): {
     ...(mode.label !== undefined ? { label: mode.label } : {}),
     ...(mode.description !== undefined ? { description: mode.description } : {}),
     ...(mode.published !== undefined ? { published: mode.published } : {}),
+    ...(mode.requires_group !== undefined ? { requires_group: mode.requires_group } : {}),
     document,
     format: 'markdown' as const,
     ...(isLegacy ? { originalSlots: mode.overrides ?? {} } : {}),
@@ -1105,6 +1107,7 @@ function mergeContentFields(
  */
 function mergeExistingMode(existing: PromptMode, incoming: PromptMode): PromptMode {
   const publishedResolved = incoming.published ?? existing.published;
+  const requiresGroupResolved = incoming.requires_group ?? existing.requires_group;
   const labelResolved = incoming.label ?? existing.label;
   const descriptionResolved = incoming.description ?? existing.description;
   return {
@@ -1112,6 +1115,7 @@ function mergeExistingMode(existing: PromptMode, incoming: PromptMode): PromptMo
     ...(labelResolved ? { label: labelResolved } : {}),
     ...(descriptionResolved ? { description: descriptionResolved } : {}),
     ...(publishedResolved !== undefined ? { published: publishedResolved } : {}),
+    ...(requiresGroupResolved !== undefined ? { requires_group: requiresGroupResolved } : {}),
     ...mergeContentFields(existing, incoming),
   };
 }

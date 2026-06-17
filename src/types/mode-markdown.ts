@@ -186,14 +186,32 @@ export function validateModeDocument(value: unknown): string | null {
  * slot-map shape or the new markdown-document shape. `getEffectiveOverrides`
  * absorbs that difference so callers always see slots.
  */
+/**
+ * Reason a matched mode may not be applied for this caller/context, or null
+ * when it is usable. `includeUnpublished` doubles as the admin/preview signal:
+ * admins bypass both the publish gate and the group gate (so the portal test
+ * chat can preview group-only drafts).
+ */
+function modeAccessBlockReason(
+  mode: PromptMode,
+  options?: { includeUnpublished?: boolean; isGroupChat?: boolean }
+): 'unpublished' | 'requires-group' | null {
+  const isAdmin = options?.includeUnpublished === true;
+  if (mode.published !== true && !isAdmin) return 'unpublished';
+  if (mode.requires_group === true && options?.isGroupChat !== true && !isAdmin) {
+    return 'requires-group';
+  }
+  return null;
+}
+
 export function resolveEffectiveMode(
   orgModes: OrgModes,
   requestedModeName: string | undefined,
-  options?: { includeUnpublished?: boolean }
+  options?: { includeUnpublished?: boolean; isGroupChat?: boolean }
 ): {
   effectiveModeName: string | undefined;
   modeOverrides: PromptOverrides;
-  reason: 'ok' | 'none-requested' | 'missing' | 'unpublished';
+  reason: 'ok' | 'none-requested' | 'missing' | 'unpublished' | 'requires-group';
 } {
   if (!requestedModeName) {
     return { effectiveModeName: undefined, modeOverrides: {}, reason: 'none-requested' };
@@ -202,8 +220,9 @@ export function resolveEffectiveMode(
   if (!mode) {
     return { effectiveModeName: undefined, modeOverrides: {}, reason: 'missing' };
   }
-  if (mode.published !== true && options?.includeUnpublished !== true) {
-    return { effectiveModeName: undefined, modeOverrides: {}, reason: 'unpublished' };
+  const blockReason = modeAccessBlockReason(mode, options);
+  if (blockReason) {
+    return { effectiveModeName: undefined, modeOverrides: {}, reason: blockReason };
   }
   return {
     effectiveModeName: requestedModeName,

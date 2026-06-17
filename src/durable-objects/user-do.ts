@@ -41,6 +41,7 @@ import {
 import { DEFAULT_ORG_CONFIG, OrgConfig } from '../types/org-config.js';
 import {
   DEFAULT_PROMPT_VALUES,
+  isModeVisible,
   ModeContext,
   mergePromptOverrides,
   PROMPT_OVERRIDE_SLOTS,
@@ -1094,9 +1095,10 @@ export class UserDO {
     loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
     logger: RequestLogger
   ) {
+    const isGroupChat = this.isGroupChatType(body);
     const classified = classifyTriggers(loaded.messageText, {
       availableModes: loaded.orgModes.modes
-        .filter((m) => loaded.isAdmin || m.published === true)
+        .filter((m) => isModeVisible(m, { isGroupChat, isAdmin: loaded.isAdmin }))
         .map((m) => ({ name: m.name, label: m.label })),
       availableLanguages: loaded.orgLanguages.languages
         .filter((l) => loaded.isAdmin || l.published === true)
@@ -1148,6 +1150,7 @@ export class UserDO {
   ) {
     const mode = resolveEffectiveMode(loaded.orgModes, modeName, {
       includeUnpublished: loaded.isAdmin,
+      isGroupChat: this.isGroupChatType(body),
     });
     if (!mode.effectiveModeName) return null;
     const orgOverrides = body._org_prompt_overrides ?? {};
@@ -1432,7 +1435,7 @@ export class UserDO {
   ): Promise<string | undefined> {
     const start = Date.now();
     const org = body.org ?? body.org_id ?? this.env.DEFAULT_ORG;
-    const isGroup = body.chat_type === 'group' || body.chat_type === 'supergroup';
+    const isGroup = this.isGroupChatType(body);
     const chatScope = isGroup && body.chat_id ? body.chat_id : body.user_id;
     const speakerScope = body.speaker?.trim() ? body.speaker : body.user_id;
     const key = generateVoiceSubmissionKey(org, chatScope, speakerScope);
@@ -1465,17 +1468,18 @@ export class UserDO {
     // mode is republished later — we only mask in-memory for this request.
     // Admin-origin requests skip the published filter so authors can test drafts
     // from the portal's test chat pane.
+    const isGroupChat = this.isGroupChatType(body);
     const { effectiveModeName, modeOverrides, reason } = resolveEffectiveMode(
       orgModes,
       requestedModeName,
-      { includeUnpublished: isAdmin }
+      { includeUnpublished: isAdmin, isGroupChat }
     );
-    if (reason === 'missing' || reason === 'unpublished') {
+    if (reason === 'missing' || reason === 'unpublished' || reason === 'requires-group') {
       logger.warn('mode_not_found', {
         active_mode: requestedModeName,
-        available_modes: isAdmin
-          ? orgModes.modes.map((m) => m.name)
-          : orgModes.modes.filter((m) => m.published === true).map((m) => m.name),
+        available_modes: orgModes.modes
+          .filter((m) => isModeVisible(m, { isGroupChat, isAdmin }))
+          .map((m) => m.name),
         reason,
       });
     }
@@ -1787,7 +1791,7 @@ export class UserDO {
       resolvedPromptValues,
       memoryStore,
       memoryTOC: formattedTOC || undefined,
-      modeContext: this.buildModeContext(orgModes, activeModeName, isAdminClient(body.client_id)),
+      modeContext: this.buildModeContext(orgModes, activeModeName, body),
       audioContext,
       attachmentsContext,
       workerOrigin,
@@ -1804,9 +1808,14 @@ export class UserDO {
     };
   }
 
-  private maybeBuildGroupContext(body: ChatRequest): GroupChatContext | undefined {
+  /** True when the request originates from a (Telegram) group/supergroup chat. */
+  private isGroupChatType(body: ChatRequest): boolean {
     const chatType = body.chat_type ?? 'private';
-    if (chatType !== 'group' && chatType !== 'supergroup') return undefined;
+    return chatType === 'group' || chatType === 'supergroup';
+  }
+
+  private maybeBuildGroupContext(body: ChatRequest): GroupChatContext | undefined {
+    if (!this.isGroupChatType(body)) return undefined;
     return {
       isGroupChat: true,
       ...(body.speaker ? { currentSpeaker: body.speaker } : {}),
@@ -1857,10 +1866,12 @@ export class UserDO {
   private buildModeContext(
     orgModes: { modes: PromptMode[] },
     activeModeName: string | undefined,
-    isAdmin: boolean
+    body: ChatRequest
   ): ModeContext {
+    const isAdmin = isAdminClient(body.client_id);
+    const isGroupChat = this.isGroupChatType(body);
     return {
-      availableModes: isAdmin ? orgModes.modes : orgModes.modes.filter((m) => m.published === true),
+      availableModes: orgModes.modes.filter((m) => isModeVisible(m, { isGroupChat, isAdmin })),
       activeModeName,
       setSelectedMode: async (name: string | null) => {
         if (name === null) {
