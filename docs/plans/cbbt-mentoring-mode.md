@@ -1,22 +1,22 @@
-# FIA Mentoring mode — implementation notes (issue #180)
+# CBBT Mentoring mode — implementation notes (issue #180)
 
-**Status:** Mode authored and **published** on production (`fia-mentoring`, `published: true`).
+**Status:** Mode authored and **published** on production (`cbbt-mentoring`, `published: true`).
 Verified via round-trip `GET` and a live admin-origin smoke test.
 
-> **Naming note.** During design this mode was prototyped as `fia-trainer`; it is now
-> **`fia-mentoring`** (label "FIA Mentoring", switch command `#fia-mentoring`). The existing
-> team-facing `fia-coach` mode is being renamed to **`fia-drafting`** ("FIA Drafting",
-> `#fia-drafting`). To avoid dropping users mid-flight, `fia-coach` and `fia-drafting`
-> currently coexist as clones; the alias/migration that retires `fia-coach` will be handled
-> separately by the engineering team. This mode's cross-references already point to
-> `#fia-drafting`.
+> **Naming.** This mode was prototyped as `fia-trainer`, briefly published as `fia-mentoring`,
+> and is now **`cbbt-mentoring`** (label "CBBT Mentoring", switch command `#cbbt-mentoring`).
+> The existing team-facing `fia-coach` mode is being renamed to **`fia-drafting`**
+> ("FIA Drafting", `#fia-drafting`). To avoid dropping users mid-flight, `fia-coach` and
+> `fia-drafting` currently coexist as clones; the alias/migration that retires `fia-coach`
+> will be handled separately by the engineering team. This mode's cross-references already
+> point to `#fia-drafting`.
 
 ## What this is
 
-`fia-mentoring` is a **trainer-facing** CBBT Training Assistant — for the people who _facilitate_
-the three Church-Based Bible Translation courses. It is distinct from the team-facing
-`fia-drafting` (which walks a translation team through the six FIA steps on a passage).
-`fia-mentoring` helps trainers:
+`cbbt-mentoring` is a **trainer-facing** CBBT Training Assistant — for the people who
+_facilitate_ the three Church-Based Bible Translation courses. It is distinct from the
+team-facing `fia-drafting` (which walks a translation team through the six FIA steps on a
+passage). `cbbt-mentoring` helps trainers:
 
 - answer questions about the CBBT curriculum (Courses 1–3),
 - build customized, day-by-day training schedules,
@@ -25,7 +25,7 @@ the three Church-Based Bible Translation courses. It is distinct from the team-f
 - track trainer/network context in structured persistent memory,
 - turn schedules/handouts into paste-ready documents.
 
-The mode document lives at [`docs/modes/fia-mentoring.mode.md`](../modes/fia-mentoring.mode.md).
+The mode document lives at [`docs/modes/cbbt-mentoring.mode.md`](../modes/cbbt-mentoring.mode.md).
 
 ## Approach (and why)
 
@@ -62,10 +62,10 @@ content, module names, or activities.
 Registered with the admin API (super-admin `ENGINE_API_KEY`):
 
 ```
-PUT /api/v1/admin/orgs/unfoldingWord/modes/fia-mentoring
-{ "name": "fia-mentoring", "label": "FIA Mentoring",
+PUT /api/v1/admin/orgs/unfoldingWord/modes/cbbt-mentoring
+{ "name": "cbbt-mentoring", "label": "CBBT Mentoring",
   "description": "...", "published": true,
-  "document": "<contents of docs/modes/fia-mentoring.mode.md>" }
+  "document": "<contents of docs/modes/cbbt-mentoring.mode.md>" }
 ```
 
 ## Verification
