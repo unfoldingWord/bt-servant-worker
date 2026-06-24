@@ -1,15 +1,22 @@
-# FIA Trainer mode — implementation notes (issue #180)
+# FIA Mentoring mode — implementation notes (issue #180)
 
-**Status:** Mode authored and registered to **production as a draft** (`published: false`).
-Verified via round-trip `GET` and a live admin-origin smoke test. Publish (`published: true`)
-when ready for the demo.
+**Status:** Mode authored and **published** on production (`fia-mentoring`, `published: true`).
+Verified via round-trip `GET` and a live admin-origin smoke test.
+
+> **Naming note.** During design this mode was prototyped as `fia-trainer`; it is now
+> **`fia-mentoring`** (label "FIA Mentoring", switch command `#fia-mentoring`). The existing
+> team-facing `fia-coach` mode is being renamed to **`fia-drafting`** ("FIA Drafting",
+> `#fia-drafting`). To avoid dropping users mid-flight, `fia-coach` and `fia-drafting`
+> currently coexist as clones; the alias/migration that retires `fia-coach` will be handled
+> separately by the engineering team. This mode's cross-references already point to
+> `#fia-drafting`.
 
 ## What this is
 
-`fia-trainer` is a new, **trainer-facing** prompt mode: a CBBT Training Assistant for the
-people who _facilitate_ the three Church-Based Bible Translation courses. It is distinct from
-the team-facing `fia-coach` (which walks a translation team through the six FIA steps on a
-passage). `fia-trainer` helps trainers:
+`fia-mentoring` is a **trainer-facing** CBBT Training Assistant — for the people who _facilitate_
+the three Church-Based Bible Translation courses. It is distinct from the team-facing
+`fia-drafting` (which walks a translation team through the six FIA steps on a passage).
+`fia-mentoring` helps trainers:
 
 - answer questions about the CBBT curriculum (Courses 1–3),
 - build customized, day-by-day training schedules,
@@ -18,7 +25,7 @@ passage). `fia-trainer` helps trainers:
 - track trainer/network context in structured persistent memory,
 - turn schedules/handouts into paste-ready documents.
 
-The mode document lives at [`docs/modes/fia-trainer.mode.md`](../modes/fia-trainer.mode.md).
+The mode document lives at [`docs/modes/fia-mentoring.mode.md`](../modes/fia-mentoring.mode.md).
 
 ## Approach (and why)
 
@@ -55,43 +62,36 @@ content, module names, or activities.
 Registered with the admin API (super-admin `ENGINE_API_KEY`):
 
 ```
-PUT /api/v1/admin/orgs/unfoldingWord/modes/fia-trainer
-{ "name": "fia-trainer", "label": "FIA Trainer",
-  "description": "...", "published": false,
-  "document": "<contents of docs/modes/fia-trainer.mode.md>" }
+PUT /api/v1/admin/orgs/unfoldingWord/modes/fia-mentoring
+{ "name": "fia-mentoring", "label": "FIA Mentoring",
+  "description": "...", "published": true,
+  "document": "<contents of docs/modes/fia-mentoring.mode.md>" }
 ```
-
-To make it available to non-admin users for the demo, re-PUT the same body with
-`"published": true` (drafts are reachable only from admin-origin chat).
 
 ## Verification
 
 - **Round-trip `GET`:** stored as a `document` (no `originalSlots`), `format: markdown`, all
-  seven slot headers present, 27,836 chars (< 64,000).
-- **Live admin-origin smoke test** (throwaway user, deleted afterward):
-  - _Curriculum Q&A_ — listed Course 2 modules by name/number from the digest, linked the
-    Google Doc, and stated its source ("from the CBBT curriculum digest").
-  - _Schedule generation_ — produced a 5-day, day-by-day Course 1 schedule with time estimates.
-  - _Deaf-context adaptation_ — visual-first throughout (SLTT video, sightlines, interpreter
-    notes, FIA Step 6 → "Signing the Word", chose Module 8's visual/oral option).
-  - _Document creation_ — returned paste-ready Markdown and was explicit it cannot attach a file.
-  - _Memory_ — wrote structured sections (Trainer Profile / Training History / Preferences and
-    Adaptations / Network Notes).
+  seven slot headers present, well under the 64,000-char limit.
+- **Live admin-origin smoke test** (throwaway user, deleted afterward): curriculum Q&A (modules
+  cited by name/number, Google-Doc link, source-level transparency), a 5-day deaf-community
+  Course 1 schedule, paste-ready document output (with the honesty caveat), and structured
+  memory all worked.
 
 ## Acceptance criteria (issue #180)
 
-All eight met, with one scoped deferral: criterion 3 (course content accessible) is met for
-**structure and summaries with module-level citation**; **verbatim full-text Q&A** is deferred
-to the growth path below (the mode links the source Doc instead).
+All eight met, with one scoped deferral: verbatim full-text Q&A (criterion 3) is deferred to the
+growth path (the mode links the source Doc instead).
 
 ## Growth path (post-demo, not in this PR)
 
-- **Verbatim AI access:** a CBBT-content MCP server, or extend the existing FIA MCP worker
-  (reuse its hosting/auth) with `get_course_outline` / `search_curriculum` / `get_module`, or a
-  generic fetch/Docs MCP tool (which would also enable issue #180 "Option C"). Then flip
-  Tool-Guidance level 2 from "link out" to "retrieve and cite."
+- **Verbatim AI access:** a CBBT-content MCP server, or extend the existing FIA MCP worker with
+  `get_course_outline` / `search_curriculum` / `get_module`, or a generic fetch/Docs MCP tool
+  (which would also enable issue #180 "Option C"). Then flip Tool-Guidance level 2 from
+  "link out" to "retrieve and cite."
 - **Real downloadable documents:** a docx/pptx generator modeled on `generate_scripture_pdf`
   plus the existing R2/`attachments` delivery path.
+- **`fia-coach` → `fia-drafting` migration:** retire the `fia-coach` slug via alias/migration so
+  currently-assigned users are not dropped.
 
 ## Out of scope (per issue #180)
 
