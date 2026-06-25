@@ -1347,6 +1347,11 @@ function dedupeSlugs(slugs: string[]): string[] {
  * alias so every subscriber whose persisted `selected_mode` still holds it is
  * rerouted at lookup time instead of being stranded. Mutates `orgModes` in
  * place. Label/description/content/published are untouched.
+ *
+ * `newName` may be one of the mode's OWN existing aliases — this "promotes" the
+ * alias back to canonical and demotes the prior name to an alias (an
+ * un-rename). It is rejected (409) only when `newName` collides with a
+ * DIFFERENT mode's name or alias; the uniqueness check excludes the source.
  */
 export function renameMode(orgModes: OrgModes, fromSlug: string, newName: unknown): ModeOpResult {
   const source = findModeBySlug(orgModes.modes, fromSlug);

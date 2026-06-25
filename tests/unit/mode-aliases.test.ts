@@ -147,6 +147,24 @@ describe('renameMode', () => {
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.savedMode.name).toBe('cbbt-final');
   });
+
+  it('promotes an OWN alias back to canonical (rename to self-alias)', () => {
+    // Renaming a mode to one of its own aliases is allowed: it makes the alias
+    // the canonical name and demotes the prior name to an alias. No subscriber
+    // is stranded (every old slug still resolves) and it is fully reversible —
+    // an "un-rename". Verified against staging during #284. The uniqueness check
+    // excludes the source itself, which is what permits this.
+    const orgModes = makeOrgModes({ ...fiaCoach });
+    renameMode(orgModes, 'fia-coach', 'cbbt-mentoring'); // aliases: [fia-coach]
+    const result = renameMode(orgModes, 'cbbt-mentoring', 'fia-coach'); // promote the alias
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.savedMode.name).toBe('fia-coach');
+      // The newly-canonical slug is removed from aliases; the prior name joins them.
+      expect(result.savedMode.aliases).not.toContain('fia-coach');
+      expect(result.savedMode.aliases).toContain('cbbt-mentoring');
+    }
+  });
 });
 
 describe('renameMode — errors', () => {
