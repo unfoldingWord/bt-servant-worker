@@ -15,6 +15,7 @@ import { ChatHistoryEntry, StreamCallbacks } from '../../types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig } from '../../types/org-config.js';
 import {
   DEFAULT_PROMPT_VALUES,
+  findModeBySlug,
   ModeContext,
   PROMPT_OVERRIDE_SLOTS,
   PromptSlot,
@@ -1754,8 +1755,9 @@ async function handleSwitchMode(input: unknown, ctx: OrchestrationContext): Prom
     return { success: true, mode: null, message: 'Mode cleared. Using default settings.' };
   }
 
-  // Validate mode exists
-  const found = ctx.modeContext.availableModes.find((m) => m.name === mode);
+  // Validate mode exists. findModeBySlug also matches aliases (issue #284), so a
+  // saved script or user typing an old slug still resolves to the renamed mode.
+  const found = findModeBySlug(ctx.modeContext.availableModes, mode);
   if (!found) {
     const available = ctx.modeContext.availableModes.map((m) => m.name).join(', ');
     return {
@@ -1763,8 +1765,14 @@ async function handleSwitchMode(input: unknown, ctx: OrchestrationContext): Prom
     };
   }
 
-  await ctx.modeContext.setSelectedMode(mode);
-  ctx.logger.log('mode_tool_dispatch', { tool_name: 'switch_mode', mode });
+  // Persist the canonical name, not the requested slug, so an alias selection is
+  // normalized in storage immediately.
+  await ctx.modeContext.setSelectedMode(found.name);
+  ctx.logger.log('mode_tool_dispatch', {
+    tool_name: 'switch_mode',
+    mode: found.name,
+    ...(found.name !== mode ? { requested_slug: mode } : {}),
+  });
 
   const label = found.label ?? found.name;
   return {

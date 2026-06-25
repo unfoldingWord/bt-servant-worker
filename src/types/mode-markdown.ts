@@ -19,6 +19,7 @@
  */
 
 import {
+  findModeBySlug,
   MAX_MODE_DOCUMENT_LENGTH,
   OrgModes,
   PROMPT_OVERRIDE_SLOTS,
@@ -209,24 +210,51 @@ export function resolveEffectiveMode(
   requestedModeName: string | undefined,
   options?: { includeUnpublished?: boolean; isGroupChat?: boolean }
 ): {
+  /** Canonical mode name when resolved — NOT the requested slug, which may be an alias. */
   effectiveModeName: string | undefined;
   modeOverrides: PromptOverrides;
   reason: 'ok' | 'none-requested' | 'missing' | 'unpublished' | 'requires-group';
+  /**
+   * True when the request resolved through an alias rather than the canonical
+   * name (issue #284) — i.e. the subscriber's persisted slug is an old one
+   * that now points at a renamed/retired mode. Callers log this (`alias_resolved`)
+   * so cutovers are visible in CF logs. Only meaningful when `reason === 'ok'`.
+   */
+  resolvedViaAlias: boolean;
 } {
   if (!requestedModeName) {
-    return { effectiveModeName: undefined, modeOverrides: {}, reason: 'none-requested' };
+    return {
+      effectiveModeName: undefined,
+      modeOverrides: {},
+      reason: 'none-requested',
+      resolvedViaAlias: false,
+    };
   }
-  const mode = orgModes.modes.find((m) => m.name === requestedModeName);
+  // findModeBySlug matches canonical name OR any alias, so a renamed mode keeps
+  // answering to the old slug instead of stranding the subscriber.
+  const mode = findModeBySlug(orgModes.modes, requestedModeName);
   if (!mode) {
-    return { effectiveModeName: undefined, modeOverrides: {}, reason: 'missing' };
+    return {
+      effectiveModeName: undefined,
+      modeOverrides: {},
+      reason: 'missing',
+      resolvedViaAlias: false,
+    };
   }
   const blockReason = modeAccessBlockReason(mode, options);
   if (blockReason) {
-    return { effectiveModeName: undefined, modeOverrides: {}, reason: blockReason };
+    return {
+      effectiveModeName: undefined,
+      modeOverrides: {},
+      reason: blockReason,
+      resolvedViaAlias: false,
+    };
   }
   return {
-    effectiveModeName: requestedModeName,
+    // Canonical name, so downstream telemetry/persistence never see the alias.
+    effectiveModeName: mode.name,
     modeOverrides: getEffectiveOverrides(mode),
     reason: 'ok',
+    resolvedViaAlias: mode.name !== requestedModeName,
   };
 }

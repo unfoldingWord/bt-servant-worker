@@ -478,3 +478,48 @@ describe('classifyTriggers — synchronous, no I/O', () => {
     expect(typeof (result as { then?: unknown }).then).not.toBe('function');
   });
 });
+
+// ─── Mode aliases (issue #284) ──────────────────────────────────────────────
+
+describe('classifyTriggers — mode aliases', () => {
+  const aliasedModes: AvailableOption[] = [
+    { name: 'cbbt-mentoring', label: 'CBBT Mentoring', aliases: ['fia-trainer', 'fia-coach'] },
+    { name: 'spoken', label: 'Spoken' },
+  ];
+  const aliasCtx = (): ClassifierContext => ({
+    availableModes: aliasedModes,
+    availableLanguages: languages,
+  });
+
+  it('resolves an old slug via alias to the canonical name', () => {
+    const result = classifyTriggers('#fia-trainer help me', aliasCtx());
+    expect(result.modeName).toBe('cbbt-mentoring');
+    expect(result.strippedMessage).toBe('help me');
+    expect(result.unmatchedTriggers).toEqual([]);
+  });
+
+  it('prefers a canonical name over another mode’s alias', () => {
+    const collidingModes: AvailableOption[] = [
+      { name: 'spoken', label: 'Spoken' },
+      { name: 'other', label: 'Other', aliases: ['spoken'] },
+    ];
+    const result = classifyTriggers('#spoken hi', {
+      availableModes: collidingModes,
+      availableLanguages: languages,
+    });
+    expect(result.modeName).toBe('spoken');
+  });
+
+  it('does NOT fuzzy-match an alias (exact tier only)', () => {
+    // "fia-trainerx" is within Levenshtein 1 of the alias but must not match,
+    // since aliases are honored only by the exact tier.
+    const result = classifyTriggers('#fia-trainerx hi', aliasCtx());
+    expect(result.modeName).toBeUndefined();
+    expect(result.unmatchedTriggers.map((t) => t.rawToken)).toEqual(['fia-trainerx']);
+  });
+
+  it('matches an alias case-insensitively', () => {
+    const result = classifyTriggers('#FIA-COACH hi', aliasCtx());
+    expect(result.modeName).toBe('cbbt-mentoring');
+  });
+});

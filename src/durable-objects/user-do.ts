@@ -1099,7 +1099,7 @@ export class UserDO {
     const classified = classifyTriggers(loaded.messageText, {
       availableModes: loaded.orgModes.modes
         .filter((m) => isModeVisible(m, { isGroupChat, isAdmin: loaded.isAdmin }))
-        .map((m) => ({ name: m.name, label: m.label })),
+        .map((m) => ({ name: m.name, label: m.label, aliases: m.aliases })),
       availableLanguages: loaded.orgLanguages.languages
         .filter((l) => loaded.isAdmin || l.published === true)
         .map((l) => ({ name: l.name, label: l.label })),
@@ -1455,6 +1455,46 @@ export class UserDO {
     }
   }
 
+  /**
+   * Emit mode-resolution telemetry: `mode_not_found` when a stale/blocked
+   * selection was masked, and `alias_resolved` (issue #284) when the persisted
+   * slug routed through an alias to a renamed/retired mode. Extracted from
+   * `resolvePrompts` to keep that method under the complexity ceiling.
+   */
+  private logModeResolution(
+    body: ChatRequest,
+    logger: RequestLogger,
+    opts: {
+      requestedModeName: string | undefined;
+      resolution: ReturnType<typeof resolveEffectiveMode>;
+      orgModes: { modes: PromptMode[] };
+      isGroupChat: boolean;
+      isAdmin: boolean;
+    }
+  ): void {
+    const { requestedModeName, resolution, orgModes, isGroupChat, isAdmin } = opts;
+    const { effectiveModeName, reason, resolvedViaAlias } = resolution;
+    if (reason === 'missing' || reason === 'unpublished' || reason === 'requires-group') {
+      logger.warn('mode_not_found', {
+        active_mode: requestedModeName,
+        available_modes: orgModes.modes
+          .filter((m) => isModeVisible(m, { isGroupChat, isAdmin }))
+          .map((m) => m.name),
+        reason,
+      });
+    }
+    // The subscriber's persisted slug is an old one now pointing at a renamed/
+    // retired mode. Logged so Benjamin's cutovers are visible in CF logs —
+    // confirms real subscribers are being rerouted, not stranded.
+    if (resolvedViaAlias) {
+      logger.log('alias_resolved', {
+        requested_slug: requestedModeName,
+        canonical_name: effectiveModeName,
+        org: body.org ?? body.org_id ?? this.env.DEFAULT_ORG,
+      });
+    }
+  }
+
   private async resolvePrompts(body: ChatRequest, logger: RequestLogger) {
     const isAdmin = isAdminClient(body.client_id);
     const orgOverrides = body._org_prompt_overrides ?? {};
@@ -1469,20 +1509,18 @@ export class UserDO {
     // Admin-origin requests skip the published filter so authors can test drafts
     // from the portal's test chat pane.
     const isGroupChat = this.isGroupChatType(body);
-    const { effectiveModeName, modeOverrides, reason } = resolveEffectiveMode(
-      orgModes,
+    const resolution = resolveEffectiveMode(orgModes, requestedModeName, {
+      includeUnpublished: isAdmin,
+      isGroupChat,
+    });
+    const { effectiveModeName, modeOverrides } = resolution;
+    this.logModeResolution(body, logger, {
       requestedModeName,
-      { includeUnpublished: isAdmin, isGroupChat }
-    );
-    if (reason === 'missing' || reason === 'unpublished' || reason === 'requires-group') {
-      logger.warn('mode_not_found', {
-        active_mode: requestedModeName,
-        available_modes: orgModes.modes
-          .filter((m) => isModeVisible(m, { isGroupChat, isAdmin }))
-          .map((m) => m.name),
-        reason,
-      });
-    }
+      resolution,
+      orgModes,
+      isGroupChat,
+      isAdmin,
+    });
 
     const userOverrides = await this.getPromptOverrides();
     const resolved = applyTemplateVariables(
