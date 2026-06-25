@@ -26,6 +26,13 @@ export type TriggerKind = 'mode' | 'language';
 export interface AvailableOption {
   name: string;
   label?: string | undefined;
+  /**
+   * Old slugs that also resolve to this option (mode aliases, issue #284).
+   * Honored ONLY by the exact-match tier so a retired `#old-slug` still routes
+   * to the canonical mode; never used for prefix/fuzzy matching (we don't want
+   * a fuzzy hit on a dead slug) and never surfaced as a selectable option.
+   */
+  aliases?: string[] | undefined;
 }
 
 export interface UnmatchedTrigger {
@@ -181,10 +188,17 @@ function boundedLevenshtein(a: string, b: string, maxDistance: number): number {
 
 const LEVENSHTEIN_MAX = 2;
 
-/** Tier 1: case-insensitive exact match. */
+/**
+ * Tier 1: case-insensitive exact match. Matches the canonical `name` or any
+ * alias (issue #284), always returning the canonical `name`. Canonical names
+ * are checked first so a name can never be shadowed by another mode's alias.
+ */
 function tryExactMatch(lower: string, options: AvailableOption[]): string | null {
   for (const opt of options) {
     if (opt.name.toLowerCase() === lower) return opt.name;
+  }
+  for (const opt of options) {
+    if (opt.aliases?.some((alias) => alias.toLowerCase() === lower) === true) return opt.name;
   }
   return null;
 }

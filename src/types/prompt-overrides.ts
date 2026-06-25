@@ -46,6 +46,13 @@ export const MAX_MODES_PER_ORG = 20;
 /** Maximum length for a mode name (slug) */
 export const MAX_MODE_NAME_LENGTH = 64;
 
+/**
+ * Maximum number of aliases a single mode may carry. Aliases accumulate one
+ * per rename/retire, so this bounds pathological growth from repeated renames.
+ * Comfortably above any realistic number of renames for one mode.
+ */
+export const MAX_MODE_ALIASES = 20;
+
 /** Maximum length for a mode label */
 export const MAX_MODE_LABEL_LENGTH = 100;
 
@@ -79,6 +86,18 @@ export const MODE_NAME_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 export interface PromptMode {
   /** Unique slug identifier within the org (e.g., "mast-methodology") */
   name: string;
+  /**
+   * Old slugs that also resolve to this mode (issue #284). When a mode is
+   * renamed/reslugged, its previous slug is kept here so subscribers whose
+   * persisted `selected_mode` still holds the old slug are rerouted at lookup
+   * time instead of being stranded on the org default.
+   *
+   * Resolve-time only: aliases are honored by `findModeBySlug` but are NEVER
+   * surfaced as selectable options (list_modes / switch_mode / the `#`-trigger
+   * show only the canonical `name`/`label`). Each alias must be unique across
+   * every name and alias within the org (see `checkModeSlugUniqueness`).
+   */
+  aliases?: string[];
   /** Human-readable display name (e.g., "MAST Methodology") */
   label?: string;
   /** Description of what this mode does */
@@ -250,6 +269,81 @@ export function validateModeName(name: unknown): string | null {
   return null;
 }
 
+/**
+ * Validate a mode's `aliases` field (format only — cross-mode uniqueness is
+ * enforced separately by `checkModeSlugUniqueness`, which needs the full org
+ * mode list). `undefined` / missing is accepted (no aliases).
+ *
+ * Returns an error message if invalid, null if valid.
+ */
+export function validateModeAliases(aliases: unknown): string | null {
+  if (aliases === undefined) return null;
+  if (!Array.isArray(aliases)) return 'Mode aliases must be an array of strings';
+  if (aliases.length > MAX_MODE_ALIASES) {
+    return `Mode cannot have more than ${MAX_MODE_ALIASES} aliases`;
+  }
+  const seen = new Set<string>();
+  for (const alias of aliases) {
+    const nameError = validateModeName(alias);
+    if (nameError) return `Invalid alias: ${nameError}`;
+    if (seen.has(alias as string)) {
+      return `Duplicate alias "${alias as string}"`;
+    }
+    seen.add(alias as string);
+  }
+  return null;
+}
+
+/**
+ * Find the mode that owns `slug`, matching either its canonical `name` or any
+ * of its `aliases` (issue #284). Single source of truth for slug → mode
+ * resolution: every lookup site (chat-time resolver, switch_mode, the
+ * `#`-trigger classifier's exact tier, admin get-by-slug) routes through this
+ * so a renamed mode keeps answering to its old slug.
+ *
+ * Returns the matched mode (whose `.name` is the canonical slug) or undefined.
+ */
+export function findModeBySlug(modes: PromptMode[], slug: string): PromptMode | undefined {
+  return modes.find((m) => m.name === slug || m.aliases?.includes(slug) === true);
+}
+
+/**
+ * Enforce the org-wide slug uniqueness invariant for issue #284: a candidate's
+ * slugs (its `name` plus every alias) may not collide with any OTHER mode's
+ * `name` or aliases within the org, and may not contain internal duplicates.
+ *
+ * `excludeNames` lists the canonical names of modes that should NOT be checked
+ * against — the candidate itself on an in-place rename, or a soon-to-be-deleted
+ * source mode on retire-and-forward.
+ *
+ * Returns an error message naming the colliding slug, or null if unique.
+ */
+export function checkModeSlugUniqueness(
+  modes: PromptMode[],
+  candidateSlugs: string[],
+  excludeNames: ReadonlyArray<string> = []
+): string | null {
+  const excluded = new Set(excludeNames);
+  const taken = new Set<string>();
+  for (const mode of modes) {
+    if (excluded.has(mode.name)) continue;
+    taken.add(mode.name);
+    for (const alias of mode.aliases ?? []) taken.add(alias);
+  }
+
+  const seen = new Set<string>();
+  for (const slug of candidateSlugs) {
+    if (seen.has(slug)) {
+      return `Slug "${slug}" is duplicated`;
+    }
+    seen.add(slug);
+    if (taken.has(slug)) {
+      return `Slug "${slug}" already belongs to another mode (as a name or alias) in this org`;
+    }
+  }
+  return null;
+}
+
 /** Narrow `unknown` to a plain object (not array, not null). */
 function asPlainObject(value: unknown): Record<string, unknown> | null {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
@@ -328,7 +422,8 @@ export function validatePromptMode(mode: unknown): string | null {
     validateOptionalString(obj, 'label', MAX_MODE_LABEL_LENGTH) ??
     validateOptionalString(obj, 'description', MAX_MODE_DESCRIPTION_LENGTH) ??
     validateOptionalBoolean(obj, 'published') ??
-    validateOptionalBoolean(obj, 'requires_group');
+    validateOptionalBoolean(obj, 'requires_group') ??
+    validateModeAliases(obj.aliases);
   if (scalarError) return scalarError;
 
   return validateModeContentField(obj);

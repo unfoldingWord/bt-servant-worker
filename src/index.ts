@@ -14,13 +14,16 @@ import { MCPServerConfig } from './services/mcp/types.js';
 import { ChatRequest, ChatTransport, ChatType } from './types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig, validateOrgConfig } from './types/org-config.js';
 import {
+  checkModeSlugUniqueness,
   DEFAULT_PROMPT_VALUES,
+  findModeBySlug,
   MAX_MODES_PER_ORG,
   mergePromptOverrides,
   OrgModes,
   PromptMode,
   PromptOverrides,
   resolvePromptOverrides,
+  validateModeAliases,
   validateModeName,
   validatePromptMode,
   validatePromptOverrides,
@@ -584,12 +587,14 @@ app.get('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
     const orgModes = (await c.env.PROMPT_OVERRIDES.get<OrgModes>(`${org}:modes`, 'json')) ?? {
       modes: [],
     };
-    const mode = orgModes.modes.find((m) => m.name === modeName);
+    // findModeBySlug honors aliases (#284) so admin tooling can address a mode
+    // by an old slug after a rename.
+    const mode = findModeBySlug(orgModes.modes, modeName);
     if (!mode) {
       return c.json({ error: `Mode '${modeName}' not found` }, 404);
     }
 
-    logger.log('admin_action', { action: 'get_mode', org, mode_name: modeName });
+    logger.log('admin_action', { action: 'get_mode', org, mode_name: mode.name });
     return c.json({ org, mode: toMarkdownView(mode) });
   } catch (error) {
     logger.error('admin_action', error, { action: 'get_mode', org });
@@ -675,6 +680,120 @@ app.delete('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
   } catch (error) {
     logger.error('admin_action', error, { action: 'delete_mode', org });
     return c.json({ error: 'Failed to delete mode from storage' }, 500);
+  }
+});
+
+// ── Mode rename / clone / retire-and-forward (issue #284) ──────────────────────
+// Alias-based cohort moves: rename/reslug a mode, clone one, or retire a mode
+// and forward its subscribers — all without stranding users. Admin-gated by the
+// `/api/v1/admin/orgs/:org/*` middleware above (covers POST). The leading `_`
+// keeps these action routes from colliding with `/modes/:modeName`.
+
+/** Map a ModeOpResult error code to an HTTP status. */
+function modeOpStatus(code: 'not_found' | 'conflict' | 'invalid'): 404 | 409 | 400 {
+  if (code === 'not_found') return 404;
+  if (code === 'conflict') return 409;
+  return 400;
+}
+
+app.post('/api/v1/admin/orgs/:org/modes/:modeName/_rename', async (c) => {
+  const org = c.req.param('org');
+  const modeName = c.req.param('modeName');
+  const logger = createRequestLogger(crypto.randomUUID());
+
+  const nameError = validateModeName(modeName);
+  if (nameError) return c.json({ error: nameError }, 400);
+
+  const body = (await c.req.json().catch(() => null)) as { newName?: unknown } | null;
+  if (!body || typeof body !== 'object') {
+    return c.json({ error: 'Request body must be a JSON object with { newName }' }, 400);
+  }
+
+  try {
+    const orgModes = (await c.env.PROMPT_OVERRIDES.get<OrgModes>(`${org}:modes`, 'json')) ?? {
+      modes: [],
+    };
+    const result = renameMode(orgModes, modeName, body.newName);
+    if (!result.ok) return c.json({ error: result.error }, modeOpStatus(result.code));
+
+    await c.env.PROMPT_OVERRIDES.put(`${org}:modes`, JSON.stringify(orgModes));
+    logger.log('mode_renamed', { org, from: modeName, to: result.savedMode.name });
+    return c.json({ org, mode: toMarkdownView(result.savedMode), message: 'Mode renamed' });
+  } catch (error) {
+    logger.error('admin_action', error, { action: 'rename_mode', org });
+    return c.json({ error: 'Failed to rename mode in storage' }, 500);
+  }
+});
+
+app.post('/api/v1/admin/orgs/:org/modes/:modeName/_clone', async (c) => {
+  const org = c.req.param('org');
+  const modeName = c.req.param('modeName');
+  const logger = createRequestLogger(crypto.randomUUID());
+
+  const nameError = validateModeName(modeName);
+  if (nameError) return c.json({ error: nameError }, 400);
+
+  const body = (await c.req.json().catch(() => null)) as {
+    newName?: unknown;
+    newLabel?: unknown;
+  } | null;
+  if (!body || typeof body !== 'object') {
+    return c.json({ error: 'Request body must be a JSON object with { newName, newLabel? }' }, 400);
+  }
+  if (body.newLabel !== undefined && typeof body.newLabel !== 'string') {
+    return c.json({ error: 'newLabel must be a string' }, 400);
+  }
+
+  try {
+    const orgModes = (await c.env.PROMPT_OVERRIDES.get<OrgModes>(`${org}:modes`, 'json')) ?? {
+      modes: [],
+    };
+    const result = cloneMode(orgModes, modeName, body.newName, body.newLabel);
+    if (!result.ok) return c.json({ error: result.error }, modeOpStatus(result.code));
+
+    await c.env.PROMPT_OVERRIDES.put(`${org}:modes`, JSON.stringify(orgModes));
+    logger.log('mode_cloned', { org, from: modeName, to: result.savedMode.name });
+    return c.json({ org, mode: toMarkdownView(result.savedMode), message: 'Mode cloned' });
+  } catch (error) {
+    logger.error('admin_action', error, { action: 'clone_mode', org });
+    return c.json({ error: 'Failed to clone mode in storage' }, 500);
+  }
+});
+
+app.post('/api/v1/admin/orgs/:org/modes/:modeName/_retire', async (c) => {
+  const org = c.req.param('org');
+  const modeName = c.req.param('modeName');
+  const logger = createRequestLogger(crypto.randomUUID());
+
+  const nameError = validateModeName(modeName);
+  if (nameError) return c.json({ error: nameError }, 400);
+
+  const body = (await c.req.json().catch(() => null)) as { forwardTo?: unknown } | null;
+  if (!body || typeof body !== 'object') {
+    return c.json({ error: 'Request body must be a JSON object with { forwardTo }' }, 400);
+  }
+
+  try {
+    const orgModes = (await c.env.PROMPT_OVERRIDES.get<OrgModes>(`${org}:modes`, 'json')) ?? {
+      modes: [],
+    };
+    const result = retireMode(orgModes, modeName, body.forwardTo);
+    if (!result.ok) return c.json({ error: result.error }, modeOpStatus(result.code));
+
+    await c.env.PROMPT_OVERRIDES.put(`${org}:modes`, JSON.stringify(orgModes));
+    logger.log('mode_retired_forwarded', {
+      org,
+      retired: modeName,
+      forward_to: result.savedMode.name,
+    });
+    return c.json({
+      org,
+      mode: toMarkdownView(result.savedMode),
+      message: `Mode retired; subscribers forwarded to '${result.savedMode.name}'`,
+    });
+  } catch (error) {
+    logger.error('admin_action', error, { action: 'retire_mode', org });
+    return c.json({ error: 'Failed to retire mode in storage' }, 500);
   }
 });
 
@@ -1042,6 +1161,26 @@ function modeShape(mode: PromptMode): ModeShape {
   return mode.document !== undefined ? 'document' : 'overrides';
 }
 
+/** Normalize an aliases field: an empty/absent array collapses to undefined. */
+function normalizeAliases(aliases: string[] | undefined): string[] | undefined {
+  return aliases && aliases.length > 0 ? aliases : undefined;
+}
+
+/**
+ * Strip keys whose value is `undefined` or `''` (the optional-field omission
+ * convention used across mode/language admin views). Booleans like `false` and
+ * objects like `{}` are kept, so `published: false` survives. Lets callers
+ * build a flat object and drop empties in one pass instead of N conditional
+ * spreads (which each add cyclomatic complexity).
+ */
+function compactOptional<T extends Record<string, unknown>>(
+  obj: T
+): { [K in keyof T]?: Exclude<T[K], undefined> } {
+  return Object.fromEntries(
+    Object.entries(obj).filter(([, value]) => value !== undefined && value !== '')
+  ) as { [K in keyof T]?: Exclude<T[K], undefined> };
+}
+
 /**
  * Project a stored mode to the markdown-document admin response shape
  * (Phase 1 of #200). Legacy modes carry their original overrides as
@@ -1051,6 +1190,7 @@ function modeShape(mode: PromptMode): ModeShape {
  */
 function toMarkdownView(mode: PromptMode): {
   name: string;
+  aliases?: string[];
   label?: string;
   description?: string;
   published?: boolean;
@@ -1063,13 +1203,16 @@ function toMarkdownView(mode: PromptMode): {
   const document = isLegacy ? synthesizeModeDocument(mode.overrides ?? {}) : mode.document!;
   return {
     name: mode.name,
-    ...(mode.label !== undefined ? { label: mode.label } : {}),
-    ...(mode.description !== undefined ? { description: mode.description } : {}),
-    ...(mode.published !== undefined ? { published: mode.published } : {}),
-    ...(mode.requires_group !== undefined ? { requires_group: mode.requires_group } : {}),
+    ...compactOptional({
+      aliases: normalizeAliases(mode.aliases),
+      label: mode.label,
+      description: mode.description,
+      published: mode.published,
+      requires_group: mode.requires_group,
+      originalSlots: isLegacy ? (mode.overrides ?? {}) : undefined,
+    }),
     document,
     format: 'markdown' as const,
-    ...(isLegacy ? { originalSlots: mode.overrides ?? {} } : {}),
   };
 }
 
@@ -1106,16 +1249,18 @@ function mergeContentFields(
  * Content fields are resolved by `mergeContentFields` above.
  */
 function mergeExistingMode(existing: PromptMode, incoming: PromptMode): PromptMode {
-  const publishedResolved = incoming.published ?? existing.published;
-  const requiresGroupResolved = incoming.requires_group ?? existing.requires_group;
-  const labelResolved = incoming.label ?? existing.label;
-  const descriptionResolved = incoming.description ?? existing.description;
+  // Aliases (issue #284) are managed by the rename/retire endpoints, not the
+  // portal editor. A normal PUT omits them, so preserve the existing set;
+  // an explicit incoming array (already format-validated) replaces it.
   return {
     name: incoming.name,
-    ...(labelResolved ? { label: labelResolved } : {}),
-    ...(descriptionResolved ? { description: descriptionResolved } : {}),
-    ...(publishedResolved !== undefined ? { published: publishedResolved } : {}),
-    ...(requiresGroupResolved !== undefined ? { requires_group: requiresGroupResolved } : {}),
+    ...compactOptional({
+      aliases: normalizeAliases(incoming.aliases ?? existing.aliases),
+      label: incoming.label ?? existing.label,
+      description: incoming.description ?? existing.description,
+      published: incoming.published ?? existing.published,
+      requires_group: incoming.requires_group ?? existing.requires_group,
+    }),
     ...mergeContentFields(existing, incoming),
   };
 }
@@ -1136,6 +1281,14 @@ export function upsertMode(
   const existingIdx = orgModes.modes.findIndex((m) => m.name === modeInput.name);
   if (existingIdx >= 0) {
     const savedMode = mergeExistingMode(orgModes.modes[existingIdx]!, modeInput);
+    // Enforce the org-wide slug invariant (#284): the saved mode's name + any
+    // aliases must not collide with another mode's name/aliases.
+    const collision = checkModeSlugUniqueness(
+      orgModes.modes,
+      [savedMode.name, ...(savedMode.aliases ?? [])],
+      [savedMode.name]
+    );
+    if (collision) return { ok: false, error: collision };
     logger?.log('admin_action', {
       action: 'upsert_mode_before',
       org,
@@ -1150,6 +1303,13 @@ export function upsertMode(
   if (orgModes.modes.length >= MAX_MODES_PER_ORG) {
     return { ok: false, error: `Cannot have more than ${MAX_MODES_PER_ORG} modes per org` };
   }
+
+  // New mode: a name colliding with another mode's alias is rejected loudly.
+  const collision = checkModeSlugUniqueness(orgModes.modes, [
+    modeInput.name,
+    ...(modeInput.aliases ?? []),
+  ]);
+  if (collision) return { ok: false, error: collision };
 
   // New mode: sanitize document field if present.
   const newMode: PromptMode =
@@ -1166,6 +1326,146 @@ export function upsertMode(
   });
   orgModes.modes.push(newMode);
   return { ok: true, savedMode: newMode };
+}
+
+/**
+ * Result of a rename/clone/retire mode operation (issue #284). `code` lets the
+ * thin HTTP handler map failures to the right status: `not_found` → 404,
+ * `conflict` (slug collision) → 409, `invalid` (bad input / limit) → 400.
+ */
+type ModeOpResult =
+  | { ok: true; savedMode: PromptMode }
+  | { ok: false; error: string; code: 'not_found' | 'conflict' | 'invalid' };
+
+/** Dedup a slug list, preserving order. */
+function dedupeSlugs(slugs: string[]): string[] {
+  return [...new Set(slugs)];
+}
+
+/**
+ * Rename/reslug a mode in place (issue #284). The old slug is retained as an
+ * alias so every subscriber whose persisted `selected_mode` still holds it is
+ * rerouted at lookup time instead of being stranded. Mutates `orgModes` in
+ * place. Label/description/content/published are untouched.
+ *
+ * `newName` may be one of the mode's OWN existing aliases — this "promotes" the
+ * alias back to canonical and demotes the prior name to an alias (an
+ * un-rename). It is rejected (409) only when `newName` collides with a
+ * DIFFERENT mode's name or alias; the uniqueness check excludes the source.
+ */
+export function renameMode(orgModes: OrgModes, fromSlug: string, newName: unknown): ModeOpResult {
+  const source = findModeBySlug(orgModes.modes, fromSlug);
+  if (!source) {
+    return { ok: false, error: `Mode '${fromSlug}' not found`, code: 'not_found' };
+  }
+  const nameError = validateModeName(newName);
+  if (nameError) return { ok: false, error: nameError, code: 'invalid' };
+  const target = newName as string;
+  if (target === source.name) {
+    return { ok: false, error: 'newName must differ from the current name', code: 'invalid' };
+  }
+
+  // Old canonical slug (and any prior aliases) keep resolving; newName must not
+  // appear among them.
+  const newAliases = dedupeSlugs([...(source.aliases ?? []), source.name]).filter(
+    (a) => a !== target
+  );
+  const aliasError = validateModeAliases(newAliases);
+  if (aliasError) return { ok: false, error: aliasError, code: 'invalid' };
+
+  const collision = checkModeSlugUniqueness(orgModes.modes, [target, ...newAliases], [source.name]);
+  if (collision) return { ok: false, error: collision, code: 'conflict' };
+
+  source.name = target;
+  if (newAliases.length > 0) source.aliases = newAliases;
+  else delete source.aliases;
+  return { ok: true, savedMode: source };
+}
+
+/**
+ * Clone a mode under a new slug (issue #284). A clone is a NEW identity:
+ * content/description/requires_group are deep-copied, the clone is forced
+ * unpublished, and aliases are deliberately NOT copied. Mutates `orgModes`.
+ */
+export function cloneMode(
+  orgModes: OrgModes,
+  fromSlug: string,
+  newName: unknown,
+  newLabel?: string
+): ModeOpResult {
+  const source = findModeBySlug(orgModes.modes, fromSlug);
+  if (!source) {
+    return { ok: false, error: `Mode '${fromSlug}' not found`, code: 'not_found' };
+  }
+  const nameError = validateModeName(newName);
+  if (nameError) return { ok: false, error: nameError, code: 'invalid' };
+  const target = newName as string;
+
+  if (orgModes.modes.length >= MAX_MODES_PER_ORG) {
+    return {
+      ok: false,
+      error: `Cannot have more than ${MAX_MODES_PER_ORG} modes per org`,
+      code: 'invalid',
+    };
+  }
+  const collision = checkModeSlugUniqueness(orgModes.modes, [target]);
+  if (collision) return { ok: false, error: collision, code: 'conflict' };
+
+  const clone: PromptMode = {
+    name: target,
+    ...compactOptional({
+      label: newLabel ?? source.label,
+      description: source.description,
+      requires_group: source.requires_group,
+    }),
+    published: false,
+    // Copy exactly one content shape, mirroring the stored mode (#200).
+    ...(source.document !== undefined
+      ? { document: source.document }
+      : { overrides: { ...(source.overrides ?? {}) } }),
+  };
+  orgModes.modes.push(clone);
+  return { ok: true, savedMode: clone };
+}
+
+/**
+ * Retire a mode and forward its subscribers to another mode (issue #284,
+ * scenario B). The retired mode's slug and any of its existing aliases are
+ * moved into `forwardTo`'s aliases, then the source mode is deleted — so every
+ * retired-mode subscriber silently resolves to `forwardTo`. Mutates `orgModes`.
+ */
+export function retireMode(orgModes: OrgModes, fromSlug: string, forwardTo: unknown): ModeOpResult {
+  const source = findModeBySlug(orgModes.modes, fromSlug);
+  if (!source) {
+    return { ok: false, error: `Mode '${fromSlug}' not found`, code: 'not_found' };
+  }
+  if (typeof forwardTo !== 'string') {
+    return { ok: false, error: 'forwardTo must be a string', code: 'invalid' };
+  }
+  const target = findModeBySlug(orgModes.modes, forwardTo);
+  if (!target) {
+    return { ok: false, error: `forwardTo mode '${forwardTo}' not found`, code: 'not_found' };
+  }
+  if (target.name === source.name) {
+    return { ok: false, error: 'Cannot forward a mode to itself', code: 'invalid' };
+  }
+
+  // The source's slugs (canonical + aliases) move onto the target.
+  const movedSlugs = dedupeSlugs([source.name, ...(source.aliases ?? [])]);
+  const newAliases = dedupeSlugs([...(target.aliases ?? []), ...movedSlugs]).filter(
+    (a) => a !== target.name
+  );
+  const aliasError = validateModeAliases(newAliases);
+  if (aliasError) return { ok: false, error: aliasError, code: 'invalid' };
+
+  // Defensive: moved slugs must not collide with any OTHER mode (source +
+  // target excluded — source is being deleted, target is the destination).
+  const collision = checkModeSlugUniqueness(orgModes.modes, movedSlugs, [source.name, target.name]);
+  if (collision) return { ok: false, error: collision, code: 'conflict' };
+
+  target.aliases = newAliases;
+  orgModes.modes = orgModes.modes.filter((m) => m.name !== source.name);
+  return { ok: true, savedMode: target };
 }
 
 /** Merge an incoming language with an existing one. Document is replaced wholesale. */
