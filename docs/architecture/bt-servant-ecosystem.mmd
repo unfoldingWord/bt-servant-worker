@@ -1,0 +1,85 @@
+%% bt-servant ecosystem — high-level architecture
+%% Repo refs (all github.com/unfoldingWord/<name>) shown in node labels.
+flowchart TB
+  translator(["Bible Translator"])
+  admin(["Org Admin"])
+
+  subgraph ext1[" "]
+    tgapi["Telegram Bot API"]
+    meta["Meta WhatsApp Cloud API"]
+    signal["Signal network"]
+  end
+
+  subgraph bts["bt-servant ecosystem"]
+    direction TB
+
+    subgraph channels["Ways of using BTS"]
+      direction LR
+      tg["telegram-gateway<br/><i>TS, CF Worker</i><br/>unfoldingWord/bt-servant-telegram-gateway"]
+      wa["whatsapp-gateway<br/><i>TS, CF Worker</i><br/>unfoldingWord/bt-servant-whatsapp-gateway"]
+      sg["signal-gateway<br/><i>Python/FastAPI, Fly.io</i><br/>unfoldingWord/bt-servant-signal-gateway"]
+      web["web-client<br/><i>Next.js on CF Workers</i><br/>unfoldingWord/bt-servant-web-client"]
+    end
+
+    worker["<b>bt-servant-worker</b><br/>TypeScript, Cloudflare Worker<br/><i>Core AI orchestrator — api.btservant.ai</i><br/>unfoldingWord/bt-servant-worker"]
+    sandbox["code sandbox<br/><i>QuickJS / WASM, in-process</i><br/>writes &amp; runs JS on the fly (30s)<br/>part of bt-servant-worker"]
+    adminp["admin-portal<br/><i>React SPA + CF Worker BFF</i><br/>unfoldingWord/bt-servant-admin-portal"]
+    baruch["baruch<br/><i>TS, CF Worker — AI admin assistant</i><br/>unfoldingWord/baruch"]
+    fia["fia-mcp<br/><i>TS, CF Worker — MCP server</i><br/>unfoldingWord/fia-mcp"]
+    thelps["translation-helps-mcp<br/><i>TS, CF Worker — MCP server</i><br/>unfoldingWord/translation-helps-mcp"]
+
+    userdo[("User / Group state<br/><i>Durable Objects (SQLite)</i><br/>memory, history, prefs, mode")]
+    kv[("Config store<br/><i>Cloudflare KV</i><br/>org config, admin keys,<br/>MCP servers, prompt overrides")]
+    r2[("Object store<br/><i>Cloudflare R2</i><br/>TTS audio, USFM, PDFs")]
+  end
+
+  claude["Anthropic Claude API"]
+  openai["OpenAI (TTS)"]
+  cfai["Cloudflare Workers AI (Whisper)"]
+  othermcp["Other MCP servers<br/>aquifer, ptxprint"]
+  fiaapi["FIA Project API<br/>GraphQL + auth"]
+
+  translator -->|Telegram| tgapi
+  translator -->|WhatsApp| meta
+  translator -->|Signal| signal
+  translator -->|HTTPS web| web
+  admin -->|HTTPS| adminp
+
+  tgapi <-->|webhook / send| tg
+  meta <-->|webhook / send| wa
+  signal <-->|signal-cli| sg
+
+  tg -->|chat + async callback| worker
+  wa -->|chat + async callback| worker
+  sg -->|chat + async callback| worker
+  web -->|chat, history, prefs, audio| worker
+  adminp -->|admin config CRUD| worker
+  adminp -->|conversational config| baruch
+  baruch -->|admin API| worker
+
+  worker -->|writes &amp; executes code| sandbox
+  worker -->|reads / writes state| userdo
+  worker -->|reads / writes config| kv
+  worker -->|stores / serves files| r2
+  worker -->|messages.create| claude
+  worker -->|synthesize speech| openai
+  worker -->|transcribe audio| cfai
+  worker -->|MCP tools/call| fia
+  worker -->|MCP tools/call| thelps
+  worker -->|MCP tools/call| othermcp
+  baruch -->|messages.create| claude
+  fia -->|GraphQL| fiaapi
+
+  style worker fill:#1168bd,stroke:#0b4884,color:#fff
+  style tg fill:#438dd5,stroke:#2e6295,color:#fff
+  style wa fill:#438dd5,stroke:#2e6295,color:#fff
+  style sg fill:#438dd5,stroke:#2e6295,color:#fff
+  style web fill:#438dd5,stroke:#2e6295,color:#fff
+  style adminp fill:#438dd5,stroke:#2e6295,color:#fff
+  style baruch fill:#438dd5,stroke:#2e6295,color:#fff
+  style sandbox fill:#85bbf0,stroke:#5d82a8,color:#000
+  style fia fill:#438dd5,stroke:#2e6295,color:#fff
+  style thelps fill:#438dd5,stroke:#2e6295,color:#fff
+  style userdo fill:#438dd5,stroke:#2e6295,color:#fff
+  style kv fill:#438dd5,stroke:#2e6295,color:#fff
+  style r2 fill:#438dd5,stroke:#2e6295,color:#fff

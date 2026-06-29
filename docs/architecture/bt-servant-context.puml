@@ -1,0 +1,35 @@
+@startuml
+!include <C4/C4_Context>
+
+title bt-servant — C4 System Context Diagram
+
+Person(translator, "Bible Translator", "Asks questions and translates Scripture, via a chat app or the web client")
+Person(admin, "Org Admin", "Configures prompts, modes, languages and MCP servers")
+
+System(bts, "bt-servant", "AI assistant for Bible translators: multi-channel chat, on-the-fly code execution in a WASM sandbox, and pluggable MCP knowledge tools")
+
+System_Ext(telegram, "Telegram", "Messaging platform")
+System_Ext(whatsapp, "WhatsApp / Meta", "Messaging platform")
+System_Ext(signal, "Signal", "Messaging platform")
+System_Ext(claude, "Anthropic Claude API", "LLM orchestration")
+System_Ext(openai, "OpenAI", "Text-to-speech")
+System_Ext(cloudflare, "Cloudflare", "Workers runtime + Workers AI (Whisper STT)")
+System_Ext(fiaapi, "FIA Project API", "Scripture internalization data (GraphQL)")
+System_Ext(door43, "Door43 / DCS", "Bible translation helps")
+System_Ext(othermcp, "Other MCP servers", "aquifer, ptxprint")
+
+Rel(translator, bts, "Chats with", "Telegram / WhatsApp / Signal / Web")
+Rel(admin, bts, "Administers", "Web")
+
+Rel(bts, telegram, "Sends / receives messages", "Bot API")
+Rel(bts, whatsapp, "Sends / receives messages", "Cloud API")
+Rel(bts, signal, "Sends / receives messages", "signal-cli")
+Rel(bts, claude, "Orchestrates with", "HTTPS")
+Rel(bts, openai, "Synthesizes speech", "HTTPS")
+Rel(bts, cloudflare, "Runs on / transcribes audio", "Workers AI")
+Rel(bts, fiaapi, "Queries (via fia-mcp)", "GraphQL")
+Rel(bts, door43, "Queries (via translation-helps-mcp)", "HTTPS")
+Rel(bts, othermcp, "Calls tools", "MCP / JSON-RPC")
+
+SHOW_LEGEND()
+@enduml

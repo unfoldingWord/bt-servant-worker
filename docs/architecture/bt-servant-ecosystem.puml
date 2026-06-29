@@ -1,0 +1,69 @@
+@startuml
+!include <C4/C4_Container>
+
+title bt-servant Ecosystem — C4 Container Diagram
+
+Person(translator, "Bible Translator", "Translates Scripture via a chat channel")
+Person(admin, "Org Admin", "Configures prompts, modes, languages, MCP servers")
+
+System_Boundary(bts, "bt-servant Ecosystem") {
+  Container(worker, "bt-servant-worker", "TypeScript, Cloudflare Worker", "Core AI orchestrator (api.btservant.ai). Claude loop, MCP tool discovery, memory, audio\n[unfoldingWord/bt-servant-worker]", $link="https://github.com/unfoldingWord/bt-servant-worker")
+  Container(tg, "telegram-gateway", "TypeScript, CF Worker", "Thin relay: Telegram to worker\n[unfoldingWord/bt-servant-telegram-gateway]", $link="https://github.com/unfoldingWord/bt-servant-telegram-gateway")
+  Container(wa, "whatsapp-gateway", "TypeScript, CF Worker", "Thin relay: WhatsApp to worker\n[unfoldingWord/bt-servant-whatsapp-gateway]", $link="https://github.com/unfoldingWord/bt-servant-whatsapp-gateway")
+  Container(sg, "signal-gateway", "Python/FastAPI, Fly.io + signal-cli", "Long-running relay: Signal to worker\n[unfoldingWord/bt-servant-signal-gateway]", $link="https://github.com/unfoldingWord/bt-servant-signal-gateway")
+  Container(web, "web-client", "Next.js on CF Workers", "Authenticated chat web UI\n[unfoldingWord/bt-servant-web-client]", $link="https://github.com/unfoldingWord/bt-servant-web-client")
+  Container(adminp, "admin-portal", "React SPA + CF Worker BFF", "Admin UI for users, prompts, modes, languages\n[unfoldingWord/bt-servant-admin-portal]", $link="https://github.com/unfoldingWord/bt-servant-admin-portal")
+  Container(baruch, "baruch", "TypeScript, CF Worker", "Conversational AI admin assistant\n[unfoldingWord/baruch]", $link="https://github.com/unfoldingWord/baruch")
+  Container(sandbox, "code sandbox", "QuickJS / WASM, in-process", "Runs Claude-generated JS on the fly (30s timeout)\n[part of bt-servant-worker]")
+  Container(fia, "fia-mcp", "TypeScript, CF Worker (MCP)", "MCP server wrapping the FIA GraphQL API\n[unfoldingWord/fia-mcp]", $link="https://github.com/unfoldingWord/fia-mcp")
+  Container(thelps, "translation-helps-mcp", "TypeScript, CF Worker (MCP)", "MCP server for Door43/DCS Bible translation helps\n[unfoldingWord/translation-helps-mcp]", $link="https://github.com/unfoldingWord/translation-helps-mcp")
+
+  ContainerDb(userdo, "User / Group state", "Durable Objects (SQLite)", "Per-user/group/thread memory, history, preferences, mode (USER_DO)")
+  ContainerDb(kv, "Config store", "Cloudflare KV", "Org config, admin keys, MCP servers, prompt overrides")
+  ContainerDb(r2, "Object store", "Cloudflare R2", "TTS audio, USFM sources, generated PDFs")
+}
+
+System_Ext(claude, "Anthropic Claude API", "LLM")
+System_Ext(openai, "OpenAI", "Text-to-speech")
+System_Ext(cfai, "Cloudflare Workers AI", "Whisper STT")
+System_Ext(tgapi, "Telegram Bot API", "Messaging platform")
+System_Ext(meta, "Meta WhatsApp Cloud API", "Messaging platform")
+System_Ext(signal, "Signal network", "Messaging platform")
+System_Ext(fiaapi, "FIA Project API", "GraphQL + auth")
+System_Ext(othermcp, "Other MCP servers", "aquifer, ptxprint")
+
+Rel(translator, tgapi, "Messages", "Telegram")
+Rel(translator, meta, "Messages", "WhatsApp")
+Rel(translator, signal, "Messages", "Signal")
+Rel(translator, web, "Chats", "HTTPS")
+Rel(admin, adminp, "Administers", "HTTPS")
+
+Rel(tgapi, tg, "Webhook updates", "HTTPS")
+Rel(tg, tgapi, "Send replies", "HTTPS")
+Rel(meta, wa, "Webhook events", "HTTPS")
+Rel(wa, meta, "Send replies", "HTTPS")
+Rel(signal, sg, "Inbound / outbound", "signal-cli")
+
+Rel(tg, worker, "Chat + async callback", "HTTPS / Bearer")
+Rel(wa, worker, "Chat + async callback", "HTTPS / Bearer")
+Rel(sg, worker, "Chat + async callback", "HTTPS / Bearer")
+Rel(web, worker, "Chat, history, prefs, audio", "HTTPS / Bearer")
+Rel(adminp, worker, "Admin config CRUD", "HTTPS / Bearer")
+Rel(adminp, baruch, "Conversational config", "service binding")
+Rel(baruch, worker, "Admin API", "HTTPS / Bearer")
+
+Rel(worker, claude, "messages.create", "HTTPS")
+Rel(worker, openai, "Synthesize speech", "HTTPS")
+Rel(worker, cfai, "Transcribe audio", "binding")
+Rel(worker, sandbox, "Executes generated code", "WASM")
+Rel(worker, userdo, "Reads / writes state", "DO binding")
+Rel(worker, kv, "Reads / writes config", "KV binding")
+Rel(worker, r2, "Stores / serves audio & files", "R2 binding")
+Rel(worker, fia, "MCP tools/call", "JSON-RPC")
+Rel(worker, thelps, "MCP tools/call", "JSON-RPC")
+Rel(worker, othermcp, "MCP tools/call", "JSON-RPC")
+Rel(baruch, claude, "messages.create", "HTTPS")
+Rel(fia, fiaapi, "GraphQL queries", "HTTPS / Bearer")
+
+SHOW_LEGEND()
+@enduml
