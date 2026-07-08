@@ -101,44 +101,90 @@ describe('getToolNames', () => {
   });
 });
 
+// Compact fixture helpers keep each `it`/`describe` callback under the
+// repo's 50-line-per-function lint cap.
+function oneToolManifest(
+  serverId: string,
+  toolName: string,
+  description: string
+): MCPServerManifest {
+  return {
+    serverId,
+    serverName: serverId,
+    tools: [{ name: toolName, description, inputSchema: { type: 'object', properties: {} } }],
+  };
+}
+
+function serverCfg(id: string, name: string): MCPServerConfig {
+  return { id, name, url: `http://${id}`, enabled: true, priority: 1 };
+}
+
 describe('generateToolCatalog', () => {
   it('should generate compact catalog format (lasker-api pattern)', () => {
-    // NOTE: The new format shows name + one-liner only (no parameter details).
-    // Full schemas are retrieved via get_tool_definitions.
+    // Name + one-liner only (no parameter details); full schemas via get_tool_definitions.
     const catalog = buildToolCatalog(
-      [
-        {
-          serverId: 's1',
-          serverName: 'S1',
-          tools: [
-            {
-              name: 'fetchData',
-              description: 'Fetches data from source',
-              inputSchema: {
-                type: 'object',
-                properties: {
-                  id: { type: 'string', description: 'The item ID' },
-                },
-                required: ['id'],
-              },
-            },
-          ],
-        },
-      ],
-      [{ id: 's1', name: 'S1', url: 'http://test', enabled: true, priority: 1 }]
+      [oneToolManifest('s1', 'fetchData', 'Fetches data from source')],
+      [serverCfg('s1', 'S1')]
     );
 
     const desc = generateToolCatalog(catalog);
     expect(desc).toContain('fetchData');
     expect(desc).toContain('Fetches data from source');
-    // New format does NOT include parameter details - they're fetched on-demand
     expect(desc).toContain('| Tool | Description |');
     expect(desc).toContain('get_tool_definitions');
+    // Tools are grouped under a per-server heading (issue #306).
+    expect(desc).toContain('### S1');
   });
 
   it('should return message when no tools available', () => {
     const catalog = buildToolCatalog([], []);
     const desc = generateToolCatalog(catalog);
     expect(desc).toBe('No MCP tools are currently available.');
+  });
+});
+
+describe('generateToolCatalog server grouping (#306)', () => {
+  it('groups tools under per-server headings in first-seen order', () => {
+    const catalog = buildToolCatalog(
+      [
+        oneToolManifest('translation-helps', 'fetch_scripture', 'Fetch Bible text for a passage.'),
+        oneToolManifest('aquifer', 'scripture', 'Fetch Bible text from Aquifer resources.'),
+      ],
+      [serverCfg('translation-helps', 'Translation Helps MCP'), serverCfg('aquifer', 'Aquifer MCP')]
+    );
+
+    const desc = generateToolCatalog(catalog);
+    const thHeading = desc.indexOf('### Translation Helps MCP');
+    const aqHeading = desc.indexOf('### Aquifer MCP');
+    expect(thHeading).toBeGreaterThanOrEqual(0);
+    expect(aqHeading).toBeGreaterThan(thHeading);
+    // escapeMarkdown escapes the underscore, so fetch_scripture renders escaped.
+    const thTool = desc.indexOf('fetch\\_scripture');
+    expect(thTool).toBeGreaterThan(thHeading);
+    expect(thTool).toBeLessThan(aqHeading);
+    // Aquifer's own `scripture` tool sits under the Aquifer heading.
+    expect(desc.indexOf('| scripture |', aqHeading)).toBeGreaterThan(aqHeading);
+  });
+
+  it('falls back to the server id when no display name is configured', () => {
+    // Construct a catalog directly with a tool whose serverId is absent from
+    // serverMap (buildToolCatalog would drop such tools) to exercise the
+    // `?? serverId` heading fallback.
+    const catalog = {
+      tools: [
+        {
+          name: 'lonelyTool',
+          description: 'A tool whose server config is missing.',
+          inputSchema: { type: 'object', properties: {} },
+          serverId: 'orphan-server',
+          serverUrl: 'http://orphan',
+        },
+      ],
+      serverMap: new Map<string, MCPServerConfig>(),
+    };
+
+    const desc = generateToolCatalog(catalog);
+    expect(desc).toContain('### orphan-server');
+    expect(desc).toContain('lonelyTool');
   });
 });

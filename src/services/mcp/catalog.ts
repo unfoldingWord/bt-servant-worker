@@ -113,24 +113,46 @@ function extractSummary(description: string | undefined): string {
  *
  * Only includes name + one-liner description to minimize token usage.
  * Claude must call get_tool_definitions to get full schemas before using tools.
+ *
+ * Tools are grouped under a per-server `###` heading so the model can tell
+ * which resource server each tool belongs to (issue #306). Without server
+ * attribution the model treats every tool as one undifferentiated bucket and
+ * cannot honor a source-ordered fallback chain (e.g. Translation Helps →
+ * Aquifer → training data). Servers appear in first-seen tool order; each
+ * server's display name comes from its config (`serverMap`), falling back to
+ * the raw server id.
  */
 export function generateToolCatalog(catalog: ToolCatalog): string {
   if (catalog.tools.length === 0) {
     return 'No MCP tools are currently available.';
   }
 
-  // Build compact markdown table
-  const rows = catalog.tools.map((t) => {
+  // Group tool rows by server, preserving first-seen server order.
+  const rowsByServer = new Map<string, string[]>();
+  for (const t of catalog.tools) {
     const summary = extractSummary(t.description);
-    return `| ${escapeMarkdown(t.name)} | ${summary} |`;
-  });
+    const row = `| ${escapeMarkdown(t.name)} | ${summary} |`;
+    const existing = rowsByServer.get(t.serverId);
+    if (existing) {
+      existing.push(row);
+    } else {
+      rowsByServer.set(t.serverId, [row]);
+    }
+  }
 
-  return `## Available MCP Tools
-
-The following tools are available for use inside \`execute_code\`.
-Before using a tool, call \`get_tool_definitions\` with the tool name(s) to get full documentation.
+  const sections = Array.from(rowsByServer.entries()).map(([serverId, rows]) => {
+    const displayName = catalog.serverMap.get(serverId)?.name ?? serverId;
+    return `### ${escapeMarkdown(displayName)}
 
 | Tool | Description |
 |------|-------------|
 ${rows.join('\n')}`;
+  });
+
+  return `## Available MCP Tools
+
+The following tools are available for use inside \`execute_code\`, grouped by the resource server that provides them.
+Before using a tool, call \`get_tool_definitions\` with the tool name(s) to get full documentation.
+
+${sections.join('\n\n')}`;
 }
