@@ -261,9 +261,9 @@ Transport mode is selected explicitly by the endpoint path. Each consumer should
 
 | Endpoint                | Transport        | Response                                                           | Use case                                                                                 |
 | ----------------------- | ---------------- | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
-| `/api/v1/chat`          | Synchronous JSON | `200 OK` with a single `ChatResponse` body (plus `message_id`)     | Telegram gateway, simple backends, CLIs — anywhere "one request, one response" is enough |
+| `/api/v1/chat`          | Synchronous JSON | `200 OK` with a single `ChatResponse` body (plus `message_id`)     | Simple backends, CLIs — anywhere "one request, one response" is enough                   |
 | `/api/v1/chat/stream`   | SSE streaming    | `text/event-stream` with `status`/`progress`/`complete` events     | Web client / admin portal — anywhere a "typing" indicator is useful                      |
-| `/api/v1/chat/callback` | Webhook (async)  | `202 Accepted` + `{ message_id }`; POST to `progress_callback_url` | WhatsApp gateway, any async consumer that can't hold an HTTP connection open             |
+| `/api/v1/chat/callback` | Webhook (async)  | `202 Accepted` + `{ message_id }`; POST to `progress_callback_url` | Telegram & WhatsApp gateways, any async consumer that can't hold an HTTP connection open |
 
 The `/chat/callback` endpoint requires both `progress_callback_url` and `message_key` in the body. The `/api/v1/chat` and `/api/v1/chat/stream` endpoints both reject `progress_callback_url`, `progress_mode`, `progress_throttle_seconds`, and `message_key` (they are only valid on `/chat/callback`).
 
@@ -386,12 +386,12 @@ interface CallbackPayload {
 
 The `progress_mode` field on the request body controls which events the worker sends to your webhook. Errors always fire regardless of mode.
 
-| Mode        | Events delivered                                                      | Use case                                                                                                                   |
-| ----------- | --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `complete`  | **Only** the final `complete` event                                   | Clean "one request, one delivery" — Telegram gateways, anywhere intermediate updates would be noise in a user-facing chat. |
-| `iteration` | `status` + per-orchestration-iteration `progress` deltas + `complete` | Default. Good for gateways that surface a "typing" indicator and can display partial text.                                 |
-| `periodic`  | `status` + accumulated `progress` every N seconds + `complete`        | Rate-limited intermediate updates on a fixed cadence. `progress_throttle_seconds` controls N.                              |
-| `sentence`  | `status` + `progress` per complete sentence + `complete`              | Natural streaming where partial text only surfaces at sentence boundaries.                                                 |
+| Mode        | Events delivered                                                      | Use case                                                                                                       |
+| ----------- | --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `complete`  | **Only** the final `complete` event                                   | Clean "one request, one delivery" — anywhere intermediate updates would be noise in a user-facing chat.        |
+| `iteration` | `status` + per-orchestration-iteration `progress` deltas + `complete` | Default. Used by the Telegram and WhatsApp gateways — good for surfacing "typing" indicators and partial text. |
+| `periodic`  | `status` + accumulated `progress` every N seconds + `complete`        | Rate-limited intermediate updates on a fixed cadence. `progress_throttle_seconds` controls N.                  |
+| `sentence`  | `status` + `progress` per complete sentence + `complete`              | Natural streaming where partial text only surfaces at sentence boundaries.                                     |
 
 ### Error Codes
 
