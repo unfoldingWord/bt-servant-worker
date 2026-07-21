@@ -170,7 +170,17 @@ export class JsonMemoryStore implements UserMemoryStore {
     const evictedNames = this.evictToFit(data);
 
     const sizeAfter = calculateTotalSize(data.entries);
-    await this.storage.put(MEMORY_STORAGE_KEY, data);
+    try {
+      await this.storage.put(MEMORY_STORAGE_KEY, data);
+    } catch (error) {
+      this.logger.error('memory_write_failed', error, {
+        sections_updated: updatedNames,
+        sections_deleted: deletedNames,
+        size_after_bytes: sizeAfter,
+        duration_ms: Date.now() - startTime,
+      });
+      throw error;
+    }
 
     this.logger.log('memory_write', {
       sections_updated: updatedNames,
@@ -271,7 +281,12 @@ export class JsonMemoryStore implements UserMemoryStore {
   async clear(): Promise<void> {
     const data = await this.getMemoryData();
     const previousSize = calculateTotalSize(data.entries);
-    await this.storage.delete(MEMORY_STORAGE_KEY);
+    try {
+      await this.storage.delete(MEMORY_STORAGE_KEY);
+    } catch (error) {
+      this.logger.error('memory_clear_failed', error, { previous_size_bytes: previousSize });
+      throw error;
+    }
     this.logger.log('memory_cleared', { previous_size_bytes: previousSize });
   }
 
@@ -416,7 +431,13 @@ export class JsonMemoryStore implements UserMemoryStore {
    * Get memory data, auto-migrating from v1 markdown format if needed.
    */
   private async getMemoryData(): Promise<MemoryStorage> {
-    const raw = await this.storage.get<unknown>(MEMORY_STORAGE_KEY);
+    let raw: unknown;
+    try {
+      raw = await this.storage.get<unknown>(MEMORY_STORAGE_KEY);
+    } catch (error) {
+      this.logger.error('memory_read_failed', error, {});
+      throw error;
+    }
 
     if (raw === undefined || raw === null) {
       return { entries: {} };

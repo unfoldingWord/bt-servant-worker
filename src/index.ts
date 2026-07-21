@@ -87,11 +87,24 @@ app.use('/api/*', async (c, next) => {
   const authHeader = c.req.header('Authorization');
 
   if (!authHeader?.startsWith('Bearer ')) {
+    // Observable rejection: never silently drop a 401. Token value is never logged.
+    createRequestLogger(crypto.randomUUID()).warn('auth_rejected', {
+      reason: 'missing_bearer',
+      status: 401,
+      path: c.req.path,
+      method: c.req.method,
+    });
     return c.json({ error: 'Authorization header with Bearer token required' }, 401);
   }
 
   const token = authHeader.slice(7);
   if (!constantTimeCompare(token, c.env.ENGINE_API_KEY)) {
+    createRequestLogger(crypto.randomUUID()).warn('auth_rejected', {
+      reason: 'invalid_token',
+      status: 403,
+      path: c.req.path,
+      method: c.req.method,
+    });
     return c.json({ error: 'Invalid API key' }, 403);
   }
 
@@ -234,6 +247,13 @@ app.use('/api/v1/admin/orgs/:org/*', async (c, next) => {
   const authHeader = c.req.header('Authorization');
 
   if (!authHeader?.startsWith('Bearer ')) {
+    createRequestLogger(crypto.randomUUID()).warn('admin_auth_rejected', {
+      reason: 'missing_bearer',
+      status: 401,
+      org,
+      path: c.req.path,
+      method: c.req.method,
+    });
     return c.json({ error: 'Authorization header with Bearer token required' }, 401);
   }
 
@@ -250,6 +270,15 @@ app.use('/api/v1/admin/orgs/:org/*', async (c, next) => {
     return next();
   }
 
+  // Observable rejection. `reason` distinguishes "org has no admin key configured"
+  // from "key present but token mismatched" — useful signal, no secret leaked.
+  createRequestLogger(crypto.randomUUID()).warn('admin_auth_rejected', {
+    reason: orgAdminKey ? 'invalid_token' : 'no_org_admin_key',
+    status: 403,
+    org,
+    path: c.req.path,
+    method: c.req.method,
+  });
   return c.json({ error: 'Unauthorized for this organization' }, 403);
 });
 

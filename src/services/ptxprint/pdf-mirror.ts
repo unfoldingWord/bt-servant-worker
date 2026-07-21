@@ -93,6 +93,9 @@ async function fetchPdfBytes(sourceUrl: string, logger: RequestLogger): Promise<
     throw new PdfMirrorError(`Network error fetching PDF from ${sourceUrl}`, 'fetch_failed');
   }
   if (!response.ok) {
+    // Best-effort body to enrich the error log immediately below. The HTTP error
+    // is always logged, so a failed .text() read degrades to a placeholder — not
+    // a silent swallow.
     const bodyPeek = await response.text().catch(() => '<unreadable>');
     logger.error('pdf_mirror_fetch_http_error', null, {
       source_url: sourceUrl,
