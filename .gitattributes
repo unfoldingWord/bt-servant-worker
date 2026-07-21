@@ -5,6 +5,10 @@
 # locally on Windows even though CI (LF on Linux) passes. `eol=lf` forces LF in
 # the working tree regardless of each machine's autocrlf setting, and stops CRLF
 # from ever leaking into a commit.
+#
+# NOTE: this only affects how files are checked out from here on. An EXISTING
+# worktree keeps its already-checked-out CRLF files after pulling this change —
+# run `pnpm normalize:eol` once (clean tree required) to rewrite them to LF.
 
 # Auto-detect text files and normalize them to LF on checkout and commit.
 * text=auto eol=lf

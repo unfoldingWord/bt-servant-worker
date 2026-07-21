@@ -18,6 +18,7 @@
     "lint:fix": "eslint src/ --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "normalize:eol": "node scripts/normalize-eol.mjs",
     "check": "tsc --noEmit",
     "check:tail": "tsc --noEmit --project tail-worker/tsconfig.json",
     "deploy:tail": "wrangler deploy --config tail-worker/wrangler.toml",
