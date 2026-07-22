@@ -122,6 +122,24 @@ describe('redactSpan', () => {
     expect(span.name).toBe('Durable Object Alarm');
   });
 
+  it('drops KV org/tenant key attributes (db.statement, db.cf.kv.key) but keeps binding/op', () => {
+    const span = {
+      name: 'KV ORG_CONFIG get',
+      attributes: {
+        'db.statement': 'get unfoldingWord',
+        'db.cf.kv.key': 'unfoldingWord',
+        'db.name': 'ORG_CONFIG',
+        'db.operation': 'get',
+      } as Record<string, unknown>,
+    };
+    redactSpan(span);
+    expect(span.attributes['db.statement']).toBeUndefined();
+    expect(span.attributes['db.cf.kv.key']).toBeUndefined();
+    expect(span.attributes['db.name']).toBe('ORG_CONFIG');
+    expect(span.attributes['db.operation']).toBe('get');
+    expect(span.name).toBe('KV ORG_CONFIG get');
+  });
+
   it('leaves a non-URL url.full value and unrelated span names unchanged', () => {
     const span = {
       name: 'fetch GET api.anthropic.com',

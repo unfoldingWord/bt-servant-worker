@@ -61,9 +61,13 @@ type MutableSpan = { name: string; attributes: Record<string, unknown> };
  *   (`idFromName("user:<org>:<user_id>")`), which rc.52 puts into the DO span NAME
  *   (`Durable Object Fetch <name>` / `... Alarm <name>`) and the `do.id`/`do.name`/
  *   `do.id.name` attributes. Drop those attributes and strip the name suffix.
+ * - KV operations are keyed by the org/tenant identifier (e.g. `ORG_CONFIG.get(org)`),
+ *   which rc.52 records in `db.statement` ("get <org>") and `db.cf.kv.key`. Drop both;
+ *   `db.name` (binding) and `db.operation` remain for tracing. (R2 and Workers AI are
+ *   NOT instrumented by the library, so message content / audio keys never egress.)
  *
- * Span names for the request root (`fetchHandler <METHOD>`) and outbound fetch
- * (`fetch <METHOD> <host>`) are already identifier-free, so they need no scrubbing.
+ * Span names for the request root (`fetchHandler <METHOD>`), outbound fetch
+ * (`fetch <METHOD> <host>`), and KV (`KV <binding> <op>`) are already identifier-free.
  */
 export function redactSpan(span: MutableSpan): void {
   const attrs = span.attributes;
@@ -77,6 +81,8 @@ export function redactSpan(span: MutableSpan): void {
   delete attrs['do.id'];
   delete attrs['do.name'];
   delete attrs['do.id.name'];
+  delete attrs['db.statement'];
+  delete attrs['db.cf.kv.key'];
   if (span.name.startsWith('Durable Object Fetch ')) {
     span.name = 'Durable Object Fetch';
   } else if (span.name.startsWith('Durable Object Alarm ')) {
