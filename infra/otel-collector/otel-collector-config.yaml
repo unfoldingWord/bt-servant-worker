@@ -1,0 +1,88 @@
+# OpenTelemetry Collector — bt-servant-worker telemetry pipe (fly.io)
+#
+# One bearer-authed OTLP/HTTP receiver exports every signal to OpenObserve
+# (self-hosted on fly). Kept as a collector (not worker→OpenObserve direct) so a
+# second sink can be added later as a change HERE ONLY — the worker never redeploys.
+#
+# All ${env:...} values come from fly secrets (see README). Nothing secret in git.
+
+extensions:
+  # Validates the shared secret the worker sends as `Authorization: Bearer <token>`.
+  # fly terminates TLS in front of us, so this bearer check is what actually gates ingest.
+  bearertokenauth/server:
+    scheme: Bearer
+    token: ${env:OTEL_INGEST_TOKEN}
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+        auth:
+          authenticator: bearertokenauth/server
+
+processors:
+  # Keep a small fly machine from OOMing on a burst. MUST be first.
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+
+  # Defense-in-depth redaction: the worker already redacts at source, but if a new
+  # call site ever leaks a sensitive attribute, drop/hash it here before egress too.
+  attributes/redact:
+    actions:
+      - { key: authorization, action: delete }
+      - { key: token, action: delete }
+      - { key: api_key, action: delete }
+      - { key: apikey, action: delete }
+      - { key: password, action: delete }
+      - { key: secret, action: delete }
+      - { key: cookie, action: delete }
+      - { key: user_id, action: hash } # pseudonymize identifiers, keep them joinable
+
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  # ── Sink #1: OpenObserve (self-hosted) ── routes by `stream-name` header per signal.
+  # endpoint is the org base; otlphttp appends /v1/{traces,logs,metrics}.
+  otlphttp/openobserve_traces:
+    endpoint: ${env:O2_ENDPOINT} # e.g. https://bt-servant-openobserve.fly.dev/api/default
+    headers:
+      Authorization: ${env:O2_AUTH} # O2_AUTH = "Basic <base64(user:token)>"
+      stream-name: traces
+  otlphttp/openobserve_logs:
+    endpoint: ${env:O2_ENDPOINT}
+    headers:
+      Authorization: ${env:O2_AUTH}
+      stream-name: logs
+  otlphttp/openobserve_metrics:
+    endpoint: ${env:O2_ENDPOINT}
+    headers:
+      Authorization: ${env:O2_AUTH} # metrics auto-stream, no stream-name
+
+  # Bring-up aid: verbose stdout so `fly logs` shows every record. Remove once the
+  # sink is confirmed (detailed verbosity is expensive under real traffic).
+  debug:
+    verbosity: detailed
+
+service:
+  extensions: [bearertokenauth/server]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/redact, batch]
+      exporters: [otlphttp/openobserve_traces, debug]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/redact, batch]
+      exporters: [otlphttp/openobserve_logs, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/redact, batch]
+      exporters: [otlphttp/openobserve_metrics, debug]
+  telemetry:
+    logs:
+      level: info

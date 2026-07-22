@@ -1,0 +1,28 @@
+# fly.io app for self-hosted OpenObserve (the telemetry sink: store + web UI in one binary).
+# Adjust `app`/`primary_region` to your fly org before `fly launch`/`fly deploy`.
+app = "bt-servant-openobserve"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+  # Pin the image at deploy time (do NOT ship :latest):
+  #   fly deploy --build-arg OPENOBSERVE_VERSION=<stable-tag>
+
+[env]
+  ZO_DATA_DIR = "/data"          # local-disk storage on the mounted volume (below).
+  # For higher volume later, switch to S3-compatible storage via ZO_S3_* env/secrets.
+
+[http_service]
+  internal_port = 5080           # OpenObserve HTTP + UI; fly terminates TLS on 443.
+  force_https = true
+  auto_stop_machines = "off"     # keep the store queryable + able to receive ingest.
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[mounts]]
+  source = "openobserve_data"    # `fly volumes create openobserve_data --size 3` first.
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"
