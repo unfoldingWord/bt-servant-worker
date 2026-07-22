@@ -57,7 +57,11 @@ import {
 import { resolveOrgFromBody } from './utils/org.js';
 import { validateChatBody } from './utils/chat-validation.js';
 import { instrument, instrumentDO } from '@microlabs/otel-cf-workers';
-import { resolveTelemetryConfig } from './services/telemetry/index.js';
+import {
+  resolveTelemetryConfig,
+  initLogTelemetry,
+  flushLogTelemetry,
+} from './services/telemetry/index.js';
 
 // Re-export so tests and consumers can import from './src/index.js'
 export { validateChatBody };
@@ -68,6 +72,30 @@ export { validateChatBody };
 export const UserDO = instrumentDO(UserDOClass, resolveTelemetryConfig);
 
 const app = new Hono<{ Bindings: Env }>();
+
+// Telemetry (M2): tee structured logs to OTLP and flush this isolate's buffered
+// records at the request boundary. Registered first so its `finally` wraps every
+// route AND the auth middleware below — a 401/403 rejection still flushes its log.
+// A genuine no-op until telemetry secrets are set (initLogTelemetry bails, no sink
+// is registered). `executionCtx` is absent in some test harnesses, so guard it.
+app.use('*', async (c, next) => {
+  initLogTelemetry(c.env);
+  try {
+    await next();
+  } finally {
+    try {
+      // The callback is only invoked when telemetry is enabled AND has buffered
+      // records; in that state (deployed envs) `executionCtx` is always present.
+      flushLogTelemetry((promise) => c.executionCtx.waitUntil(promise));
+    } catch (err) {
+      // Telemetry is best-effort and must NEVER alter the response, so we contain
+      // any flush-time failure here. We cannot route it through the logger facade
+      // (that would re-enter this same OTLP path); console.warn is the safety net.
+
+      console.warn(`otlp_log_flush_failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+});
 
 // Health check - no auth required
 app.get('/health', (c) => c.json({ status: 'healthy', version: APP_VERSION }));
