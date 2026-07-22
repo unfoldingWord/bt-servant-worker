@@ -16,13 +16,16 @@
  *     (the RAW global fetch, so our own log export is not itself re-traced).
  *
  * Governance (same posture as M1 traces): telemetry is a genuine no-op unless the
- * endpoint + token are both set. Redaction happens at SOURCE (attributes are built
- * from already-summarized log data and sensitive KEYS are masked here) and again in
- * the exporter (defense in depth); the collector applies a third pass. No message
- * content or precise location egresses. Identifiers (`request_id`, `user_id`) ARE
- * kept — they are the correlation keys the existing logs already carry and are what
- * makes a support report ("it broke for this user") debuggable; they are opaque ids,
- * not content or location.
+ * endpoint + token are both set. Redaction at SOURCE is FAIL-CLOSED (see
+ * `buildLogAttributes`): numbers/booleans pass, URLs collapse to origin, but a
+ * string only egresses raw under an allow-list of bounded structural keys — any
+ * other string (and every nested value) is summarized to type+length, so message
+ * content / precise location cannot leak even from call sites that log it. Sensitive
+ * keys are masked, and the collector applies a further pass (defense in depth).
+ * Identifiers (`request_id`, `user_id`) ARE kept — they are the correlation keys the
+ * existing logs already carry and make a support report ("it broke for this user")
+ * debuggable; they are opaque ids, not content or location (and `user_id` is hashed
+ * at the collector).
  *
  * Trace correlation is automatic: the SDK `Logger.emit` reads `context.active()`,
  * and otel-cf-workers installs the global AsyncLocalStorage context manager, so a
