@@ -627,6 +627,18 @@ bt-servant-worker/
 pnpm install
 ```
 
+#### Line endings (Windows)
+
+The repo enforces LF line endings via `.gitattributes`. Fresh clones are handled
+automatically. If you have an **existing** clone made under Git-for-Windows'
+default `core.autocrlf=true`, its files are still CRLF on disk and
+`pnpm format:check` will fail until you migrate them once (clean working tree
+required — commit or stash first):
+
+```bash
+pnpm normalize:eol
+```
+
 ### Commands
 
 | Command                    | Description                                  |
@@ -639,6 +651,7 @@ pnpm install
 | `pnpm lint:fix`            | Run ESLint with auto-fix                     |
 | `pnpm format`              | Format code with Prettier                    |
 | `pnpm format:check`        | Check formatting without writing             |
+| `pnpm normalize:eol`       | Re-checkout the worktree as LF (one-time)    |
 | `pnpm check`               | TypeScript type check                        |
 | `pnpm check:tail`          | Type check the tail worker                   |
 | `pnpm architecture`        | Check for circular dependencies              |
