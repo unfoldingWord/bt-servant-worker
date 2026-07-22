@@ -66,6 +66,19 @@ interface CapturedAnthropicCall {
   body: Record<string, unknown>;
 }
 
+// Read the outbound request body regardless of fetch calling convention: direct
+// orchestrator calls pass (url, init) with a string body, but the OTel fetch
+// instrumentation (active inside the instrumented DO trace context) normalizes to
+// fetch(Request), where the body lives on the Request and `init` is undefined.
+async function readMockRequestBody(
+  input: RequestInfo | URL,
+  init: RequestInit | undefined
+): Promise<string> {
+  if (typeof init?.body === 'string') return init.body;
+  if (input instanceof Request) return input.clone().text();
+  return '';
+}
+
 function setupAnthropicFetchCapture(): {
   calls: CapturedAnthropicCall[];
   warnLogs: Array<{ event: string; payload: Record<string, unknown> | undefined }>;
@@ -84,8 +97,8 @@ function setupAnthropicFetchCapture(): {
     const url =
       typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     if (url.includes(ANTHROPIC_MARKER_HOST)) {
-      const rawBody = typeof init?.body === 'string' ? init.body : '';
-      const parsed = JSON.parse(rawBody) as Record<string, unknown>;
+      const rawBody = await readMockRequestBody(input, init);
+      const parsed = rawBody ? (JSON.parse(rawBody) as Record<string, unknown>) : {};
       calls.push({ system: String(parsed.system ?? ''), body: parsed });
       return new Response(
         JSON.stringify({

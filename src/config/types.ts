@@ -47,6 +47,11 @@ export interface Env {
 
   // Durable Object bindings
   USER_DO: DurableObjectNamespace;
+
+  // OpenTelemetry (optional — telemetry is a no-op unless BOTH are set; see
+  // src/services/telemetry). Set via `wrangler secret put`.
+  OTEL_EXPORTER_OTLP_ENDPOINT?: string;
+  OTEL_COLLECTOR_TOKEN?: string;
 }
 
 /**

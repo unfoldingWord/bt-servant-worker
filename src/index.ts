@@ -8,7 +8,7 @@
 import { Hono } from 'hono';
 import { Env } from './config/types.js';
 import { APP_VERSION } from './generated/version.js';
-import { UserDO } from './durable-objects/index.js';
+import { UserDO as UserDOClass } from './durable-objects/index.js';
 import { discoverAllTools } from './services/mcp/index.js';
 import { MCPServerConfig } from './services/mcp/types.js';
 import { ChatRequest, ChatTransport, ChatType } from './types/engine.js';
@@ -56,11 +56,16 @@ import {
 } from './utils/mcp-validation.js';
 import { resolveOrgFromBody } from './utils/org.js';
 import { validateChatBody } from './utils/chat-validation.js';
+import { instrument, instrumentDO } from '@microlabs/otel-cf-workers';
+import { resolveTelemetryConfig } from './services/telemetry/index.js';
 
 // Re-export so tests and consumers can import from './src/index.js'
 export { validateChatBody };
 
-export { UserDO };
+// Instrument the Durable Object: each fetch()/alarm() invocation gets its own
+// trace context, flushed from the DO fetch context where raw global fetch works.
+// No-op export until telemetry is configured (0% head sampler when unset).
+export const UserDO = instrumentDO(UserDOClass, resolveTelemetryConfig);
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -1170,7 +1175,11 @@ app.delete('/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/memory', (c
   handleThreadRequest(c, '/memory')
 );
 
-export default app;
+// Instrument the worker fetch handler: every invocation gets a request root span
+// and all outbound fetch hops (Anthropic, MCP, TTS, webhooks) auto-nest under it.
+// Additive + feature-flagged — a true no-op until OTEL_EXPORTER_OTLP_ENDPOINT +
+// OTEL_COLLECTOR_TOKEN are set.
+export default instrument(app, resolveTelemetryConfig);
 
 /** Storage shape tag for log/diagnostic clarity. */
 type ModeShape = 'overrides' | 'document';
