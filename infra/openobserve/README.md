@@ -10,12 +10,15 @@ dashboards, alerting). Operated and queried only by us — governance stays in o
 fly launch --no-deploy                       # edit fly.toml app/region first
 fly volumes create openobserve_data --size 3 # persistent storage for /data
 
-# Root user is created on first boot from these secrets.
+# Root user is created on first boot. Choose a password and SAVE IT first — Fly secrets are
+# write-only, so a value you can't read back locks you out of the UI login below.
+ZO_ROOT_USER_PASSWORD="$(openssl rand -hex 24)"
+echo "OpenObserve root password (store in your password manager): $ZO_ROOT_USER_PASSWORD"
 fly secrets set \
   ZO_ROOT_USER_EMAIL="you@example.com" \
-  ZO_ROOT_USER_PASSWORD="$(openssl rand -hex 24)"
+  ZO_ROOT_USER_PASSWORD="$ZO_ROOT_USER_PASSWORD"
 
-fly deploy
+fly deploy --build-arg OPENOBSERVE_VERSION=<pin-a-stable-tag>
 ```
 
 Open `https://bt-servant-openobserve.fly.dev` and log in with those credentials.
