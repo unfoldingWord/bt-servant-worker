@@ -92,8 +92,14 @@ export function createRequestLogger(requestId: string, userId?: string) {
         stack?: string | undefined;
       };
       errorEntry.error = err instanceof Error ? err.message : String(err);
-      if (err instanceof Error && err.stack) {
-        errorEntry.stack = err.stack;
+      if (err instanceof Error) {
+        // The error CLASS name is a bounded, vetted signal (e.g. 'MCPError',
+        // 'TypeError') safe to export to OTLP, unlike the raw message/stack which
+        // may embed untrusted upstream text. See telemetry/logs.ts redaction policy.
+        errorEntry.error_name = err.name;
+        if (err.stack) {
+          errorEntry.stack = err.stack;
+        }
       }
       logError(errorEntry);
     },

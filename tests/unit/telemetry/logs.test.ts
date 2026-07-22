@@ -183,20 +183,58 @@ describe('buildLogAttributes — fail-closed content policy', () => {
       language: 'es',
       transport: 'whatsapp',
       error_type: 'timeout',
-      voice_audio_key: 'org/user/abc.ogg', // matches the `_key` safe suffix
+      error_name: 'MCPError',
     });
     expect(attrs.book).toBe('John');
     expect(attrs.language).toBe('es');
     expect(attrs.transport).toBe('whatsapp');
     expect(attrs.error_type).toBe('timeout');
-    expect(attrs.voice_audio_key).toBe('org/user/abc.ogg');
+    expect(attrs.error_name).toBe('MCPError');
+  });
+
+  it('summarizes raw error/stack (may embed untrusted content or credential URLs)', () => {
+    const attrs = buildLogAttributes({
+      event: 'mcp_tool_call_error',
+      request_id: 'r1',
+      timestamp: 1,
+      // Untrusted upstream text with user content AND an embedded signed URL mid-sentence.
+      error: 'RPC failed for "what does John 3:16 mean" via https://mcp.example/cb?sig=SECRET here',
+      stack: 'Error: boom\n    at fetch (https://mcp.example/cb?sig=SECRET:1:1)',
+      error_name: 'MCPError',
+    });
+    expect(attrs.error).toMatch(/^string\(\d+\)$/);
+    expect(attrs.stack).toMatch(/^string\(\d+\)$/);
+    // Neither content nor the embedded credential survives.
+    for (const v of Object.values(attrs)) {
+      expect(String(v)).not.toContain('John 3:16');
+      expect(String(v)).not.toContain('SECRET');
+    }
+    // The bounded error class is still exported for observability.
+    expect(attrs.error_name).toBe('MCPError');
+  });
+
+  it('summarizes *_key values (exact R2 audio paths embedding user/chat/speaker ids)', () => {
+    const attrs = buildLogAttributes({
+      event: 'e',
+      request_id: 'r1',
+      timestamp: 1,
+      audio_key: 'audio/unfoldingWord/whatsapp-15551234567/abc-uuid.opus',
+      voice_submission_key: 'voice-submissions/unfoldingWord/chat-999/speaker-Mary/uuid.ogg',
+    });
+    expect(attrs.audio_key).toMatch(/^string\(\d+\)$/);
+    expect(attrs.voice_submission_key).toMatch(/^string\(\d+\)$/);
+    for (const v of Object.values(attrs)) {
+      expect(String(v)).not.toContain('whatsapp-15551234567');
+      expect(String(v)).not.toContain('speaker-Mary');
+      expect(String(v)).not.toContain('chat-999');
+    }
   });
 
   it('truncates an oversized allow-listed string value', () => {
     const big = 'x'.repeat(600);
-    const attrs = buildLogAttributes({ event: 'e', request_id: 'r1', timestamp: 1, error: big });
-    expect(String(attrs.error)).toContain('[truncated, 600 chars]');
-    expect(String(attrs.error).length).toBeLessThan(600);
+    const attrs = buildLogAttributes({ event: 'e', request_id: 'r1', timestamp: 1, reason: big });
+    expect(String(attrs.reason)).toContain('[truncated, 600 chars]');
+    expect(String(attrs.reason).length).toBeLessThan(600);
   });
 });
 
@@ -368,7 +406,7 @@ describe('telemetry logs wiring (init → emit → flush)', () => {
 
     const logger = createRequestLogger('req-2');
     logger.warn('slow_thing');
-    logger.error('boom', new Error('kaboom'));
+    logger.error('boom', new TypeError('kaboom bad value'));
 
     let flushPromise: Promise<unknown> | undefined;
     flushLogTelemetry((p) => {
@@ -378,8 +416,19 @@ describe('telemetry logs wiring (init → emit → flush)', () => {
 
     const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
     const payload = decodeBody(init.body);
-    const severities = payload.resourceLogs[0].scopeLogs[0].logRecords.map((r) => r.severityText);
+    const records = payload.resourceLogs[0].scopeLogs[0].logRecords;
+    const severities = records.map((r) => r.severityText);
     expect(severities).toContain('WARN');
     expect(severities).toContain('ERROR');
+
+    // The error record exports the bounded error class, not the raw message.
+    const errorRecord = records.find((r) => r.severityText === 'ERROR');
+    const attrs = Object.fromEntries(
+      (errorRecord?.attributes as Array<{ key: string; value: Record<string, unknown> }>).map(
+        (a) => [a.key, a.value]
+      )
+    );
+    expect(attrs.error_name).toEqual({ stringValue: 'TypeError' });
+    expect(attrs.error).toEqual({ stringValue: 'string(16)' });
   });
 });

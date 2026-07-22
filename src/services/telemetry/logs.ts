@@ -84,9 +84,14 @@ type AttributeValue = string | number | boolean;
  * the policy fails CLOSED so a content-bearing field under a new/innocuous key
  * (e.g. `response`, `text_preview`, `user_message`) can never leak by default.
  *
- * `error`/`stack` are included as debugging-essential (truncated); they are the
- * one allow-listed pair that could conceivably echo user input, accepted as a
- * deliberate trade-off for error observability.
+ * Deliberately EXCLUDED: raw `error`/`stack`, and the generic `name`/`_key`/`_name`
+ * families. Error boundaries embed untrusted upstream text (e.g. MCPError carries a
+ * remote JSON-RPC message that may contain user content or a signed URL inside a
+ * sentence — neither URL-origin nor truncation redacts that), so we export the
+ * bounded `error_name` (error class) and keep full diagnostics on the console path.
+ * `*_key` values are exact R2 audio paths embedding org/user/chat/speaker ids that
+ * collector `user_id` hashing cannot reach; `name`/`*_name` can be filenames/display
+ * names. All of these are summarized to length instead.
  */
 const SAFE_STRING_ATTRIBUTE_KEYS = new Set<string>([
   'request_id',
@@ -129,9 +134,8 @@ const SAFE_STRING_ATTRIBUTE_KEYS = new Set<string>([
   'step',
   'stage',
   'reason',
-  'error',
+  'error_name',
   'error_type',
-  'stack',
   'type',
   'action',
   'operation',
@@ -142,12 +146,15 @@ const SAFE_STRING_ATTRIBUTE_KEYS = new Set<string>([
   'direction',
   'kind',
   'level',
-  'name',
   'version',
   'code',
 ]);
 
-/** Key suffixes whose string values are structural ids/enums/paths, not content. */
+/**
+ * Key suffixes whose string values are bounded structural ids/enums, not content.
+ * Excludes `_key` (exact R2 audio paths with embedded ids) and `_name`
+ * (filenames/display names) — those are summarized to length instead.
+ */
 const SAFE_STRING_KEY_SUFFIXES = [
   '_id',
   '_ids',
@@ -160,8 +167,6 @@ const SAFE_STRING_KEY_SUFFIXES = [
   '_language',
   '_phase',
   '_state',
-  '_key',
-  '_name',
   '_kind',
 ];
 
