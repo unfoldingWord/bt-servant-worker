@@ -467,6 +467,9 @@ async function throwAnthropicHttpError(
   streaming: boolean,
   fetchStart: number
 ): Promise<never> {
+  // Best-effort body to enrich the error log immediately below. The HTTP error
+  // is always logged, so a failed .text() read degrades to a placeholder — not
+  // a silent swallow.
   const errorText = await response.text().catch(() => '(unreadable)');
   ctx.logger.error('claude_fetch_http_error', null, {
     streaming,
@@ -680,7 +683,9 @@ export async function fetchAnthropicWithRetry(
     }
 
     logAnthropicRetry(ctx, streaming, outcome, { attempt, delayMs, retryAfterMs });
-    // Drain the error body so the connection is freed before we back off.
+    // Drain the error body so the connection is freed before we back off. Best-effort:
+    // the retry is already logged above, and a failed drain is harmless (the body is
+    // discarded on cleanup regardless), so the fallback is intentional, not a swallow.
     if (outcome.response) await outcome.response.text().catch(() => undefined);
     outcome.cleanup();
     await clock.sleep(delayMs);
@@ -781,7 +786,9 @@ function attachSSEAbortListener(
       event_counts: { ...ref.state.eventCounts },
     });
     reader.cancel('upstream-abort').catch(() => {
-      /* ignore — already logged */
+      // The abort itself is already logged above (sse_stream_aborted). reader.cancel()
+      // rejecting — e.g. the stream is already closed — is idempotent and harmless,
+      // so there is nothing further to record here.
     });
   };
   signal.addEventListener('abort', onAbort);

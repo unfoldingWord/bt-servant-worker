@@ -42,9 +42,18 @@ export async function uploadAudio(
   logger: RequestLogger
 ): Promise<void> {
   const start = Date.now();
-  await bucket.put(key, audioBytes, {
-    httpMetadata: { contentType: 'audio/ogg' },
-  });
+  try {
+    await bucket.put(key, audioBytes, {
+      httpMetadata: { contentType: 'audio/ogg' },
+    });
+  } catch (error) {
+    logger.error('r2_audio_upload_failed', error, {
+      key,
+      size_bytes: audioBytes.byteLength,
+      upload_ms: Date.now() - start,
+    });
+    throw error;
+  }
   logger.log('r2_audio_uploaded', {
     key,
     size_bytes: audioBytes.byteLength,
@@ -59,7 +68,13 @@ export async function getAudio(
   logger: RequestLogger
 ): Promise<R2ObjectBody | null> {
   const start = Date.now();
-  const object = await bucket.get(key);
+  let object: R2ObjectBody | null;
+  try {
+    object = await bucket.get(key);
+  } catch (error) {
+    logger.error('r2_audio_get_failed', error, { key, get_ms: Date.now() - start });
+    throw error;
+  }
   if (!object) {
     logger.warn('r2_audio_not_found', { key, get_ms: Date.now() - start });
     return null;
@@ -114,9 +129,19 @@ export async function uploadVoiceSubmission(
   logger: RequestLogger
 ): Promise<void> {
   const start = Date.now();
-  await bucket.put(key, audioBytes, {
-    httpMetadata: { contentType: mimeType },
-  });
+  try {
+    await bucket.put(key, audioBytes, {
+      httpMetadata: { contentType: mimeType },
+    });
+  } catch (error) {
+    logger.error('r2_voice_submission_upload_failed', error, {
+      key,
+      size_bytes: audioBytes.byteLength,
+      mime_type: mimeType,
+      upload_ms: Date.now() - start,
+    });
+    throw error;
+  }
   logger.log('r2_voice_submission_uploaded', {
     key,
     size_bytes: audioBytes.byteLength,

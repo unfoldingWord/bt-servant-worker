@@ -139,6 +139,9 @@ async function fetchUsfmBytes(url: string, logger: RequestLogger): Promise<Uint8
     throw new UsfmSourceError(`Network error fetching USFM from upstream: ${url}`, 'fetch_failed');
   }
   if (!response.ok) {
+    // Best-effort body to enrich the error log immediately below. The HTTP error
+    // is always logged, so a failed .text() read degrades to a placeholder — not
+    // a silent swallow.
     const bodyPeek = await response.text().catch(() => '<unreadable>');
     logger.error('usfm_upstream_fetch_http_error', null, {
       url,

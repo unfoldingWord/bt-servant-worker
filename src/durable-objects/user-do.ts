@@ -393,12 +393,7 @@ export class UserDO {
     const { body } = parsed;
 
     // Rate limiting
-    const rateLimited = this.checkRateLimit(
-      this.enqueueTimestamps,
-      ENQUEUE_RATE_WINDOW_MS,
-      ENQUEUE_RATE_LIMIT,
-      '10'
-    );
+    const rateLimited = this.enforceEnqueueRateLimit(body, transport, logger);
     if (rateLimited) return rateLimited;
 
     const messageId = crypto.randomUUID();
@@ -467,6 +462,12 @@ export class UserDO {
     const position = await this.enqueueEntry(entry, maxDepth);
 
     if (position === -1) {
+      logger.warn('chat_queue_full', {
+        message_id: messageId,
+        user_id: body.user_id,
+        max_depth: maxDepth,
+        status: 429,
+      });
       return Response.json(
         {
           error: 'Queue full',
@@ -956,6 +957,30 @@ export class UserDO {
       errorMessage.includes('timeout') ||
       errorMessage.includes('ECONNREFUSED')
     );
+  }
+
+  /** Enforce the enqueue rate limit; returns a logged 429 response if exceeded, else null. */
+  private enforceEnqueueRateLimit(
+    body: ChatRequest,
+    transport: ChatTransport,
+    logger: RequestLogger
+  ): Response | null {
+    const rateLimited = this.checkRateLimit(
+      this.enqueueTimestamps,
+      ENQUEUE_RATE_WINDOW_MS,
+      ENQUEUE_RATE_LIMIT,
+      '10'
+    );
+    if (!rateLimited) return null;
+    // A 429 is a signal, not a non-event — make it observable.
+    logger.warn('chat_rate_limited', {
+      user_id: body.user_id,
+      transport,
+      status: 429,
+      window_ms: ENQUEUE_RATE_WINDOW_MS,
+      limit: ENQUEUE_RATE_LIMIT,
+    });
+    return rateLimited;
   }
 
   /** Sliding-window rate limiter. */

@@ -14,8 +14,13 @@ import {
 } from './types.js';
 
 /** Validate audio input and return the estimated decoded size in bytes. */
-function validateAudioInput(audioBase64: string, audioFormat: string): number {
+function validateAudioInput(
+  audioBase64: string,
+  audioFormat: string,
+  logger: RequestLogger
+): number {
   if (normalizeAudioFormat(audioFormat) === null) {
+    logger.warn('stt_validation_failed', { reason: 'unsupported_format', format: audioFormat });
     throw new AudioTranscriptionError(
       `Unsupported audio format: ${audioFormat}. Supported: ${SUPPORTED_AUDIO_FORMATS.join(', ')}`
     );
@@ -24,6 +29,7 @@ function validateAudioInput(audioBase64: string, audioFormat: string): number {
   try {
     atob(audioBase64.slice(0, 16));
   } catch {
+    logger.warn('stt_validation_failed', { reason: 'invalid_base64' });
     throw new AudioTranscriptionError('Invalid base64 audio data');
   }
 
@@ -32,6 +38,11 @@ function validateAudioInput(audioBase64: string, audioFormat: string): number {
   const decodedSize = Math.floor((audioBase64.length * 3) / 4) - padding;
 
   if (decodedSize > MAX_AUDIO_SIZE_BYTES) {
+    logger.warn('stt_validation_failed', {
+      reason: 'oversized',
+      size_bytes: decodedSize,
+      max_bytes: MAX_AUDIO_SIZE_BYTES,
+    });
     throw new AudioTranscriptionError(
       `Audio size ${decodedSize} bytes exceeds maximum of ${MAX_AUDIO_SIZE_BYTES} bytes (25 MB)`
     );
@@ -49,7 +60,7 @@ export async function transcribeAudio(
   logger: RequestLogger
 ): Promise<TranscriptionResult> {
   const startTime = Date.now();
-  const decodedSize = validateAudioInput(audioBase64, audioFormat);
+  const decodedSize = validateAudioInput(audioBase64, audioFormat, logger);
   logger.log('stt_start', {
     format: audioFormat,
     size_bytes: decodedSize,

@@ -87,11 +87,24 @@ app.use('/api/*', async (c, next) => {
   const authHeader = c.req.header('Authorization');
 
   if (!authHeader?.startsWith('Bearer ')) {
+    // Observable rejection: never silently drop a 401. Token value is never logged.
+    createRequestLogger(crypto.randomUUID()).warn('auth_rejected', {
+      reason: 'missing_bearer',
+      status: 401,
+      path: c.req.path,
+      method: c.req.method,
+    });
     return c.json({ error: 'Authorization header with Bearer token required' }, 401);
   }
 
   const token = authHeader.slice(7);
   if (!constantTimeCompare(token, c.env.ENGINE_API_KEY)) {
+    createRequestLogger(crypto.randomUUID()).warn('auth_rejected', {
+      reason: 'invalid_token',
+      status: 403,
+      path: c.req.path,
+      method: c.req.method,
+    });
     return c.json({ error: 'Invalid API key' }, 403);
   }
 
@@ -228,7 +241,12 @@ app.get('/api/v1/voice-submissions/*', async (c) => {
   }
 });
 
-// Admin auth middleware - validates org-specific or super admin access
+// Admin auth middleware - validates org-specific or super admin access.
+// NOTE: auth rejections for these routes are already gated and logged
+// (auth_rejected) by the global `/api/*` middleware above, which runs first. A
+// request only reaches here after presenting a valid ENGINE_API_KEY, so the
+// rejection branches below are effectively unreachable and deliberately do not
+// re-log — the global middleware is the single place auth failures are recorded.
 app.use('/api/v1/admin/orgs/:org/*', async (c, next) => {
   const org = c.req.param('org');
   const authHeader = c.req.header('Authorization');
