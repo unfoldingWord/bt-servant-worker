@@ -59,10 +59,12 @@ if (realUnstaged || realStaged) {
 git(['rm', '--cached', '-r', '--quiet', '.']);
 git(['reset', '--hard']);
 
-// Verify — never claim success while CRLF files remain.
+// Verify — never claim success while a should-be-LF file is still CRLF. Files
+// with an explicit `eol=crlf` attribute (*.bat/*.cmd/*.ps1) are intentionally
+// CRLF per .gitattributes, so exclude them from the check.
 const stillCrlf = git(['ls-files', '--eol'])
   .split('\n')
-  .filter((line) => line.includes('w/crlf')).length;
+  .filter((line) => line.includes('w/crlf') && !line.includes('eol=crlf')).length;
 if (stillCrlf > 0) {
   console.error(
     `normalize-eol: ${stillCrlf} file(s) still have CRLF after normalization. ` +
