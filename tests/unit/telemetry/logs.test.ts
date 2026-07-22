@@ -94,17 +94,20 @@ describe('buildLogAttributes', () => {
     expect(attrs.duration_ms).toBe(17);
   });
 
-  it('JSON-encodes nested objects/arrays with nested sensitive keys masked', () => {
+  it('summarizes nested objects to keys+types, never nested raw values', () => {
     const attrs = buildLogAttributes({
       event: 'e',
       request_id: 'r1',
       timestamp: 1,
-      details: { book: 'John', password: 'hunter2' },
+      details: { book: 'John', note: 'secret user note' },
     });
     expect(typeof attrs.details).toBe('string');
     const parsed = JSON.parse(attrs.details as string);
-    expect(parsed.book).toBe('John');
-    expect(parsed.password).toBe('[REDACTED]');
+    // Values are type+size summaries, not the raw strings.
+    expect(parsed.book).toBe('string(4)');
+    expect(parsed.note).toBe('string(16)');
+    expect(attrs.details as string).not.toContain('John');
+    expect(attrs.details as string).not.toContain('secret user note');
   });
 
   it('skips null/undefined values', () => {
@@ -117,6 +120,83 @@ describe('buildLogAttributes', () => {
     });
     expect(attrs).not.toHaveProperty('maybe');
     expect(attrs).not.toHaveProperty('nope');
+  });
+});
+
+describe('buildLogAttributes — fail-closed content policy', () => {
+  it('never egresses free-text values under non-allow-listed string keys', () => {
+    const attrs = buildLogAttributes({
+      event: 'process_chat_complete',
+      request_id: 'r1',
+      timestamp: 1,
+      response: 'Here is the full translated passage the user asked about...',
+      text_preview: 'transcribed user speech snippet',
+      user_message: 'what does John 3:16 mean',
+      description: 'a free-form description that could carry content',
+    });
+    // Summarized to length only — the raw content never appears.
+    expect(attrs.response).toMatch(/^string\(\d+\)$/);
+    expect(attrs.text_preview).toMatch(/^string\(\d+\)$/);
+    expect(attrs.user_message).toMatch(/^string\(\d+\)$/);
+    expect(attrs.description).toMatch(/^string\(\d+\)$/);
+    for (const v of Object.values(attrs)) {
+      expect(String(v)).not.toContain('translated passage');
+      expect(String(v)).not.toContain('John 3:16');
+      expect(String(v)).not.toContain('user speech');
+    }
+  });
+
+  it('reduces URL values to origin, dropping path and signed query credentials', () => {
+    const attrs = buildLogAttributes({
+      event: 'webhook_failure',
+      request_id: 'r1',
+      timestamp: 1,
+      url: 'https://hooks.example.com/callback/abc123?sig=SECRETSIGNATURE&token=xyz',
+      source_url: 'https://cdn.example.com/private/user-42/audio.ogg?exp=999',
+    });
+    expect(attrs.url).toBe('https://hooks.example.com');
+    expect(attrs.source_url).toBe('https://cdn.example.com');
+    expect(String(attrs.url)).not.toContain('SECRETSIGNATURE');
+    expect(String(attrs.source_url)).not.toContain('user-42');
+  });
+
+  it('passes numbers and booleans through raw (never content)', () => {
+    const attrs = buildLogAttributes({
+      event: 'e',
+      request_id: 'r1',
+      timestamp: 1,
+      duration_ms: 1420,
+      total_response_chars: 58,
+      has_voice_audio: true,
+    });
+    expect(attrs.duration_ms).toBe(1420);
+    expect(attrs.total_response_chars).toBe(58);
+    expect(attrs.has_voice_audio).toBe(true);
+  });
+
+  it('passes allow-listed structural string keys through raw', () => {
+    const attrs = buildLogAttributes({
+      event: 'e',
+      request_id: 'r1',
+      timestamp: 1,
+      book: 'John',
+      language: 'es',
+      transport: 'whatsapp',
+      error_type: 'timeout',
+      voice_audio_key: 'org/user/abc.ogg', // matches the `_key` safe suffix
+    });
+    expect(attrs.book).toBe('John');
+    expect(attrs.language).toBe('es');
+    expect(attrs.transport).toBe('whatsapp');
+    expect(attrs.error_type).toBe('timeout');
+    expect(attrs.voice_audio_key).toBe('org/user/abc.ogg');
+  });
+
+  it('truncates an oversized allow-listed string value', () => {
+    const big = 'x'.repeat(600);
+    const attrs = buildLogAttributes({ event: 'e', request_id: 'r1', timestamp: 1, error: big });
+    expect(String(attrs.error)).toContain('[truncated, 600 chars]');
+    expect(String(attrs.error).length).toBeLessThan(600);
   });
 });
 

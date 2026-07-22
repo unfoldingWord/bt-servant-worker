@@ -42,7 +42,7 @@ import { __unwrappedFetch } from '@microlabs/otel-cf-workers';
 import { Env } from '../../config/types.js';
 import { APP_VERSION } from '../../generated/version.js';
 import {
-  redactArgsForError,
+  summarizeArgs,
   SENSITIVE_KEY_PATTERN,
   setLogSink,
   type LogEntry,
@@ -75,29 +75,154 @@ function severityFor(level: LogLevel): { number: SeverityNumber; text: string } 
 type AttributeValue = string | number | boolean;
 
 /**
- * Turn a `LogEntry` into flat, redacted OTLP log attributes.
+ * Allow-list of string-valued attribute keys that may egress with their RAW
+ * value. These are bounded structural identifiers / enums, never message content
+ * or precise location. Anything NOT here is summarized to its length instead —
+ * the policy fails CLOSED so a content-bearing field under a new/innocuous key
+ * (e.g. `response`, `text_preview`, `user_message`) can never leak by default.
  *
- * - `event`/`timestamp` are lifted onto the record (body / timestamp) elsewhere,
- *   so they are skipped here.
- * - Sensitive KEYS (token/secret/auth/…) are masked regardless of value.
- * - Primitives pass through; objects/arrays are redacted (`redactArgsForError`
- *   masks nested sensitive keys + truncates long strings) then JSON-encoded, so
- *   attributes stay flat and bounded.
+ * `error`/`stack` are included as debugging-essential (truncated); they are the
+ * one allow-listed pair that could conceivably echo user input, accepted as a
+ * deliberate trade-off for error observability.
+ */
+const SAFE_STRING_ATTRIBUTE_KEYS = new Set<string>([
+  'request_id',
+  'user_id',
+  'event',
+  'org',
+  'organization',
+  'environment',
+  'region',
+  'transport',
+  'chat_type',
+  'chat_id',
+  'thread_id',
+  'client_id',
+  'message_id',
+  'message_type',
+  'intent',
+  'language',
+  'source_language',
+  'target_language',
+  'response_language',
+  'book',
+  'chapter',
+  'verse',
+  'reference',
+  'model',
+  'tool',
+  'tool_name',
+  'server',
+  'server_id',
+  'server_name',
+  'job_id',
+  'bucket',
+  'mode',
+  'mode_name',
+  'status',
+  'status_code',
+  'state',
+  'phase',
+  'step',
+  'stage',
+  'reason',
+  'error',
+  'error_type',
+  'stack',
+  'type',
+  'action',
+  'operation',
+  'method',
+  'format',
+  'audio_format',
+  'original_format',
+  'direction',
+  'kind',
+  'level',
+  'name',
+  'version',
+  'code',
+]);
+
+/** Key suffixes whose string values are structural ids/enums/paths, not content. */
+const SAFE_STRING_KEY_SUFFIXES = [
+  '_id',
+  '_ids',
+  '_type',
+  '_status',
+  '_code',
+  '_format',
+  '_reason',
+  '_mode',
+  '_language',
+  '_phase',
+  '_state',
+  '_key',
+  '_name',
+  '_kind',
+];
+
+/** Cap allow-listed string values so an unexpectedly large one cannot bloat egress. */
+const MAX_ATTRIBUTE_STRING_LENGTH = 512;
+
+function isSafeStringKey(key: string): boolean {
+  if (SAFE_STRING_ATTRIBUTE_KEYS.has(key)) return true;
+  return SAFE_STRING_KEY_SUFFIXES.some((suffix) => key.endsWith(suffix));
+}
+
+/** Reduce an http(s) URL to `scheme://host`; undefined if the value is not such a URL. */
+function urlToOrigin(value: string): string | undefined {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined;
+    return `${url.protocol}//${url.host}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function truncateAttribute(value: string): string {
+  return value.length <= MAX_ATTRIBUTE_STRING_LENGTH
+    ? value
+    : `${value.slice(0, MAX_ATTRIBUTE_STRING_LENGTH)} [truncated, ${value.length} chars]`;
+}
+
+/**
+ * Classify a single log value into a safe OTLP attribute under the FAIL-CLOSED
+ * policy (see `buildLogAttributes`).
+ * - sensitive-named key → `[REDACTED]`.
+ * - number / boolean → raw (never content).
+ * - http(s) URL string → origin only (drops path + signed query creds), any key.
+ * - other string → raw (truncated) only if the key is allow-listed, else `string(<len>)`.
+ * - object / array → keys+types summary, never nested raw values.
+ */
+function attributeValueFor(key: string, value: unknown): AttributeValue {
+  if (SENSITIVE_KEY_PATTERN.test(key)) return '[REDACTED]';
+  if (typeof value === 'number' || typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const origin = urlToOrigin(value);
+    if (origin !== undefined) return origin;
+    if (isSafeStringKey(key)) return truncateAttribute(value);
+    // Unknown string key ⇒ potential message content ⇒ never egress the value.
+    return `string(${value.length})`;
+  }
+  // Objects/arrays: keys+types only, never nested raw values.
+  return JSON.stringify(summarizeArgs(value));
+}
+
+/**
+ * Turn a `LogEntry` into flat OTLP log attributes under a FAIL-CLOSED policy, so
+ * no message content or precise location egresses even though call sites log rich
+ * data. `event`/`timestamp` are lifted onto the record elsewhere and skipped here;
+ * null/undefined are dropped. Each remaining value is classified by
+ * `attributeValueFor`.
  */
 export function buildLogAttributes(entry: LogEntry): Record<string, AttributeValue> {
   const attributes: Record<string, AttributeValue> = {};
   for (const [key, value] of Object.entries(entry)) {
     if (key === 'event' || key === 'timestamp') continue;
     if (value === undefined || value === null) continue;
-    if (SENSITIVE_KEY_PATTERN.test(key)) {
-      attributes[key] = '[REDACTED]';
-      continue;
-    }
-    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
-      attributes[key] = value;
-      continue;
-    }
-    attributes[key] = JSON.stringify(redactArgsForError(value));
+    attributes[key] = attributeValueFor(key, value);
   }
   return attributes;
 }
