@@ -478,7 +478,14 @@ export class JsonMemoryStore implements UserMemoryStore {
     }
 
     const data: MemoryStorage = { entries };
-    await this.storage.put(MEMORY_STORAGE_KEY, data);
+    try {
+      await this.storage.put(MEMORY_STORAGE_KEY, data);
+    } catch (error) {
+      this.logger.error('memory_migration_write_failed', error, {
+        section_count: sections.length,
+      });
+      throw error;
+    }
 
     this.logger.log('memory_migrated_v1_to_v2', {
       section_count: sections.length,

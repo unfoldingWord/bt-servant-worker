@@ -241,19 +241,17 @@ app.get('/api/v1/voice-submissions/*', async (c) => {
   }
 });
 
-// Admin auth middleware - validates org-specific or super admin access
+// Admin auth middleware - validates org-specific or super admin access.
+// NOTE: auth rejections for these routes are already gated and logged
+// (auth_rejected) by the global `/api/*` middleware above, which runs first. A
+// request only reaches here after presenting a valid ENGINE_API_KEY, so the
+// rejection branches below are effectively unreachable and deliberately do not
+// re-log — the global middleware is the single place auth failures are recorded.
 app.use('/api/v1/admin/orgs/:org/*', async (c, next) => {
   const org = c.req.param('org');
   const authHeader = c.req.header('Authorization');
 
   if (!authHeader?.startsWith('Bearer ')) {
-    createRequestLogger(crypto.randomUUID()).warn('admin_auth_rejected', {
-      reason: 'missing_bearer',
-      status: 401,
-      org,
-      path: c.req.path,
-      method: c.req.method,
-    });
     return c.json({ error: 'Authorization header with Bearer token required' }, 401);
   }
 
@@ -270,15 +268,6 @@ app.use('/api/v1/admin/orgs/:org/*', async (c, next) => {
     return next();
   }
 
-  // Observable rejection. `reason` distinguishes "org has no admin key configured"
-  // from "key present but token mismatched" — useful signal, no secret leaked.
-  createRequestLogger(crypto.randomUUID()).warn('admin_auth_rejected', {
-    reason: orgAdminKey ? 'invalid_token' : 'no_org_admin_key',
-    status: 403,
-    org,
-    path: c.req.path,
-    method: c.req.method,
-  });
   return c.json({ error: 'Unauthorized for this organization' }, 403);
 });
 

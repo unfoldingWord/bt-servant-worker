@@ -616,3 +616,26 @@ describe('JsonMemoryStore - storage failure paths (no silent swallow)', () => {
     expect(failLogger.error).toHaveBeenCalledWith('memory_read_failed', boom, expect.any(Object));
   });
 });
+
+describe('JsonMemoryStore - v1 migration failure path (no silent swallow)', () => {
+  it('migrateV1 logs memory_migration_write_failed and rethrows when the migration write fails', async () => {
+    const boom = new Error('migration put failed');
+    const failingStorage = {
+      // A raw markdown string triggers the v1 -> v2 migration, whose own put() fails.
+      get: vi.fn(async () => '## Section A\n\nlegacy content'),
+      put: vi.fn(async () => {
+        throw boom;
+      }),
+      delete: vi.fn(async () => true),
+    } as unknown as DurableObjectStorage;
+    const failLogger = createMockLogger();
+    const failStore = new JsonMemoryStore(failingStorage, failLogger);
+
+    await expect(failStore.read()).rejects.toBe(boom);
+    expect(failLogger.error).toHaveBeenCalledWith(
+      'memory_migration_write_failed',
+      boom,
+      expect.any(Object)
+    );
+  });
+});
