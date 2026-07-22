@@ -19,6 +19,7 @@
  */
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { CfWorkerJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/cfworker';
 
 import { MCPError, MCPResponseTooLargeError } from '../../utils/errors.js';
 import { redactArgsForError, RequestLogger, summarizeArgs } from '../../utils/logger.js';
@@ -35,6 +36,12 @@ import { recordFailure, recordSuccess } from './health.js';
 
 const CLIENT_INFO = { name: 'bt-servant-worker', version: '1.0.0' };
 
+// The SDK's default validator (Ajv) compiles JSON schemas with `new Function`,
+// which workerd forbids — any server whose tools declare `outputSchema` would
+// kill discovery with "Code generation from strings disallowed". The cfworker
+// provider validates by interpretation, no code generation.
+const JSON_SCHEMA_VALIDATOR = new CfWorkerJsonSchemaValidator();
+
 interface ConnectedClient {
   client: Client;
   close: () => Promise<void>;
@@ -49,7 +56,7 @@ async function openClient(server: MCPServerConfig): Promise<ConnectedClient> {
     };
   }
   const transport = new StreamableHTTPClientTransport(url, transportOpts);
-  const client = new Client(CLIENT_INFO);
+  const client = new Client(CLIENT_INFO, { jsonSchemaValidator: JSON_SCHEMA_VALIDATOR });
   // The SDK's StreamableHTTPClientTransport types `sessionId` as
   // `string | undefined`, while the consuming `Transport` interface declares
   // it as `string`. Under our `exactOptionalPropertyTypes: true` the two are
