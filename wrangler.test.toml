@@ -5,6 +5,9 @@
 name = "bt-servant-worker"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
+# Matches wrangler.toml: the otel-cf-workers runtime (loaded via src/index.ts)
+# needs AsyncLocalStorage, so the test worker pool requires nodejs_compat too.
+compatibility_flags = ["nodejs_compat"]
 
 [observability]
 enabled = true

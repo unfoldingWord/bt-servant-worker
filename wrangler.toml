@@ -1,6 +1,9 @@
 name = "bt-servant-worker"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
+# Required by @microlabs/otel-cf-workers for AsyncLocalStorage-based trace-context
+# propagation. Top-level flags are inherited by named environments (e.g. staging).
+compatibility_flags = ["nodejs_compat"]
 
 # Tail consumer captures non-ok outcomes (CPU/memory/wall-time exhaustion,
 # uncaught exceptions, isolate eviction) that the producer cannot log from
