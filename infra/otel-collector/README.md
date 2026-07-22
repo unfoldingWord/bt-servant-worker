@@ -22,7 +22,7 @@ fly secrets set \
   O2_ENDPOINT="https://bt-servant-openobserve.fly.dev/api/default" \
   O2_AUTH="Basic $(printf '%s' 'you@example.com:INGEST_TOKEN' | base64)"
 
-fly deploy --build-arg OTELCOL_VERSION=<pin-a-stable-tag>
+fly deploy --build-arg OTELCOL_VERSION=0.157.0   # pin a stable tag; see Dockerfile
 ```
 
 `OTEL_INGEST_TOKEN` is the value the worker must send. Store the **same** string as the
@@ -47,7 +47,7 @@ Prove one hop at a time by trimming each pipeline's `exporters:` list in
 `otel-collector-config.yaml` and redeploying (worker never changes):
 
 1. `[debug]` only — proves worker → collector + bearer auth.
-2. add `otlphttp/openobserve_*` — proves the sink. **M0 done.**
+2. add `otlp_http/openobserve_*` — proves the sink. **M0 done.**
 
 Remove `debug` from the lists once the sink is confirmed. To add a second sink later, add
 its exporter block + append it to each pipeline's `exporters:` list and redeploy — the

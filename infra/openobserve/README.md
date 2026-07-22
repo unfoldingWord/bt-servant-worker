@@ -12,13 +12,16 @@ fly volumes create openobserve_data --size 3 # persistent storage for /data
 
 # Root user is created on first boot. Choose a password and SAVE IT first — Fly secrets are
 # write-only, so a value you can't read back locks you out of the UI login below.
-ZO_ROOT_USER_PASSWORD="$(openssl rand -hex 24)"
+# NOTE: OpenObserve >= v0.91.0 enforces a password policy (>=8 chars, with at least one
+# lowercase, uppercase, digit, and special char). A bare `openssl rand -hex` is hex-only and
+# crash-loops the app on boot ("ZO_ROOT_USER_PASSWORD is too weak"), so append a compliant suffix.
+ZO_ROOT_USER_PASSWORD="$(openssl rand -hex 20)Aa1@"
 echo "OpenObserve root password (store in your password manager): $ZO_ROOT_USER_PASSWORD"
 fly secrets set \
   ZO_ROOT_USER_EMAIL="you@example.com" \
   ZO_ROOT_USER_PASSWORD="$ZO_ROOT_USER_PASSWORD"
 
-fly deploy --build-arg OPENOBSERVE_VERSION=<pin-a-stable-tag>
+fly deploy --build-arg OPENOBSERVE_VERSION=v0.91.0   # pin a stable tag; see Dockerfile
 ```
 
 Open `https://bt-servant-openobserve.fly.dev` and log in with those credentials.
