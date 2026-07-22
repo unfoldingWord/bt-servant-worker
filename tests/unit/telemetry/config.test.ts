@@ -14,8 +14,8 @@ function makeEnv(overrides: Partial<Env> = {}): Env {
 // The Trigger arg is unused by resolveTelemetryConfig; a placeholder satisfies the type.
 const trigger = {} as never;
 
-// Narrow the TraceConfig union to the exporter variant for assertions.
-function exporterOf(config: ReturnType<typeof resolveTelemetryConfig>): {
+// Narrow the TraceConfig union to the OTLP exporter variant for assertions.
+function otlpExporterOf(config: ReturnType<typeof resolveTelemetryConfig>): {
   url: string;
   headers?: Record<string, string>;
 } {
@@ -50,12 +50,8 @@ describe('isTelemetryEnabled', () => {
   });
 });
 
-describe('resolveTelemetryConfig (disabled — no-op)', () => {
+describe('resolveTelemetryConfig (disabled — guaranteed no-op)', () => {
   const config = resolveTelemetryConfig(makeEnv({ ENVIRONMENT: 'staging' }), trigger);
-
-  it('uses a 0% head sampler so no spans are recorded or exported', () => {
-    expect(config.sampling?.headSampler).toEqual({ ratio: 0 });
-  });
 
   it('carries service name, namespace (environment), and version', () => {
     expect(config.service.name).toBe(TELEMETRY_SERVICE_NAME);
@@ -63,8 +59,31 @@ describe('resolveTelemetryConfig (disabled — no-op)', () => {
     expect(typeof config.service.version).toBe('string');
   });
 
-  it('points the exporter at a never-contacted localhost placeholder', () => {
-    expect(exporterOf(config).url).toBe('http://localhost:4318/v1/traces');
+  it('uses a 0% head sampler', () => {
+    expect(config.sampling?.headSampler).toEqual({ ratio: 0 });
+  });
+
+  it('uses a no-op exporter (no OTLP url, so no network is possible)', () => {
+    const exp = ('exporter' in config ? config.exporter : undefined) as
+      | { url?: string; export?: unknown; shutdown?: unknown }
+      | undefined;
+    expect(exp).toBeDefined();
+    expect(exp?.url).toBeUndefined();
+    expect(typeof exp?.export).toBe('function');
+    expect(typeof exp?.shutdown).toBe('function');
+  });
+
+  it('no-op exporter reports success synchronously without exporting', () => {
+    const exp = (
+      config as {
+        exporter: { export: (s: unknown, cb: (r: { code: number }) => void) => void };
+      }
+    ).exporter;
+    let result: { code: number } | undefined;
+    exp.export([], (r) => {
+      result = r;
+    });
+    expect(result).toEqual({ code: 0 });
   });
 });
 
@@ -83,14 +102,67 @@ describe('resolveTelemetryConfig (enabled)', () => {
   });
 
   it('builds the OTLP traces URL, trimming a trailing slash', () => {
-    expect(exporterOf(config).url).toBe('https://collector.example.com/v1/traces');
+    expect(otlpExporterOf(config).url).toBe('https://collector.example.com/v1/traces');
   });
 
   it('sends the collector token as a Bearer Authorization header', () => {
-    expect(exporterOf(config).headers?.Authorization).toBe('Bearer secret-token');
+    expect(otlpExporterOf(config).headers?.Authorization).toBe('Bearer secret-token');
   });
 
   it('reports the environment as the service namespace', () => {
     expect(config.service.namespace).toBe('production');
+  });
+});
+
+describe('span redaction (postProcessor)', () => {
+  // Redaction runs in both states; use the enabled config so it is the real export path.
+  const config = resolveTelemetryConfig(
+    makeEnv({
+      OTEL_EXPORTER_OTLP_ENDPOINT: 'https://c.example',
+      OTEL_COLLECTOR_TOKEN: 'tok',
+    }),
+    trigger
+  );
+  const postProcessor = config.postProcessor;
+
+  it('is configured', () => {
+    expect(typeof postProcessor).toBe('function');
+  });
+
+  it('reduces url.full to scheme://host and drops url.path + url.query', () => {
+    const span = {
+      attributes: {
+        'url.full': 'https://api.anthropic.com/v1/messages?user=alice&thread=42',
+        'url.path': '/v1/messages',
+        'url.query': '?user=alice&thread=42',
+        'server.address': 'api.anthropic.com',
+        'http.request.method': 'POST',
+      } as Record<string, unknown>,
+    };
+    postProcessor!([span] as never);
+    expect(span.attributes['url.full']).toBe('https://api.anthropic.com');
+    expect(span.attributes['url.path']).toBeUndefined();
+    expect(span.attributes['url.query']).toBeUndefined();
+    // Non-URL attributes are untouched.
+    expect(span.attributes['server.address']).toBe('api.anthropic.com');
+    expect(span.attributes['http.request.method']).toBe('POST');
+  });
+
+  it('reduces http.url (cache spans) to origin and drops http.target', () => {
+    const span = {
+      attributes: {
+        'http.url': 'https://bt-servant.example.workers.dev/public/ptxprint/abc123?sig=secret',
+        'http.target': '/public/ptxprint/abc123?sig=secret',
+      } as Record<string, unknown>,
+    };
+    postProcessor!([span] as never);
+    expect(span.attributes['http.url']).toBe('https://bt-servant.example.workers.dev');
+    expect(span.attributes['http.target']).toBeUndefined();
+  });
+
+  it('leaves a non-URL url.full value unchanged rather than blanking it', () => {
+    const span = { attributes: { 'url.full': 'not-a-url' } as Record<string, unknown> };
+    postProcessor!([span] as never);
+    expect(span.attributes['url.full']).toBe('not-a-url');
   });
 });
