@@ -149,6 +149,56 @@ describe('redactSpan', () => {
     expect(span.attributes['url.full']).toBe('not-a-url');
     expect(span.name).toBe('fetch GET api.anthropic.com');
   });
+
+  it('strips exception.message/stacktrace from top-level attributes, keeping exception.type', () => {
+    const span = {
+      name: 'fetch POST api.anthropic.com',
+      attributes: {
+        'exception.type': 'MCPError',
+        'exception.message': 'remote said: user secret leaked in message',
+        'exception.stacktrace': 'MCPError: user secret\n  at handler (mcp.ts:1:1)',
+      } as Record<string, unknown>,
+    };
+    redactSpan(span);
+    expect(span.attributes['exception.type']).toBe('MCPError');
+    expect(span.attributes['exception.message']).toBeUndefined();
+    expect(span.attributes['exception.stacktrace']).toBeUndefined();
+  });
+
+  it('strips exception.message/stacktrace from span EVENTS (where recordException writes them)', () => {
+    // recordException(err) records an "exception" event, NOT top-level attributes.
+    const span = {
+      name: 'Durable Object Fetch',
+      attributes: {} as Record<string, unknown>,
+      events: [
+        {
+          name: 'exception',
+          attributes: {
+            'exception.type': 'TypeError',
+            'exception.message': 'user chat content that must not egress',
+            'exception.stacktrace': 'TypeError: user chat content\n  at do (user-do.ts:1:1)',
+          } as Record<string, unknown>,
+        },
+      ],
+    };
+    redactSpan(span);
+    const eventAttrs = span.events[0]!.attributes;
+    expect(eventAttrs['exception.type']).toBe('TypeError');
+    expect(eventAttrs['exception.message']).toBeUndefined();
+    expect(eventAttrs['exception.stacktrace']).toBeUndefined();
+    // Whole-span scan: no exception free-text survives anywhere.
+    expect(JSON.stringify(span)).not.toContain('must not egress');
+    expect(JSON.stringify(span)).not.toContain('user chat content');
+  });
+
+  it('handles spans with no events and events with no attributes without throwing', () => {
+    const span = {
+      name: 'code_exec',
+      attributes: {} as Record<string, unknown>,
+      events: [{ name: 'phase_marker' }],
+    };
+    expect(() => redactSpan(span)).not.toThrow();
+  });
 });
 
 describe('resolveTelemetryConfig (disabled — guaranteed no-op)', () => {

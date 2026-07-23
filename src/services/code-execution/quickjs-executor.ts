@@ -12,6 +12,7 @@ import { getQuickJSWASMModule, QuickJSContext } from '@cf-wasm/quickjs/workerd';
 import { CodeExecutionError, MCPCallLimitError, TimeoutError } from '../../utils/errors.js';
 import { RequestLogger, summarizeArgs } from '../../utils/logger.js';
 import { CodeExecutionOptions, CodeExecutionResult, ConsoleLog, HostFunction } from './types.js';
+import { withSpan, withSpanSync } from '../telemetry/index.js';
 
 /**
  * Number of VM cycles between timeout checks.
@@ -366,12 +367,15 @@ function evaluateUserCode(vm: QuickJSContext, code: string): void {
   result.value.dispose();
 }
 
-function checkExecutionError(vm: QuickJSContext): void {
+function checkExecutionError(vm: QuickJSContext, logger: RequestLogger): void {
   const errorResult = vm.evalCode('__executionError__', 'get-error.js');
 
   if (errorResult.error) {
     errorResult.error.dispose();
-    return; // Can't read error state, assume no error
+    // The VM could not even read its own error slot — rare, but silently assuming
+    // "no error" here would hide a genuinely broken execution. Make it observable.
+    logger.warn('vm_error_state_unreadable', {});
+    return; // Can't read error state; proceed as if no error, but it is now logged.
   }
 
   const errorValue = vm.dump(errorResult.value);
@@ -481,16 +485,22 @@ async function runCodeInVM(ctx: VMExecutionContext): Promise<unknown> {
   const pendingCalls = setupHostFunctions(ctx.vm, ctx.options.hostFunctions);
   const interrupt = createInterruptHandler(startTime, ctx.options.timeout_ms);
   ctx.vm.runtime.setInterruptHandler(interrupt.handler);
-  evaluateUserCode(ctx.vm, ctx.code);
-  if (interrupt.isInterrupted()) {
-    throw new TimeoutError(`Code execution exceeded ${ctx.options.timeout_ms}ms`);
-  }
-  ctx.vm.runtime.executePendingJobs();
-  await processPendingCalls(ctx.vm, pendingCalls, ctx.mcpCounter, ctx.logger, {
-    startTime,
-    timeoutMs: ctx.options.timeout_ms,
+  // Phase spans nest under the `code_exec` span; a syntax/eval error or a failing
+  // MCP host call lands on the specific phase, not the whole execution.
+  withSpanSync('code_exec.eval', {}, () => {
+    evaluateUserCode(ctx.vm, ctx.code);
+    if (interrupt.isInterrupted()) {
+      throw new TimeoutError(`Code execution exceeded ${ctx.options.timeout_ms}ms`);
+    }
+    ctx.vm.runtime.executePendingJobs();
   });
-  checkExecutionError(ctx.vm);
+  await withSpan('code_exec.pending_calls', {}, () =>
+    processPendingCalls(ctx.vm, pendingCalls, ctx.mcpCounter, ctx.logger, {
+      startTime,
+      timeoutMs: ctx.options.timeout_ms,
+    })
+  );
+  checkExecutionError(ctx.vm, ctx.logger);
   return extractResult(ctx.vm);
 }
 
@@ -521,7 +531,14 @@ export async function executeCode(
     if (!vm) {
       throw new Error('Failed to create QuickJS context: newContext() returned null');
     }
-    const value = await runCodeInVM({ vm, code, options, logs, mcpCounter, logger });
+    const activeVm = vm;
+    // `code_length`/`max_mcp_calls` are bounded numbers; the code itself is never
+    // attached (model-authored code can embed user content — same reason the log omits it).
+    const value = await withSpan(
+      'code_exec',
+      { code_length: code.length, max_mcp_calls: mcpCounter.limit },
+      () => runCodeInVM({ vm: activeVm, code, options, logs, mcpCounter, logger })
+    );
     logger.log('code_execution_complete', {
       duration_ms: Date.now() - startTime,
       console_logs_count: logs.length,

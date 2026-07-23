@@ -48,8 +48,29 @@ function toOrigin(value: unknown): string | undefined {
   }
 }
 
-/** A span carries a mutable name + attributes at runtime (otel-cf-workers SpanImpl). */
-type MutableSpan = { name: string; attributes: Record<string, unknown> };
+/** A mutable OTLP attribute bag (span attributes or a span event's attributes). */
+type MutableAttributes = Record<string, unknown>;
+
+/** A span event carries a name + its own attribute bag (SDK TimedEvent at runtime). */
+type MutableSpanEvent = { name?: string; attributes?: MutableAttributes };
+
+/**
+ * A span carries a mutable name + attributes at runtime (otel-cf-workers SpanImpl),
+ * plus the `events` array where `recordException` records exception data.
+ */
+type MutableSpan = { name: string; attributes: MutableAttributes; events?: MutableSpanEvent[] };
+
+/**
+ * Drop the untrusted free-text parts of a recorded exception (`exception.message`,
+ * `exception.stacktrace`) from an attribute bag in place. `exception.type` (the error
+ * class) is bounded and kept. Applied to both top-level span attributes and every span
+ * EVENT's attributes, because `span.recordException` records into `span.events[*]`.
+ */
+function stripExceptionText(attrs: MutableAttributes | undefined): void {
+  if (!attrs) return;
+  delete attrs['exception.message'];
+  delete attrs['exception.stacktrace'];
+}
 
 /**
  * Redact identifiers/credentials from a span in place, at export time.
@@ -65,6 +86,13 @@ type MutableSpan = { name: string; attributes: Record<string, unknown> };
  *   which rc.52 records in `db.statement` ("get <org>") and `db.cf.kv.key`. Drop both;
  *   `db.name` (binding) and `db.operation` remain for tracing. (R2 and Workers AI are
  *   NOT instrumented by the library, so message content / audio keys never egress.)
+ * - `exception.message`/`exception.stacktrace` (written by `span.recordException`)
+ *   embed untrusted upstream text (e.g. an MCPError's remote message) — the same leak
+ *   the log path guards by exporting only `error_name`. Our `withSpan` records only the
+ *   bounded `error_name`, never `recordException`; stripping these is defense in depth
+ *   against any manual/library `recordException`. Crucially, `recordException` records
+ *   into `span.events[*].attributes`, NOT the top-level attribute bag, so both are
+ *   scrubbed. `exception.type` (the error class) is bounded and kept.
  *
  * Span names for the request root (`fetchHandler <METHOD>`), outbound fetch
  * (`fetch <METHOD> <host>`), and KV (`KV <binding> <op>`) are already identifier-free.
@@ -83,6 +111,11 @@ export function redactSpan(span: MutableSpan): void {
   delete attrs['do.id.name'];
   delete attrs['db.statement'];
   delete attrs['db.cf.kv.key'];
+  // `recordException` writes exception.* into span EVENTS, not top-level attrs; scrub both.
+  stripExceptionText(attrs);
+  if (span.events) {
+    for (const event of span.events) stripExceptionText(event.attributes);
+  }
   if (span.name.startsWith('Durable Object Fetch ')) {
     span.name = 'Durable Object Fetch';
   } else if (span.name.startsWith('Durable Object Alarm ')) {

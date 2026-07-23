@@ -31,6 +31,7 @@ import { redactToolInputForError, RequestLogger, summarizeToolInput } from '../.
 import { stripUlyssesComments } from '../../utils/ulysses-comments.js';
 import { UnmatchedTrigger } from '../classifier/index.js';
 import { createMCPHostFunctions, executeCode } from '../code-execution/index.js';
+import { withSpan, recordSpanError } from '../telemetry/index.js';
 import {
   callMCPTool,
   createHealthTracker,
@@ -987,52 +988,56 @@ async function executeIterationTools(
   }
 }
 
-async function processIteration(ctx: OrchestrationContext, iteration: number): Promise<boolean> {
-  const iterStart = Date.now();
-  ctx.logger.log('iteration_start', { iteration, message_count: ctx.messages.length });
-  ctx.logger.log('claude_request', { iteration, message_count: ctx.messages.length });
+function processIteration(ctx: OrchestrationContext, iteration: number): Promise<boolean> {
+  return withSpan('iteration', { iteration }, async () => {
+    const iterStart = Date.now();
+    ctx.logger.log('iteration_start', { iteration, message_count: ctx.messages.length });
+    ctx.logger.log('claude_request', { iteration, message_count: ctx.messages.length });
 
-  if (iteration > 0 && ctx.callbacks) {
-    notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress('\n'));
-    notifyCallback(ctx.logger, () => ctx.callbacks?.onStatus('Preparing your response...'));
-  }
+    if (iteration > 0 && ctx.callbacks) {
+      notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress('\n'));
+      notifyCallback(ctx.logger, () => ctx.callbacks?.onStatus('Preparing your response...'));
+    }
 
-  const response = await callClaudeForIteration(ctx, iteration, iterStart);
-  const toolCalls = extractToolCalls(response.content);
-  ctx.logger.log('claude_response', {
-    iteration,
-    stop_reason: response.stop_reason,
-    tool_calls_count: toolCalls.length,
-    text_blocks_count: response.content.filter((b) => b.type === 'text').length,
-    duration_ms: Date.now() - iterStart,
-  });
+    const response = await callClaudeForIteration(ctx, iteration, iterStart);
+    const toolCalls = extractToolCalls(response.content);
+    ctx.logger.log('claude_response', {
+      iteration,
+      stop_reason: response.stop_reason,
+      tool_calls_count: toolCalls.length,
+      text_blocks_count: response.content.filter((b) => b.type === 'text').length,
+      duration_ms: Date.now() - iterStart,
+    });
 
-  ctx.lastIterationStartIndex = ctx.responses.length;
-  ctx.responses.push(...extractTextResponses(response.content));
+    ctx.lastIterationStartIndex = ctx.responses.length;
+    ctx.responses.push(...extractTextResponses(response.content));
 
-  if (response.stop_reason === 'end_turn' || toolCalls.length === 0) {
+    if (response.stop_reason === 'end_turn' || toolCalls.length === 0) {
+      ctx.logger.log('iteration_end', {
+        iteration,
+        reason: response.stop_reason === 'end_turn' ? 'end_turn' : 'no_tool_calls',
+        total_duration_ms: Date.now() - iterStart,
+      });
+      return true;
+    }
+
+    notifyCallback(ctx.logger, () =>
+      ctx.callbacks?.onStatus(`Executing ${toolCalls.length} tool(s)...`)
+    );
+    const toolResults = await executeIterationTools(toolCalls, ctx, iteration, iterStart);
+    ctx.messages.push({ role: 'assistant', content: response.content as Anthropic.ContentBlock[] });
+    ctx.messages.push({ role: 'user', content: toolResults });
+    notifyCallback(ctx.logger, () =>
+      ctx.callbacks?.onIterationComplete?.(ctx.responses.join('\n'))
+    );
     ctx.logger.log('iteration_end', {
       iteration,
-      reason: response.stop_reason === 'end_turn' ? 'end_turn' : 'no_tool_calls',
+      reason: 'continuing',
+      tool_calls_executed: toolCalls.length,
       total_duration_ms: Date.now() - iterStart,
     });
-    return true;
-  }
-
-  notifyCallback(ctx.logger, () =>
-    ctx.callbacks?.onStatus(`Executing ${toolCalls.length} tool(s)...`)
-  );
-  const toolResults = await executeIterationTools(toolCalls, ctx, iteration, iterStart);
-  ctx.messages.push({ role: 'assistant', content: response.content as Anthropic.ContentBlock[] });
-  ctx.messages.push({ role: 'user', content: toolResults });
-  notifyCallback(ctx.logger, () => ctx.callbacks?.onIterationComplete?.(ctx.responses.join('\n')));
-  ctx.logger.log('iteration_end', {
-    iteration,
-    reason: 'continuing',
-    tool_calls_executed: toolCalls.length,
-    total_duration_ms: Date.now() - iterStart,
+    return false;
   });
-  return false;
 }
 
 /** Default code execution timeout in milliseconds (30 seconds) */
@@ -1274,14 +1279,18 @@ async function runOrchestrationLoop(
   ctx.logger.log('orchestration_loop_start', { max_iterations: maxIterations });
   let lastIteration = -1;
   let exitReason: 'done' | 'max_iterations' = 'max_iterations';
-  for (let i = 0; i < maxIterations; i++) {
-    lastIteration = i;
-    const done = await processIteration(ctx, i);
-    if (done) {
-      exitReason = 'done';
-      break;
+  // Root of the manual span tree: the auto request/DO span → `orchestration` →
+  // per-`iteration` → per-`tool_dispatch` (+ auto fetch/binding-I/O children).
+  await withSpan('orchestration', { max_iterations: maxIterations }, async () => {
+    for (let i = 0; i < maxIterations; i++) {
+      lastIteration = i;
+      const done = await processIteration(ctx, i);
+      if (done) {
+        exitReason = 'done';
+        break;
+      }
     }
-  }
+  });
   if (exitReason === 'max_iterations') {
     ctx.logger.warn('orchestration_max_iterations_reached', {
       max_iterations: maxIterations,
@@ -1358,36 +1367,47 @@ async function executeToolCalls(
   return Promise.all(toolCalls.map((tc) => executeSingleTool(tc, ctx)));
 }
 
-async function executeSingleTool(
+function executeSingleTool(
   toolCall: ToolUseBlock,
   ctx: OrchestrationContext
 ): Promise<Anthropic.ToolResultBlockParam> {
-  ctx.logger.log('tool_execution_start', {
-    tool_name: toolCall.name,
-    tool_id: toolCall.id,
-    input: summarizeToolInput(toolCall.name, toolCall.input),
-  });
-  ctx.callbacks?.onToolUse?.(toolCall.name, toolCall.input);
-
-  const startTime = Date.now();
-
-  try {
-    const result = await dispatchToolCall(toolCall, ctx);
-    logToolSuccess(ctx, toolCall, startTime);
-    ctx.callbacks?.onToolResult?.(toolCall.name, result);
-    const serialized = JSON.stringify(result);
-    const content = truncateToolResultContent(serialized, toolCall.name);
-    if (content.length < serialized.length) {
-      ctx.logger.warn('tool_result_truncated', {
+  // `tool_name`/`tool_id` are allow-listed bounded ids; the tool INPUT is not attached
+  // to the span (it can carry user content) — the existing summarized log keeps it.
+  return withSpan(
+    'tool_dispatch',
+    { tool_name: toolCall.name, tool_id: toolCall.id },
+    async (span) => {
+      ctx.logger.log('tool_execution_start', {
         tool_name: toolCall.name,
-        original_bytes: serialized.length,
-        capped_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+        tool_id: toolCall.id,
+        input: summarizeToolInput(toolCall.name, toolCall.input),
       });
+      ctx.callbacks?.onToolUse?.(toolCall.name, toolCall.input);
+
+      const startTime = Date.now();
+
+      try {
+        const result = await dispatchToolCall(toolCall, ctx);
+        logToolSuccess(ctx, toolCall, startTime);
+        ctx.callbacks?.onToolResult?.(toolCall.name, result);
+        const serialized = JSON.stringify(result);
+        const content = truncateToolResultContent(serialized, toolCall.name);
+        if (content.length < serialized.length) {
+          ctx.logger.warn('tool_result_truncated', {
+            tool_name: toolCall.name,
+            original_bytes: serialized.length,
+            capped_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
+          });
+        }
+        return { type: 'tool_result', tool_use_id: toolCall.id, content };
+      } catch (error) {
+        // The tool error is handled here (returned to the model as an error result),
+        // not thrown, so mark the span explicitly — withSpan only auto-records throws.
+        recordSpanError(span, error);
+        return handleToolError(ctx, toolCall, error, startTime);
+      }
     }
-    return { type: 'tool_result', tool_use_id: toolCall.id, content };
-  } catch (error) {
-    return handleToolError(ctx, toolCall, error, startTime);
-  }
+  );
 }
 
 function dispatchPtxprintTool(
