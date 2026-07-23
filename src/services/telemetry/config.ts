@@ -65,6 +65,12 @@ type MutableSpan = { name: string; attributes: Record<string, unknown> };
  *   which rc.52 records in `db.statement` ("get <org>") and `db.cf.kv.key`. Drop both;
  *   `db.name` (binding) and `db.operation` remain for tracing. (R2 and Workers AI are
  *   NOT instrumented by the library, so message content / audio keys never egress.)
+ * - `exception.message`/`exception.stacktrace` (written by `span.recordException`)
+ *   embed untrusted upstream text (e.g. an MCPError's remote message) — the same leak
+ *   the log path guards by exporting only `error_name`. Our `withSpan` records only the
+ *   bounded `error_name`, never `recordException`; dropping these here is defense in
+ *   depth against any manual/library `recordException`. `exception.type` (the error
+ *   class) is bounded and kept.
  *
  * Span names for the request root (`fetchHandler <METHOD>`), outbound fetch
  * (`fetch <METHOD> <host>`), and KV (`KV <binding> <op>`) are already identifier-free.
@@ -83,6 +89,8 @@ export function redactSpan(span: MutableSpan): void {
   delete attrs['do.id.name'];
   delete attrs['db.statement'];
   delete attrs['db.cf.kv.key'];
+  delete attrs['exception.message'];
+  delete attrs['exception.stacktrace'];
   if (span.name.startsWith('Durable Object Fetch ')) {
     span.name = 'Durable Object Fetch';
   } else if (span.name.startsWith('Durable Object Alarm ')) {

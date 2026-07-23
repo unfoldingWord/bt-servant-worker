@@ -21,6 +21,7 @@
  */
 
 import { RequestLogger } from '../../utils/logger.js';
+import { withSpan } from '../telemetry/index.js';
 
 /** Generate a unique R2 key for a TTS audio object. */
 export function generateAudioKey(org: string, userId: string): string {
@@ -43,9 +44,10 @@ export async function uploadAudio(
 ): Promise<void> {
   const start = Date.now();
   try {
-    await bucket.put(key, audioBytes, {
-      httpMetadata: { contentType: 'audio/ogg' },
-    });
+    // Span carries only the bounded size; the key embeds org/user ids and never egresses.
+    await withSpan('r2.put', { size_bytes: audioBytes.byteLength }, () =>
+      bucket.put(key, audioBytes, { httpMetadata: { contentType: 'audio/ogg' } })
+    );
   } catch (error) {
     logger.error('r2_audio_upload_failed', error, {
       key,
@@ -70,7 +72,7 @@ export async function getAudio(
   const start = Date.now();
   let object: R2ObjectBody | null;
   try {
-    object = await bucket.get(key);
+    object = await withSpan('r2.get', {}, () => bucket.get(key));
   } catch (error) {
     logger.error('r2_audio_get_failed', error, { key, get_ms: Date.now() - start });
     throw error;
@@ -130,9 +132,9 @@ export async function uploadVoiceSubmission(
 ): Promise<void> {
   const start = Date.now();
   try {
-    await bucket.put(key, audioBytes, {
-      httpMetadata: { contentType: mimeType },
-    });
+    await withSpan('r2.put', { size_bytes: audioBytes.byteLength }, () =>
+      bucket.put(key, audioBytes, { httpMetadata: { contentType: mimeType } })
+    );
   } catch (error) {
     logger.error('r2_voice_submission_upload_failed', error, {
       key,

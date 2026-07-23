@@ -7,6 +7,7 @@
  */
 
 import { RequestLogger } from '../../utils/logger.js';
+import { withSpan } from '../telemetry/index.js';
 import { calculateTotalSize, parseV1Sections } from './parser.js';
 import {
   MAX_MEMORY_SIZE_BYTES,
@@ -171,7 +172,9 @@ export class JsonMemoryStore implements UserMemoryStore {
 
     const sizeAfter = calculateTotalSize(data.entries);
     try {
-      await this.storage.put(MEMORY_STORAGE_KEY, data);
+      await withSpan('memory.write', { size_after_bytes: sizeAfter }, () =>
+        this.storage.put(MEMORY_STORAGE_KEY, data)
+      );
     } catch (error) {
       this.logger.error('memory_write_failed', error, {
         sections_updated: updatedNames,
@@ -282,7 +285,9 @@ export class JsonMemoryStore implements UserMemoryStore {
     const data = await this.getMemoryData();
     const previousSize = calculateTotalSize(data.entries);
     try {
-      await this.storage.delete(MEMORY_STORAGE_KEY);
+      await withSpan('memory.clear', { previous_size_bytes: previousSize }, () =>
+        this.storage.delete(MEMORY_STORAGE_KEY)
+      );
     } catch (error) {
       this.logger.error('memory_clear_failed', error, { previous_size_bytes: previousSize });
       throw error;
@@ -433,7 +438,7 @@ export class JsonMemoryStore implements UserMemoryStore {
   private async getMemoryData(): Promise<MemoryStorage> {
     let raw: unknown;
     try {
-      raw = await this.storage.get<unknown>(MEMORY_STORAGE_KEY);
+      raw = await withSpan('memory.read', {}, () => this.storage.get<unknown>(MEMORY_STORAGE_KEY));
     } catch (error) {
       this.logger.error('memory_read_failed', error, {});
       throw error;

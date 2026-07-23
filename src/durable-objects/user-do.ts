@@ -70,7 +70,7 @@ import { AppError, AudioTranscriptionError, ValidationError } from '../utils/err
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
 import { applyTemplateVariables } from '../utils/template.js';
 import { createTimingContext, timePhase, TimingContext } from '../utils/timing.js';
-import { initLogTelemetry, flushLogTelemetry } from '../services/telemetry/index.js';
+import { initLogTelemetry, flushLogTelemetry, withSpan } from '../services/telemetry/index.js';
 import { classifyTriggers, ClassifierResult } from '../services/classifier/index.js';
 import type { UnmatchedTrigger } from '../services/classifier/index.js';
 import { isAdminClient, validateChatBody } from '../utils/chat-validation.js';
@@ -872,21 +872,25 @@ export class UserDO {
 
   /** Atomically append entry to queue and schedule alarm if idle. Returns -1 if full. */
   private async enqueueEntry(entry: InternalQueueEntry, maxDepth: number): Promise<number> {
-    return this.state.blockConcurrencyWhile(async () => {
-      const queue = (await this.state.storage.get<InternalQueueEntry[]>(QUEUE_KEY)) ?? [];
+    // Runs in the DO fetch context (unlike the alarm-drained dequeue path, which
+    // cannot export spans — CF error 1003), so this span reaches the collector.
+    return withSpan('do.enqueue', { max_depth: maxDepth }, () =>
+      this.state.blockConcurrencyWhile(async () => {
+        const queue = (await this.state.storage.get<InternalQueueEntry[]>(QUEUE_KEY)) ?? [];
 
-      if (queue.length >= maxDepth) return -1;
+        if (queue.length >= maxDepth) return -1;
 
-      queue.push(entry);
-      await this.state.storage.put(QUEUE_KEY, queue);
+        queue.push(entry);
+        await this.state.storage.put(QUEUE_KEY, queue);
 
-      const isProcessing = (await this.state.storage.get<boolean>(QUEUE_PROCESSING_KEY)) ?? false;
-      if (!isProcessing) {
-        await this.state.storage.put(QUEUE_PROCESSING_KEY, true);
-        await this.state.storage.setAlarm(Date.now());
-      }
-      return queue.length;
-    });
+        const isProcessing = (await this.state.storage.get<boolean>(QUEUE_PROCESSING_KEY)) ?? false;
+        if (!isProcessing) {
+          await this.state.storage.put(QUEUE_PROCESSING_KEY, true);
+          await this.state.storage.setAlarm(Date.now());
+        }
+        return queue.length;
+      })
+    );
   }
 
   /** Atomically dequeue the next entry, or return null if queue is empty. */
