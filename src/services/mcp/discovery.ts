@@ -271,8 +271,12 @@ export async function discoverAllTools(
 }
 
 function extractTextContent(content: Array<{ type: string; text?: string }>): string {
-  const textContent = content.find((c) => c.type === 'text' && c.text);
-  return textContent?.text ?? JSON.stringify(content);
+  // Servers may split a result across blocks (e.g. translation-helps v2 sends
+  // a summary block followed by the full payload) — keep every text block.
+  const texts = content
+    .filter((c) => c.type === 'text' && typeof c.text === 'string')
+    .map((c) => c.text as string);
+  return texts.length > 0 ? texts.join('\n\n') : JSON.stringify(content);
 }
 
 // CallMCPToolOptions and MCPToolCallResult moved to ./types.ts to break a

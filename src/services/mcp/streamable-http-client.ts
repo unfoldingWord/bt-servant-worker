@@ -137,8 +137,12 @@ interface SdkToolCallContent {
 }
 
 function extractText(content: Array<{ type?: string; text?: string }>): string {
-  const text = content.find((c) => c.type === 'text' && typeof c.text === 'string');
-  return text?.text ?? JSON.stringify(content);
+  // Servers may split a result across blocks (e.g. translation-helps v2 sends
+  // a summary block followed by the full payload) — keep every text block.
+  const texts = content
+    .filter((c) => c.type === 'text' && typeof c.text === 'string')
+    .map((c) => c.text as string);
+  return texts.length > 0 ? texts.join('\n\n') : JSON.stringify(content);
 }
 
 function extractResult(raw: SdkToolCallContent): unknown {
