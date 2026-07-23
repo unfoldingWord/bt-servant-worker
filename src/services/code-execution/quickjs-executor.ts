@@ -12,7 +12,7 @@ import { getQuickJSWASMModule, QuickJSContext } from '@cf-wasm/quickjs/workerd';
 import { CodeExecutionError, MCPCallLimitError, TimeoutError } from '../../utils/errors.js';
 import { RequestLogger, summarizeArgs } from '../../utils/logger.js';
 import { CodeExecutionOptions, CodeExecutionResult, ConsoleLog, HostFunction } from './types.js';
-import { withSpan, withSpanSync } from '../telemetry/index.js';
+import { withSpan, withSpanSync, countMetric, recordMetric } from '../telemetry/index.js';
 
 /**
  * Number of VM cycles between timeout checks.
@@ -468,6 +468,11 @@ function logExecutionError(
   } else {
     logger.error('code_execution_error', error, baseData);
   }
+  recordMetric('code_execution_duration_ms', Date.now() - startTime, { status: 'error' });
+  countMetric('code_execution_total', {
+    status: 'error',
+    error_name: error instanceof Error ? error.name : 'Error',
+  });
 }
 
 interface VMExecutionContext {
@@ -546,6 +551,8 @@ export async function executeCode(
       mcp_calls_limit: mcpCounter.limit,
       success: true,
     });
+    recordMetric('code_execution_duration_ms', Date.now() - startTime, { status: 'success' });
+    countMetric('code_execution_total', { status: 'success' });
     return buildSuccessResult(value, logs, startTime, mcpCounter);
   } catch (error) {
     logExecutionError(logger, error, startTime, mcpCounter);

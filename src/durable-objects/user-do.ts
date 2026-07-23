@@ -70,7 +70,14 @@ import { AppError, AudioTranscriptionError, ValidationError } from '../utils/err
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
 import { applyTemplateVariables } from '../utils/template.js';
 import { createTimingContext, timePhase, TimingContext } from '../utils/timing.js';
-import { initLogTelemetry, flushLogTelemetry, withSpan } from '../services/telemetry/index.js';
+import {
+  initLogTelemetry,
+  flushLogTelemetry,
+  initMetricTelemetry,
+  flushMetricTelemetry,
+  countMetric,
+  withSpan,
+} from '../services/telemetry/index.js';
 import { classifyTriggers, ClassifierResult } from '../services/classifier/index.js';
 import type { UnmatchedTrigger } from '../services/classifier/index.js';
 import { isAdminClient, validateChatBody } from '../utils/chat-validation.js';
@@ -290,6 +297,7 @@ export class UserDO {
     // DO's own waitUntil. No-op until telemetry is configured. See the alarm-path
     // note below for the one context this cannot cover.
     initLogTelemetry(this.env);
+    initMetricTelemetry(this.env);
     try {
       // Chat endpoints — one route per explicit transport.
       //   /chat/final     → synchronous final-only JSON. Worker has already
@@ -317,6 +325,7 @@ export class UserDO {
       // are covered by the tail worker on isolate death. Full DO-lifecycle log
       // coverage (SSE lifetime, alarm) lands in M3 with the withSpan seams.
       flushLogTelemetry((promise) => this.state.waitUntil(promise));
+      flushMetricTelemetry((promise) => this.state.waitUntil(promise));
     }
   }
 
@@ -483,6 +492,7 @@ export class UserDO {
         max_depth: maxDepth,
         status: 429,
       });
+      countMetric('queue_entries_total', { status: 'rejected', reason: 'queue_full' });
       return Response.json(
         {
           error: 'Queue full',
@@ -498,6 +508,10 @@ export class UserDO {
       delivery: isCallbackDelivery ? 'callback' : 'sse',
       queue_position: position,
       user_id: body.user_id,
+    });
+    countMetric('queue_entries_total', {
+      status: 'enqueued',
+      type: isCallbackDelivery ? 'callback' : 'sse',
     });
 
     if (isCallbackDelivery) {
@@ -999,6 +1013,7 @@ export class UserDO {
       window_ms: ENQUEUE_RATE_WINDOW_MS,
       limit: ENQUEUE_RATE_LIMIT,
     });
+    countMetric('rate_limits_total', { type: 'enqueue', transport });
     return rateLimited;
   }
 

@@ -21,7 +21,7 @@
  */
 
 import { RequestLogger } from '../../utils/logger.js';
-import { withSpan } from '../telemetry/index.js';
+import { withSpan, countMetric } from '../telemetry/index.js';
 
 /** Generate a unique R2 key for a TTS audio object. */
 export function generateAudioKey(org: string, userId: string): string {
@@ -49,6 +49,11 @@ export async function uploadAudio(
       bucket.put(key, audioBytes, { httpMetadata: { contentType: 'audio/ogg' } })
     );
   } catch (error) {
+    countMetric('r2_operations_total', {
+      op: 'put',
+      status: 'error',
+      error_name: error instanceof Error ? error.name : 'Error',
+    });
     logger.error('r2_audio_upload_failed', error, {
       key,
       size_bytes: audioBytes.byteLength,
@@ -56,6 +61,7 @@ export async function uploadAudio(
     });
     throw error;
   }
+  countMetric('r2_operations_total', { op: 'put', status: 'success' });
   logger.log('r2_audio_uploaded', {
     key,
     size_bytes: audioBytes.byteLength,
@@ -74,13 +80,20 @@ export async function getAudio(
   try {
     object = await withSpan('r2.get', {}, () => bucket.get(key));
   } catch (error) {
+    countMetric('r2_operations_total', {
+      op: 'get',
+      status: 'error',
+      error_name: error instanceof Error ? error.name : 'Error',
+    });
     logger.error('r2_audio_get_failed', error, { key, get_ms: Date.now() - start });
     throw error;
   }
   if (!object) {
+    countMetric('r2_operations_total', { op: 'get', status: 'not_found' });
     logger.warn('r2_audio_not_found', { key, get_ms: Date.now() - start });
     return null;
   }
+  countMetric('r2_operations_total', { op: 'get', status: 'success' });
   logger.log('r2_audio_retrieved', { key, size: object.size, get_ms: Date.now() - start });
   return object;
 }
@@ -136,6 +149,11 @@ export async function uploadVoiceSubmission(
       bucket.put(key, audioBytes, { httpMetadata: { contentType: mimeType } })
     );
   } catch (error) {
+    countMetric('r2_operations_total', {
+      op: 'put',
+      status: 'error',
+      error_name: error instanceof Error ? error.name : 'Error',
+    });
     logger.error('r2_voice_submission_upload_failed', error, {
       key,
       size_bytes: audioBytes.byteLength,
@@ -144,6 +162,7 @@ export async function uploadVoiceSubmission(
     });
     throw error;
   }
+  countMetric('r2_operations_total', { op: 'put', status: 'success' });
   logger.log('r2_voice_submission_uploaded', {
     key,
     size_bytes: audioBytes.byteLength,

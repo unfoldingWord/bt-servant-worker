@@ -6,6 +6,7 @@
 
 import { AudioTranscriptionError } from '../../utils/errors.js';
 import { RequestLogger } from '../../utils/logger.js';
+import { countMetric, recordMetric } from '../telemetry/index.js';
 import {
   MAX_AUDIO_SIZE_BYTES,
   SUPPORTED_AUDIO_FORMATS,
@@ -87,9 +88,17 @@ export async function transcribeAudio(
       had_text: text.length > 0,
     });
 
+    recordMetric('stt_duration_ms', durationMs, { status: 'success', format: audioFormat });
+    countMetric('stt_total', { status: 'success', format: audioFormat });
     return { text, duration_ms: durationMs };
   } catch (error) {
     const durationMs = Date.now() - startTime;
+    recordMetric('stt_duration_ms', durationMs, { status: 'error', format: audioFormat });
+    countMetric('stt_total', {
+      status: 'error',
+      format: audioFormat,
+      error_name: error instanceof Error ? error.name : 'Error',
+    });
     if (error instanceof AudioTranscriptionError) throw error;
     const msg = error instanceof Error ? error.message : String(error);
     logger.error('stt_error', error, {

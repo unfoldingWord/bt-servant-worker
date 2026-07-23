@@ -7,7 +7,7 @@
  */
 
 import { RequestLogger } from '../../utils/logger.js';
-import { withSpan } from '../telemetry/index.js';
+import { withSpan, countMetric } from '../telemetry/index.js';
 import { calculateTotalSize, parseV1Sections } from './parser.js';
 import {
   MAX_MEMORY_SIZE_BYTES,
@@ -176,6 +176,11 @@ export class JsonMemoryStore implements UserMemoryStore {
         this.storage.put(MEMORY_STORAGE_KEY, data)
       );
     } catch (error) {
+      countMetric('memory_operations_total', {
+        op: 'write',
+        status: 'error',
+        error_name: error instanceof Error ? error.name : 'Error',
+      });
       this.logger.error('memory_write_failed', error, {
         sections_updated: updatedNames,
         sections_deleted: deletedNames,
@@ -184,6 +189,7 @@ export class JsonMemoryStore implements UserMemoryStore {
       });
       throw error;
     }
+    countMetric('memory_operations_total', { op: 'write', status: 'success' });
 
     this.logger.log('memory_write', {
       sections_updated: updatedNames,
@@ -289,9 +295,15 @@ export class JsonMemoryStore implements UserMemoryStore {
         this.storage.delete(MEMORY_STORAGE_KEY)
       );
     } catch (error) {
+      countMetric('memory_operations_total', {
+        op: 'clear',
+        status: 'error',
+        error_name: error instanceof Error ? error.name : 'Error',
+      });
       this.logger.error('memory_clear_failed', error, { previous_size_bytes: previousSize });
       throw error;
     }
+    countMetric('memory_operations_total', { op: 'clear', status: 'success' });
     this.logger.log('memory_cleared', { previous_size_bytes: previousSize });
   }
 
@@ -440,9 +452,15 @@ export class JsonMemoryStore implements UserMemoryStore {
     try {
       raw = await withSpan('memory.read', {}, () => this.storage.get<unknown>(MEMORY_STORAGE_KEY));
     } catch (error) {
+      countMetric('memory_operations_total', {
+        op: 'read',
+        status: 'error',
+        error_name: error instanceof Error ? error.name : 'Error',
+      });
       this.logger.error('memory_read_failed', error, {});
       throw error;
     }
+    countMetric('memory_operations_total', { op: 'read', status: 'success' });
 
     if (raw === undefined || raw === null) {
       return { entries: {} };
