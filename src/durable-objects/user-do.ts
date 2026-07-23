@@ -70,6 +70,7 @@ import { AppError, AudioTranscriptionError, ValidationError } from '../utils/err
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
 import { applyTemplateVariables } from '../utils/template.js';
 import { createTimingContext, timePhase, TimingContext } from '../utils/timing.js';
+import { initLogTelemetry, flushLogTelemetry } from '../services/telemetry/index.js';
 import { classifyTriggers, ClassifierResult } from '../services/classifier/index.js';
 import type { UnmatchedTrigger } from '../services/classifier/index.js';
 import { isAdminClient, validateChatBody } from '../utils/chat-validation.js';
@@ -284,25 +285,39 @@ export class UserDO {
     const requestId = request.headers.get('X-Request-ID') ?? crypto.randomUUID();
     this.requestLogger = createRequestLogger(requestId);
 
-    // Chat endpoints — one route per explicit transport.
-    //   /chat/final     → synchronous final-only JSON. Worker has already
-    //                     validated that none of the callback-flavored
-    //                     fields are present.
-    //   /chat/stream    → always SSE.
-    //   /chat/callback  → always webhook; worker has already validated that
-    //                     progress_callback_url and message_key are present.
-    if (url.pathname === '/chat/final') {
-      return this.handleUnifiedChat(request, 'final');
-    }
-    if (url.pathname === '/chat/stream') {
-      return this.handleUnifiedChat(request, 'stream');
-    }
-    if (url.pathname === '/chat/callback') {
-      return this.handleUnifiedChat(request, 'callback');
-    }
+    // Telemetry (M2): the DO runs in its own isolate with its own log buffer, so
+    // it must init + flush independently of the worker. Flush in `finally` via the
+    // DO's own waitUntil. No-op until telemetry is configured. See the alarm-path
+    // note below for the one context this cannot cover.
+    initLogTelemetry(this.env);
+    try {
+      // Chat endpoints — one route per explicit transport.
+      //   /chat/final     → synchronous final-only JSON. Worker has already
+      //                     validated that none of the callback-flavored
+      //                     fields are present.
+      //   /chat/stream    → always SSE.
+      //   /chat/callback  → always webhook; worker has already validated that
+      //                     progress_callback_url and message_key are present.
+      if (url.pathname === '/chat/final') {
+        return await this.handleUnifiedChat(request, 'final');
+      }
+      if (url.pathname === '/chat/stream') {
+        return await this.handleUnifiedChat(request, 'stream');
+      }
+      if (url.pathname === '/chat/callback') {
+        return await this.handleUnifiedChat(request, 'callback');
+      }
 
-    // Non-chat endpoints don't need locking
-    return this.app.fetch(request);
+      // Non-chat endpoints don't need locking
+      return await this.app.fetch(request);
+    } finally {
+      // Drains logs buffered up to this point. The streaming/callback transports
+      // continue emitting from background work AFTER this returns (SSE writer,
+      // queued alarm drain); those late records flush on the NEXT DO boundary or
+      // are covered by the tail worker on isolate death. Full DO-lifecycle log
+      // coverage (SSE lifetime, alarm) lands in M3 with the withSpan seams.
+      flushLogTelemetry((promise) => this.state.waitUntil(promise));
+    }
   }
 
   // ── Alarm-based queue processing ──────────────────────────────────────────────

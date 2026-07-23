@@ -29,22 +29,46 @@ function buildLogEntry(
   return entry;
 }
 
+// ── Optional log sink (dependency-injected by the telemetry layer) ───────────
+// M2 tees every structured log to OTLP logs. To keep this util a pure, zero-
+// service-dependency module (and to categorically avoid a logger↔telemetry
+// import cycle), telemetry registers its emitter here via `setLogSink` instead
+// of logger importing telemetry. When no sink is registered (endpoint unset, or
+// in tests) logging is exactly the prior console-only behavior.
+export type LogLevel = 'info' | 'warn' | 'error';
+export type LogSink = (level: LogLevel, entry: LogEntry) => void;
+
+let logSink: LogSink | null = null;
+
+/**
+ * Register (or clear, with `null`) the OTLP log sink. The sink MUST NOT throw —
+ * it is invoked on the hot logging path and any failure must stay inside the
+ * telemetry layer, never break console logging.
+ */
+export function setLogSink(sink: LogSink | null): void {
+  logSink = sink;
+}
+
 export function log(entry: LogEntry): void {
   // eslint-disable-next-line no-console
   console.log(JSON.stringify(entry));
+  logSink?.('info', entry);
 }
 
 export function logInfo(entry: LogEntry): void {
   // eslint-disable-next-line no-console
   console.info(JSON.stringify(entry));
+  logSink?.('info', entry);
 }
 
 export function logWarn(entry: LogEntry): void {
   console.warn(JSON.stringify(entry));
+  logSink?.('warn', entry);
 }
 
 export function logError(entry: LogEntry & { error: string; stack?: string | undefined }): void {
   console.error(JSON.stringify(entry));
+  logSink?.('error', entry);
 }
 
 /**
@@ -68,8 +92,14 @@ export function createRequestLogger(requestId: string, userId?: string) {
         stack?: string | undefined;
       };
       errorEntry.error = err instanceof Error ? err.message : String(err);
-      if (err instanceof Error && err.stack) {
-        errorEntry.stack = err.stack;
+      if (err instanceof Error) {
+        // The error CLASS name is a bounded, vetted signal (e.g. 'MCPError',
+        // 'TypeError') safe to export to OTLP, unlike the raw message/stack which
+        // may embed untrusted upstream text. See telemetry/logs.ts redaction policy.
+        errorEntry.error_name = err.name;
+        if (err.stack) {
+          errorEntry.stack = err.stack;
+        }
       }
       logError(errorEntry);
     },
@@ -86,7 +116,7 @@ export type RequestLogger = ReturnType<typeof createRequestLogger>;
 //   - Start/success logs: summarized (keys + value types/lengths)
 //   - Error logs: raw values with sensitive-key masking + string truncation
 
-const SENSITIVE_KEY_PATTERN =
+export const SENSITIVE_KEY_PATTERN =
   /token|secret|password|cookie|session|credential|auth|api.?key|private.?key/i;
 const MAX_ERROR_STRING_LENGTH = 1000;
 const ERROR_STRING_HEAD = 500;
