@@ -184,7 +184,7 @@ export function enforceResponseSizeLimit(
   const text = typeof extracted === 'string' ? extracted : JSON.stringify(extracted);
   const size = new TextEncoder().encode(text).byteLength;
   if (size > maxResponseSizeBytes) {
-    countMetric('mcp_response_size_exceeded_total', { server: serverId });
+    countMetric('mcp_response_size_exceeded_total', { server: serverId, reason: 'tool_result' });
     throw new MCPResponseTooLargeError(size, maxResponseSizeBytes, serverId);
   }
 }

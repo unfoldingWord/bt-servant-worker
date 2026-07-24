@@ -188,6 +188,33 @@ describe('metrics stack (init → emit → flush)', () => {
     expect(joined).not.toContain('request_id');
   });
 
+  it('bounds series count per metric — high-cardinality values fold into overflow', async () => {
+    const fetchFn = okFetch();
+    initMetricTelemetry(ENABLED, { fetchFn });
+    // error_name is allow-listed (bounded in practice) but the KEY allow-list does not
+    // bound VALUES. Smuggle 1500 distinct values to prove the reader's per-metric cap
+    // (1000) collapses the excess into a single overflow series rather than emitting
+    // 1500 distinct time series.
+    for (let i = 0; i < 1500; i++) {
+      countMetric('requests_total', { status: 'error', error_name: `Err${i}` });
+    }
+    await flushAndWait();
+
+    const [, init] = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    const decoded = decodeBody(init.body) as {
+      resourceMetrics: Array<{
+        scopeMetrics: Array<{ metrics: Array<{ name: string; sum?: { dataPoints: unknown[] } }> }>;
+      }>;
+    };
+    const metric = decoded.resourceMetrics
+      .flatMap((rm) => rm.scopeMetrics)
+      .flatMap((sm) => sm.metrics)
+      .find((m) => m.name === 'requests_total');
+    // 1000 distinct + 1 overflow, never 1500.
+    expect(metric?.sum?.dataPoints.length).toBeLessThanOrEqual(1001);
+    expect(collectStrings(decoded)).toContain('otel.metric.overflow');
+  });
+
   it('does not throw when the export fetch rejects', async () => {
     const fetchFn = vi.fn(async () => {
       throw new Error('network down');

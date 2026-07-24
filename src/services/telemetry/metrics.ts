@@ -25,12 +25,17 @@
  * them — the correct model for a stateless/serverless producer.
  *
  * CARDINALITY is the governing constraint here, the metrics analogue of the logs/span
- * FAIL-CLOSED redaction. Metric labels MUST be a bounded enum set (see
- * `ALLOWED_LABEL_KEYS`): an unbounded label (user_id, request_id, chat_id, a raw error
- * message, a URL, an R2 key) both explodes the backend's time-series cardinality AND
- * re-introduces the PII that the trace/log paths strip. `sanitizeMetricLabels` fails
- * CLOSED — it drops any key not on the allow-list, so a stray label can never leak into
- * a dimension even from a call site that passes one in.
+ * FAIL-CLOSED redaction, enforced in TWO layers:
+ *   1. `sanitizeMetricLabels` bounds the label KEYS — it fails CLOSED, dropping any key
+ *      not in `ALLOWED_LABEL_KEYS`, so an unbounded/content-bearing label (user_id,
+ *      request_id, chat_id, a raw error message, a URL, an R2 key) can never become a
+ *      dimension even from a call site that passes one in. (This also strips the PII the
+ *      trace/log paths strip.)
+ *   2. The reader enforces a hard per-metric series cap (`MAX_SERIES_PER_METRIC`) at
+ *      aggregation time — the KEY allow-list does NOT bound VALUES (a dynamic tool/server
+ *      name or error class is legitimately allow-listed but externally sourced), so this
+ *      cap is what makes unbounded time series structurally impossible: once a metric
+ *      hits the cap, further distinct label-sets fold into one overflow series.
  *
  * Governance (same posture as M1/M2): telemetry is a genuine no-op unless the endpoint
  * + token are both set; nothing egresses and no instrument is created.
@@ -96,10 +101,24 @@ export const ALLOWED_LABEL_KEYS = new Set<string>([
 
 /**
  * Cap a label value's length so an unexpectedly large value under an allow-listed key
- * cannot bloat a dimension. Bounded values (enums, short codes) are far under this;
- * the cap is a backstop, not the primary guard (the key allow-list is).
+ * cannot bloat a single series. Bounded values (enums, short codes) are far under this;
+ * the cap is a backstop for value SIZE, not for cardinality — series COUNT is bounded
+ * separately by `MAX_SERIES_PER_METRIC` (truncation alone does not reduce cardinality:
+ * two distinct long values truncate to two distinct series).
  */
 const MAX_LABEL_VALUE_LENGTH = 64;
+
+/**
+ * Hard cap on the number of distinct label-combinations (time series) per metric. The
+ * SDK enforces this at aggregation time: once a metric reaches the limit, every further
+ * distinct attribute-set folds into a single overflow series (`otel.metric.overflow`),
+ * so a stray high-cardinality value can never create unbounded series — it degrades one
+ * metric to an overflow bucket instead. This is the definitive cardinality guarantee;
+ * the key allow-list and value truncation are the first lines that keep us far below it.
+ * Set deliberately (well under the SDK's generous 2000 default) and sized comfortably
+ * above the worst-case product of our bounded label value sets.
+ */
+const MAX_SERIES_PER_METRIC = 1000;
 
 /**
  * The typed label bag callers pass. Every key is optional and MUST be one of the
@@ -249,6 +268,9 @@ export class PerInvocationMetricReader extends MetricReader {
   constructor(private readonly exporter: PushMetricExporter) {
     super({
       aggregationTemporalitySelector: () => AggregationTemporality.DELTA,
+      // Hard cardinality cap per metric — see MAX_SERIES_PER_METRIC. Makes unbounded
+      // time series structurally impossible: overflow folds into one overflow series.
+      cardinalitySelector: () => MAX_SERIES_PER_METRIC,
     });
   }
 
