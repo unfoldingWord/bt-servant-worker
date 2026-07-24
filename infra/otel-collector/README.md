@@ -1,7 +1,8 @@
 # OpenTelemetry Collector (fly.io)
 
-The telemetry pipe. One bearer-authed OTLP/HTTP receiver → redact + batch → **OpenObserve**.
-Kept as a collector (not worker→OpenObserve direct) so a second sink can be added later as a
+The telemetry pipe. One bearer-authed OTLP/HTTP receiver → redact + batch →
+**OpenObserve** (all signals) + **InfluxDB 3 via door43** (metrics fan-out).
+Kept as a collector (not worker→sink direct) so sinks are added/changed as a
 collector-only change. See [`../README.md`](../README.md) for the big picture.
 
 ## Deploy
@@ -17,13 +18,25 @@ OTEL_INGEST_TOKEN="$(openssl rand -hex 32)"
 echo "Ingest token (also set on the worker as OTEL_COLLECTOR_TOKEN): $OTEL_INGEST_TOKEN"
 
 # O2_AUTH carries the OpenObserve ingestion token (from its UI), NOT the OTEL_INGEST_TOKEN above.
+# INFLUX_TOKEN is the door43-issued token mapped (by their Nginx) to the bucket named in
+# the `influxdb/door43_metrics` exporter — the token and the bucket must be a matched pair.
 fly secrets set \
   OTEL_INGEST_TOKEN="$OTEL_INGEST_TOKEN" \
   O2_ENDPOINT="https://bt-servant-openobserve.fly.dev/api/default" \
-  O2_AUTH="Basic $(printf '%s' 'you@example.com:INGEST_TOKEN' | base64)"
+  O2_AUTH="Basic $(printf '%s' 'you@example.com:INGEST_TOKEN' | base64)" \
+  INFLUX_TOKEN="<door43 apiv3_… token for the bucket in the config>"
 
 fly deploy --build-arg OTELCOL_VERSION=0.157.0   # pin a stable tag; see Dockerfile
 ```
+
+### InfluxDB sink notes
+
+- Smoke-test the token↔bucket pair first with [`tools/send_metrics.sh`](../../tools/send_metrics.sh)
+  (`./tools/send_metrics.sh <bucket>` — HTTP 204 = good).
+- The bucket **auto-creates on the first write** with infinite retention — ask infra to set
+  the retention period after it exists.
+- Verify in InfluxDB 3 Explorer: measurements arrive named after each OTel metric
+  (`requests_total`, `claude_fetch_duration_ms`, …) with our bounded labels as tags.
 
 `OTEL_INGEST_TOKEN` is the value the worker must send. Store the **same** string as the
 worker's `OTEL_COLLECTOR_TOKEN` secret (`wrangler secret put OTEL_COLLECTOR_TOKEN`).

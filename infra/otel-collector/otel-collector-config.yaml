@@ -1,8 +1,9 @@
 # OpenTelemetry Collector — bt-servant-worker telemetry pipe (fly.io)
 #
 # One bearer-authed OTLP/HTTP receiver exports every signal to OpenObserve
-# (self-hosted on fly). Kept as a collector (not worker→OpenObserve direct) so a
-# second sink can be added later as a change HERE ONLY — the worker never redeploys.
+# (self-hosted on fly); metrics ALSO fan out to InfluxDB 3 (door43). Kept as a
+# collector (not worker→sink direct) so sinks are added/changed HERE ONLY — the
+# worker never redeploys.
 #
 # All ${env:...} values come from fly secrets (see README). Nothing secret in git.
 
@@ -63,6 +64,22 @@ exporters:
     headers:
       Authorization: ${env:O2_AUTH} # metrics auto-stream, no stream-name
 
+  # ── Sink #2 (metrics only): InfluxDB 3 Core via door43's Nginx write proxy ──
+  # Influx 3 has NO native OTLP receiver, so this exporter converts OTLP metrics to
+  # line protocol and POSTs them to the v2-compat write API
+  # (`/api/v2/write?org=...&bucket=...`). The Nginx in front VALIDATES the
+  # `bucket=` in the request against the token, so `bucket` must be the exact name
+  # the token is mapped to; the bucket auto-creates on first write (retention is
+  # then set by infra, after creation). Auth is door43's CUSTOM header — the
+  # exporter's own `token` field would send `Authorization: Token ...`, which the
+  # proxy does not read, so it stays unset and the header is passed explicitly.
+  influxdb/door43_metrics:
+    endpoint: https://metrics.door43.org
+    org: unfoldingword # required by the exporter; Influx 3 ignores it (bucket is what's validated)
+    bucket: bt-servant-staging
+    headers:
+      X-InfluxDB-API-Token: ${env:INFLUX_TOKEN}
+
   # Bring-up aid: verbose stdout so `fly logs` shows every record. Remove once the
   # sink is confirmed (detailed verbosity is expensive under real traffic).
   debug:
@@ -82,7 +99,7 @@ service:
     metrics:
       receivers: [otlp]
       processors: [memory_limiter, attributes/redact, batch]
-      exporters: [otlp_http/openobserve_metrics, debug]
+      exporters: [otlp_http/openobserve_metrics, influxdb/door43_metrics, debug]
   telemetry:
     logs:
       level: info
