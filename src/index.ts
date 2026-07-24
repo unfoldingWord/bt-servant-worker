@@ -47,8 +47,8 @@ import { stripControlChars } from './types/prompt-overrides.js';
 import { constantTimeCompare } from './utils/crypto.js';
 import { ValidationError } from './utils/errors.js';
 import { getAudio, VOICE_SUBMISSION_PREFIX } from './services/audio/index.js';
-import { createRequestLogger } from './utils/logger.js';
-import { createTimingContext, timePhase } from './utils/timing.js';
+import { createRequestLogger, type RequestLogger } from './utils/logger.js';
+import { createTimingContext, timePhase, type TimingContext } from './utils/timing.js';
 import {
   MAX_SERVERS_PER_ORG,
   validateServerConfig,
@@ -61,6 +61,9 @@ import {
   resolveTelemetryConfig,
   initLogTelemetry,
   flushLogTelemetry,
+  initMetricTelemetry,
+  flushMetricTelemetry,
+  countMetric,
 } from './services/telemetry/index.js';
 
 // Re-export so tests and consumers can import from './src/index.js'
@@ -80,19 +83,21 @@ const app = new Hono<{ Bindings: Env }>();
 // is registered). `executionCtx` is absent in some test harnesses, so guard it.
 app.use('*', async (c, next) => {
   initLogTelemetry(c.env);
+  initMetricTelemetry(c.env);
   try {
     await next();
   } finally {
     try {
-      // The callback is only invoked when telemetry is enabled AND has buffered
-      // records; in that state (deployed envs) `executionCtx` is always present.
+      // The callbacks are only invoked when telemetry is enabled AND has buffered
+      // data; in that state (deployed envs) `executionCtx` is always present.
       flushLogTelemetry((promise) => c.executionCtx.waitUntil(promise));
+      flushMetricTelemetry((promise) => c.executionCtx.waitUntil(promise));
     } catch (err) {
       // Telemetry is best-effort and must NEVER alter the response, so we contain
       // any flush-time failure here. We cannot route it through the logger facade
       // (that would re-enter this same OTLP path); console.warn is the safety net.
 
-      console.warn(`otlp_log_flush_failed: ${err instanceof Error ? err.message : String(err)}`);
+      console.warn(`otlp_flush_failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 });
@@ -127,6 +132,7 @@ app.use('/api/*', async (c, next) => {
       path: c.req.path,
       method: c.req.method,
     });
+    countMetric('auth_rejections_total', { reason: 'missing_bearer', status_code: 401 });
     return c.json({ error: 'Authorization header with Bearer token required' }, 401);
   }
 
@@ -138,6 +144,7 @@ app.use('/api/*', async (c, next) => {
       path: c.req.path,
       method: c.req.method,
     });
+    countMetric('auth_rejections_total', { reason: 'invalid_token', status_code: 403 });
     return c.json({ error: 'Invalid API key' }, 403);
   }
 
@@ -1758,6 +1765,7 @@ async function handleChatRequest(
         user_id: body.user_id,
         client_id: body.client_id,
       });
+      countMetric('requests_total', { transport, status: 'validation_failed', status_code: 400 });
       return Response.json({ error: validationError }, { status: 400 });
     }
 
@@ -1778,19 +1786,39 @@ async function handleChatRequest(
       phases: timing.phases,
     });
 
+    countMetric('requests_total', {
+      transport,
+      chat_type: body.chat_type ?? 'private',
+      status_code: response.status,
+    });
     return response;
   } catch (error) {
-    logger.error('request_error', error, {
-      transport,
-      total_ms: Date.now() - timing.start,
-      phases: timing.phases,
-    });
-    if (error instanceof SyntaxError)
-      return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
-    if (error instanceof ValidationError)
-      return Response.json({ error: error.message }, { status: 400 });
-    return Response.json({ error: 'Internal server error' }, { status: 500 });
+    return respondToChatRequestError(error, transport, timing, logger);
   }
+}
+
+/** Log + count a failed chat request, then map the error to its HTTP response. */
+function respondToChatRequestError(
+  error: unknown,
+  transport: ChatTransport,
+  timing: TimingContext,
+  logger: RequestLogger
+): Response {
+  logger.error('request_error', error, {
+    transport,
+    total_ms: Date.now() - timing.start,
+    phases: timing.phases,
+  });
+  countMetric('requests_total', {
+    transport,
+    status: 'error',
+    error_name: error instanceof Error ? error.name : 'Error',
+  });
+  if (error instanceof SyntaxError)
+    return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
+  if (error instanceof ValidationError)
+    return Response.json({ error: error.message }, { status: 400 });
+  return Response.json({ error: 'Internal server error' }, { status: 500 });
 }
 
 interface DORequestParams {

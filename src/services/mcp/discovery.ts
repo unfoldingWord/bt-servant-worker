@@ -28,6 +28,7 @@ import { MCPError, MCPResponseTooLargeError } from '../../utils/errors.js';
 import { redactArgsForError, RequestLogger, summarizeArgs } from '../../utils/logger.js';
 import { recordFailure, recordSuccess } from './health.js';
 import { callMCPToolViaSdk, discoverServerToolsViaSdk } from './streamable-http-client.js';
+import { countMetric } from '../telemetry/index.js';
 import {
   CallMCPToolOptions,
   DEFAULT_MAX_RESPONSE_SIZE_BYTES,
@@ -99,6 +100,10 @@ function checkContentLengthHeader(response: Response, maxSize: number, serverId:
   if (contentLength) {
     const size = parseInt(contentLength, 10);
     if (!isNaN(size) && size > maxSize) {
+      countMetric('mcp_response_size_exceeded_total', {
+        server: serverId,
+        reason: 'content_length',
+      });
       throw new MCPResponseTooLargeError(size, maxSize, serverId);
     }
   }
@@ -124,6 +129,10 @@ async function readResponseWithSizeLimit(
     totalSize += value.length;
     if (totalSize > maxSize) {
       reader.cancel();
+      countMetric('mcp_response_size_exceeded_total', {
+        server: serverId,
+        reason: 'streamed_body',
+      });
       throw new MCPResponseTooLargeError(totalSize, maxSize, serverId);
     }
     chunks.push(value);

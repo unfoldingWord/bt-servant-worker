@@ -6,6 +6,7 @@ import OpenAI from 'openai';
 import { AudioSynthesisError } from '../../utils/errors.js';
 import { RequestLogger } from '../../utils/logger.js';
 import { MAX_TTS_INPUT_CHARS, SpeechSynthesisResult } from './types.js';
+import { countMetric, recordMetric } from '../telemetry/index.js';
 
 const TTS_MODEL = 'gpt-4o-mini-tts';
 const TTS_VOICE = 'ash';
@@ -261,6 +262,8 @@ export async function synthesizeSpeech(
         original_input_chars: text.length,
         was_truncated: text.length > MAX_TTS_INPUT_CHARS,
       });
+      recordMetric('tts_duration_ms', Date.now() - startTime, { status: 'success' });
+      countMetric('tts_total', { status: 'success' });
       return {
         audio_base64: audioBase64,
         audio_bytes: audioBytes,
@@ -274,9 +277,24 @@ export async function synthesizeSpeech(
     }
   }
 
+  return throwTtsExhausted(lastError, startTime, truncatedText.length, logger);
+}
+
+/** Emit the failure metric + log for exhausted TTS retries, then throw. */
+function throwTtsExhausted(
+  lastError: unknown,
+  startTime: number,
+  inputChars: number,
+  logger: RequestLogger
+): never {
+  recordMetric('tts_duration_ms', Date.now() - startTime, { status: 'error' });
+  countMetric('tts_total', {
+    status: 'error',
+    error_name: lastError instanceof Error ? lastError.name : 'Error',
+  });
   logger.error('tts_all_attempts_exhausted', lastError, {
     total_ms: Date.now() - startTime,
-    input_chars: truncatedText.length,
+    input_chars: inputChars,
   });
   if (lastError instanceof AudioSynthesisError) throw lastError;
   const msg = lastError instanceof Error ? lastError.message : String(lastError);

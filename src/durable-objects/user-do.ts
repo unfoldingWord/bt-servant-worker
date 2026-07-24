@@ -70,7 +70,15 @@ import { AppError, AudioTranscriptionError, ValidationError } from '../utils/err
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
 import { applyTemplateVariables } from '../utils/template.js';
 import { createTimingContext, timePhase, TimingContext } from '../utils/timing.js';
-import { initLogTelemetry, flushLogTelemetry, withSpan } from '../services/telemetry/index.js';
+import {
+  initLogTelemetry,
+  flushLogTelemetry,
+  initMetricTelemetry,
+  flushMetricTelemetry,
+  countMetric,
+  runWithMetricsSuppressed,
+  withSpan,
+} from '../services/telemetry/index.js';
 import { classifyTriggers, ClassifierResult } from '../services/classifier/index.js';
 import type { UnmatchedTrigger } from '../services/classifier/index.js';
 import { isAdminClient, validateChatBody } from '../utils/chat-validation.js';
@@ -280,16 +288,36 @@ export class UserDO {
     return this.requestLogger ?? createRequestLogger(crypto.randomUUID());
   }
 
+  /**
+   * Stand up this isolate's telemetry (logs + metrics). Idempotent per isolate and a
+   * genuine no-op until the OTEL secrets are set.
+   */
+  private initTelemetry(): void {
+    initLogTelemetry(this.env);
+    initMetricTelemetry(this.env);
+  }
+
+  /**
+   * Drain this isolate's buffered logs + aggregated metrics via the DO's own
+   * `waitUntil`. Safe to call MORE THAN ONCE per invocation: logs drain their buffer,
+   * and metrics use DELTA temporality so each flush exports only the measurements
+   * recorded since the previous drain (no double-counting). This is why background
+   * processing (SSE/callback drain) can flush its own late measurements without
+   * disturbing the fetch-boundary flush.
+   */
+  private flushTelemetry(): void {
+    flushLogTelemetry((promise) => this.state.waitUntil(promise));
+    flushMetricTelemetry((promise) => this.state.waitUntil(promise));
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const requestId = request.headers.get('X-Request-ID') ?? crypto.randomUUID();
     this.requestLogger = createRequestLogger(requestId);
 
-    // Telemetry (M2): the DO runs in its own isolate with its own log buffer, so
-    // it must init + flush independently of the worker. Flush in `finally` via the
-    // DO's own waitUntil. No-op until telemetry is configured. See the alarm-path
-    // note below for the one context this cannot cover.
-    initLogTelemetry(this.env);
+    // Telemetry (M2/M4): the DO runs in its own isolate with its own log buffer +
+    // metric aggregation, so it must init + flush independently of the worker.
+    this.initTelemetry();
     try {
       // Chat endpoints — one route per explicit transport.
       //   /chat/final     → synchronous final-only JSON. Worker has already
@@ -311,12 +339,12 @@ export class UserDO {
       // Non-chat endpoints don't need locking
       return await this.app.fetch(request);
     } finally {
-      // Drains logs buffered up to this point. The streaming/callback transports
-      // continue emitting from background work AFTER this returns (SSE writer,
-      // queued alarm drain); those late records flush on the NEXT DO boundary or
-      // are covered by the tail worker on isolate death. Full DO-lifecycle log
-      // coverage (SSE lifetime, alarm) lands in M3 with the withSpan seams.
-      flushLogTelemetry((promise) => this.state.waitUntil(promise));
+      // Drains everything buffered up to this point. The streaming/callback transports
+      // keep emitting from background work AFTER this returns (SSE writer, queued
+      // drain); those late measurements are flushed by an explicit `flushTelemetry()`
+      // at the end of each background path (see processImmediate*), and any residue on
+      // isolate death is covered by the tail worker.
+      this.flushTelemetry();
     }
   }
 
@@ -324,7 +352,27 @@ export class UserDO {
 
   async alarm(): Promise<void> {
     const logger = createRequestLogger(crypto.randomUUID());
+    // Metric recording is SUPPRESSED for the whole alarm call tree. Outbound fetch from an
+    // alarm() context is blocked by Cloudflare (1003, the same wall that forces
+    // orchestration into the fetch handler), so no exporter can egress here, and there is
+    // NO backstop for custom metrics (the tail worker forwards this isolate's console logs
+    // + exceptions, not our in-memory OTLP metric payloads). Simply not calling
+    // `initMetricTelemetry` here is not enough: a PRIOR fetch on a warm isolate may have
+    // already stood up the module meter, so alarm work would otherwise record DELTAs into
+    // it that can never export and are lost on a quiet eviction. `runWithMetricsSuppressed`
+    // makes those `countMetric`/`recordMetric` calls no-ops for this async context only
+    // (never a concurrent fetch's background work sharing the isolate). Metrics for queued
+    // work are captured where that work runs under the fetch handler (processImmediate* →
+    // drainQueue), which can export. Logs are NOT suppressed — the tail worker forwards
+    // them — so alarm diagnostics stay observable.
+    await runWithMetricsSuppressed(async () => {
+      await this.drainAlarmQueue(logger);
+      await this.rescheduleAlarm(logger);
+    });
+  }
 
+  /** Dequeue and process one entry for an alarm tick; recover the lock on failure. */
+  private async drainAlarmQueue(logger: RequestLogger): Promise<void> {
     try {
       const entry = await this.dequeueNext();
       if (!entry) {
@@ -342,7 +390,10 @@ export class UserDO {
         });
       }
     }
+  }
 
+  /** Schedule the next alarm tick; clear the processing flag if scheduling fails. */
+  private async rescheduleAlarm(logger: RequestLogger): Promise<void> {
     try {
       await this.scheduleNextAlarm();
     } catch (error) {
@@ -483,6 +534,7 @@ export class UserDO {
         max_depth: maxDepth,
         status: 429,
       });
+      countMetric('queue_entries_total', { status: 'rejected', reason: 'queue_full' });
       return Response.json(
         {
           error: 'Queue full',
@@ -498,6 +550,10 @@ export class UserDO {
       delivery: isCallbackDelivery ? 'callback' : 'sse',
       queue_position: position,
       user_id: body.user_id,
+    });
+    countMetric('queue_entries_total', {
+      status: 'enqueued',
+      type: isCallbackDelivery ? 'callback' : 'sse',
     });
 
     if (isCallbackDelivery) {
@@ -578,6 +634,10 @@ export class UserDO {
         await this.drainQueue(logger);
       } catch (drainErr) {
         logger.error('immediate_final_drain_failed', drainErr, { message_id: messageId });
+      } finally {
+        // Flush measurements emitted by the background drain — they were recorded
+        // after fetch()'s boundary flush already ran.
+        this.flushTelemetry();
       }
     })().catch((err) =>
       logger.error('immediate_final_drain_unhandled', err, { message_id: messageId })
@@ -607,6 +667,8 @@ export class UserDO {
       } finally {
         await this.releaseLock();
         await this.drainQueue(logger);
+        // Flush measurements from this background path — emitted after fetch() returned.
+        this.flushTelemetry();
       }
     })().catch((err) =>
       logger.error('immediate_callback_unhandled', err, { message_id: messageId })
@@ -654,6 +716,8 @@ export class UserDO {
         }
         await this.releaseLock();
         await this.drainQueue(logger);
+        // Flush measurements from this background path — emitted after fetch() returned.
+        this.flushTelemetry();
       }
     })().catch((err) => logger.error('immediate_sse_unhandled', err, { message_id: messageId }));
 
@@ -999,6 +1063,7 @@ export class UserDO {
       window_ms: ENQUEUE_RATE_WINDOW_MS,
       limit: ENQUEUE_RATE_LIMIT,
     });
+    countMetric('rate_limits_total', { type: 'enqueue', transport });
     return rateLimited;
   }
 

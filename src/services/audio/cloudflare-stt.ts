@@ -6,6 +6,7 @@
 
 import { AudioTranscriptionError } from '../../utils/errors.js';
 import { RequestLogger } from '../../utils/logger.js';
+import { countMetric, recordMetric } from '../telemetry/index.js';
 import {
   MAX_AUDIO_SIZE_BYTES,
   SUPPORTED_AUDIO_FORMATS,
@@ -60,6 +61,10 @@ export async function transcribeAudio(
   logger: RequestLogger
 ): Promise<TranscriptionResult> {
   const startTime = Date.now();
+  // Canonicalize the format for the metric label at the source (case-insensitive,
+  // MIME → bare extension), so `audio/ogg` / `OGG` count as `ogg` instead of collapsing
+  // to `other`. Unrecognized formats become `other` — the bounded value set for the label.
+  const metricFormat = normalizeAudioFormat(audioFormat) ?? 'other';
   const decodedSize = validateAudioInput(audioBase64, audioFormat, logger);
   logger.log('stt_start', {
     format: audioFormat,
@@ -87,9 +92,17 @@ export async function transcribeAudio(
       had_text: text.length > 0,
     });
 
+    recordMetric('stt_duration_ms', durationMs, { status: 'success', format: metricFormat });
+    countMetric('stt_total', { status: 'success', format: metricFormat });
     return { text, duration_ms: durationMs };
   } catch (error) {
     const durationMs = Date.now() - startTime;
+    recordMetric('stt_duration_ms', durationMs, { status: 'error', format: metricFormat });
+    countMetric('stt_total', {
+      status: 'error',
+      format: metricFormat,
+      error_name: error instanceof Error ? error.name : 'Error',
+    });
     if (error instanceof AudioTranscriptionError) throw error;
     const msg = error instanceof Error ? error.message : String(error);
     logger.error('stt_error', error, {

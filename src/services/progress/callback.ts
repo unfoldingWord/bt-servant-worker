@@ -7,6 +7,7 @@
 
 import { Attachment, ChatResponse, ProgressMode, StreamCallbacks } from '../../types/engine.js';
 import { RequestLogger, safeAsync } from '../../utils/logger.js';
+import { countMetric } from '../telemetry/index.js';
 
 export interface ProgressCallbackConfig {
   url: string;
@@ -112,6 +113,11 @@ export class ProgressCallbackSender {
     try {
       const response = await this.fetchWithTimeout(fullPayload);
       this.logger?.log('webhook_response', { ...ctx, status: response.status });
+      countMetric('progress_webhook_total', {
+        type: payload.type,
+        status: response.ok ? 'success' : 'http_error',
+        status_code: response.status,
+      });
       if (!response.ok) {
         this.logger?.warn('webhook_failure', {
           url: this.config.url,
@@ -122,6 +128,11 @@ export class ProgressCallbackSender {
     } catch (error) {
       // Non-blocking: webhook failures shouldn't break main flow
       const isTimeout = error instanceof Error && error.name === 'AbortError';
+      countMetric('progress_webhook_total', {
+        type: payload.type,
+        status: 'error',
+        error_name: error instanceof Error ? error.name : 'Error',
+      });
       this.logger?.error('webhook_failure', error, {
         url: this.config.url,
         is_timeout: isTimeout,

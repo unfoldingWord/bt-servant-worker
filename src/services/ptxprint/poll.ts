@@ -10,6 +10,7 @@
 
 import { RequestLogger } from '../../utils/logger.js';
 import { JobStatusResult } from './types.js';
+import { countMetric, recordMetric } from '../telemetry/index.js';
 
 export const DEFAULT_POLL_INTERVAL_MS = 5_000;
 export const DEFAULT_POLL_TIMEOUT_MS = 60_000;
@@ -90,6 +91,8 @@ function buildTerminalResult(
     polls,
     elapsed_ms: elapsed,
   });
+  recordMetric('ptxprint_poll_duration_ms', elapsed, { status: status.state });
+  countMetric('ptxprint_poll_total', { status: status.state });
   return {
     outcome: status.state as 'succeeded' | 'failed' | 'cancelled',
     state: status.state,
@@ -112,6 +115,8 @@ function buildTimeoutPollResult(
     elapsed_ms: elapsed,
     last_state: lastStatus?.state ?? 'unknown',
   });
+  recordMetric('ptxprint_poll_duration_ms', elapsed, { status: 'timeout' });
+  countMetric('ptxprint_poll_total', { status: 'timeout' });
   return {
     outcome: 'timeout',
     state: lastStatus?.state ?? 'unknown',

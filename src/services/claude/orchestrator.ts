@@ -31,7 +31,7 @@ import { redactToolInputForError, RequestLogger, summarizeToolInput } from '../.
 import { stripUlyssesComments } from '../../utils/ulysses-comments.js';
 import { UnmatchedTrigger } from '../classifier/index.js';
 import { createMCPHostFunctions, executeCode } from '../code-execution/index.js';
-import { withSpan, recordSpanError } from '../telemetry/index.js';
+import { withSpan, recordSpanError, countMetric, recordMetric } from '../telemetry/index.js';
 import {
   callMCPTool,
   createHealthTracker,
@@ -958,9 +958,18 @@ async function callClaudeForIteration(
   iteration: number,
   iterStart: number
 ): Promise<Anthropic.Message> {
+  const callStart = Date.now();
   try {
-    return await callClaude(ctx);
+    const response = await callClaude(ctx);
+    recordMetric('claude_fetch_duration_ms', Date.now() - callStart, { status: 'success' });
+    countMetric('claude_fetch_total', { status: 'success' });
+    return response;
   } catch (error) {
+    recordMetric('claude_fetch_duration_ms', Date.now() - callStart, { status: 'error' });
+    countMetric('claude_fetch_total', {
+      status: 'error',
+      error_name: error instanceof Error ? error.name : 'Error',
+    });
     ctx.logger.error('iteration_claude_call_failed', error, {
       iteration,
       message_count: ctx.messages.length,
@@ -1303,6 +1312,9 @@ async function runOrchestrationLoop(
     exit_reason: exitReason,
     last_iteration: lastIteration,
   });
+  // Iterations actually run this request (lastIteration is 0-based), labeled by how
+  // the loop exited — bounded reason enum, no ids.
+  recordMetric('orchestration_iterations', lastIteration + 1, { reason: exitReason });
 
   // Log health summary at end of orchestration
   logOrchestrationSummary(ctx);
@@ -1367,12 +1379,34 @@ async function executeToolCalls(
   return Promise.all(toolCalls.map((tc) => executeSingleTool(tc, ctx)));
 }
 
+/** Emit the tool-dispatch counter + duration histogram with bounded labels. */
+function recordToolCallMetrics(
+  toolName: string,
+  status: 'success' | 'error',
+  durationMs: number,
+  errorName?: string
+): void {
+  recordMetric('tool_call_duration_ms', durationMs, { tool_name: toolName, status });
+  countMetric('tool_calls_total', {
+    tool_name: toolName,
+    status,
+    ...(errorName ? { error_name: errorName } : {}),
+  });
+}
+
 function executeSingleTool(
   toolCall: ToolUseBlock,
   ctx: OrchestrationContext
 ): Promise<Anthropic.ToolResultBlockParam> {
   // `tool_name`/`tool_id` are allow-listed bounded ids; the tool INPUT is not attached
   // to the span (it can carry user content) — the existing summarized log keeps it.
+  // Bound the tool_name METRIC label to the tools actually offered to Claude this
+  // request (+ 'unknown' for a name the model invented), so a hallucinated tool name on
+  // an error path can't spawn unbounded metric series. Spans/logs keep the raw name —
+  // they are per-request events, not aggregated into fixed-cardinality series.
+  const metricToolName = ctx.tools.some((t) => t.name === toolCall.name)
+    ? toolCall.name
+    : 'unknown';
   return withSpan(
     'tool_dispatch',
     { tool_name: toolCall.name, tool_id: toolCall.id },
@@ -1388,6 +1422,7 @@ function executeSingleTool(
 
       try {
         const result = await dispatchToolCall(toolCall, ctx);
+        recordToolCallMetrics(metricToolName, 'success', Date.now() - startTime);
         logToolSuccess(ctx, toolCall, startTime);
         ctx.callbacks?.onToolResult?.(toolCall.name, result);
         const serialized = JSON.stringify(result);
@@ -1404,6 +1439,12 @@ function executeSingleTool(
         // The tool error is handled here (returned to the model as an error result),
         // not thrown, so mark the span explicitly — withSpan only auto-records throws.
         recordSpanError(span, error);
+        recordToolCallMetrics(
+          metricToolName,
+          'error',
+          Date.now() - startTime,
+          error instanceof Error ? error.name : 'Error'
+        );
         return handleToolError(ctx, toolCall, error, startTime);
       }
     }
