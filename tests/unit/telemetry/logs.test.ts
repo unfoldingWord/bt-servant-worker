@@ -345,6 +345,46 @@ describe('FetchLogExporter', () => {
     );
     expect(result.code).toBe(1);
   });
+
+  it('invokes the fetcher detached from `this` (Workers illegal-invocation guard)', async () => {
+    // Regression: calling the raw fetch as `this.fetchFn(...)` sets the receiver to the
+    // exporter instance, which the Workers runtime rejects with `TypeError: Illegal
+    // invocation` — so every log flush threw and nothing reached the collector. The
+    // fetcher must be called detached (bare call → `this === undefined`).
+    const capturingFetch = vi.fn(() => Promise.resolve(new Response(null, { status: 200 })));
+    const exporter = new FetchLogExporter(
+      'https://c.example/v1/logs',
+      't',
+      capturingFetch as unknown as typeof fetch
+    );
+    await new Promise<{ code: number }>((resolve) =>
+      exporter.export([serializableRecord({ a: 1 })], resolve)
+    );
+
+    // `mock.contexts` records the `this` receiver of each call. With the bug it is the
+    // exporter instance; called detached it is `undefined`.
+    expect(capturingFetch).toHaveBeenCalledOnce();
+    expect(capturingFetch.mock.contexts[0]).toBeUndefined();
+  });
+
+  it('catches a synchronous fetch throw and reports FAILED instead of escaping', async () => {
+    // The illegal-invocation TypeError is thrown synchronously, before the promise chain,
+    // so the `.catch` cannot see it — it must be caught explicitly or it escapes export().
+    const throwingFetch = vi.fn(() => {
+      throw new TypeError('Illegal invocation');
+    });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const exporter = new FetchLogExporter(
+      'https://c.example/v1/logs',
+      't',
+      throwingFetch as unknown as typeof fetch
+    );
+    const result = await new Promise<{ code: number }>((resolve) =>
+      exporter.export([serializableRecord({ a: 1 })], resolve)
+    );
+    expect(result.code).toBe(1);
+    expect(throwingFetch).toHaveBeenCalledOnce();
+  });
 });
 
 describe('telemetry logs wiring (init → emit → flush)', () => {
