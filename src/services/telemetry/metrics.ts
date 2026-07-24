@@ -305,14 +305,32 @@ export class FetchMetricExporter implements PushMetricExporter {
       return;
     }
 
-    this.fetchFn(this.url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.token}`,
-      },
-      body,
-    })
+    // Detach the fetcher from `this` before calling. Invoking it as `this.fetchFn(...)`
+    // sets the receiver to this exporter instance, which the Workers runtime rejects with
+    // `TypeError: Illegal invocation` — native fetch must be called with a global/undefined
+    // `this`. A bare call in strict ESM passes `this === undefined`, which fetch accepts.
+    // The throw is synchronous (before the promise chain), so it must be caught here or it
+    // escapes as a raw platform error, bypassing the `.catch` below and this handler's logs.
+    const fetchFn = this.fetchFn;
+    let responsePromise: Promise<Response>;
+    try {
+      responsePromise = fetchFn(this.url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${this.token}`,
+        },
+        body,
+      });
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+
+      console.warn(`otlp_metrics_export_error: ${error.message}`);
+      resultCallback({ code: 1, error });
+      return;
+    }
+
+    responsePromise
       .then((response) => {
         if (response.ok) {
           resultCallback({ code: 0 }); // ExportResultCode.SUCCESS

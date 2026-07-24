@@ -187,6 +187,38 @@ describe('metrics stack (init → emit → flush)', () => {
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
+  it('invokes the fetcher detached from `this` (Workers illegal-invocation guard)', async () => {
+    // Regression: calling the raw fetch as `this.fetchFn(...)` sets the receiver to the
+    // exporter instance, which the Workers runtime rejects with `TypeError: Illegal
+    // invocation` — so every metrics flush threw and nothing reached the collector. The
+    // fetcher must be called detached (bare call → `this === undefined`).
+    const capturingFetch = okFetch();
+    initMetricTelemetry(ENABLED, { fetchFn: capturingFetch });
+    countMetric('requests_total', { transport: 'whatsapp', status_code: 200 });
+    await flushAndWait();
+
+    // `mock.contexts` records the `this` receiver of each call. With the bug it is the
+    // exporter instance; called detached it is `undefined`.
+    const mock = capturingFetch as unknown as ReturnType<typeof vi.fn>;
+    expect(mock).toHaveBeenCalledTimes(1);
+    expect(mock.mock.contexts[0]).toBeUndefined();
+  });
+
+  it('catches a synchronous fetch throw so the flush resolves (does not escape)', async () => {
+    // The illegal-invocation TypeError is thrown synchronously, before the promise chain,
+    // so the `.catch` cannot see it. Without an explicit try/catch it escapes export() and
+    // rejects the flush; assert it is caught and reported instead.
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const throwingFetch = vi.fn(() => {
+      throw new TypeError('Illegal invocation');
+    }) as unknown as typeof fetch;
+    initMetricTelemetry(ENABLED, { fetchFn: throwingFetch });
+    countMetric('requests_total', { transport: 'whatsapp', status_code: 200 });
+
+    await expect(flushAndWait()).resolves.toBeUndefined();
+    expect(throwingFetch).toHaveBeenCalledTimes(1);
+  });
+
   it('records a histogram observation', async () => {
     const fetchFn = okFetch();
     initMetricTelemetry(ENABLED, { fetchFn });
