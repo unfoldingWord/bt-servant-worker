@@ -9,6 +9,7 @@ export {
   flushMetricTelemetry,
   countMetric,
   recordMetric,
+  runWithMetricsSuppressed,
   type MetricLabels,
 } from './metrics.js';
 export { withSpan, withSpanSync, recordSpanError } from './span.js';

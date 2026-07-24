@@ -7,6 +7,7 @@ import {
   FetchMetricExporter,
   countMetric,
   recordMetric,
+  runWithMetricsSuppressed,
   initMetricTelemetry,
   flushMetricTelemetry,
   resetMetricTelemetryForTests,
@@ -108,16 +109,19 @@ describe('sanitizeMetricLabels', () => {
   });
 
   it('clamps runtime-sourced label values outside their allow-list to "other"', () => {
-    // error_name/chat_type are bounded VALUE sets; anything else collapses so a dynamic
-    // value (a novel error class, a spoofed chat_type) cannot spawn a new series.
+    // error_name/chat_type/format are bounded VALUE sets; anything else collapses so a
+    // dynamic value (a novel error class, a spoofed chat_type) cannot spawn a new series.
+    // `format` values are canonicalized at their source; the guard here is defense in depth.
     const safe = sanitizeMetricLabels({
       error_name: 'SomeLibrarySpecificError',
       chat_type: 'not-a-real-type',
+      format: 'exotic-codec',
       status: 'error',
     });
     expect(safe).toEqual({
       error_name: 'other',
       chat_type: 'other',
+      format: 'other',
       status: 'error',
     });
   });
@@ -126,10 +130,12 @@ describe('sanitizeMetricLabels', () => {
     const safe = sanitizeMetricLabels({
       error_name: 'MCPResponseTooLargeError',
       chat_type: 'supergroup',
+      format: 'ogg',
     });
     expect(safe).toEqual({
       error_name: 'MCPResponseTooLargeError',
       chat_type: 'supergroup',
+      format: 'ogg',
     });
   });
 });
@@ -265,6 +271,32 @@ describe('metrics stack (init → emit → flush)', () => {
     // 1000 distinct + 1 overflow, never 1500.
     expect(metric?.sum?.dataPoints.length).toBeLessThanOrEqual(1001);
     expect(collectStrings(decoded)).toContain('otel.metric.overflow');
+  });
+
+  it('suppresses recording inside runWithMetricsSuppressed but not outside it', async () => {
+    const fetchFn = okFetch();
+    initMetricTelemetry(ENABLED, { fetchFn });
+    // Emitted inside the suppressed async context (the alarm path) — must be dropped even
+    // though the meter is live, since an alarm cannot export and has no metric backstop.
+    await runWithMetricsSuppressed(async () => {
+      countMetric('requests_total', { status: 'error', reason: 'alarm_work' });
+      recordMetric('claude_fetch_duration_ms', 99, { status: 'error' });
+      await Promise.resolve(); // suppression must survive an await in the call tree
+      countMetric('tool_calls_total', { tool_name: 'read_memory', status: 'error' });
+    });
+    // Emitted outside — a concurrent/subsequent fetch's work must still record.
+    countMetric('requests_total', { transport: 'stream', status_code: 200 });
+    await flushAndWait();
+
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    const strings = collectStrings(
+      decodeBody((fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls[0][1].body)
+    ).join('\n');
+    expect(strings).toContain('requests_total'); // the outside emit
+    expect(strings).toContain('stream');
+    expect(strings).not.toContain('alarm_work'); // suppressed emits absent
+    expect(strings).not.toContain('claude_fetch_duration_ms');
+    expect(strings).not.toContain('tool_calls_total');
   });
 
   it('does not throw when the export fetch rejects', async () => {

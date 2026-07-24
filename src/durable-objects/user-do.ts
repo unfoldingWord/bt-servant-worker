@@ -76,6 +76,7 @@ import {
   initMetricTelemetry,
   flushMetricTelemetry,
   countMetric,
+  runWithMetricsSuppressed,
   withSpan,
 } from '../services/telemetry/index.js';
 import { classifyTriggers, ClassifierResult } from '../services/classifier/index.js';
@@ -351,19 +352,23 @@ export class UserDO {
 
   async alarm(): Promise<void> {
     const logger = createRequestLogger(crypto.randomUUID());
-    // No OTLP telemetry lifecycle here — deliberately. Outbound fetch from an alarm()
-    // context is blocked by Cloudflare (1003, the same wall that forces orchestration into
-    // the fetch handler), so no exporter can egress from here, and there is NO backstop for
-    // custom metrics (the tail worker forwards this isolate's console logs + exceptions,
-    // not our in-memory OTLP metric payloads). We therefore do not `initMetricTelemetry`
-    // here: standing up a meter in a context that cannot export would only record
-    // measurements that are unrecoverable if the isolate is evicted before any fetch, and
-    // flushing would be worse still — `collect()` resets the DELTA accumulator, so a failed
-    // export would drop the data outright. Metrics for queued work are captured where that
-    // work actually runs, under the fetch handler (processImmediate* → drainQueue), which
-    // CAN export. Alarm diagnostics remain observable via the tail worker's log forwarding.
-    await this.drainAlarmQueue(logger);
-    await this.rescheduleAlarm(logger);
+    // Metric recording is SUPPRESSED for the whole alarm call tree. Outbound fetch from an
+    // alarm() context is blocked by Cloudflare (1003, the same wall that forces
+    // orchestration into the fetch handler), so no exporter can egress here, and there is
+    // NO backstop for custom metrics (the tail worker forwards this isolate's console logs
+    // + exceptions, not our in-memory OTLP metric payloads). Simply not calling
+    // `initMetricTelemetry` here is not enough: a PRIOR fetch on a warm isolate may have
+    // already stood up the module meter, so alarm work would otherwise record DELTAs into
+    // it that can never export and are lost on a quiet eviction. `runWithMetricsSuppressed`
+    // makes those `countMetric`/`recordMetric` calls no-ops for this async context only
+    // (never a concurrent fetch's background work sharing the isolate). Metrics for queued
+    // work are captured where that work runs under the fetch handler (processImmediate* →
+    // drainQueue), which can export. Logs are NOT suppressed — the tail worker forwards
+    // them — so alarm diagnostics stay observable.
+    await runWithMetricsSuppressed(async () => {
+      await this.drainAlarmQueue(logger);
+      await this.rescheduleAlarm(logger);
+    });
   }
 
   /** Dequeue and process one entry for an alarm tick; recover the lock on failure. */

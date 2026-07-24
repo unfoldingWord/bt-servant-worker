@@ -45,6 +45,7 @@
  * Governance (same posture as M1/M2): telemetry is a genuine no-op unless the endpoint
  * + token are both set; nothing egresses and no instrument is created.
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { type Counter, type Histogram, type Meter } from '@opentelemetry/api';
 import {
   AggregationTemporality,
@@ -172,14 +173,17 @@ const OTHER_LABEL_VALUE = 'other';
  * BACKEND series over time — the cap alone does NOT stop it. So any value outside its
  * allow-list collapses to `OTHER_LABEL_VALUE` here, at the source, before it can egress.
  *
+ * `format` is canonicalized at its SOURCE (`normalizeAudioFormat` maps MIME/mixed-case to
+ * a bare `AudioFormat` or `other`) — the domain logic that belongs with the audio module —
+ * so the values that reach this guard are already bare extensions. Keeping it in the set
+ * here is safe (no legitimate value is wrongly collapsed) and adds fail-closed defense in
+ * depth for any future call site that forgets to canonicalize first.
+ *
  * Deliberately NOT bounded here: `tool_name`/`server`/`model`/`language*`/`intent` are
  * operator-/catalog-scoped identifiers — they are the intended breakdown dimensions and
  * are bounded by CONFIGURATION (registered tools, configured servers), not by request
  * traffic. Clamping them to `other` would destroy the metric's purpose; the per-metric
  * series cap (`MAX_SERIES_PER_METRIC`) backstops them against a within-window blow-up.
- * `format` is likewise absent: it is canonicalized at its source (`normalizeAudioFormat`
- * maps MIME/mixed-case to a bare `AudioFormat` or `other`), which belongs with the audio
- * module — re-clamping a raw value here would wrongly collapse `audio/ogg`/`OGG` to `other`.
  *
  * `error_name` is kept in sync with `src/utils/errors.ts` (+ common JS built-ins and the
  * Anthropic SDK error classes). A new error class not listed here degrades to `other`
@@ -187,6 +191,7 @@ const OTHER_LABEL_VALUE = 'other';
  */
 const BOUNDED_LABEL_VALUES: Record<string, ReadonlySet<string>> = {
   chat_type: new Set(['private', 'group', 'supergroup']),
+  format: new Set(['ogg', 'mp3', 'wav', 'webm', 'flac', 'm4a']),
   error_name: new Set([
     // AppError hierarchy (src/utils/errors.ts)
     'AppError',
@@ -390,6 +395,26 @@ let moduleProvider: MeterProvider | null = null;
 const counters = new Map<string, Counter>();
 const histograms = new Map<string, Histogram>();
 
+/**
+ * When a truthy value is present in this async context, `countMetric`/`recordMetric` are
+ * no-ops. Used to disable metric recording inside the DO `alarm()` handler: the module
+ * meter may already be live (stood up by a PRIOR fetch on a warm/shared isolate), but an
+ * alarm context cannot export (Cloudflare 1003) and there is NO backstop for custom
+ * metrics — so recording there would only strand unexportable DELTAs that are lost on a
+ * quiet eviction. Scoping via AsyncLocalStorage (not a module flag) is essential: an alarm
+ * can run while a prior fetch's background work is still emitting on the same isolate, and
+ * only the alarm's own async call tree must be suppressed — never the concurrent fetch.
+ */
+const metricSuppression = new AsyncLocalStorage<boolean>();
+
+/**
+ * Run `fn` (and its entire async call tree) with metric recording suppressed. Logs are
+ * unaffected — they have the tail worker's console-forwarding backstop; metrics do not.
+ */
+export function runWithMetricsSuppressed<T>(fn: () => T): T {
+  return metricSuppression.run(true, fn);
+}
+
 /** Lazily create + cache a counter by name (idempotent within an isolate). */
 function getCounter(name: string): Counter | null {
   const meter = moduleMeter;
@@ -421,6 +446,7 @@ function getHistogram(name: string): Histogram | null {
  * not break the request path.
  */
 export function countMetric(name: string, labels: MetricLabels = {}, value = 1): void {
+  if (metricSuppression.getStore()) return;
   const counter = getCounter(name);
   if (!counter) return;
   try {
@@ -436,6 +462,7 @@ export function countMetric(name: string, labels: MetricLabels = {}, value = 1):
  * contract as {@link countMetric}.
  */
 export function recordMetric(name: string, value: number, labels: MetricLabels = {}): void {
+  if (metricSuppression.getStore()) return;
   const histogram = getHistogram(name);
   if (!histogram) return;
   try {
