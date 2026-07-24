@@ -106,6 +106,36 @@ describe('sanitizeMetricLabels', () => {
     const safe = sanitizeMetricLabels({ reason: long });
     expect((safe.reason as string).length).toBe(64);
   });
+
+  it('clamps runtime-sourced label values outside their allow-list to "other"', () => {
+    // error_name/chat_type/format are bounded VALUE sets; anything else collapses so a
+    // dynamic value (a novel error class, a spoofed chat_type) cannot spawn a new series.
+    const safe = sanitizeMetricLabels({
+      error_name: 'SomeLibrarySpecificError',
+      chat_type: 'not-a-real-type',
+      format: 'exotic-codec',
+      status: 'error',
+    });
+    expect(safe).toEqual({
+      error_name: 'other',
+      chat_type: 'other',
+      format: 'other',
+      status: 'error',
+    });
+  });
+
+  it('keeps runtime-sourced label values that ARE in their allow-list', () => {
+    const safe = sanitizeMetricLabels({
+      error_name: 'MCPResponseTooLargeError',
+      chat_type: 'supergroup',
+      format: 'ogg',
+    });
+    expect(safe).toEqual({
+      error_name: 'MCPResponseTooLargeError',
+      chat_type: 'supergroup',
+      format: 'ogg',
+    });
+  });
 });
 
 describe('FetchMetricExporter', () => {
@@ -188,13 +218,11 @@ describe('metrics stack (init → emit → flush)', () => {
     expect(joined).not.toContain('request_id');
   });
 
-  it('bounds series count per metric — high-cardinality values fold into overflow', async () => {
+  it('clamps a runtime-value flood to one series through the whole export path', async () => {
     const fetchFn = okFetch();
     initMetricTelemetry(ENABLED, { fetchFn });
-    // error_name is allow-listed (bounded in practice) but the KEY allow-list does not
-    // bound VALUES. Smuggle 1500 distinct values to prove the reader's per-metric cap
-    // (1000) collapses the excess into a single overflow series rather than emitting
-    // 1500 distinct time series.
+    // error_name values are bounded at the SOURCE, so 1500 distinct novel classes all
+    // collapse to `other` — one series, no per-window overflow, and no raw value egresses.
     for (let i = 0; i < 1500; i++) {
       countMetric('requests_total', { status: 'error', error_name: `Err${i}` });
     }
@@ -210,6 +238,34 @@ describe('metrics stack (init → emit → flush)', () => {
       .flatMap((rm) => rm.scopeMetrics)
       .flatMap((sm) => sm.metrics)
       .find((m) => m.name === 'requests_total');
+    // Only {status:error, error_name:other} — a single series, never 1500.
+    expect(metric?.sum?.dataPoints.length).toBe(1);
+    const joined = collectStrings(decoded).join('\n');
+    expect(joined).not.toContain('Err0');
+    expect(joined).not.toContain('Err1499');
+  });
+
+  it('backstops a pass-through identifier flood with the per-metric overflow cap', async () => {
+    const fetchFn = okFetch();
+    initMetricTelemetry(ENABLED, { fetchFn });
+    // tool_name is an operator-scoped identifier we intentionally pass through (not value-
+    // clamped). A within-window blow-up is caught by the SDK series cap: excess distinct
+    // values fold into one `otel.metric.overflow` series rather than 1500 distinct ones.
+    for (let i = 0; i < 1500; i++) {
+      countMetric('tool_calls_total', { status: 'success', tool_name: `tool_${i}` });
+    }
+    await flushAndWait();
+
+    const [, init] = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    const decoded = decodeBody(init.body) as {
+      resourceMetrics: Array<{
+        scopeMetrics: Array<{ metrics: Array<{ name: string; sum?: { dataPoints: unknown[] } }> }>;
+      }>;
+    };
+    const metric = decoded.resourceMetrics
+      .flatMap((rm) => rm.scopeMetrics)
+      .flatMap((sm) => sm.metrics)
+      .find((m) => m.name === 'tool_calls_total');
     // 1000 distinct + 1 overflow, never 1500.
     expect(metric?.sum?.dataPoints.length).toBeLessThanOrEqual(1001);
     expect(collectStrings(decoded)).toContain('otel.metric.overflow');

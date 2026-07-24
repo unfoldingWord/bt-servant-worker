@@ -25,17 +25,22 @@
  * them — the correct model for a stateless/serverless producer.
  *
  * CARDINALITY is the governing constraint here, the metrics analogue of the logs/span
- * FAIL-CLOSED redaction, enforced in TWO layers:
- *   1. `sanitizeMetricLabels` bounds the label KEYS — it fails CLOSED, dropping any key
- *      not in `ALLOWED_LABEL_KEYS`, so an unbounded/content-bearing label (user_id,
- *      request_id, chat_id, a raw error message, a URL, an R2 key) can never become a
- *      dimension even from a call site that passes one in. (This also strips the PII the
- *      trace/log paths strip.)
- *   2. The reader enforces a hard per-metric series cap (`MAX_SERIES_PER_METRIC`) at
- *      aggregation time — the KEY allow-list does NOT bound VALUES (a dynamic tool/server
- *      name or error class is legitimately allow-listed but externally sourced), so this
- *      cap is what makes unbounded time series structurally impossible: once a metric
- *      hits the cap, further distinct label-sets fold into one overflow series.
+ * FAIL-CLOSED redaction, enforced in THREE layers (`sanitizeMetricLabels` + the reader):
+ *   1. KEY allow-list — drops any key not in `ALLOWED_LABEL_KEYS`, so an unbounded/
+ *      content-bearing label (user_id, request_id, chat_id, a raw error message, a URL,
+ *      an R2 key) can never become a dimension. (Also strips the PII the trace/log paths
+ *      strip.)
+ *   2. VALUE allow-list — for the labels whose values come from runtime/untrusted input
+ *      (`error_name`, `chat_type`, `format`), a value outside its `BOUNDED_LABEL_VALUES`
+ *      set collapses to `other`. This is the PRIMARY value-cardinality guarantee: the SDK
+ *      series cap (layer 3) only bounds a single collection window, and DELTA collection
+ *      resets it every flush, so a per-window cap alone can't stop a value that varies
+ *      across flushes from accumulating unbounded BACKEND series over time — bounding the
+ *      value SET at the source can.
+ *   3. Per-metric series cap (`MAX_SERIES_PER_METRIC`) — the reader's within-window
+ *      backstop for the operator-scoped identifier labels we intentionally pass through
+ *      (`tool_name`/`server`, bounded by configuration, not request traffic): a blow-up
+ *      folds into one `otel.metric.overflow` series.
  *
  * Governance (same posture as M1/M2): telemetry is a genuine no-op unless the endpoint
  * + token are both set; nothing egresses and no instrument is created.
@@ -109,14 +114,18 @@ export const ALLOWED_LABEL_KEYS = new Set<string>([
 const MAX_LABEL_VALUE_LENGTH = 64;
 
 /**
- * Hard cap on the number of distinct label-combinations (time series) per metric. The
- * SDK enforces this at aggregation time: once a metric reaches the limit, every further
- * distinct attribute-set folds into a single overflow series (`otel.metric.overflow`),
- * so a stray high-cardinality value can never create unbounded series — it degrades one
- * metric to an overflow bucket instead. This is the definitive cardinality guarantee;
- * the key allow-list and value truncation are the first lines that keep us far below it.
- * Set deliberately (well under the SDK's generous 2000 default) and sized comfortably
- * above the worst-case product of our bounded label value sets.
+ * Per-metric distinct-series cap enforced by the SDK at aggregation time: once a metric
+ * reaches the limit within a collection window, every further distinct attribute-set
+ * folds into one overflow series (`otel.metric.overflow`).
+ *
+ * IMPORTANT — this is a BACKSTOP, not the primary cardinality guarantee. Because we use
+ * DELTA temporality and drain once per invocation, each flush is a fresh collection
+ * window and the cap resets, so a value that varies across windows would still create
+ * unbounded BACKEND series over time despite never exceeding the cap in any single
+ * window. The real guarantee is bounding the VALUE SET at the source (`BOUNDED_LABEL_
+ * VALUES`); this cap only backstops the operator-scoped identifier labels we pass through
+ * (`tool_name`/`server`) against a within-window blow-up. Set well under the SDK's 2000
+ * default.
  */
 const MAX_SERIES_PER_METRIC = 1000;
 
@@ -150,11 +159,85 @@ export interface MetricLabels {
 /** An OTLP metric attribute (label) value must be a bounded primitive. */
 type LabelValue = string | number | boolean;
 
+/** Sentinel a runtime-sourced label value collapses to when it is outside its allow-list. */
+const OTHER_LABEL_VALUE = 'other';
+
+/**
+ * Per-key allow-lists of bounded VALUES for the labels whose values come from RUNTIME or
+ * UNTRUSTED input — a thrown error's class name, a user-supplied `chat_type`/`format`.
+ * Unlike code-literal labels (`status`/`op`/`reason`/`transport`/`type`, whose values are
+ * string literals in our own source and thus inherently bounded), these could otherwise
+ * carry unbounded distinct values. And because DELTA collection resets the SDK's
+ * per-window cardinality cap on every flush, an unbounded value would accumulate unbounded
+ * BACKEND series over time — the cap alone does NOT stop it. So any value outside its
+ * allow-list collapses to `OTHER_LABEL_VALUE` here, at the source, before it can egress.
+ *
+ * Deliberately NOT bounded here: `tool_name`/`server`/`model`/`language*`/`intent` are
+ * operator-/catalog-scoped identifiers — they are the intended breakdown dimensions and
+ * are bounded by CONFIGURATION (registered tools, configured servers), not by request
+ * traffic. Clamping them to `other` would destroy the metric's purpose; the per-metric
+ * series cap (`MAX_SERIES_PER_METRIC`) backstops them against a within-window blow-up.
+ *
+ * `error_name` is kept in sync with `src/utils/errors.ts` (+ common JS built-ins and the
+ * Anthropic SDK error classes). A new error class not listed here degrades to `other`
+ * rather than leaking cardinality — a safe, self-correcting default.
+ */
+const BOUNDED_LABEL_VALUES: Record<string, ReadonlySet<string>> = {
+  chat_type: new Set(['private', 'group', 'supergroup']),
+  format: new Set(['ogg', 'mp3', 'wav', 'webm', 'flac', 'm4a']),
+  error_name: new Set([
+    // AppError hierarchy (src/utils/errors.ts)
+    'AppError',
+    'AuthenticationError',
+    'AuthorizationError',
+    'ValidationError',
+    'MCPError',
+    'CodeExecutionError',
+    'ClaudeAPIError',
+    'TimeoutError',
+    'MCPCallLimitError',
+    'MCPRequestCallLimitError',
+    'AudioTranscriptionError',
+    'AudioSynthesisError',
+    'MCPResponseTooLargeError',
+    // JS built-ins
+    'Error',
+    'TypeError',
+    'RangeError',
+    'SyntaxError',
+    'ReferenceError',
+    'EvalError',
+    'URIError',
+    'AbortError',
+    // Anthropic SDK error classes
+    'APIError',
+    'APIConnectionError',
+    'APIConnectionTimeoutError',
+    'APIUserAbortError',
+    'BadRequestError',
+    'RateLimitError',
+    'InternalServerError',
+    'NotFoundError',
+    'PermissionDeniedError',
+    'UnprocessableEntityError',
+    'ConflictError',
+  ]),
+};
+
+/** Clamp a runtime-sourced label value to its allow-list, else the `other` sentinel. */
+function boundLabelValue(key: string, value: string): string {
+  const allowed = BOUNDED_LABEL_VALUES[key];
+  if (!allowed) return value;
+  return allowed.has(value) ? value : OTHER_LABEL_VALUE;
+}
+
 /**
  * Reduce an arbitrary label bag to safe, bounded metric dimensions. FAILS CLOSED:
  * - a key not in `ALLOWED_LABEL_KEYS` is DROPPED entirely (never becomes a dimension);
  * - null/undefined values are dropped;
- * - string values are truncated to `MAX_LABEL_VALUE_LENGTH`;
+ * - a runtime-sourced string value outside its `BOUNDED_LABEL_VALUES` allow-list collapses
+ *   to the `other` sentinel (bounds VALUE cardinality — the SDK series cap can't, under
+ *   DELTA); other string values are truncated to `MAX_LABEL_VALUE_LENGTH`;
  * - number/boolean pass through; any other type is dropped (cannot be a bounded label).
  */
 export function sanitizeMetricLabels(labels: MetricLabels): Record<string, LabelValue> {
@@ -163,8 +246,9 @@ export function sanitizeMetricLabels(labels: MetricLabels): Record<string, Label
     if (!ALLOWED_LABEL_KEYS.has(key)) continue;
     if (value === undefined || value === null) continue;
     if (typeof value === 'string') {
-      safe[key] =
+      const truncated =
         value.length > MAX_LABEL_VALUE_LENGTH ? value.slice(0, MAX_LABEL_VALUE_LENGTH) : value;
+      safe[key] = boundLabelValue(key, truncated);
     } else if (typeof value === 'number' || typeof value === 'boolean') {
       safe[key] = value;
     }

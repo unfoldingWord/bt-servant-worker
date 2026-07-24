@@ -351,21 +351,18 @@ export class UserDO {
 
   async alarm(): Promise<void> {
     const logger = createRequestLogger(crypto.randomUUID());
-    // Best-effort telemetry from the alarm isolate. Outbound fetch from an alarm()
-    // context is blocked by Cloudflare (1003) — the same wall that forces orchestration
-    // into the fetch handler — so this export may not leave the isolate. We still init
-    // + flush so that (a) any measurement that CAN egress does, (b) buffered deltas drain
-    // on the next fetch to this DO (DELTA temporality accumulates in-isolate), and
-    // (c) the tail worker remains the backstop for measurements lost on isolate death.
+    // Init the telemetry stack so any measurement emitted during alarm processing
+    // ACCUMULATES in this isolate's buffers — but deliberately do NOT flush here.
+    // Outbound fetch from an alarm() context is blocked by Cloudflare (1003, the same
+    // wall that forces orchestration into the fetch handler), so an export attempted
+    // here cannot succeed. Worse, flushing would `collect()` the metrics — which RESETS
+    // the DELTA accumulator — and hand them to an export that then fails, dropping them
+    // for good. By not flushing, the accumulated logs/metrics survive in-isolate and are
+    // exported by the next fetch() to this DO (which CAN fetch); the tail worker remains
+    // the backstop for anything lost on isolate death.
     this.initTelemetry();
-
-    try {
-      await this.drainAlarmQueue(logger);
-      await this.rescheduleAlarm(logger);
-    } finally {
-      // Single flush covering every exit path (incl. the empty-queue early return).
-      this.flushTelemetry();
-    }
+    await this.drainAlarmQueue(logger);
+    await this.rescheduleAlarm(logger);
   }
 
   /** Dequeue and process one entry for an alarm tick; recover the lock on failure. */
