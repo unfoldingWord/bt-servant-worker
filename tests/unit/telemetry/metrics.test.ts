@@ -108,18 +108,16 @@ describe('sanitizeMetricLabels', () => {
   });
 
   it('clamps runtime-sourced label values outside their allow-list to "other"', () => {
-    // error_name/chat_type/format are bounded VALUE sets; anything else collapses so a
-    // dynamic value (a novel error class, a spoofed chat_type) cannot spawn a new series.
+    // error_name/chat_type are bounded VALUE sets; anything else collapses so a dynamic
+    // value (a novel error class, a spoofed chat_type) cannot spawn a new series.
     const safe = sanitizeMetricLabels({
       error_name: 'SomeLibrarySpecificError',
       chat_type: 'not-a-real-type',
-      format: 'exotic-codec',
       status: 'error',
     });
     expect(safe).toEqual({
       error_name: 'other',
       chat_type: 'other',
-      format: 'other',
       status: 'error',
     });
   });
@@ -128,12 +126,10 @@ describe('sanitizeMetricLabels', () => {
     const safe = sanitizeMetricLabels({
       error_name: 'MCPResponseTooLargeError',
       chat_type: 'supergroup',
-      format: 'ogg',
     });
     expect(safe).toEqual({
       error_name: 'MCPResponseTooLargeError',
       chat_type: 'supergroup',
-      format: 'ogg',
     });
   });
 });

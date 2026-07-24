@@ -164,7 +164,7 @@ const OTHER_LABEL_VALUE = 'other';
 
 /**
  * Per-key allow-lists of bounded VALUES for the labels whose values come from RUNTIME or
- * UNTRUSTED input — a thrown error's class name, a user-supplied `chat_type`/`format`.
+ * UNTRUSTED input — a thrown error's class name, a user-supplied `chat_type`.
  * Unlike code-literal labels (`status`/`op`/`reason`/`transport`/`type`, whose values are
  * string literals in our own source and thus inherently bounded), these could otherwise
  * carry unbounded distinct values. And because DELTA collection resets the SDK's
@@ -177,6 +177,9 @@ const OTHER_LABEL_VALUE = 'other';
  * are bounded by CONFIGURATION (registered tools, configured servers), not by request
  * traffic. Clamping them to `other` would destroy the metric's purpose; the per-metric
  * series cap (`MAX_SERIES_PER_METRIC`) backstops them against a within-window blow-up.
+ * `format` is likewise absent: it is canonicalized at its source (`normalizeAudioFormat`
+ * maps MIME/mixed-case to a bare `AudioFormat` or `other`), which belongs with the audio
+ * module — re-clamping a raw value here would wrongly collapse `audio/ogg`/`OGG` to `other`.
  *
  * `error_name` is kept in sync with `src/utils/errors.ts` (+ common JS built-ins and the
  * Anthropic SDK error classes). A new error class not listed here degrades to `other`
@@ -184,7 +187,6 @@ const OTHER_LABEL_VALUE = 'other';
  */
 const BOUNDED_LABEL_VALUES: Record<string, ReadonlySet<string>> = {
   chat_type: new Set(['private', 'group', 'supergroup']),
-  format: new Set(['ogg', 'mp3', 'wav', 'webm', 'flac', 'm4a']),
   error_name: new Set([
     // AppError hierarchy (src/utils/errors.ts)
     'AppError',

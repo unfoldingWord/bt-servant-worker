@@ -351,16 +351,17 @@ export class UserDO {
 
   async alarm(): Promise<void> {
     const logger = createRequestLogger(crypto.randomUUID());
-    // Init the telemetry stack so any measurement emitted during alarm processing
-    // ACCUMULATES in this isolate's buffers — but deliberately do NOT flush here.
-    // Outbound fetch from an alarm() context is blocked by Cloudflare (1003, the same
-    // wall that forces orchestration into the fetch handler), so an export attempted
-    // here cannot succeed. Worse, flushing would `collect()` the metrics — which RESETS
-    // the DELTA accumulator — and hand them to an export that then fails, dropping them
-    // for good. By not flushing, the accumulated logs/metrics survive in-isolate and are
-    // exported by the next fetch() to this DO (which CAN fetch); the tail worker remains
-    // the backstop for anything lost on isolate death.
-    this.initTelemetry();
+    // No OTLP telemetry lifecycle here — deliberately. Outbound fetch from an alarm()
+    // context is blocked by Cloudflare (1003, the same wall that forces orchestration into
+    // the fetch handler), so no exporter can egress from here, and there is NO backstop for
+    // custom metrics (the tail worker forwards this isolate's console logs + exceptions,
+    // not our in-memory OTLP metric payloads). We therefore do not `initMetricTelemetry`
+    // here: standing up a meter in a context that cannot export would only record
+    // measurements that are unrecoverable if the isolate is evicted before any fetch, and
+    // flushing would be worse still — `collect()` resets the DELTA accumulator, so a failed
+    // export would drop the data outright. Metrics for queued work are captured where that
+    // work actually runs, under the fetch handler (processImmediate* → drainQueue), which
+    // CAN export. Alarm diagnostics remain observable via the tail worker's log forwarding.
     await this.drainAlarmQueue(logger);
     await this.rescheduleAlarm(logger);
   }
