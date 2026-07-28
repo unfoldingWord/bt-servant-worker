@@ -78,6 +78,7 @@ import {
   countMetric,
   runWithMetricsSuppressed,
   withSpan,
+  withUserPseudonym,
 } from '../services/telemetry/index.js';
 import { classifyTriggers, ClassifierResult } from '../services/classifier/index.js';
 import type { UnmatchedTrigger } from '../services/classifier/index.js';
@@ -458,6 +459,36 @@ export class UserDO {
     if (parsed.error) return parsed.error;
     const { body } = parsed;
 
+    // The worker's pseudonym scope does NOT reach here. The DO is a separate isolate, so
+    // async context cannot survive the stub.fetch() boundary — the same reason initTelemetry
+    // runs independently in fetch(). Re-establish it from the body using the SAME salt, so
+    // DO records carry the SAME user_hash the worker computed for this request. Without
+    // this, the dozens of records produced here (tool calls, orchestration, timings) reach
+    // OpenObserve with no user identifier at all.
+    return withUserPseudonym(
+      this.env,
+      body.client_id,
+      body.user_id,
+      () => this.dispatchUnifiedChat(body, request, transport, logger),
+      (error) =>
+        logger.warn('user_pseudonym_failed', {
+          error: error instanceof Error ? error.message : String(error),
+          transport,
+          client_id: body.client_id,
+        })
+    );
+  }
+
+  /**
+   * The chat flow proper, run inside the DO's pseudonym scope. Split out of
+   * `handleUnifiedChat` only to give that scope a callback boundary; behavior is unchanged.
+   */
+  private async dispatchUnifiedChat(
+    body: ChatRequest,
+    request: Request,
+    transport: ChatTransport,
+    logger: RequestLogger
+  ): Promise<Response> {
     // Rate limiting
     const rateLimited = this.enforceEnqueueRateLimit(body, transport, logger);
     if (rateLimited) return rateLimited;
@@ -780,6 +811,28 @@ export class UserDO {
   // ── Queue entry processing (called by alarm or drainQueue) ────────────────────
 
   private async processQueueEntry(entry: InternalQueueEntry, logger: RequestLogger): Promise<void> {
+    // Queued work drains from alarm(), a SEPARATE invocation from the fetch() that enqueued
+    // it — so the scope established in handleUnifiedChat is long gone. Re-establish from the
+    // stored entry body; same salt, same inputs, same user_hash as the rest of the request.
+    return withUserPseudonym(
+      this.env,
+      entry.body.client_id,
+      entry.body.user_id,
+      () => this.processQueueEntryInScope(entry, logger),
+      (error) =>
+        logger.warn('user_pseudonym_failed', {
+          error: error instanceof Error ? error.message : String(error),
+          message_id: entry.message_id,
+          client_id: entry.body.client_id,
+        })
+    );
+  }
+
+  /** Queue-entry processing proper, inside the pseudonym scope. Behavior unchanged. */
+  private async processQueueEntryInScope(
+    entry: InternalQueueEntry,
+    logger: RequestLogger
+  ): Promise<void> {
     const startTime = Date.now();
     const body = entry.body;
     const isCallbackMode = !!body.progress_callback_url;

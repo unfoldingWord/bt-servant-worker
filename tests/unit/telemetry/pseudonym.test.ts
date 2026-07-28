@@ -128,6 +128,25 @@ describe('withUserPseudonym — resilience', () => {
     expect((errors[0] as Error).message).toBe('subtle unavailable');
   });
 
+  it('two independent scopes agree — the worker/DO isolate boundary', async () => {
+    // A chat request is handled by TWO isolates: the worker, then the Durable Object.
+    // AsyncLocalStorage cannot cross stub.fetch(), so each establishes its own scope from
+    // the same body. This asserts the property that makes that safe: same salt + same
+    // identifiers ⇒ same pseudonym, so both halves of one request correlate in the sink.
+    // If this ever fails, one user appears as two in OpenObserve.
+    const workerSide = await withUserPseudonym(
+      SALTED,
+      'whatsapp',
+      'whatsapp:15551234567',
+      async () => getUserPseudonym()
+    );
+    const doSide = await withUserPseudonym(SALTED, 'whatsapp', 'whatsapp:15551234567', async () =>
+      getUserPseudonym()
+    );
+    expect(workerSide).toBeDefined();
+    expect(doSide).toBe(workerSide);
+  });
+
   it('isolates concurrent async contexts', async () => {
     const [a, b, outside] = await Promise.all([
       withUserPseudonym(SALTED, 'telegram', 'telegram:42', async () => getUserPseudonym()),
