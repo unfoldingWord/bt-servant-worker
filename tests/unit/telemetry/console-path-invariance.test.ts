@@ -1,4 +1,3 @@
-/* eslint-disable max-lines-per-function */
 /**
  * CONSOLE PATH INVARIANCE — the safety net for A1 (docs/plans/production-otel.md).
  *
@@ -28,173 +27,179 @@ function captureConsole(method: 'log' | 'warn' | 'error') {
   return { lines, restore: () => spy.mockRestore() };
 }
 
-describe('console path invariance (bt-servant-telemetry tail contract)', () => {
+/** Deterministic timestamps, and no sink leaking between cases. */
+function useConsoleFixture(): void {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(FIXED_MS);
     setLogSink(null);
   });
-
   afterEach(() => {
     vi.useRealTimers();
     setLogSink(null);
     vi.restoreAllMocks();
   });
+}
 
-  describe('golden output', () => {
-    it('emits the exact JSON shape the tail consumer parses for request_received', () => {
-      const { lines, restore } = captureConsole('log');
-      const logger = createRequestLogger('req-123');
+/**
+ * Golden cases — the exact bytes the tail consumer parses.
+ *
+ * `userId` present means the case exercises the TWO-ARG
+ * `createRequestLogger(requestId, userId)` form, where `user_id` is appended by
+ * `buildLogEntry` rather than arriving in the data payload. That form is live at
+ * `handleDORequest` (src/index.ts): a different code path, the same contract — the
+ * consumer cannot tell them apart and must not have to.
+ */
+const GOLDEN = [
+  {
+    label: 'request_received',
+    event: 'request_received',
+    requestId: 'req-123',
+    userId: undefined as string | undefined,
+    // prettier-ignore
+    payload: {
+      user_id: 'whatsapp:15551234567', client_id: 'whatsapp', org: 'unfoldingWord',
+      transport: 'whatsapp', chat_type: 'private', chat_id: 'chat-9', thread_id: 'thread-1',
+    },
+    expected: JSON.stringify({
+      event: 'request_received',
+      request_id: 'req-123',
+      timestamp: FIXED_MS,
+      user_id: 'whatsapp:15551234567',
+      client_id: 'whatsapp',
+      org: 'unfoldingWord',
+      transport: 'whatsapp',
+      chat_type: 'private',
+      chat_id: 'chat-9',
+      thread_id: 'thread-1',
+    }),
+  },
+  {
+    label: 'request_timing_summary',
+    event: 'request_timing_summary',
+    requestId: 'req-456',
+    userId: undefined as string | undefined,
+    payload: {
+      user_id: 'telegram:99',
+      org: 'unfoldingWord',
+      transport: 'telegram',
+      total_ms: 1234,
+    },
+    expected: JSON.stringify({
+      event: 'request_timing_summary',
+      request_id: 'req-456',
+      timestamp: FIXED_MS,
+      user_id: 'telegram:99',
+      org: 'unfoldingWord',
+      transport: 'telegram',
+      total_ms: 1234,
+    }),
+  },
+  {
+    label: 'do_request_received (two-arg logger form)',
+    event: 'do_request_received',
+    requestId: 'req-do-1',
+    userId: 'telegram:31337' as string | undefined,
+    // prettier-ignore
+    payload: {
+      do_key: 'user:unfoldingWord:telegram:31337', org: 'unfoldingWord',
+      path: '/chat', method: 'POST',
+    },
+    expected: JSON.stringify({
+      event: 'do_request_received',
+      request_id: 'req-do-1',
+      timestamp: FIXED_MS,
+      do_key: 'user:unfoldingWord:telegram:31337',
+      org: 'unfoldingWord',
+      path: '/chat',
+      method: 'POST',
+      user_id: 'telegram:31337',
+    }),
+  },
+];
 
-      // prettier-ignore
-      logger.log('request_received', {
-        user_id: 'whatsapp:15551234567', client_id: 'whatsapp', org: 'unfoldingWord',
-        transport: 'whatsapp', chat_type: 'private', chat_id: 'chat-9', thread_id: 'thread-1',
-      });
+describe('golden console output', () => {
+  useConsoleFixture();
 
-      restore();
-      expect(lines).toHaveLength(1);
-      expect(lines[0]).toBe(
-        JSON.stringify({
-          event: 'request_received',
-          request_id: 'req-123',
-          timestamp: FIXED_MS,
-          user_id: 'whatsapp:15551234567',
-          client_id: 'whatsapp',
-          org: 'unfoldingWord',
-          transport: 'whatsapp',
-          chat_type: 'private',
-          chat_id: 'chat-9',
-          thread_id: 'thread-1',
-        })
-      );
-    });
-
-    it('emits the exact JSON shape for request_timing_summary', () => {
-      const { lines, restore } = captureConsole('log');
-      const logger = createRequestLogger('req-456');
-
-      logger.log('request_timing_summary', {
-        user_id: 'telegram:99',
-        org: 'unfoldingWord',
-        transport: 'telegram',
-        total_ms: 1234,
-      });
-
-      restore();
-      expect(lines[0]).toBe(
-        JSON.stringify({
-          event: 'request_timing_summary',
-          request_id: 'req-456',
-          timestamp: FIXED_MS,
-          user_id: 'telegram:99',
-          org: 'unfoldingWord',
-          transport: 'telegram',
-          total_ms: 1234,
-        })
-      );
-    });
-
-    it('emits user_id from the two-arg createRequestLogger form (do_request_received)', () => {
-      // `handleDORequest` (src/index.ts:1841) is the ONE live call site that passes userId
-      // as the logger's second argument, so `user_id` is appended by buildLogEntry rather
-      // than arriving via the data payload. Different code path, same tail contract — the
-      // consumer cannot tell them apart and must not have to.
-      const { lines, restore } = captureConsole('log');
-      const logger = createRequestLogger('req-do-1', 'telegram:31337');
-
-      logger.log('do_request_received', {
-        do_key: 'user:unfoldingWord:telegram:31337',
-        org: 'unfoldingWord',
-        path: '/chat',
-        method: 'POST',
-      });
-
-      restore();
-      expect(lines[0]).toBe(
-        JSON.stringify({
-          event: 'do_request_received',
-          request_id: 'req-do-1',
-          timestamp: FIXED_MS,
-          do_key: 'user:unfoldingWord:telegram:31337',
-          org: 'unfoldingWord',
-          path: '/chat',
-          method: 'POST',
-          user_id: 'telegram:31337',
-        })
-      );
-    });
-
-    it('keeps user_id on the error path too', () => {
-      const { lines, restore } = captureConsole('error');
-      const logger = createRequestLogger('req-789');
-
-      logger.error('request_error', new TypeError('boom'), {
-        user_id: 'telegram:42',
-        org: 'unfoldingWord',
-        transport: 'telegram',
-      });
-
-      restore();
-      const parsed = JSON.parse(lines[0] as string) as Record<string, unknown>;
-      expect(parsed.user_id).toBe('telegram:42');
-      expect(parsed.event).toBe('request_error');
-      expect(parsed.error).toBe('boom');
-      expect(parsed.error_name).toBe('TypeError');
-    });
+  it.each(GOLDEN)('emits the exact JSON the tail consumer parses for $label', (c) => {
+    const { lines, restore } = captureConsole('log');
+    createRequestLogger(c.requestId, c.userId).log(c.event, c.payload);
+    restore();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toBe(c.expected);
   });
+});
 
-  describe('the OTLP sink cannot alter the console bytes', () => {
-    it('produces byte-identical console output with and without a sink registered', () => {
-      const logEvent = () => {
-        const logger = createRequestLogger('req-abc');
-        // prettier-ignore
-        logger.log('request_received', {
-          user_id: 'whatsapp:15550009999', client_id: 'whatsapp', org: 'unfoldingWord',
-          transport: 'whatsapp', chat_type: 'group', chat_id: 'c-1', thread_id: 't-1',
-        });
-      };
+describe('golden console output — error path', () => {
+  useConsoleFixture();
 
-      const withoutSink = captureConsole('log');
-      logEvent();
-      withoutSink.restore();
-
-      // A sink that behaves as badly as a sink plausibly could: it reads everything and
-      // (attempts to) rewrite the identifier in place, exactly the mistake A1 must not make.
-      setLogSink((_level, entry) => {
-        buildLogAttributes(entry);
-        try {
-          (entry as Record<string, unknown>).user_id = 'MUTATED';
-        } catch {
-          /* frozen in some runtimes — the assertion below is what matters */
-        }
-      });
-
-      const withSink = captureConsole('log');
-      logEvent();
-      withSink.restore();
-
-      expect(withSink.lines[0]).toBe(withoutSink.lines[0]);
-      expect(withSink.lines[0]).toContain('"user_id":"whatsapp:15550009999"');
+  it('keeps user_id, and carries the bounded error_name', () => {
+    const { lines, restore } = captureConsole('error');
+    createRequestLogger('req-789').error('request_error', new TypeError('boom'), {
+      user_id: 'telegram:42',
+      org: 'unfoldingWord',
     });
+    restore();
+
+    const parsed = JSON.parse(lines[0] as string) as Record<string, unknown>;
+    expect(parsed.user_id).toBe('telegram:42');
+    expect(parsed.event).toBe('request_error');
+    expect(parsed.error).toBe('boom');
+    expect(parsed.error_name).toBe('TypeError');
   });
+});
 
-  describe('the OTLP branch must not mutate the entry', () => {
-    it('buildLogAttributes leaves a frozen entry untouched and does not throw', () => {
-      const entry = Object.freeze({
-        event: 'request_received',
-        request_id: 'req-frozen',
-        timestamp: FIXED_MS,
-        user_id: 'telegram:7',
-        client_id: 'telegram',
-        org: 'unfoldingWord',
-        total_ms: 10,
-      }) as LogEntry;
+/** A sink as badly behaved as one plausibly could be: reads everything, then tries to
+ *  rewrite the identifier in place — exactly the mistake A1 must never make. */
+const hostileSink = (_level: unknown, entry: LogEntry) => {
+  buildLogAttributes(entry);
+  try {
+    (entry as Record<string, unknown>).user_id = 'MUTATED';
+  } catch {
+    /* frozen in some runtimes — the assertion in the test is what matters */
+  }
+};
 
-      const before = JSON.stringify(entry);
-      expect(() => buildLogAttributes(entry)).not.toThrow();
-      expect(JSON.stringify(entry)).toBe(before);
+describe('the OTLP sink cannot alter the console bytes', () => {
+  useConsoleFixture();
+
+  const emit = () => {
+    // prettier-ignore
+    createRequestLogger('req-abc').log('request_received', {
+      user_id: 'whatsapp:15550009999', client_id: 'whatsapp', org: 'unfoldingWord',
+      transport: 'whatsapp', chat_type: 'group', chat_id: 'c-1', thread_id: 't-1',
     });
+  };
+
+  it('produces byte-identical output with and without a sink registered', () => {
+    const withoutSink = captureConsole('log');
+    emit();
+    withoutSink.restore();
+
+    setLogSink(hostileSink);
+    const withSink = captureConsole('log');
+    emit();
+    withSink.restore();
+
+    expect(withSink.lines[0]).toBe(withoutSink.lines[0]);
+    expect(withSink.lines[0]).toContain('"user_id":"whatsapp:15550009999"');
+  });
+});
+
+describe('the OTLP branch must not mutate the entry', () => {
+  it('buildLogAttributes leaves a frozen entry untouched and does not throw', () => {
+    const entry = Object.freeze({
+      event: 'request_received',
+      request_id: 'req-frozen',
+      timestamp: FIXED_MS,
+      user_id: 'telegram:7',
+      client_id: 'telegram',
+      total_ms: 10,
+    }) as LogEntry;
+
+    const before = JSON.stringify(entry);
+    expect(() => buildLogAttributes(entry)).not.toThrow();
+    expect(JSON.stringify(entry)).toBe(before);
   });
 });
 
@@ -235,25 +240,13 @@ function consumerRedact(rawJson: string) {
   };
 }
 
-describe('consumer contract (bt-servant-telemetry redact())', () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-    vi.setSystemTime(FIXED_MS);
-    setLogSink(null);
-  });
+describe('consumer contract — all 14 CleanEvent fields survive', () => {
+  useConsoleFixture();
 
-  afterEach(() => {
-    vi.useRealTimers();
-    setLogSink(null);
-    vi.restoreAllMocks();
-  });
-
-  it('every field the consumer extracts survives our console output', () => {
+  it('extracts every field the consumer reads', () => {
     const { lines, restore } = captureConsole('log');
-    const logger = createRequestLogger('req-contract');
-
     // prettier-ignore
-    logger.log('tool_execution_complete', {
+    createRequestLogger('req-contract').log('tool_execution_complete', {
       user_id: 'whatsapp:15551112222', client_id: 'whatsapp', org: 'unfoldingWord',
       transport: 'whatsapp', chat_type: 'private', total_ms: 900, duration_ms: 120,
       tool_name: 'aquifer_search', server_id: 'aquifer', first_interaction: true,
@@ -277,23 +270,24 @@ describe('consumer contract (bt-servant-telemetry redact())', () => {
       first_interaction: true,
     });
   });
+});
 
-  it('the hash inputs are unchanged when the OTLP sink is active', () => {
-    const emit = () => {
-      const logger = createRequestLogger('req-contract-2');
-      logger.log('request_received', {
-        user_id: 'telegram:5150',
-        client_id: 'telegram',
-        org: 'unfoldingWord',
-      });
-    };
+describe('consumer contract — hash inputs survive an active OTLP sink', () => {
+  useConsoleFixture();
 
+  const emit = () =>
+    createRequestLogger('req-contract-2').log('request_received', {
+      user_id: 'telegram:5150',
+      client_id: 'telegram',
+      org: 'unfoldingWord',
+    });
+
+  it('yields an identical CleanEvent with the sink registered', () => {
     const before = captureConsole('log');
     emit();
     before.restore();
 
     setLogSink((_level, entry) => void buildLogAttributes(entry));
-
     const after = captureConsole('log');
     emit();
     after.restore();
