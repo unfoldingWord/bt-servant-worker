@@ -20,6 +20,7 @@ import type {
 } from '@microlabs/otel-cf-workers';
 import { Env } from '../../config/types.js';
 import { APP_VERSION } from '../../generated/version.js';
+import { getUserPseudonym } from './pseudonym.js';
 
 /** Stable service.name reported to the collector for every signal. */
 export const TELEMETRY_SERVICE_NAME = 'bt-servant-worker';
@@ -111,6 +112,14 @@ export function redactSpan(span: MutableSpan): void {
   delete attrs['do.id.name'];
   delete attrs['db.statement'];
   delete attrs['db.cf.kv.key'];
+  // Spans reach OpenObserve ONLY — unlike logs, nothing downstream needs the raw id — so
+  // here we SUBSTITUTE rather than emit both. Outside a pseudonym scope the id is simply
+  // dropped (fail closed); a span without a correlation key beats a leaked identifier.
+  if (attrs['user_id'] !== undefined) {
+    delete attrs['user_id'];
+    const pseudonym = getUserPseudonym();
+    if (pseudonym !== undefined) attrs['user_hash'] = pseudonym;
+  }
   // `recordException` writes exception.* into span EVENTS, not top-level attrs; scrub both.
   stripExceptionText(attrs);
   if (span.events) {

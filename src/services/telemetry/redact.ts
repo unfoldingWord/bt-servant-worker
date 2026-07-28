@@ -37,7 +37,11 @@ export type AttributeValue = string | number | boolean;
  */
 const SAFE_STRING_ATTRIBUTE_KEYS = new Set<string>([
   'request_id',
+  // `user_id` stays allow-listed: bt-servant-telemetry's OTLP receive route (Phase C1)
+  // needs the raw value to compute its own hash, and the collector deletes it on the
+  // OpenObserve pipeline. `user_hash` is the salted pseudonym that reaches the sink.
   'user_id',
+  'user_hash',
   'event',
   'org',
   'organization',

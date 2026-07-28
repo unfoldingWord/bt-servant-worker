@@ -13,4 +13,5 @@ export {
   type MetricLabels,
 } from './metrics.js';
 export { withSpan, withSpanSync, recordSpanError } from './span.js';
+export { withUserPseudonym, getUserPseudonym, hashUserId } from './pseudonym.js';
 export type { Span } from '@opentelemetry/api';

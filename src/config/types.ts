@@ -52,6 +52,13 @@ export interface Env {
   // src/services/telemetry). Set via `wrangler secret put`.
   OTEL_EXPORTER_OTLP_ENDPOINT?: string;
   OTEL_COLLECTOR_TOKEN?: string;
+  /**
+   * HMAC key for the OTLP-path user pseudonym (`user_hash`). Deliberately UNRELATED to
+   * bt-servant-telemetry's `PII_HASH_SALT`: that app hashes independently for D1, this one
+   * only ever reaches OpenObserve, and the two never meet. See docs/plans/production-otel.md
+   * ("Why two hashes cannot double-count"). Unset ⇒ no `user_hash` egresses (fail closed).
+   */
+  TELEMETRY_USER_ID_SALT?: string;
 }
 
 /**

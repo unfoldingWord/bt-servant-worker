@@ -52,6 +52,7 @@ import {
 } from '../../utils/logger.js';
 import { isTelemetryEnabled, TELEMETRY_SERVICE_NAME } from './config.js';
 import { attributeValueFor, type AttributeValue } from './redact.js';
+import { getUserPseudonym } from './pseudonym.js';
 
 /** Instrumentation scope name reported for every emitted log record. */
 const LOG_SCOPE_NAME = TELEMETRY_SERVICE_NAME;
@@ -88,6 +89,16 @@ export function buildLogAttributes(entry: LogEntry): Record<string, AttributeVal
     if (value === undefined || value === null) continue;
     attributes[key] = attributeValueFor(key, value);
   }
+  // The salted pseudonym for this request, ADDED not substituted: the collector deletes
+  // `user_id` on the OpenObserve pipeline and deletes `user_hash` on the pipeline feeding
+  // bt-servant-telemetry, which needs the raw id to compute its own (different, unrelated)
+  // hash. Emitting whenever the pseudonym is in scope — not only when this particular entry
+  // repeated `user_id` — so every record in a request is user-correlatable in the sink.
+  //
+  // NEVER mutate `entry` here: console.log has already serialized it, but the tests in
+  // console-path-invariance.test.ts freeze it to keep it that way.
+  const pseudonym = getUserPseudonym();
+  if (pseudonym !== undefined) attributes.user_hash = pseudonym;
   return attributes;
 }
 
