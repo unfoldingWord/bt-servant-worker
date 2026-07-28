@@ -7,7 +7,7 @@
  *  2. Async contexts are isolated. A DO alarm can run while a prior fetch's background
  *     work still emits on the same isolate, and neither may see the other's pseudonym.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   hashUserId,
   withUserPseudonym,
@@ -82,9 +82,7 @@ describe('withUserPseudonym — fail closed', () => {
     expect(seen).toBeUndefined();
   });
 
-  it('still returns the handler result when hashing is impossible, and reports it', async () => {
-    // An empty salt makes importKey reject; the request must survive and the failure must
-    // be observable rather than swallowed.
+  it('treats an empty-string salt as unset and still runs the handler', async () => {
     const errors: unknown[] = [];
     const result = await withUserPseudonym(
       { TELEMETRY_USER_ID_SALT: '' } as Env,
@@ -94,9 +92,40 @@ describe('withUserPseudonym — fail closed', () => {
       (e) => errors.push(e)
     );
     expect(result).toBe('handler-ran');
-    // Empty salt short-circuits as falsy before hashing, so no error is reported — the
-    // point of the case is that the handler is never skipped on the telemetry account.
+    // Short-circuits as falsy before hashing, so this is the fail-closed path, not the
+    // error path — nothing to report. The error path is covered below.
     expect(errors).toHaveLength(0);
+    expect(getUserPseudonym()).toBeUndefined();
+  });
+});
+
+describe('withUserPseudonym — resilience', () => {
+  it('reports a hashing failure and still runs the handler', async () => {
+    // Force the failure the fail-closed branch exists for: make importKey reject.
+    const subtle = globalThis.crypto.subtle;
+    const spy = vi
+      .spyOn(subtle, 'importKey')
+      .mockRejectedValue(new Error('subtle unavailable') as never);
+
+    const errors: unknown[] = [];
+    let seen: string | undefined = 'not-run';
+    const result = await withUserPseudonym(
+      SALTED,
+      'telegram',
+      'telegram:42',
+      async () => {
+        seen = getUserPseudonym();
+        return 'handler-ran';
+      },
+      (e) => errors.push(e)
+    );
+
+    spy.mockRestore();
+    // The request must survive a telemetry failure, with the failure observable.
+    expect(result).toBe('handler-ran');
+    expect(seen).toBeUndefined();
+    expect(errors).toHaveLength(1);
+    expect((errors[0] as Error).message).toBe('subtle unavailable');
   });
 
   it('isolates concurrent async contexts', async () => {
