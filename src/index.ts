@@ -1756,27 +1756,48 @@ async function handleChatRequest(
   const logger = createRequestLogger(requestId);
   const timing = createTimingContext();
 
+  let body: ChatRequest;
   try {
-    const body = (await request.clone().json()) as ChatRequest;
-    // Establish the OTLP user pseudonym for this request's ENTIRE async call tree before
-    // anything logs, so every record and span it produces can carry `user_hash` without
-    // re-hashing on the sync logging path. The console.log branch is untouched — it still
-    // emits raw `user_id`, which is what bt-servant-telemetry's tail ingest depends on.
-    return await withUserPseudonym(
-      env,
-      body.client_id,
-      body.user_id,
-      () => dispatchChatRequest({ request, env, transport, body, logger, timing, requestId }),
-      (error: unknown) =>
-        logger.warn('user_pseudonym_failed', {
-          error: error instanceof Error ? error.message : String(error),
-          transport,
-          client_id: body.client_id,
-        })
-    );
+    body = (await request.clone().json()) as ChatRequest;
   } catch (error) {
+    // A malformed body has no identifiers to hash, so there is no scope to be inside.
     return respondToChatRequestError(error, transport, timing, logger);
   }
+
+  // Establish the OTLP user pseudonym for this request's ENTIRE async call tree before
+  // anything logs, so every record and span it produces can carry `user_hash` without
+  // re-hashing on the sync logging path. The console.log branch is untouched — it still
+  // emits raw `user_id`, which is what bt-servant-telemetry's tail ingest depends on.
+  return withUserPseudonym(
+    env,
+    body.client_id,
+    body.user_id,
+    async () => {
+      // The catch MUST live inside the scope. If it sat outside, a rejected promise would
+      // resume only after `AsyncLocalStorage.run` restored the outer context, and
+      // `request_error` — the record where correlation matters most — would lose its
+      // `user_hash`.
+      try {
+        return await dispatchChatRequest({
+          request,
+          env,
+          transport,
+          body,
+          logger,
+          timing,
+          requestId,
+        });
+      } catch (error) {
+        return respondToChatRequestError(error, transport, timing, logger);
+      }
+    },
+    (error: unknown) =>
+      logger.warn('user_pseudonym_failed', {
+        error: error instanceof Error ? error.message : String(error),
+        transport,
+        client_id: body.client_id,
+      })
+  );
 }
 
 /** Params for {@link dispatchChatRequest} — the chat flow inside the pseudonym scope. */

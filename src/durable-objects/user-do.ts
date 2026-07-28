@@ -803,28 +803,47 @@ export class UserDO {
       const entry = await this.dequeueNext();
       if (!entry) return;
 
-      logger.log('drain_queue_entry', { message_id: entry.message_id });
-      await this.processQueueEntry(entry, logger);
+      // Emit INSIDE the dequeued entry's scope. This loop runs as background work started
+      // in whichever user's `handleUnifiedChat` scope triggered the drain, and a group DO's
+      // queue can hold entries for several users — so logging here unscoped would stamp
+      // user A's `user_hash` onto a record carrying user B's `message_id`. The nested
+      // `withUserPseudonym` inside `processQueueEntry` re-derives the same value; the
+      // duplicated HMAC is negligible next to mis-attributing a user.
+      await this.withEntryPseudonym(entry, logger, async () => {
+        logger.log('drain_queue_entry', { message_id: entry.message_id });
+        await this.processQueueEntry(entry, logger);
+      });
     }
   }
 
   // ── Queue entry processing (called by alarm or drainQueue) ────────────────────
 
+  /**
+   * Run `fn` under the pseudonym of the user who owns `entry`.
+   *
+   * Queue draining crosses user boundaries in two ways: `alarm()` is a separate invocation
+   * from the `fetch()` that enqueued the work, and a group DO's queue can hold entries for
+   * several users. Either way the ambient scope belongs to someone else — or to nobody — so
+   * every per-entry emission re-derives from the stored body. Fails closed: on a hashing
+   * failure `withUserPseudonym` clears the store rather than inheriting the outer user's.
+   */
+  private withEntryPseudonym<T>(
+    entry: InternalQueueEntry,
+    logger: RequestLogger,
+    fn: () => Promise<T>
+  ): Promise<T> {
+    return withUserPseudonym(this.env, entry.body.client_id, entry.body.user_id, fn, (error) =>
+      logger.warn('user_pseudonym_failed', {
+        error: error instanceof Error ? error.message : String(error),
+        message_id: entry.message_id,
+        client_id: entry.body.client_id,
+      })
+    );
+  }
+
   private async processQueueEntry(entry: InternalQueueEntry, logger: RequestLogger): Promise<void> {
-    // Queued work drains from alarm(), a SEPARATE invocation from the fetch() that enqueued
-    // it — so the scope established in handleUnifiedChat is long gone. Re-establish from the
-    // stored entry body; same salt, same inputs, same user_hash as the rest of the request.
-    return withUserPseudonym(
-      this.env,
-      entry.body.client_id,
-      entry.body.user_id,
-      () => this.processQueueEntryInScope(entry, logger),
-      (error) =>
-        logger.warn('user_pseudonym_failed', {
-          error: error instanceof Error ? error.message : String(error),
-          message_id: entry.message_id,
-          client_id: entry.body.client_id,
-        })
+    return this.withEntryPseudonym(entry, logger, () =>
+      this.processQueueEntryInScope(entry, logger)
     );
   }
 

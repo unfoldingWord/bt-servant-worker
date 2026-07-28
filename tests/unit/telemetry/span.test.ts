@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { trace, SpanStatusCode, type Tracer, type TracerProvider } from '@opentelemetry/api';
 import { withSpan, withSpanSync, recordSpanError } from '../../../src/services/telemetry/span.js';
+import { runWithPseudonymForTests } from '../../../src/services/telemetry/pseudonym.js';
 
 /** A minimal recording Span stub that captures the calls withSpan makes. */
 class FakeSpan {
@@ -144,5 +145,44 @@ describe('recordSpanError', () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     recordSpanError(span as any, 'just a string');
     expect(span.attributes.error_name).toBe('Error');
+  });
+});
+
+const HASH = '62e087febfdc7dca0c35c57e4e5f5b59574e4b3e826fe18cd8c0270258d99dd8';
+
+/** Seams under test, hoisted so the cases below do not nest callbacks needlessly. */
+const tracedOk = () => withSpan('phase', { step: 'one' }, async () => 'ok');
+const tracedSyncOk = () => withSpanSync('phase', {}, () => 'ok');
+const tracedThrow = () =>
+  withSpan('phase', {}, async () => {
+    throw new TypeError('boom');
+  });
+
+describe('user_hash attachment at span creation', () => {
+  // Attributes MUST be set while the span is live. RedactingSpanExporter.export() runs
+  // after spans end, by which point the request has left withUserPseudonym and the store
+  // reads undefined — so an export-time read would attach nothing, silently.
+  it('withSpan tags the span from the ambient pseudonym scope', async () => {
+    await runWithPseudonymForTests(HASH, tracedOk);
+    expect(spans[0]?.attributes.user_hash).toBe(HASH);
+    expect(spans[0]?.attributes.step).toBe('one');
+  });
+
+  it('withSpanSync tags the span from the ambient pseudonym scope', () => {
+    runWithPseudonymForTests(HASH, tracedSyncOk);
+    expect(spans[0]?.attributes.user_hash).toBe(HASH);
+  });
+
+  it('attaches nothing outside a scope — fail closed', async () => {
+    await tracedOk();
+    expect(spans[0]?.attributes.user_hash).toBeUndefined();
+    expect(spans[0]?.attributes.step).toBe('one');
+  });
+
+  it('still tags the span when fn throws', async () => {
+    await expect(runWithPseudonymForTests(HASH, tracedThrow)).rejects.toThrow('boom');
+    // Failure spans are the ones most worth correlating.
+    expect(spans[0]?.attributes.user_hash).toBe(HASH);
+    expect(spans[0]?.attributes.error_name).toBe('TypeError');
   });
 });

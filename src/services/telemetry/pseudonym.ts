@@ -31,6 +31,7 @@
  * identity. Correlate on `request_id`, which is present in both.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { trace } from '@opentelemetry/api';
 import { Env } from '../../config/types.js';
 
 /**
@@ -38,7 +39,20 @@ import { Env } from '../../config/types.js';
  * `withUserPseudonym` scope — startup, an unwrapped alarm handler, tests — and the
  * consumers treat that as "emit nothing" rather than falling back to a raw id.
  */
-const userPseudonym = new AsyncLocalStorage<string>();
+const userPseudonym = new AsyncLocalStorage<string | undefined>();
+
+/**
+ * Run `fn` with the pseudonym explicitly CLEARED.
+ *
+ * Calling `fn()` bare would not do this: `AsyncLocalStorage` inherits the enclosing
+ * store, so a fail-closed path nested inside another user's scope would silently run
+ * under THAT user's pseudonym. Real path: a group DO drains user B's queue entry from
+ * background work created in user A's `handleUnifiedChat` scope. Cross-user attribution
+ * is worse than no attribution, so every fallback runs through here.
+ */
+function withoutPseudonym<T>(fn: () => Promise<T>): Promise<T> {
+  return userPseudonym.run(undefined, fn);
+}
 
 /**
  * HMAC-SHA-256 over `${clientId}:${userId}`, hex-encoded.
@@ -82,17 +96,23 @@ export async function withUserPseudonym<T>(
   onError?: (error: unknown) => void
 ): Promise<T> {
   const salt = env.TELEMETRY_USER_ID_SALT;
-  if (!salt || !clientId || !userId) return fn();
+  if (!salt || !clientId || !userId) return withoutPseudonym(fn);
 
   let pseudonym: string;
   try {
     pseudonym = await hashUserId(salt, clientId, userId);
   } catch (error) {
-    // Degrade to no pseudonym — but never silently. The caller logs it with request
-    // context; telemetry losing a correlation key must not take the request with it.
+    // Degrade to no pseudonym — but never silently, and never to the ENCLOSING scope's
+    // pseudonym. The caller logs it with request context; telemetry losing a correlation
+    // key must not take the request with it.
     onError?.(error);
-    return fn();
+    return withoutPseudonym(fn);
   }
+  // Tag the currently-active span too. Span attributes must be set while the span is
+  // live: `RedactingSpanExporter` runs at EXPORT time, long after the handler has left
+  // this scope, so reading the store there would always see undefined. This catches the
+  // auto-instrumented request/DO root; `withSpan` tags its own children at creation.
+  trace.getActiveSpan()?.setAttribute('user_hash', pseudonym);
   return userPseudonym.run(pseudonym, fn);
 }
 
