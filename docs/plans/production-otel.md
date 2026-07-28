@@ -60,6 +60,9 @@ depended upon. Phase C moves it onto the OTel pipe without ever putting it at ri
   anyone we later give QA — read access to production data, with no way to scope it down
   later without Enterprise. Instance separation is the only access control we have.
 - **Pseudonymization blocks prod telemetry** (A1 before B3).
+- **The two salts are independent.** The worker gets a fresh `TELEMETRY_USER_ID_SALT` for the
+  OpenObserve path; `bt-servant-telemetry` keeps using its existing, unreadable
+  `PII_HASH_SALT` for D1. Nothing needs to be retrieved, matched, or rotated.
 - **R2 object storage for the prod OO from day one.** Greenfield, so no migration.
 - **Nothing may change what `console.log` emits** until Phase C is complete. That is the
   hard safety constraint; see A1.
@@ -94,49 +97,41 @@ fail silently.
 
 ### The change
 
-Substitute **inside the OTLP branch only** — `buildLogAttributes()`
+Emit **both** identifiers on the OTLP branch and let the collector deliver the right one to
+each destination. The work lands in `buildLogAttributes()`
 (`src/services/telemetry/logs.ts:84`), which builds a brand-new object and runs after
 `console.log` has already serialized. The console branch is therefore untouched _by
 construction_, not by convention.
 
-- New secret `TELEMETRY_USER_ID_SALT`, set to the **same value** as the handrolled app's
-  `PII_HASH_SALT` — **per environment**. That app uses a distinct salt per env
-  (`../bt-servant-telemetry/docs/implementation-plan.md:89`), so the staging worker takes
-  `bt-servant-telemetry-dev`'s salt and the prod worker takes `-production`'s.
+### The two salts are independent — do NOT share them
 
-  > **BLOCKER — resolve before A1 can be verified.** `PII_HASH_SALT` is a wrangler secret
-  > and Cloudflare secrets are write-only; the values cannot be read back from Cloudflare.
-  > They must come from wherever they were backed up (that app's plan says the salt is
-  > "backed up alongside production secrets" and must never be rotated, `:232`).
-  >
-  > This is a **correctness** requirement for Phase C, not merely a continuity nicety.
-  > During C2/C3 both ingest paths write to the same D1. If the worker's salt differs from
-  > the app's, the same person produces two different `user_hash` values ⇒ two rows in
-  > `users` ⇒ every cohort tile inflates, silently.
-  >
-  > If a salt turns out to be unrecoverable, Phase C cannot dual-write safely for that env,
-  > and the options are: (a) rotate both sides to a new shared salt and accept a cohort
-  > epoch break, or (b) have the OTLP receive route in C1 hash `user_id` itself — which
-  > means A1 must keep emitting something it can hash, changing A1's design. Decide before
-  > writing A1.
+|            | salt                           | computed by            | lands in    | consumed by     |
+| ---------- | ------------------------------ | ---------------------- | ----------- | --------------- |
+| **hash A** | `PII_HASH_SALT` (existing)     | `bt-servant-telemetry` | D1          | cohort KPIs     |
+| **hash B** | `TELEMETRY_USER_ID_SALT` (new) | the worker             | OpenObserve | ops correlation |
 
-- Compute `HMAC-SHA-256(salt, "${client_id}:${user_id}")`, byte-identical to `hashUserId()`
-  in the handrolled app. Identical inputs and salt ⇒ identical pseudonyms ⇒ Phase C can
-  consume them directly with full cohort continuity.
+`PII_HASH_SALT` is a write-only wrangler secret that cannot be read back — and does not need
+to be. `bt-servant-telemetry` keeps _using_ it without anyone reading it, so it keeps
+producing the exact hash A it always has. The worker's salt is unrelated and freshly
+generated. See "Why two hashes cannot double-count" at the end of Phase C.
+
+### Changes
+
+- **New secret `TELEMETRY_USER_ID_SALT`, per env, freshly generated** (`openssl rand -hex 32`).
+  No relationship to `PII_HASH_SALT` and no coordination with the other repo.
+- Compute `user_hash = HMAC-SHA-256(TELEMETRY_USER_ID_SALT, "${client_id}:${user_id}")`.
 - **Hash once per request, at the entry point**, and stash it in `AsyncLocalStorage`.
   `crypto.subtle.sign` is async; `buildLogAttributes` is sync. This pattern already exists
   here — `metrics.ts:426` uses ALS for `metricSuppression`, and `logs.ts:31` notes
   otel-cf-workers installs the global ALS context manager.
-- In `buildLogAttributes`, on key `user_id`: emit `user_hash` from ALS, omit the raw value.
-  Apply the same substitution in `redactSpan()` for the trace path.
-- Drop `user_id` from `SAFE_STRING_ATTRIBUTE_KEYS`; add `user_hash`. The allow-list already
-  fails closed, so a future call site passing a raw id gets length-summarized rather than
-  leaking.
-- **Remove the collector's `attributes/redact` `user_id: hash` action.** Leaving it would
-  double-hash and break parity with the handrolled app.
+- In `buildLogAttributes`, emit `user_hash` **alongside** `user_id`. Both stay in
+  `SAFE_STRING_ATTRIBUTE_KEYS`; the collector strips whichever is wrong per destination
+  (B1 and C2).
+- In `redactSpan()`, **substitute** rather than emit both — spans go only to OpenObserve, so
+  a raw id there has no consumer and should not exist.
 - **Fail closed outside ALS scope.** No pseudonym in context (startup, an unwrapped alarm
-  handler) ⇒ omit the identifier entirely. A missing correlation key is recoverable; a
-  leaked raw id is not.
+  handler) ⇒ omit `user_hash`. A missing correlation key is recoverable; a leaked raw id is
+  not.
 - **The OTLP branch must never mutate `entry`.** It currently doesn't. Make it a test.
 
 ### Verification — four layers, not confidence
@@ -145,7 +140,9 @@ construction_, not by convention.
    events; assert byte-identical before and after. Fails loudly if the console shape ever
    drifts, including from unrelated future PRs.
 2. **Consumer contract test.** Run the handrolled `redact()` against before/after log lines
-   and assert an identical `CleanEvent` — same `user_hash`, same everything.
+   and assert an identical `CleanEvent` — same `user_hash`, same everything. (It reads
+   `obj.user_id`, which A1 leaves in place, so this should pass trivially. Assert it anyway:
+   it is the regression gate for anyone who later "cleans up" the duplicate identifier.)
 3. **No-mutation test.** Deep-freeze the `LogEntry`, run `emitLog`, assert no throw.
 4. **Staging bake on live traffic.** Staging feeds a separate instance of the consumer,
    `bt-servant-telemetry-dev`, backed by its own D1 (`wrangler.toml:98-100`). Deploy to
@@ -155,9 +152,14 @@ construction_, not by convention.
 ### Caveat to record
 
 This is pseudonymization, not anonymization. Stable pseudonyms remain personal data,
-re-identifiable by linkage, and the stability is _required_ for cohort math — the salt can
-never be rotated without destroying continuity. It reduces blast radius; it does not retire
-the need for a retention and deletion policy.
+re-identifiable by linkage. It reduces blast radius; it does not retire the need for a
+retention and deletion policy.
+
+Rotation asymmetry worth knowing: **hash A's salt can never be rotated** without destroying
+cohort continuity (that repo's `implementation-plan.md:232` treats it as a one-way migration
+value). **Hash B's salt can be rotated freely** — it only affects the ability to correlate
+one OpenObserve record to another within the retention window, and nothing is computed
+cumulatively from it. If we ever suspect a leak, rotating the worker's salt is cheap.
 
 ---
 
@@ -175,6 +177,10 @@ the need for a retention and deletion policy.
 - Parameterize the env-specific collector value — `bucket: bt-servant-staging` is hardcoded
   → `${env:INFLUX_BUCKET}`. `O2_ENDPOINT` / `O2_AUTH` / `OTEL_INGEST_TOKEN` are already
   env-driven. One config file, two apps, different secrets.
+- **Replace the `attributes/redact` `user_id: hash` action with `user_id: delete`.** After A1
+  the worker sends a properly salted `user_hash`, so the collector's unsalted digest is
+  redundant; deleting the raw id is what keeps it out of OpenObserve. Until C2 there is only
+  one logs pipeline, so a single `delete` covers it.
 - **Remove the `debug` exporter from all three pipelines.** The config's own comment says to
   once the sink is confirmed; `verbosity: detailed` is expensive under real traffic.
 - New GitHub Actions workflow: deploy the collector on pushes to `main` touching
@@ -237,7 +243,7 @@ and nothing changes when you do, because it was writing rows the other path alre
 | field                                                                                                  | how it survives the OTLP path                    |
 | ------------------------------------------------------------------------------------------------------ | ------------------------------------------------ |
 | `event`, `org`, `client_id`, `request_id`, `chat_type`, `transport`, `tool_name`, `server_id`, `level` | in `SAFE_STRING_ATTRIBUTE_KEYS` — egress raw     |
-| `user_hash`                                                                                            | emitted directly by A1                           |
+| `user_id`                                                                                              | emitted by A1; the app hashes it itself (hash A) |
 | `total_ms`, `duration_ms`                                                                              | numbers pass through untouched (`redact.ts:150`) |
 | `first_interaction`                                                                                    | booleans pass through untouched (same line)      |
 | `ts`                                                                                                   | the OTLP log record's native timestamp           |
@@ -249,19 +255,38 @@ Add a bearer-authed route that accepts OTLP/HTTP logs (JSON encoding), parses
 existing `ingestBatch()`. Keep the tail handler running alongside it. D1 schema, KPI
 queries, the SvelteKit page, and Zulip digests are untouched.
 
+**The route must hash `user_id` by calling the same `hashUserId()` the tail path calls, with
+the same `env.PII_HASH_SALT`.** Not a copy of the function — the same one. That is what makes
+both ingest paths produce an identical hash A, and it is the single most important line in
+Phase C. It must never store a pre-hashed value off the wire.
+
 Apply the same `isKnownEvent` filter the tail path uses — the OTLP path tees _all_
 structured logs, and the existing `telemetry_unknown_event_dropped` drift warning should
 keep working.
 
 ## C2 — staging dual-write
 
-Add an `otlphttp` exporter to the **staging** collector's logs pipeline, pointed at the C1
-route on `bt-servant-telemetry-dev`. Collector-only change; the worker is never touched.
-Bake, then verify `-dev`'s row counts and sampled `user_hash` values against the tail path.
+Split the collector's logs pipeline in two, both fed by the same OTLP receiver:
+
+```yaml
+pipelines:
+  logs/openobserve: # attributes: delete user_id   → OpenObserve  (hash B only)
+  logs/telemetry_app: # attributes: delete user_hash → bt-servant-telemetry (raw user_id)
+```
+
+Point `logs/telemetry_app` at the C1 route on `bt-servant-telemetry-dev`. Collector-only
+change; the worker is never touched. Bake, then verify `-dev`'s row counts and sampled
+`user_hash` values against the tail path.
+
+**Config assertion to add:** `logs/openobserve` must delete `user_id` and `logs/telemetry_app`
+must delete `user_hash`. Getting either backwards leaks a raw id into the sink, or feeds the
+cohort tables a hash they cannot reproduce. `otelcol validate` will not catch this — it is a
+semantic error, not a syntactic one, so it needs a review-checklist line in the runbook.
 
 ## C3 — prod dual-write **[requires B3]**
 
-Same exporter on the prod collector → `bt-servant-telemetry-production`. Bake and verify.
+Same two-pipeline split on the prod collector → `bt-servant-telemetry-production`. Bake and
+verify.
 
 ## C4 — remove the tail path
 
@@ -272,6 +297,52 @@ Drop `bt-servant-telemetry-production` / `bt-servant-telemetry-dev` from `tail_c
 all — which is what stands between us and #309's "cut the Cloudflare Observability path,"
 and which makes A1's compromise (raw `user_id` still in Workers Logs) temporary by design
 rather than permanent.
+
+## Why two hashes cannot double-count
+
+The two pseudonyms live in different systems and never meet. **No table, query, or count ever
+contains both.**
+
+```
+                         user_id (raw)
+                              │
+   worker ────────────────────┼──────────────────────────────────
+     │                        │
+     ├─ console.log ─► tail ─►│                    ┌─────────────┐
+     │                        ├───────────────────►│ bt-servant- │
+     └─ OTLP ─► collector     │  raw user_id       │ telemetry   │
+                  ├─ logs/telemetry_app ───────────►│             │
+                  │                                 │ HMAC(A) ────┼──► D1
+                  │                                 └─────────────┘   hash A ONLY
+                  │
+                  └─ logs/openobserve ──────────────► OpenObserve
+                     (user_hash = HMAC(B))            hash B ONLY
+```
+
+- **D1 only ever contains hash A.** Both writers into it — the tail handler and the C1 OTLP
+  route — receive raw `user_id` and call the same `hashUserId()` with the same
+  `env.PII_HASH_SALT`. Same function, same input, same salt ⇒ same output. The idempotent
+  PKs then collapse the two writes onto one row.
+- **OpenObserve only ever contains hash B**, and nothing cumulative is computed from it —
+  it is a correlation key within a retention window, not a cohort identity.
+- **The cohort KPIs read only D1.** `COUNT(DISTINCT user_hash)` is counting hash A values
+  exclusively. Hash B is not in that database and could not enter it.
+
+The double-count risk I originally flagged was real, but it belonged to a _different_ design
+— one where the OTLP path delivered a pre-hashed value into D1. Two writers putting two
+different hashes for the same person into `users` would produce two rows and inflate every
+tile. Sending raw `user_id` and hashing at the destination removes that failure mode
+entirely.
+
+**The one real cost:** you cannot join an OpenObserve record to a D1 user row by identity —
+the hashes are unrelated by design. Correlate on `request_id` instead, which is present in
+both and is what you actually want when debugging a specific interaction.
+
+**The one way to break it:** if C1's route ever stores a hash it received off the wire
+instead of computing one, D1 gets both hash kinds and the counts inflate. That is why C1
+specifies the same function, not a copy, and why `logs/telemetry_app` deletes `user_hash`
+before delivery — so there is nothing on the wire for a future maintainer to mistakenly
+persist.
 
 ---
 
