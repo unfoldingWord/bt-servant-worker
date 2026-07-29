@@ -105,8 +105,15 @@ export async function withUserPseudonym<T>(
     // Degrade to no pseudonym — but never silently, and never to the ENCLOSING scope's
     // pseudonym. The caller logs it with request context; telemetry losing a correlation
     // key must not take the request with it.
-    onError?.(error);
-    return withoutPseudonym(fn);
+    //
+    // `onError` runs INSIDE the cleared store, not before it. `onError` is a logging
+    // callback, so emitting it under the enclosing scope would stamp the outer user's
+    // `user_hash` onto a `user_pseudonym_failed` record carrying THIS user's client_id and
+    // message_id — the exact cross-user attribution this fail-closed path exists to prevent.
+    return withoutPseudonym(async () => {
+      onError?.(error);
+      return fn();
+    });
   }
   // Tag the currently-active span too. Span attributes must be set while the span is
   // live: `RedactingSpanExporter` runs at EXPORT time, long after the handler has left

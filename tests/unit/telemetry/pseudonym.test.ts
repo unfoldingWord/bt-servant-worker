@@ -239,9 +239,14 @@ describe('withUserPseudonym — nested scopes must clear, not inherit', () => {
   const nestedMissingId = () =>
     withUserPseudonym(SALTED, undefined, 'whatsapp:15550001111', readPseudonym);
 
+  /** What the onError callback observed, so a case can assert the diagnostic's own scope. */
+  let seenByOnError: string | undefined | 'never-called';
+
   /** Inner call whose hashing will fail, run from inside an outer user's scope. */
   const nestedFailing = () =>
-    withUserPseudonym(SALTED, 'whatsapp', 'whatsapp:15550001111', readPseudonym, () => {});
+    withUserPseudonym(SALTED, 'whatsapp', 'whatsapp:15550001111', readPseudonym, () => {
+      seenByOnError = getUserPseudonym();
+    });
 
   it('clears when the inner call is missing identifiers', async () => {
     const inner = await withUserPseudonym(SALTED, 'telegram', 'telegram:42', nestedMissingId);
@@ -253,5 +258,17 @@ describe('withUserPseudonym — nested scopes must clear, not inherit', () => {
     const inner = await runWithPseudonymForTests(HASH_TELEGRAM, nestedFailing);
     spy.mockRestore();
     expect(inner).toBeUndefined();
+  });
+
+  it('clears for the onError diagnostic itself, not just the handler', async () => {
+    // onError is a LOGGING callback. Running it under the enclosing store would stamp user
+    // A's user_hash onto a user_pseudonym_failed record carrying user B's client_id — the
+    // same cross-user attribution, just relocated into the diagnostic.
+    seenByOnError = 'never-called';
+    const spy = breakHashing();
+    await runWithPseudonymForTests(HASH_TELEGRAM, nestedFailing);
+    spy.mockRestore();
+    expect(seenByOnError).not.toBe('never-called');
+    expect(seenByOnError).toBeUndefined();
   });
 });
