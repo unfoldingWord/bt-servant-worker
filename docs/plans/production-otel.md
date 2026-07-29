@@ -187,8 +187,13 @@ exporter errors, and the staged `INFLUX_BUCKET` applied.
    input, whose default is `latest`). Pinning the action alone still installs an unreviewed
    binary that receives the deploy token. See the table in `infra/otel-collector/README.md`.
 
-Also note `.github/scripts/assert-collector-invariants.py` **fails if `debug` is wired into
-any pipeline** — intentional, and relevant to B3 step 4, which temporarily wires it.
+**`.github/scripts/assert-collector-invariants.py` fails if `debug` is wired into any
+pipeline, and that gate is absolute** — every deploy job `needs: [validate]`, so there is no
+deploy path that skips it. Do not plan around it with a manual laptop `fly deploy`; that is
+precisely the anti-pattern B1 and #324 item 1 eliminated. B3 therefore does **not** wire
+`debug` at all (see its step 4). If a future bring-up genuinely needs record-level stdout,
+the auditable route is a normal PR that relaxes the assertion and wires the exporter in the
+same reviewed diff, shipped through the same workflow — then a second PR reverting it.
 
 - **`wrangler.toml:35`: `ENVIRONMENT = "development"` → `"production"`.** Prod deploys run
   with no `--env` flag (`.github/workflows/deploy.yml:36`), so the top-level `[vars]` block
@@ -227,9 +232,13 @@ any pipeline** — intentional, and relevant to B3 step 4, which temporarily wir
   during B1: it is a bucket _name_, not a secret, and as a fly secret it is the single value
   distinguishing the two environments while being invisible and unreviewable (`fly secrets
 list` shows only a digest). In `fly.toml [env]` the bucket↔environment mapping lives in git
-  and is code-reviewed; only the door43 _token_ needs to stay secret. If done, teach
-  `assert-collector-invariants.py` to assert each `fly.toml`'s bucket matches its app, and
-  drop `INFLUX_BUCKET` from `check-collector-secrets.sh`'s required list.
+  and is code-reviewed; only the door43 _token_ needs to stay secret. If done:
+  - Teach `assert-collector-invariants.py` to assert each `fly.toml`'s bucket matches its app,
+    and drop `INFLUX_BUCKET` from `check-collector-secrets.sh`'s required list.
+  - **`flyctl secrets unset INFLUX_BUCKET` on every app that carries it** (the staging
+    collector does, from B1). **A fly secret takes precedence over `[env]`**, so leaving the
+    old one behind silently shadows the new code-reviewed value — the move would look done
+    and change nothing. B3's checklist is conditional on this decision for the same reason.
 
 ## B3 — provision + enable **[no code; runbook]** → **issue #341**
 
@@ -242,11 +251,32 @@ Ordered, because each step proves the previous one.
 3. door43: point the prod collector at the **`bt-servant`** bucket (PR #329 smoke-tested
    both token↔bucket pairs). It auto-creates with infinite retention — ask infra to set a
    retention period after first write.
-4. Deploy the prod collector with `debug`-only exporters; confirm bearer auth end to end.
-5. Add the OpenObserve exporters; confirm records land in the prod UI.
+4. **Deploy the prod collector through the workflow** — set `FLY_PROD_COLLECTOR_APP`, land a
+   commit on `main`. Then confirm bearer auth end to end with two requests, **no `debug`
+   exporter involved**:
+
+   ```bash
+   # 401 without the token, 200 with it.
+   curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+     https://<prod-collector>.fly.dev/v1/traces \
+     -H 'Content-Type: application/json' -d '{"resourceSpans":[]}'
+   curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+     https://<prod-collector>.fly.dev/v1/traces \
+     -H "Authorization: Bearer $OTEL_INGEST_TOKEN" \
+     -H 'Content-Type: application/json' -d '{"resourceSpans":[]}'
+   ```
+
+   Plus `fly logs` for `Everything is ready. Begin running and processing data.` on every
+   machine. This is exactly how B1's collector was verified on 2026-07-29, and it needs no
+   config change and no exception to the invariant gate. `debug` was an M0-era aid from when
+   no sink existed yet; it is redundant now that step 5 exists.
+
+5. Confirm records land in the **prod OpenObserve UI** — a real queryable sink, strictly
+   better than `debug`'s stdout for proving the pipeline end to end.
 6. `wrangler secret put OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_COLLECTOR_TOKEN` on the prod
    worker. **This is the switch.** Telemetry starts flowing here and nowhere earlier.
-7. Watch one full traffic cycle before removing `debug`.
+7. Watch one full traffic cycle in the prod UI, checking that `user_id` is absent and
+   `user_hash` is present on the arriving records.
 
 **Credentials for B3** (see B1's carry-forward notes above for why):
 
@@ -257,8 +287,16 @@ Ordered, because each step proves the previous one.
   staging app.
 - Set the **`FLY_PROD_COLLECTOR_APP`** repo variable — this is what un-skips the prod deploy
   job. It stays skipped until then, by design.
-- Give the prod app all five secrets, with `INFLUX_BUCKET=bt-servant` (not the staging bucket)
-  paired with a matching door43 token — their Nginx validates the two against each other.
+- Give the prod app every secret its config dereferences. **`INFLUX_BUCKET` is conditional on
+  what B2 decided:**
+  - **If B2 left the bucket as a fly secret** — set `INFLUX_BUCKET=bt-servant` (NOT the
+    staging bucket), paired with a matching door43 token; their Nginx validates the two
+    against each other.
+  - **If B2 moved the bucket into `fly.toml [env]`** — do **not** set it as a secret here.
+    **A fly secret of the same name takes precedence over `[env]`**, so adding it back
+    silently shadows the code-reviewed mapping and lets the two drift apart invisibly —
+    undoing the entire reason for the move. Also `flyctl secrets unset INFLUX_BUCKET` on any
+    app that still carries the old one (the staging collector does, from B1).
 - Prefer `fly secrets set --stage` so secrets apply on the next deploy instead of restarting a
   live pipe. Staged secrets still appear in `flyctl secrets list --json`, so the pre-flight
   passes.
