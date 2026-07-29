@@ -30,7 +30,11 @@ worker is never touched or redeployed.
 
 **Governance.** OpenObserve is operated and queried only by us (fly is just an IaaS host);
 the control plane stays in our hands. We still **redact at source** (in the worker) and
-again in the collector, so no message content or precise location reaches the sink. The
+again in the collector, so no message content or precise location reaches the sink.
+**User identifiers never reach a sink at all:** the worker emits a salted `user_hash`
+(HMAC-SHA-256, secret `TELEMETRY_USER_ID_SALT`) for joinability, and the collector
+**deletes** the raw `user_id` outright — it is not hashed there, because the collector's
+`hash` action is unsalted and therefore reversible for enumerable ids. The
 sovereign endgame (owned-hardware Grafana LGTM) is later a collector-config change, nothing
 more. (A 3rd-party SaaS sink like Axiom was considered and dropped.)
 

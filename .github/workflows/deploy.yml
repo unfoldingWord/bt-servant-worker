@@ -22,6 +22,20 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
+      # This job deploys with NO --env flag, so the top-level [vars] block is what
+      # reaches production. If ENVIRONMENT ever drifts back to "development", the deploy
+      # still succeeds and prod telemetry silently lands in the wrong service.namespace —
+      # exactly the bug production-otel.md B1 fixed. Fail loudly instead.
+      - name: Assert production environment label
+        run: |
+          set -euo pipefail
+          value="$(sed -n '/^\[vars\]/,/^\[/p' wrangler.toml | sed -n 's/^ENVIRONMENT *= *"\(.*\)"/\1/p')"
+          echo "wrangler.toml top-level [vars] ENVIRONMENT = '$value'"
+          if [ "$value" != "production" ]; then
+            echo "::error file=wrangler.toml::top-level [vars] ENVIRONMENT must be \"production\" (got \"$value\")"
+            exit 1
+          fi
+
       # Tail consumer must exist before the producer worker references it
       # via tail_consumers in wrangler.toml — deploy it first.
       - name: Deploy Tail Worker (Production)

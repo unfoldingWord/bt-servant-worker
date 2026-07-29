@@ -1,0 +1,144 @@
+name: Deploy OTel Collector
+
+# The collector is the telemetry pipe (infra/otel-collector/). It is NOT part of the
+# Worker bundle, so the main CI/Deploy workflows never touch it — this workflow is its
+# entire CI/CD.
+#
+# validate runs on every PR that touches the collector; deploy runs only on main.
+# The M0 lesson: a config the collector rejects crash-loops the fly app on boot, and
+# fly happily rolls it out anyway. So we validate with the EXACT pinned image before
+# any deploy, and we pre-flight the fly secrets the config depends on.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infra/otel-collector/**'
+      - '.github/workflows/deploy-collector.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'infra/otel-collector/**'
+      - '.github/workflows/deploy-collector.yml'
+  workflow_dispatch:
+
+# Never let two collector deploys race onto the same fly app.
+concurrency:
+  group: deploy-collector-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate Config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Single source of truth for the version is the Dockerfile's ARG — validating
+      # against a different build than we ship would defeat the point.
+      - name: Resolve pinned collector version
+        id: otelcol
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^ARG OTELCOL_VERSION=//p' infra/otel-collector/Dockerfile)"
+          if [ -z "$version" ]; then
+            echo "::error file=infra/otel-collector/Dockerfile::could not parse ARG OTELCOL_VERSION"
+            exit 1
+          fi
+          echo "Pinned collector version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Dummy env values: `validate` resolves every ${env:...} reference, so the real
+      # secrets are irrelevant but the placeholders must be well-SHAPED (O2_ENDPOINT is
+      # parsed as a URL). Nothing here is sensitive.
+      - name: otelcol validate
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$PWD/infra/otel-collector:/cfg:ro" \
+            -e OTEL_INGEST_TOKEN=validate-only \
+            -e O2_ENDPOINT=https://validate-only.invalid/api/default \
+            -e O2_AUTH="Basic dmFsaWRhdGUtb25seQ==" \
+            -e INFLUX_TOKEN=validate-only \
+            -e INFLUX_BUCKET=validate-only \
+            "otel/opentelemetry-collector-contrib:${{ steps.otelcol.outputs.version }}" \
+            validate --config /cfg/otel-collector-config.yaml
+
+      # `validate` does NOT catch this: an unset ${env:...} resolves to an empty string
+      # and exits 0, so a missing INFLUX_BUCKET would ship a collector that starts fine
+      # and writes metrics to bucket="" forever. Guard the config side here; the deploy
+      # jobs guard the fly-secret side.
+      - name: Assert no unparameterized env-specific values
+        run: |
+          set -euo pipefail
+          cfg=infra/otel-collector/otel-collector-config.yaml
+          # NB: the lookahead must sit directly after the colon. Putting a \s* BEFORE it
+          # lets the regex backtrack to zero-width and match anything.
+          if grep -nP '^\s*bucket:(?!\s*\$\{env:)' "$cfg"; then
+            echo "::error file=$cfg::influxdb bucket must be \${env:INFLUX_BUCKET}, not a hardcoded name"
+            exit 1
+          fi
+          if grep -nP '^\s*-\s*\{\s*key:\s*user_id,\s*action:(?!\s*delete\b)' "$cfg"; then
+            echo "::error file=$cfg::user_id must be deleted, not hashed — the collector's hash is unsalted"
+            exit 1
+          fi
+
+  deploy-staging:
+    name: Deploy Collector (Staging)
+    needs: [validate]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Resolve app name
+        id: app
+        working-directory: infra/otel-collector
+        run: |
+          set -euo pipefail
+          app="$(sed -n 's/^app *= *"\(.*\)"/\1/p' fly.toml)"
+          if [ -z "$app" ]; then
+            echo "::error file=infra/otel-collector/fly.toml::could not parse app name"
+            exit 1
+          fi
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+
+      - name: Pre-flight required secrets
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: .github/scripts/check-collector-secrets.sh "${{ steps.app.outputs.app }}"
+
+      - name: Deploy
+        working-directory: infra/otel-collector
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: flyctl deploy --remote-only --config fly.toml
+
+  deploy-production:
+    name: Deploy Collector (Production)
+    needs: [validate]
+    # Skipped until the prod collector app exists (production-otel.md B3 step 1).
+    # Provision it, then set the FLY_PROD_COLLECTOR_APP repo variable to its app name
+    # and this job starts deploying — no workflow edit needed. B2 may replace the
+    # --app override with a dedicated fly.prod.toml.
+    if: github.event_name != 'pull_request' && vars.FLY_PROD_COLLECTOR_APP != ''
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Pre-flight required secrets
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: .github/scripts/check-collector-secrets.sh "${{ vars.FLY_PROD_COLLECTOR_APP }}"
+
+      - name: Deploy
+        working-directory: infra/otel-collector
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: flyctl deploy --remote-only --config fly.toml --app "${{ vars.FLY_PROD_COLLECTOR_APP }}"

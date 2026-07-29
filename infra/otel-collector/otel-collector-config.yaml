@@ -40,7 +40,12 @@ processors:
       - { key: password, action: delete }
       - { key: secret, action: delete }
       - { key: cookie, action: delete }
-      - { key: user_id, action: hash } # pseudonymize identifiers, keep them joinable
+      # DELETE, not hash. The collector's `hash` is an UNSALTED digest — reversible by
+      # brute force for enumerable ids (phone numbers). The worker now emits a properly
+      # salted `user_hash` (HMAC-SHA-256, secret `TELEMETRY_USER_ID_SALT`) alongside the
+      # raw id, so the joinable pseudonym already exists downstream and the raw id is
+      # pure liability here. Never weaken this back to `hash`.
+      - { key: user_id, action: delete }
 
   batch:
     timeout: 5s
@@ -76,12 +81,19 @@ exporters:
   influxdb/door43_metrics:
     endpoint: https://metrics.door43.org
     org: unfoldingword # required by the exporter; Influx 3 ignores it (bucket is what's validated)
-    bucket: bt-servant-staging
+    # Env-driven so ONE config file serves both collector apps: staging sets
+    # INFLUX_BUCKET=bt-servant-staging, prod sets INFLUX_BUCKET=bt-servant. No default
+    # on purpose — a wrong-but-plausible bucket is worse than a startup failure, and
+    # door43's Nginx validates the bucket against the token anyway.
+    bucket: ${env:INFLUX_BUCKET}
     headers:
       X-InfluxDB-API-Token: ${env:INFLUX_TOKEN}
 
-  # Bring-up aid: verbose stdout so `fly logs` shows every record. Remove once the
-  # sink is confirmed (detailed verbosity is expensive under real traffic).
+  # Bring-up aid, DELIBERATELY NOT WIRED INTO ANY PIPELINE. `verbosity: detailed`
+  # prints every record and is far too expensive under real traffic. Kept defined so
+  # a new environment's bring-up (prod: see docs/plans/production-otel.md B3) can
+  # prove worker→collector+auth by temporarily appending `debug` to a pipeline's
+  # `exporters:` list, then removing it again once the real sink is confirmed.
   debug:
     verbosity: detailed
 
@@ -91,15 +103,15 @@ service:
     traces:
       receivers: [otlp]
       processors: [memory_limiter, attributes/redact, batch]
-      exporters: [otlp_http/openobserve_traces, debug]
+      exporters: [otlp_http/openobserve_traces]
     logs:
       receivers: [otlp]
       processors: [memory_limiter, attributes/redact, batch]
-      exporters: [otlp_http/openobserve_logs, debug]
+      exporters: [otlp_http/openobserve_logs]
     metrics:
       receivers: [otlp]
       processors: [memory_limiter, attributes/redact, batch]
-      exporters: [otlp_http/openobserve_metrics, influxdb/door43_metrics, debug]
+      exporters: [otlp_http/openobserve_metrics, influxdb/door43_metrics]
   telemetry:
     logs:
       level: info

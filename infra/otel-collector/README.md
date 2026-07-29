@@ -18,16 +18,51 @@ OTEL_INGEST_TOKEN="$(openssl rand -hex 32)"
 echo "Ingest token (also set on the worker as OTEL_COLLECTOR_TOKEN): $OTEL_INGEST_TOKEN"
 
 # O2_AUTH carries the OpenObserve ingestion token (from its UI), NOT the OTEL_INGEST_TOKEN above.
-# INFLUX_TOKEN is the door43-issued token mapped (by their Nginx) to the bucket named in
-# the `influxdb/door43_metrics` exporter — the token and the bucket must be a matched pair.
+# INFLUX_TOKEN is the door43-issued token; INFLUX_BUCKET is the bucket their Nginx maps that
+# token to — the two must be a matched pair, or writes are rejected at the proxy.
 fly secrets set \
   OTEL_INGEST_TOKEN="$OTEL_INGEST_TOKEN" \
   O2_ENDPOINT="https://bt-servant-openobserve.fly.dev/api/default" \
   O2_AUTH="Basic $(printf '%s' 'you@example.com:INGEST_TOKEN' | base64)" \
-  INFLUX_TOKEN="<door43 apiv3_… token for the bucket in the config>"
+  INFLUX_TOKEN="<door43 apiv3_… token for the bucket below>" \
+  INFLUX_BUCKET="bt-servant-staging"   # prod: bt-servant
 
 fly deploy --build-arg OTELCOL_VERSION=0.157.0   # pin a stable tag; see Dockerfile
 ```
+
+### Required secrets
+
+The config dereferences all five; **every one is mandatory on every collector app**.
+
+| Secret              | What it is                                                                       |
+| ------------------- | -------------------------------------------------------------------------------- |
+| `OTEL_INGEST_TOKEN` | Shared secret the worker sends as `Authorization: Bearer …`                      |
+| `O2_ENDPOINT`       | OpenObserve org base URL                                                         |
+| `O2_AUTH`           | `Basic <base64(user:token)>` for OpenObserve                                     |
+| `INFLUX_TOKEN`      | door43-issued write token                                                        |
+| `INFLUX_BUCKET`     | door43 bucket that token maps to — this is what makes one config serve both envs |
+
+> **`INFLUX_BUCKET` fails silently if you forget it.** An unset `${env:…}` resolves to an
+> empty string and `otelcol validate` still exits 0 — the collector boots healthy and writes
+> every metric to `bucket=""`. That is why the deploy workflow runs
+> [`check-collector-secrets.sh`](../../.github/scripts/check-collector-secrets.sh) against the
+> live fly app before shipping, rather than trusting `validate` alone.
+
+## CI/CD
+
+[`.github/workflows/deploy-collector.yml`](../../.github/workflows/deploy-collector.yml) owns
+this directory. Nothing here is in the Worker bundle, so the main `CI` / `Deploy` workflows
+ignore it entirely.
+
+- **On PRs** that touch this directory — `otelcol validate` against the exact image tag
+  pinned in the `Dockerfile`, plus grep guards asserting the bucket stays parameterized and
+  `user_id` stays `delete`.
+- **On push to `main`** — pre-flight the fly secrets, then `flyctl deploy --remote-only`.
+
+Requires a `FLY_API_TOKEN` repo secret. The production job stays **skipped** until the repo
+variable `FLY_PROD_COLLECTOR_APP` is set to the prod app's name (see
+`docs/plans/production-otel.md` B3 step 1); it then deploys the same config with an `--app`
+override.
 
 ### InfluxDB sink notes
 
@@ -62,9 +97,10 @@ Prove one hop at a time by trimming each pipeline's `exporters:` list in
 1. `[debug]` only — proves worker → collector + bearer auth.
 2. add `otlp_http/openobserve_*` — proves the sink. **M0 done.**
 
-Remove `debug` from the lists once the sink is confirmed. To add a second sink later, add
-its exporter block + append it to each pipeline's `exporters:` list and redeploy — the
-worker is never touched.
+`debug` is defined in the config but **wired into no pipeline** — `verbosity: detailed` is
+too expensive to leave on under real traffic. Append it to a pipeline's `exporters:` list for
+a bring-up, then take it back out. To add a second sink later, add its exporter block +
+append it to each pipeline's `exporters:` list and redeploy — the worker is never touched.
 
 ## Notes
 

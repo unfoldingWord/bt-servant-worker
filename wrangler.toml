@@ -32,7 +32,13 @@ head_sampling_rate = 1
 cpu_ms = 300000
 
 [vars]
-ENVIRONMENT = "development"
+# The top-level [vars] block IS the production config: the Deploy workflow runs
+# `wrangler deploy` with no `--env` flag (.github/workflows/deploy.yml). Only
+# consumers are the three `service.namespace` telemetry sites, so this is a
+# telemetry-labelling change and nothing more. `wrangler dev` reports
+# "production" too, which is harmless — telemetry is a no-op locally without
+# OTEL_EXPORTER_OTLP_ENDPOINT / OTEL_COLLECTOR_TOKEN.
+ENVIRONMENT = "production"
 MAX_ORCHESTRATION_ITERATIONS = "100"
 CODE_EXEC_TIMEOUT_MS = "30000"
 MAX_MCP_CALLS_PER_EXECUTION = "10"
