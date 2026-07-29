@@ -12,14 +12,23 @@ name: Deploy OTel Collector
 on:
   push:
     branches: [main]
+    # Both helper scripts are load-bearing gates, so they must trigger their own
+    # workflow — otherwise a script-only edit could weaken the invariant check or the
+    # secrets pre-flight with nothing running to catch it.
+    # (Duplicated below rather than using a YAML anchor — the Actions workflow parser
+    # does not reliably support anchors, and this list is a gate.)
     paths:
       - 'infra/otel-collector/**'
       - '.github/workflows/deploy-collector.yml'
+      - '.github/scripts/assert-collector-invariants.py'
+      - '.github/scripts/check-collector-secrets.sh'
   pull_request:
     branches: [main]
     paths:
       - 'infra/otel-collector/**'
       - '.github/workflows/deploy-collector.yml'
+      - '.github/scripts/assert-collector-invariants.py'
+      - '.github/scripts/check-collector-secrets.sh'
   workflow_dispatch:
 
 # Least privilege: nothing here writes to the repo. The deploy jobs hand
@@ -99,8 +108,15 @@ jobs:
 
       # Pinned to a reviewed commit, not @master: this action installs the flyctl
       # binary that is handed FLY_API_TOKEN two steps later, so a mutable upstream
-      # tag is a path to the deployment credential. Bump deliberately.
+      # tag is a path to the deployment credential.
+      #
+      # `version` matters as much as the action SHA — its default is `latest`, so
+      # pinning only the action still installs an unreviewed binary. 0.4.75 is the
+      # exact build this PR's token scoping and `secrets list --json` pre-flight were
+      # verified against locally. Bump both deliberately, together.
       - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # master @ 2026-04-08
+        with:
+          version: 0.4.75
 
       - name: Resolve app name
         id: app
@@ -141,8 +157,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Pinned for the same reason as the staging job — see the comment there.
+      # Action SHA and CLI version both pinned, same reasoning as the staging job.
       - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # master @ 2026-04-08
+        with:
+          version: 0.4.75
 
       - name: Pre-flight required secrets
         env:

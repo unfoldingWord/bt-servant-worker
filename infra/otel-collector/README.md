@@ -65,10 +65,20 @@ ignore it entirely.
   Deploy jobs are pinned to `refs/heads/main`, so a `workflow_dispatch` from another branch
   cannot ship an unmerged ref, and each is serialized on a per-app concurrency group.
 
-Requires a `FLY_API_TOKEN` repo secret. The production job stays **skipped** until the repo
+Requires a `FLY_API_TOKEN` repo secret — an **app-scoped Fly deploy token**, not an org-wide
+one, so a CI leak cannot reach other apps. The production job stays **skipped** until the repo
 variable `FLY_PROD_COLLECTOR_APP` is set to the prod app's name (see
 `docs/plans/production-otel.md` B3 step 1); it then deploys the same config with an `--app`
-override.
+override, and will need its own token.
+
+Three things are version-pinned on purpose, because each one ends up holding a credential or
+gating a deploy — bump them deliberately, never to "latest":
+
+| Pin                   | Where                              | Why                                                                                   |
+| --------------------- | ---------------------------------- | ------------------------------------------------------------------------------------- |
+| Collector image       | `Dockerfile` `ARG OTELCOL_VERSION` | What CI validates against must be what ships                                          |
+| `setup-flyctl` action | full commit SHA                    | A mutable tag is a path to `FLY_API_TOKEN`                                            |
+| `flyctl` CLI          | the action's `version:` input      | Its default is `latest`; pinning the action alone still installs an unreviewed binary |
 
 ### InfluxDB sink notes
 
