@@ -22,10 +22,11 @@ on:
       - '.github/workflows/deploy-collector.yml'
   workflow_dispatch:
 
-# Never let two collector deploys race onto the same fly app.
-concurrency:
-  group: deploy-collector-${{ github.ref }}
-  cancel-in-progress: false
+# Least privilege: nothing here writes to the repo. The deploy jobs hand
+# FLY_API_TOKEN to a third-party binary, so the ambient GITHUB_TOKEN should carry
+# as little authority as possible alongside it.
+permissions:
+  contents: read
 
 jobs:
   validate:
@@ -64,35 +65,42 @@ jobs:
             "otel/opentelemetry-collector-contrib:${{ steps.otelcol.outputs.version }}" \
             validate --config /cfg/otel-collector-config.yaml
 
-      # `validate` does NOT catch this: an unset ${env:...} resolves to an empty string
-      # and exits 0, so a missing INFLUX_BUCKET would ship a collector that starts fine
-      # and writes metrics to bucket="" forever. Guard the config side here; the deploy
-      # jobs guard the fly-secret side.
-      - name: Assert no unparameterized env-specific values
-        run: |
-          set -euo pipefail
-          cfg=infra/otel-collector/otel-collector-config.yaml
-          # NB: the lookahead must sit directly after the colon. Putting a \s* BEFORE it
-          # lets the regex backtrack to zero-width and match anything.
-          if grep -nP '^\s*bucket:(?!\s*\$\{env:)' "$cfg"; then
-            echo "::error file=$cfg::influxdb bucket must be \${env:INFLUX_BUCKET}, not a hardcoded name"
-            exit 1
-          fi
-          if grep -nP '^\s*-\s*\{\s*key:\s*user_id,\s*action:(?!\s*delete\b)' "$cfg"; then
-            echo "::error file=$cfg::user_id must be deleted, not hashed — the collector's hash is unsalted"
-            exit 1
-          fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet --disable-pip-version-check pyyaml
+
+      # `validate` type-checks the config; it has no idea which values are
+      # load-bearing for us. An unset or misspelled ${env:...} resolves to an empty
+      # string and validate still exits 0 — a collector missing INFLUX_BUCKET boots
+      # healthy and writes every metric to bucket="". Likewise it does not care
+      # whether user_id is deleted, hashed, or forwarded untouched. Hence exact
+      # assertions on the parsed YAML. The deploy jobs guard the fly-secret side.
+      - name: Assert collector invariants
+        run: python3 .github/scripts/assert-collector-invariants.py infra/otel-collector/otel-collector-config.yaml
 
   deploy-staging:
     name: Deploy Collector (Staging)
     needs: [validate]
-    if: github.event_name != 'pull_request'
+    # Deploy ONLY from main. workflow_dispatch lets a caller pick any branch, so
+    # `event_name != pull_request` alone would ship unmerged refs to a live app.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: staging
+    # Keyed on the APP, not github.ref — two dispatched refs sharing a ref-scoped
+    # group would still race onto the same fly app.
+    concurrency:
+      group: deploy-collector-app-staging
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
-      - uses: superfly/flyctl-actions/setup-flyctl@master
+      # Pinned to a reviewed commit, not @master: this action installs the flyctl
+      # binary that is handed FLY_API_TOKEN two steps later, so a mutable upstream
+      # tag is a path to the deployment credential. Bump deliberately.
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # master @ 2026-04-08
 
       - name: Resolve app name
         id: app
@@ -124,13 +132,17 @@ jobs:
     # Provision it, then set the FLY_PROD_COLLECTOR_APP repo variable to its app name
     # and this job starts deploying — no workflow edit needed. B2 may replace the
     # --app override with a dedicated fly.prod.toml.
-    if: github.event_name != 'pull_request' && vars.FLY_PROD_COLLECTOR_APP != ''
+    if: github.ref == 'refs/heads/main' && vars.FLY_PROD_COLLECTOR_APP != ''
     runs-on: ubuntu-latest
     environment: production
+    concurrency:
+      group: deploy-collector-app-production
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
-      - uses: superfly/flyctl-actions/setup-flyctl@master
+      # Pinned for the same reason as the staging job — see the comment there.
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # master @ 2026-04-08
 
       - name: Pre-flight required secrets
         env:

@@ -55,9 +55,15 @@ this directory. Nothing here is in the Worker bundle, so the main `CI` / `Deploy
 ignore it entirely.
 
 - **On PRs** that touch this directory — `otelcol validate` against the exact image tag
-  pinned in the `Dockerfile`, plus grep guards asserting the bucket stays parameterized and
-  `user_id` stays `delete`.
-- **On push to `main`** — pre-flight the fly secrets, then `flyctl deploy --remote-only`.
+  pinned in the `Dockerfile`, then
+  [`assert-collector-invariants.py`](../../.github/scripts/assert-collector-invariants.py),
+  which parses the YAML and asserts exactly: the bucket is `${env:INFLUX_BUCKET}`, there is
+  exactly one `user_id` action and it is `delete` on a processor every pipeline runs, and no
+  pipeline exports to `debug`. `validate` type-checks the config but has no opinion on which
+  values are load-bearing, so it catches none of these.
+- **On push to `main` only** — pre-flight the fly secrets, then `flyctl deploy --remote-only`.
+  Deploy jobs are pinned to `refs/heads/main`, so a `workflow_dispatch` from another branch
+  cannot ship an unmerged ref, and each is serialized on a per-app concurrency group.
 
 Requires a `FLY_API_TOKEN` repo secret. The production job stays **skipped** until the repo
 variable `FLY_PROD_COLLECTOR_APP` is set to the prod app's name (see
