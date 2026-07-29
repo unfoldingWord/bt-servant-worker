@@ -64,6 +64,7 @@ import {
   initMetricTelemetry,
   flushMetricTelemetry,
   countMetric,
+  withUserPseudonym,
 } from './services/telemetry/index.js';
 
 // Re-export so tests and consumers can import from './src/index.js'
@@ -1755,46 +1756,103 @@ async function handleChatRequest(
   const logger = createRequestLogger(requestId);
   const timing = createTimingContext();
 
+  let body: ChatRequest;
   try {
-    const body = (await request.clone().json()) as ChatRequest;
-    const validationError = validateChatBody(body, transport);
-    if (validationError) {
-      logger.warn('chat_validation_failed', {
-        transport,
-        error: validationError,
-        user_id: body.user_id,
-        client_id: body.client_id,
-      });
-      countMetric('requests_total', { transport, status: 'validation_failed', status_code: 400 });
-      return Response.json({ error: validationError }, { status: 400 });
-    }
-
-    const org = resolveOrgFromBody(body, env.DEFAULT_ORG);
-    // prettier-ignore
-    logger.log('request_received', { user_id: body.user_id, client_id: body.client_id, org, transport, chat_type: body.chat_type ?? 'private', chat_id: body.chat_id, thread_id: body.thread_id });
-
-    const { stub, doRequest } = await timePhase(timing, 'kv_and_routing', () =>
-      buildDOChatRequest(request, env, { body, org, transport, logger, requestId })
-    );
-    const response = await timePhase(timing, 'do_fetch', () => stub.fetch(doRequest));
-
-    logger.log('request_timing_summary', {
-      user_id: body.user_id,
-      org,
-      transport,
-      total_ms: Date.now() - timing.start,
-      phases: timing.phases,
-    });
-
-    countMetric('requests_total', {
-      transport,
-      chat_type: body.chat_type ?? 'private',
-      status_code: response.status,
-    });
-    return response;
+    body = (await request.clone().json()) as ChatRequest;
   } catch (error) {
+    // A malformed body has no identifiers to hash, so there is no scope to be inside.
     return respondToChatRequestError(error, transport, timing, logger);
   }
+
+  // Establish the OTLP user pseudonym for this request's ENTIRE async call tree before
+  // anything logs, so every record and span it produces can carry `user_hash` without
+  // re-hashing on the sync logging path. The console.log branch is untouched — it still
+  // emits raw `user_id`, which is what bt-servant-telemetry's tail ingest depends on.
+  return withUserPseudonym(
+    env,
+    body.client_id,
+    body.user_id,
+    async () => {
+      // The catch MUST live inside the scope. If it sat outside, a rejected promise would
+      // resume only after `AsyncLocalStorage.run` restored the outer context, and
+      // `request_error` — the record where correlation matters most — would lose its
+      // `user_hash`.
+      try {
+        return await dispatchChatRequest({
+          request,
+          env,
+          transport,
+          body,
+          logger,
+          timing,
+          requestId,
+        });
+      } catch (error) {
+        return respondToChatRequestError(error, transport, timing, logger);
+      }
+    },
+    (error: unknown) =>
+      logger.warn('user_pseudonym_failed', {
+        error: error instanceof Error ? error.message : String(error),
+        transport,
+        client_id: body.client_id,
+      })
+  );
+}
+
+/** Params for {@link dispatchChatRequest} — the chat flow inside the pseudonym scope. */
+type ChatDispatchParams = {
+  request: Request;
+  env: Env;
+  transport: ChatTransport;
+  body: ChatRequest;
+  logger: RequestLogger;
+  timing: TimingContext;
+  requestId: string;
+};
+
+/**
+ * The chat request flow proper, run inside `withUserPseudonym` so its logs and spans are
+ * user-correlatable in OpenObserve. Split out of `handleChatRequest` only to give that
+ * scope a callback boundary; the behavior is unchanged.
+ */
+async function dispatchChatRequest(params: ChatDispatchParams): Promise<Response> {
+  const { request, env, transport, body, logger, timing, requestId } = params;
+  const validationError = validateChatBody(body, transport);
+  if (validationError) {
+    logger.warn('chat_validation_failed', {
+      transport,
+      error: validationError,
+      user_id: body.user_id,
+      client_id: body.client_id,
+    });
+    countMetric('requests_total', { transport, status: 'validation_failed', status_code: 400 });
+    return Response.json({ error: validationError }, { status: 400 });
+  }
+
+  const org = resolveOrgFromBody(body, env.DEFAULT_ORG);
+  // prettier-ignore
+  logger.log('request_received', { user_id: body.user_id, client_id: body.client_id, org, transport, chat_type: body.chat_type ?? 'private', chat_id: body.chat_id, thread_id: body.thread_id });
+
+  const { stub, doRequest } = await timePhase(timing, 'kv_and_routing', () =>
+    buildDOChatRequest(request, env, { body, org, transport, logger, requestId })
+  );
+  const response = await timePhase(timing, 'do_fetch', () => stub.fetch(doRequest));
+
+  logger.log('request_timing_summary', {
+    user_id: body.user_id,
+    org,
+    transport,
+    total_ms: Date.now() - timing.start,
+    phases: timing.phases,
+  });
+
+  countMetric('requests_total', {
+    transport,
+    chat_type: body.chat_type ?? 'private',
+    status_code: response.status,
+  });
+  return response;
 }
 
 /** Log + count a failed chat request, then map the error to its HTTP response. */

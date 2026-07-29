@@ -78,6 +78,7 @@ import {
   countMetric,
   runWithMetricsSuppressed,
   withSpan,
+  withUserPseudonym,
 } from '../services/telemetry/index.js';
 import { classifyTriggers, ClassifierResult } from '../services/classifier/index.js';
 import type { UnmatchedTrigger } from '../services/classifier/index.js';
@@ -458,6 +459,36 @@ export class UserDO {
     if (parsed.error) return parsed.error;
     const { body } = parsed;
 
+    // The worker's pseudonym scope does NOT reach here. The DO is a separate isolate, so
+    // async context cannot survive the stub.fetch() boundary — the same reason initTelemetry
+    // runs independently in fetch(). Re-establish it from the body using the SAME salt, so
+    // DO records carry the SAME user_hash the worker computed for this request. Without
+    // this, the dozens of records produced here (tool calls, orchestration, timings) reach
+    // OpenObserve with no user identifier at all.
+    return withUserPseudonym(
+      this.env,
+      body.client_id,
+      body.user_id,
+      () => this.dispatchUnifiedChat(body, request, transport, logger),
+      (error) =>
+        logger.warn('user_pseudonym_failed', {
+          error: error instanceof Error ? error.message : String(error),
+          transport,
+          client_id: body.client_id,
+        })
+    );
+  }
+
+  /**
+   * The chat flow proper, run inside the DO's pseudonym scope. Split out of
+   * `handleUnifiedChat` only to give that scope a callback boundary; behavior is unchanged.
+   */
+  private async dispatchUnifiedChat(
+    body: ChatRequest,
+    request: Request,
+    transport: ChatTransport,
+    logger: RequestLogger
+  ): Promise<Response> {
     // Rate limiting
     const rateLimited = this.enforceEnqueueRateLimit(body, transport, logger);
     if (rateLimited) return rateLimited;
@@ -772,14 +803,55 @@ export class UserDO {
       const entry = await this.dequeueNext();
       if (!entry) return;
 
-      logger.log('drain_queue_entry', { message_id: entry.message_id });
-      await this.processQueueEntry(entry, logger);
+      // Emit INSIDE the dequeued entry's scope. This loop runs as background work started
+      // in whichever user's `handleUnifiedChat` scope triggered the drain, and a group DO's
+      // queue can hold entries for several users — so logging here unscoped would stamp
+      // user A's `user_hash` onto a record carrying user B's `message_id`. The nested
+      // `withUserPseudonym` inside `processQueueEntry` re-derives the same value; the
+      // duplicated HMAC is negligible next to mis-attributing a user.
+      await this.withEntryPseudonym(entry, logger, async () => {
+        logger.log('drain_queue_entry', { message_id: entry.message_id });
+        await this.processQueueEntry(entry, logger);
+      });
     }
   }
 
   // ── Queue entry processing (called by alarm or drainQueue) ────────────────────
 
+  /**
+   * Run `fn` under the pseudonym of the user who owns `entry`.
+   *
+   * Queue draining crosses user boundaries in two ways: `alarm()` is a separate invocation
+   * from the `fetch()` that enqueued the work, and a group DO's queue can hold entries for
+   * several users. Either way the ambient scope belongs to someone else — or to nobody — so
+   * every per-entry emission re-derives from the stored body. Fails closed: on a hashing
+   * failure `withUserPseudonym` clears the store rather than inheriting the outer user's.
+   */
+  private withEntryPseudonym<T>(
+    entry: InternalQueueEntry,
+    logger: RequestLogger,
+    fn: () => Promise<T>
+  ): Promise<T> {
+    return withUserPseudonym(this.env, entry.body.client_id, entry.body.user_id, fn, (error) =>
+      logger.warn('user_pseudonym_failed', {
+        error: error instanceof Error ? error.message : String(error),
+        message_id: entry.message_id,
+        client_id: entry.body.client_id,
+      })
+    );
+  }
+
   private async processQueueEntry(entry: InternalQueueEntry, logger: RequestLogger): Promise<void> {
+    return this.withEntryPseudonym(entry, logger, () =>
+      this.processQueueEntryInScope(entry, logger)
+    );
+  }
+
+  /** Queue-entry processing proper, inside the pseudonym scope. Behavior unchanged. */
+  private async processQueueEntryInScope(
+    entry: InternalQueueEntry,
+    logger: RequestLogger
+  ): Promise<void> {
     const startTime = Date.now();
     const body = entry.body;
     const isCallbackMode = !!body.progress_callback_url;

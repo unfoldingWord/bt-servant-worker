@@ -111,6 +111,13 @@ export function redactSpan(span: MutableSpan): void {
   delete attrs['do.id.name'];
   delete attrs['db.statement'];
   delete attrs['db.cf.kv.key'];
+  // Spans reach OpenObserve ONLY — nothing downstream needs the raw id — so drop it.
+  // This CANNOT substitute `user_hash` here: export runs after spans end, by which point
+  // the handler has left the pseudonym scope and the store reads undefined. The pseudonym
+  // is attached at span CREATION instead (`withSpan`, and the active root in
+  // `withUserPseudonym`). This delete is defense in depth for a future call site that
+  // attaches a raw id to a span.
+  delete attrs['user_id'];
   // `recordException` writes exception.* into span EVENTS, not top-level attrs; scrub both.
   stripExceptionText(attrs);
   if (span.events) {

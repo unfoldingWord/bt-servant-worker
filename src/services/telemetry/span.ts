@@ -29,6 +29,7 @@ import { trace, SpanStatusCode, type Span } from '@opentelemetry/api';
 import { APP_VERSION } from '../../generated/version.js';
 import { TELEMETRY_SERVICE_NAME } from './config.js';
 import { buildSafeAttributes } from './redact.js';
+import { getUserPseudonym } from './pseudonym.js';
 
 /**
  * Record an error on a span without leaking content: only the bounded error class
@@ -66,6 +67,11 @@ export function withSpan<T>(
 ): Promise<T> {
   return tracer().startActiveSpan(name, async (span) => {
     span.setAttributes(buildSafeAttributes(attrs));
+    // Set at CREATION, while the request scope is live. `RedactingSpanExporter` runs
+    // after spans end — by then the handler has left `withUserPseudonym` and the store
+    // reads undefined, so an export-time read would never see it.
+    const pseudonym = getUserPseudonym();
+    if (pseudonym !== undefined) span.setAttribute('user_hash', pseudonym);
     try {
       return await fn(span);
     } catch (err) {
@@ -88,6 +94,11 @@ export function withSpanSync<T>(
 ): T {
   return tracer().startActiveSpan(name, (span) => {
     span.setAttributes(buildSafeAttributes(attrs));
+    // Set at CREATION, while the request scope is live. `RedactingSpanExporter` runs
+    // after spans end — by then the handler has left `withUserPseudonym` and the store
+    // reads undefined, so an export-time read would never see it.
+    const pseudonym = getUserPseudonym();
+    if (pseudonym !== undefined) span.setAttribute('user_hash', pseudonym);
     try {
       return fn(span);
     } catch (err) {
