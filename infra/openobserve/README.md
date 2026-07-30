@@ -13,8 +13,12 @@ dashboards, alerting). Operated and queried only by us — governance stays in o
 Separate instances, not two streams on one box: the OSS build reports `rbac_enabled: false`,
 so there is no per-stream scoping and every login on an instance can read all of it.
 
-**Neither instance has CI/CD** — unlike the collector, this directory is hand-deployed, so a
-change to either `fly.toml` does nothing until someone runs `fly deploy`. Known gap.
+**Neither instance has CI/CD yet** — unlike the collector, this directory is hand-deployed,
+so a change to either `fly.toml` does nothing until someone runs `fly deploy`. That is
+[`docs/plans/production-otel.md`](../../docs/plans/production-otel.md) **B2.5**, and it must
+land **before** B3 provisions the production app: otherwise prod OpenObserve gets
+bootstrapped by a laptop `fly deploy`, which is exactly what the CI/CD boundary exists to
+prevent, and its deployed state starts out unreconcilable with `main`.
 
 ## Deploy
 

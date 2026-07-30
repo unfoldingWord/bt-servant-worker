@@ -21,7 +21,9 @@ fresh `main`, its own version bump, and its own review cycle.
   B2  prod OpenObserve +             ▼                             │
       prod collector config      C2  staging collector → exporter  │
    ▼                                 DUAL-WRITE on staging         │
-  B3  provision + secrets            verify vs -dev D1             │
+  B2.5 CI/CD for openobserve/        verify vs -dev D1             │
+   ▼   (so B3 hand-deploys nothing)                                │
+  B3  provision + secrets                                          │
       PROD TELEMETRY LIVE ──────────►▼                             │
                                  C3  prod collector → exporter     │
                                      DUAL-WRITE on prod            │
@@ -31,7 +33,7 @@ fresh `main`, its own version bump, and its own review cycle.
                                      + delete tail handler
 ```
 
-**Linear, if you want one list:** A1 → (B1 → B2 → B3) and (C1 → C2) in parallel → C3 → C4.
+**Linear, if you want one list:** A1 → (B1 → B2 → B2.5 → B3) and (C1 → C2) in parallel → C3 → C4.
 
 **The one dependency people trip on:** C3 requires B3. The production telemetry app can only
 be fed by OTLP once the _production_ worker is exporting OTLP, and that is what B3 turns on.
@@ -253,16 +255,44 @@ writing to `bucket=""`. So:
 3. **PR B** — promote that warning to a hard failure, so no future app can reintroduce the
    invisible mapping. Marked `TODO(#340 follow-up)` in the script.
 
+## B2.5 — CI/CD for `infra/openobserve/` **[must land before B3]**
+
+`infra/openobserve/**` has no workflow: both instances are hand-deployed. That was a
+tolerable gap while OpenObserve was one staging box, and stops being one the moment B3
+creates the production sink — **B3 would have to bootstrap it with a laptop `fly deploy`,
+which is precisely the anti-pattern #324 item 1 removed for the collector**, and the
+deployed sink would start out unreconcilable with `main`.
+
+So this lands as its own PR, **before B3 provisions anything**:
+
+- `.github/workflows/deploy-openobserve.yml`, mirroring the collector's: validate → deploy
+  on push to `main` touching `infra/openobserve/**`, `--config fly.toml` for staging and
+  `--config fly.prod.toml` for production, each job declaring its `environment:` so it
+  resolves its own scoped token. **Deploy-on-merge, same as the collector** — the store
+  restarts, which the collector's exporter queue absorbs, and the alternative is letting
+  `main` and the running sink drift.
+- Parse `ARG OPENOBSERVE_VERSION` out of the Dockerfile and pass it as the build arg, so the
+  version pin is enforced by CI instead of by remembering to type it (the collector already
+  does this with `OTELCOL_VERSION`).
+- A secrets pre-flight for the prod app's `ZO_S3_ACCESS_KEY` / `ZO_S3_SECRET_KEY` /
+  `ZO_S3_SERVER_URL`. Same failure shape as `INFLUX_BUCKET`: wrong or missing R2 credentials
+  are not a boot failure, they surface on a write path later.
+- Two **new app-scoped deploy tokens** — the existing `FLY_API_TOKEN` is scoped to
+  `bt-servant-otel-collector` and cannot see either OpenObserve app. Mint them alongside
+  B3's collector token rather than in a separate sitting.
+
 ## B3 — provision + enable **[no code; runbook]** → **issue #341**
 
 Ordered, because each step proves the previous one.
 
 1. Provision the prod fly apps (`bt-servant-otel-collector-prod`,
    `bt-servant-openobserve-prod`) with `fly launch --no-deploy`, plus the R2 bucket
-   `bt-servant-openobserve-prod` and its access key. B2 already wrote both `fly.prod.toml`
-   files; the collector's is deployed by CI, OpenObserve's is hand-deployed (no CI/CD there
-   yet). Apply the two per-stream retention overrides (traces 14d, logs 30d) in the
-   OpenObserve UI once the streams exist — the `[env]` ceiling is 395d by design.
+   `bt-servant-openobserve-prod` and its access key. B2 wrote both `fly.prod.toml` files and
+   B2.5 gives each directory a workflow, so **neither app is ever deployed by hand — not
+   even its first deploy.** Mint three app-scoped tokens in this sitting: one per prod app,
+   plus the staging OpenObserve one B2.5 needs. Apply the two per-stream retention overrides
+   (traces 14d, logs 30d) in the OpenObserve UI once the streams exist — the `[env]` ceiling
+   is 395d by design.
 2. Create the prod OpenObserve root user. **Save the password before setting it** — fly
    secrets are write-only, and v0.91 enforces ≥8 chars with upper + lower + digit + special
    (a non-compliant value crash-loops the app on boot).
