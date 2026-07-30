@@ -165,7 +165,35 @@ cumulatively from it. If we ever suspect a leak, rotating the worker's salt is c
 
 # Phase B — Production OTel bring-up
 
-## B1 — prod `ENVIRONMENT` + collector parameterization + CI/CD
+## B1 — prod `ENVIRONMENT` + collector parameterization + CI/CD ✅ SHIPPED
+
+**Shipped 2026-07-29** — PR #339, merged as `1ed38ef`, tagged `v2.35.2`. Closed #324 item 1.
+The collector deploy ran for real on merge: machines v3→v4, both `Everything is ready`, no
+exporter errors, and the staged `INFLUX_BUCKET` applied.
+
+**Three things B1 established that B2/B3 depend on — do not re-derive or undo:**
+
+1. **The deploy jobs' `environment: staging` / `environment: production` declarations are
+   load-bearing.** GitHub resolves environment-scoped secrets over repo-level ones, so the
+   prod job can pick up a _different_ `FLY_API_TOKEN` value under the same name with **no
+   workflow edit**. That is how two narrowly-scoped tokens serve one workflow. Do not remove
+   those lines, and do not consolidate onto one org-wide token — a CI leak would then reach
+   every app in the org.
+2. **`FLY_API_TOKEN` is app-scoped to `bt-servant-otel-collector` only** (verified: it cannot
+   see other apps in the org). **It cannot deploy the prod collector** — B3 mints its own.
+   It **expires ~2027-07-29**; collector deploys go red when it lapses.
+3. **Three deliberate version pins** — collector image (`Dockerfile ARG OTELCOL_VERSION`),
+   `setup-flyctl` action commit SHA, and the `flyctl` CLI version (the action's `version:`
+   input, whose default is `latest`). Pinning the action alone still installs an unreviewed
+   binary that receives the deploy token. See the table in `infra/otel-collector/README.md`.
+
+**`.github/scripts/assert-collector-invariants.py` fails if `debug` is wired into any
+pipeline, and that gate is absolute** — every deploy job `needs: [validate]`, so there is no
+deploy path that skips it. Do not plan around it with a manual laptop `fly deploy`; that is
+precisely the anti-pattern B1 and #324 item 1 eliminated. B3 therefore does **not** wire
+`debug` at all (see its step 4). If a future bring-up genuinely needs record-level stdout,
+the auditable route is a normal PR that relaxes the assertion and wires the exporter in the
+same reviewed diff, shipped through the same workflow — then a second PR reverting it.
 
 - **`wrangler.toml:35`: `ENVIRONMENT = "development"` → `"production"`.** Prod deploys run
   with no `--env` flag (`.github/workflows/deploy.yml:36`), so the top-level `[vars]` block
@@ -181,14 +209,16 @@ cumulatively from it. If we ever suspect a leak, rotating the worker's salt is c
   the worker sends a properly salted `user_hash`, so the collector's unsalted digest is
   redundant; deleting the raw id is what keeps it out of OpenObserve. Until C2 there is only
   one logs pipeline, so a single `delete` covers it.
-- **Remove the `debug` exporter from all three pipelines.** The config's own comment says to
-  once the sink is confirmed; `verbosity: detailed` is expensive under real traffic.
+- **Remove the `debug` exporter from all three pipelines** — `verbosity: detailed` is
+  expensive under real traffic. It stays _defined_ but wired nowhere, and
+  `assert-collector-invariants.py` now enforces that, so re-wiring it is not a local edit
+  anyone can make; see the note above B2.
 - New GitHub Actions workflow: deploy the collector on pushes to `main` touching
   `infra/otel-collector/**`, via `flyctl deploy --remote-only` with a `FLY_API_TOKEN` repo
   secret. `otelcol validate` as a pre-deploy gate — the M0 crash-loop lesson. Deploys both
   the staging and prod collector apps.
 
-## B2 — prod OpenObserve + prod collector config
+## B2 — prod OpenObserve + prod collector config → **issue #340**
 
 - `infra/openobserve/fly.prod.toml`:
   - **Machine:** staging runs `shared-cpu-1x` / 1 GB. Size CPU and RAM first — for
@@ -200,8 +230,19 @@ cumulatively from it. If we ever suspect a leak, rotating the worker's salt is c
     (bounded-label, so tiny).
 - `infra/otel-collector/fly.prod.toml` (or an `--app` override in the B1 workflow).
 - Update `infra/README.md` and both `infra/*/README.md` for the two-environment topology.
+- **Move `INFLUX_BUCKET` out of fly secrets into `[env]` in each app's `fly.toml`.** Surfaced
+  during B1: it is a bucket _name_, not a secret, and as a fly secret it is the single value
+  distinguishing the two environments while being invisible and unreviewable (`fly secrets
+list` shows only a digest). In `fly.toml [env]` the bucket↔environment mapping lives in git
+  and is code-reviewed; only the door43 _token_ needs to stay secret. If done:
+  - Teach `assert-collector-invariants.py` to assert each `fly.toml`'s bucket matches its app,
+    and drop `INFLUX_BUCKET` from `check-collector-secrets.sh`'s required list.
+  - **`flyctl secrets unset INFLUX_BUCKET` on every app that carries it** (the staging
+    collector does, from B1). **A fly secret takes precedence over `[env]`**, so leaving the
+    old one behind silently shadows the new code-reviewed value — the move would look done
+    and change nothing. B3's checklist is conditional on this decision for the same reason.
 
-## B3 — provision + enable **[no code; runbook]**
+## B3 — provision + enable **[no code; runbook]** → **issue #341**
 
 Ordered, because each step proves the previous one.
 
@@ -212,11 +253,66 @@ Ordered, because each step proves the previous one.
 3. door43: point the prod collector at the **`bt-servant`** bucket (PR #329 smoke-tested
    both token↔bucket pairs). It auto-creates with infinite retention — ask infra to set a
    retention period after first write.
-4. Deploy the prod collector with `debug`-only exporters; confirm bearer auth end to end.
-5. Add the OpenObserve exporters; confirm records land in the prod UI.
+4. **Deploy the prod collector through the workflow** — set `FLY_PROD_COLLECTOR_APP`, land a
+   commit on `main`. Then prove the receiver is up and rejecting properly, **no `debug`
+   exporter involved**:
+
+   ```bash
+   # Must be 401 — proves the process is up AND the bearer extension is enforcing.
+   curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+     https://<prod-collector>.fly.dev/v1/traces \
+     -H 'Content-Type: application/json' -d '{"resourceSpans":[]}'
+   ```
+
+   Plus `fly logs` for `Everything is ready. Begin running and processing data.` on every
+   machine. This is how B1's collector was verified on 2026-07-29 — no config change, no
+   exception to the invariant gate.
+
+   **Do not use an empty batch to test the success path.** `{"resourceSpans":[]}` returns 200
+   while creating no span, so it proves the receiver and nothing downstream — step 5 would
+   have nothing to look for and the collector→sink hop would stay unproven until real traffic
+   arrived, which is far too late to discover a broken exporter.
+
+5. **Send one real span and find it in the sink.** `tools/send_trace.sh` posts a valid
+   non-empty OTLP span stamped with a unique `smoke_marker`, then tells you what to query:
+
+   ```bash
+   ./tools/send_trace.sh <prod-collector>.fly.dev     # prompts for OTEL_INGEST_TOKEN
+   ```
+
+   Then query the prod OpenObserve **traces** stream for that `smoke_marker` (or the trace
+   id it prints). **A 2xx from the collector is not sufficient** — it only means the receiver
+   accepted the span. The record appearing in OpenObserve is what proves the exporter leg.
+   If it 2xx'd but nothing lands, check `fly logs` for export errors. Companion to
+   `tools/send_metrics.sh`, which proves the InfluxDB leg the same way.
+
 6. `wrangler secret put OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_COLLECTOR_TOKEN` on the prod
    worker. **This is the switch.** Telemetry starts flowing here and nowhere earlier.
-7. Watch one full traffic cycle before removing `debug`.
+7. Watch one full traffic cycle in the prod UI, checking that `user_id` is absent and
+   `user_hash` is present on the arriving records.
+
+**Credentials for B3** (see B1's carry-forward notes above for why):
+
+- Mint a **new app-scoped** deploy token: `flyctl tokens create deploy --app <prod-collector>`.
+  The existing `FLY_API_TOKEN` cannot deploy prod.
+- Store it as `FLY_API_TOKEN` **on the `production` GitHub environment**, not at repo level.
+- Verify it can run `flyctl secrets list` (the pre-flight depends on it) and **cannot** see the
+  staging app.
+- Set the **`FLY_PROD_COLLECTOR_APP`** repo variable — this is what un-skips the prod deploy
+  job. It stays skipped until then, by design.
+- Give the prod app every secret its config dereferences. **`INFLUX_BUCKET` is conditional on
+  what B2 decided:**
+  - **If B2 left the bucket as a fly secret** — set `INFLUX_BUCKET=bt-servant` (NOT the
+    staging bucket), paired with a matching door43 token; their Nginx validates the two
+    against each other.
+  - **If B2 moved the bucket into `fly.toml [env]`** — do **not** set it as a secret here.
+    **A fly secret of the same name takes precedence over `[env]`**, so adding it back
+    silently shadows the code-reviewed mapping and lets the two drift apart invisibly —
+    undoing the entire reason for the move. Also `flyctl secrets unset INFLUX_BUCKET` on any
+    app that still carries the old one (the staging collector does, from B1).
+- Prefer `fly secrets set --stage` so secrets apply on the next deploy instead of restarting a
+  live pipe. Staged secrets still appear in `flyctl secrets list --json`, so the pre-flight
+  passes.
 
 **Rollback** is unsetting either worker secret: `isTelemetryEnabled()` gates on both
 (`config.ts:32`), and the disabled path makes no network call at all.

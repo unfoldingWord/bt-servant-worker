@@ -27,8 +27,43 @@ fly secrets set \
   INFLUX_TOKEN="<door43 apiv3_… token for the bucket below>" \
   INFLUX_BUCKET="bt-servant-staging"   # prod: bt-servant
 
-fly deploy --build-arg OTELCOL_VERSION=0.157.0   # pin a stable tag; see Dockerfile
 ```
+
+**Then let CI deploy it. Never run `fly deploy` from a laptop — including the first
+deployment.** Config changes go PR → review → merge → [the workflow](#cicd) deploys. That is
+the whole point of the CI/CD gate (#324 item 1).
+
+**There is no bootstrap exception**, because there is no chicken-and-egg problem to solve:
+`fly launch --no-deploy` above already created the app, so the full first-deploy path is
+
+1. set the app's secrets (above),
+2. mint its app-scoped deploy token and store it as `FLY_API_TOKEN` (for a prod app: on the
+   `production` GitHub environment),
+3. set the `FLY_PROD_COLLECTOR_APP` repo variable,
+4. land a commit on `main` — the workflow performs the first deployment, gates included.
+
+### Break-glass only
+
+If a real incident makes waiting for CI untenable, run **both gates locally first** — they are
+the reason the boundary exists, and skipping them is how you ship a crash-looping config (the
+M0 lesson) or silently undo the `user_id` deletion:
+
+```bash
+# 1. Same image tag CI uses, from the Dockerfile — not :latest.
+docker run --rm -v "$PWD:/cfg:ro" \
+  -e OTEL_INGEST_TOKEN=x -e O2_ENDPOINT=https://x.invalid/api/default -e O2_AUTH=x \
+  -e INFLUX_TOKEN=x -e INFLUX_BUCKET=x \
+  otel/opentelemetry-collector-contrib:0.157.0 validate --config /cfg/otel-collector-config.yaml
+
+# 2. The privacy + parameterization invariants.
+python3 ../../.github/scripts/assert-collector-invariants.py otel-collector-config.yaml
+
+# 3. Only if both pass:
+fly deploy --build-arg OTELCOL_VERSION=0.157.0
+```
+
+Then land the identical config through a PR **immediately**, so the deployed state and `main`
+cannot silently disagree.
 
 ### Required secrets
 
@@ -83,7 +118,8 @@ gating a deploy — bump them deliberately, never to "latest":
 ### InfluxDB sink notes
 
 - Smoke-test the token↔bucket pair first with [`tools/send_metrics.sh`](../../tools/send_metrics.sh)
-  (`./tools/send_metrics.sh <bucket>` — HTTP 204 = good).
+  (`./tools/send_metrics.sh <bucket>` — HTTP 204 = good). Its trace-side companion is
+  [`tools/send_trace.sh`](../../tools/send_trace.sh), which proves the OpenObserve leg.
 - The bucket **auto-creates on the first write** with infinite retention — ask infra to set
   the retention period after it exists.
 - Verify in InfluxDB 3 Explorer: measurements arrive named after each OTel metric
@@ -95,28 +131,51 @@ worker's `OTEL_COLLECTOR_TOKEN` secret (`wrangler secret put OTEL_COLLECTOR_TOKE
 ## Prove it
 
 ```bash
-# Should 401 without the token, 200 with it.
-curl -i https://bt-servant-otel-collector.fly.dev/v1/traces \
-  -H "Authorization: Bearer $OTEL_INGEST_TOKEN" \
+# 1. Receiver up + bearer auth enforcing: must be 401.
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  https://bt-servant-otel-collector.fly.dev/v1/traces \
   -H 'Content-Type: application/json' -d '{"resourceSpans":[]}'
 
-fly logs   # watch the `debug` exporter print received records
+# 2. Startup line on every machine.
+fly logs --app bt-servant-otel-collector   # "Everything is ready. Begin running and processing data."
+
+# 3. A REAL span, end to end — prompts for the ingest token.
+./tools/send_trace.sh bt-servant-otel-collector.fly.dev
 ```
 
-Then confirm the record lands in the OpenObserve UI.
+Then query the OpenObserve **traces** stream for the `smoke_marker` step 3 prints.
+
+**Do not prove the success path with an empty batch.** `{"resourceSpans":[]}` returns 200 while
+creating no span, so it tests the receiver and nothing downstream — the collector→sink hop
+stays unproven until real traffic arrives. That is why `send_trace.sh` exists, and why a 2xx
+from it is still not the finish line: the record showing up in OpenObserve is.
 
 ## Staged bring-up
 
-Prove one hop at a time by trimming each pipeline's `exporters:` list in
-`otel-collector-config.yaml` and redeploying (worker never changes):
+Prove one hop at a time, **without ever editing the pipelines**. The historical version of
+this runbook said to trim each pipeline to `[debug]` and redeploy; that is no longer possible
+and must not be attempted:
+`assert-collector-invariants.py` rejects `debug` in any pipeline, every deploy job
+`needs: [validate]`, and the plan explicitly forbids working around it with a laptop
+`fly deploy` — the anti-pattern the CI/CD gate exists to prevent. Use the steps in
+[Prove it](#prove-it) instead; each proves strictly more than the `debug` stage it replaces:
 
-1. `[debug]` only — proves worker → collector + bearer auth.
-2. add `otlp_http/openobserve_*` — proves the sink. **M0 done.**
+| Hop to prove             | How                                                                     |
+| ------------------------ | ----------------------------------------------------------------------- |
+| Process up + bearer auth | unauthenticated `POST /v1/traces` returns **401**                       |
+| Config loaded, no crash  | `fly logs` → `Everything is ready. Begin running and processing data.`  |
+| Receiver accepts a span  | `./tools/send_trace.sh <host>` returns 2xx                              |
+| **Collector → sink**     | that span's `smoke_marker` is findable in the OpenObserve traces stream |
+| Metrics → InfluxDB       | `./tools/send_metrics.sh <bucket>` (HTTP 204)                           |
 
-`debug` is defined in the config but **wired into no pipeline** — `verbosity: detailed` is
-too expensive to leave on under real traffic. Append it to a pipeline's `exporters:` list for
-a bring-up, then take it back out. To add a second sink later, add its exporter block +
-append it to each pipeline's `exporters:` list and redeploy — the worker is never touched.
+`debug` stays **defined but wired into no pipeline** — `verbosity: detailed` is far too
+expensive under real traffic, and `send_trace.sh` + a queryable sink beat reading it out of
+stdout anyway. If you ever genuinely need record-level stdout, the auditable route is a
+reviewed PR that relaxes the assertion and wires the exporter **in the same diff**, shipped
+through the normal workflow, then a second PR reverting it — not a local edit.
+
+To add a second sink later: add its exporter block, append it to each pipeline's `exporters:`
+list, and let the workflow deploy it — the worker is never touched.
 
 ## Notes
 

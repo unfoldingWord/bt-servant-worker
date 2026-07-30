@@ -46,11 +46,24 @@ more. (A 3rd-party SaaS sink like Axiom was considered and dropped.)
 ## Bring-up order
 
 1. Deploy **OpenObserve** (`openobserve/`). Note its URL + create an ingestion token.
-2. Deploy the **collector** (`otel-collector/`) with `debug` exporter only → confirm it
-   starts and authenticates.
-3. Point the worker's `OTEL_EXPORTER_OTLP_ENDPOINT` at the collector, send a request,
-   watch it appear in the collector `debug` logs (proves worker→collector + bearer auth).
-4. Enable the OpenObserve exporters → confirm data in the OpenObserve UI.
-   **This is the M0 Definition of Done.**
+2. Deploy the **collector** (`otel-collector/`) **through its workflow** — never a laptop
+   `fly deploy`. Confirm the process is up and enforcing auth: an unauthenticated
+   `POST /v1/traces` returns **401**, and `fly logs` shows
+   `Everything is ready. Begin running and processing data.`
+3. Run `./tools/send_trace.sh <collector-host>` — one real OTLP span with a unique
+   `smoke_marker` — then find that marker in the OpenObserve **traces** stream. This proves
+   collector → sink, which a 2xx alone does not.
+   **This is the Definition of Done for a new environment's pipe.**
+4. Only then point the worker's `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_COLLECTOR_TOKEN` at the
+   collector — that is the switch that starts real traffic flowing.
 
-All secrets live in the respective fly app (`fly secrets set ...`), never in git.
+> **Do not wire the `debug` exporter to do any of this.**
+> `assert-collector-invariants.py` rejects `debug` in any pipeline and every deploy job
+> depends on that gate, so such a config cannot ship. Step 3 proves strictly more than
+> reading records out of stdout ever did. See
+> [`otel-collector/README.md`](otel-collector/README.md) for the reviewed exception route if
+> stdout is ever genuinely required.
+
+All secrets live in the respective fly app (`fly secrets set ...`), never in git — except
+values that are not actually secret; see the `INFLUX_BUCKET` discussion in
+`docs/plans/production-otel.md` B2.
