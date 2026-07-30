@@ -252,27 +252,38 @@ Ordered, because each step proves the previous one.
    both token↔bucket pairs). It auto-creates with infinite retention — ask infra to set a
    retention period after first write.
 4. **Deploy the prod collector through the workflow** — set `FLY_PROD_COLLECTOR_APP`, land a
-   commit on `main`. Then confirm bearer auth end to end with two requests, **no `debug`
+   commit on `main`. Then prove the receiver is up and rejecting properly, **no `debug`
    exporter involved**:
 
    ```bash
-   # 401 without the token, 200 with it.
+   # Must be 401 — proves the process is up AND the bearer extension is enforcing.
    curl -s -o /dev/null -w '%{http_code}\n' -X POST \
      https://<prod-collector>.fly.dev/v1/traces \
-     -H 'Content-Type: application/json' -d '{"resourceSpans":[]}'
-   curl -s -o /dev/null -w '%{http_code}\n' -X POST \
-     https://<prod-collector>.fly.dev/v1/traces \
-     -H "Authorization: Bearer $OTEL_INGEST_TOKEN" \
      -H 'Content-Type: application/json' -d '{"resourceSpans":[]}'
    ```
 
    Plus `fly logs` for `Everything is ready. Begin running and processing data.` on every
-   machine. This is exactly how B1's collector was verified on 2026-07-29, and it needs no
-   config change and no exception to the invariant gate. `debug` was an M0-era aid from when
-   no sink existed yet; it is redundant now that step 5 exists.
+   machine. This is how B1's collector was verified on 2026-07-29 — no config change, no
+   exception to the invariant gate.
 
-5. Confirm records land in the **prod OpenObserve UI** — a real queryable sink, strictly
-   better than `debug`'s stdout for proving the pipeline end to end.
+   **Do not use an empty batch to test the success path.** `{"resourceSpans":[]}` returns 200
+   while creating no span, so it proves the receiver and nothing downstream — step 5 would
+   have nothing to look for and the collector→sink hop would stay unproven until real traffic
+   arrived, which is far too late to discover a broken exporter.
+
+5. **Send one real span and find it in the sink.** `tools/send_trace.sh` posts a valid
+   non-empty OTLP span stamped with a unique `smoke_marker`, then tells you what to query:
+
+   ```bash
+   ./tools/send_trace.sh <prod-collector>.fly.dev     # prompts for OTEL_INGEST_TOKEN
+   ```
+
+   Then query the prod OpenObserve **traces** stream for that `smoke_marker` (or the trace
+   id it prints). **A 2xx from the collector is not sufficient** — it only means the receiver
+   accepted the span. The record appearing in OpenObserve is what proves the exporter leg.
+   If it 2xx'd but nothing lands, check `fly logs` for export errors. Companion to
+   `tools/send_metrics.sh`, which proves the InfluxDB leg the same way.
+
 6. `wrangler secret put OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_COLLECTOR_TOKEN` on the prod
    worker. **This is the switch.** Telemetry starts flowing here and nowhere earlier.
 7. Watch one full traffic cycle in the prod UI, checking that `user_id` is absent and

@@ -83,7 +83,8 @@ gating a deploy — bump them deliberately, never to "latest":
 ### InfluxDB sink notes
 
 - Smoke-test the token↔bucket pair first with [`tools/send_metrics.sh`](../../tools/send_metrics.sh)
-  (`./tools/send_metrics.sh <bucket>` — HTTP 204 = good).
+  (`./tools/send_metrics.sh <bucket>` — HTTP 204 = good). Its trace-side companion is
+  [`tools/send_trace.sh`](../../tools/send_trace.sh), which proves the OpenObserve leg.
 - The bucket **auto-creates on the first write** with infinite retention — ask infra to set
   the retention period after it exists.
 - Verify in InfluxDB 3 Explorer: measurements arrive named after each OTel metric
@@ -95,15 +96,24 @@ worker's `OTEL_COLLECTOR_TOKEN` secret (`wrangler secret put OTEL_COLLECTOR_TOKE
 ## Prove it
 
 ```bash
-# Should 401 without the token, 200 with it.
-curl -i https://bt-servant-otel-collector.fly.dev/v1/traces \
-  -H "Authorization: Bearer $OTEL_INGEST_TOKEN" \
+# 1. Receiver up + bearer auth enforcing: must be 401.
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  https://bt-servant-otel-collector.fly.dev/v1/traces \
   -H 'Content-Type: application/json' -d '{"resourceSpans":[]}'
 
-fly logs   # watch the `debug` exporter print received records
+# 2. Startup line on every machine.
+fly logs --app bt-servant-otel-collector   # "Everything is ready. Begin running and processing data."
+
+# 3. A REAL span, end to end — prompts for the ingest token.
+./tools/send_trace.sh bt-servant-otel-collector.fly.dev
 ```
 
-Then confirm the record lands in the OpenObserve UI.
+Then query the OpenObserve **traces** stream for the `smoke_marker` step 3 prints.
+
+**Do not prove the success path with an empty batch.** `{"resourceSpans":[]}` returns 200 while
+creating no span, so it tests the receiver and nothing downstream — the collector→sink hop
+stays unproven until real traffic arrives. That is why `send_trace.sh` exists, and why a 2xx
+from it is still not the finish line: the record showing up in OpenObserve is.
 
 ## Staged bring-up
 
