@@ -209,8 +209,10 @@ same reviewed diff, shipped through the same workflow — then a second PR rever
   the worker sends a properly salted `user_hash`, so the collector's unsalted digest is
   redundant; deleting the raw id is what keeps it out of OpenObserve. Until C2 there is only
   one logs pipeline, so a single `delete` covers it.
-- **Remove the `debug` exporter from all three pipelines.** The config's own comment says to
-  once the sink is confirmed; `verbosity: detailed` is expensive under real traffic.
+- **Remove the `debug` exporter from all three pipelines** — `verbosity: detailed` is
+  expensive under real traffic. It stays _defined_ but wired nowhere, and
+  `assert-collector-invariants.py` now enforces that, so re-wiring it is not a local edit
+  anyone can make; see the note above B2.
 - New GitHub Actions workflow: deploy the collector on pushes to `main` touching
   `infra/otel-collector/**`, via `flyctl deploy --remote-only` with a `FLY_API_TOKEN` repo
   secret. `otelcol validate` as a pre-deploy gate — the M0 crash-loop lesson. Deploys both

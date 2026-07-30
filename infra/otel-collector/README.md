@@ -27,8 +27,21 @@ fly secrets set \
   INFLUX_TOKEN="<door43 apiv3_… token for the bucket below>" \
   INFLUX_BUCKET="bt-servant-staging"   # prod: bt-servant
 
-fly deploy --build-arg OTELCOL_VERSION=0.157.0   # pin a stable tag; see Dockerfile
 ```
+
+**Then let CI deploy it — do not run `fly deploy` from a laptop.** Config changes go
+PR → review → merge → [the workflow](#cicd) deploys, which is the whole point of the CI/CD
+gate (#324 item 1). The one legitimate manual use is **bootstrapping a brand-new app** before
+its repo variable exists, or a genuine emergency:
+
+```bash
+fly deploy --build-arg OTELCOL_VERSION=0.157.0   # bootstrap/emergency only; pin the tag
+```
+
+A manual deploy skips `otelcol validate` and `assert-collector-invariants.py`, so it can ship
+a crash-looping config (the M0 lesson) or silently undo the `user_id` deletion. If you use it,
+land the same config through a PR immediately afterwards so the deployed state and `main`
+agree.
 
 ### Required secrets
 
@@ -117,16 +130,30 @@ from it is still not the finish line: the record showing up in OpenObserve is.
 
 ## Staged bring-up
 
-Prove one hop at a time by trimming each pipeline's `exporters:` list in
-`otel-collector-config.yaml` and redeploying (worker never changes):
+Prove one hop at a time, **without ever editing the pipelines**. The historical version of
+this runbook said to trim each pipeline to `[debug]` and redeploy; that is no longer possible
+and must not be attempted:
+`assert-collector-invariants.py` rejects `debug` in any pipeline, every deploy job
+`needs: [validate]`, and the plan explicitly forbids working around it with a laptop
+`fly deploy` — the anti-pattern the CI/CD gate exists to prevent. Use the steps in
+[Prove it](#prove-it) instead; each proves strictly more than the `debug` stage it replaces:
 
-1. `[debug]` only — proves worker → collector + bearer auth.
-2. add `otlp_http/openobserve_*` — proves the sink. **M0 done.**
+| Hop to prove             | How                                                                     |
+| ------------------------ | ----------------------------------------------------------------------- |
+| Process up + bearer auth | unauthenticated `POST /v1/traces` returns **401**                       |
+| Config loaded, no crash  | `fly logs` → `Everything is ready. Begin running and processing data.`  |
+| Receiver accepts a span  | `./tools/send_trace.sh <host>` returns 2xx                              |
+| **Collector → sink**     | that span's `smoke_marker` is findable in the OpenObserve traces stream |
+| Metrics → InfluxDB       | `./tools/send_metrics.sh <bucket>` (HTTP 204)                           |
 
-`debug` is defined in the config but **wired into no pipeline** — `verbosity: detailed` is
-too expensive to leave on under real traffic. Append it to a pipeline's `exporters:` list for
-a bring-up, then take it back out. To add a second sink later, add its exporter block +
-append it to each pipeline's `exporters:` list and redeploy — the worker is never touched.
+`debug` stays **defined but wired into no pipeline** — `verbosity: detailed` is far too
+expensive under real traffic, and `send_trace.sh` + a queryable sink beat reading it out of
+stdout anyway. If you ever genuinely need record-level stdout, the auditable route is a
+reviewed PR that relaxes the assertion and wires the exporter **in the same diff**, shipped
+through the normal workflow, then a second PR reverting it — not a local edit.
+
+To add a second sink later: add its exporter block, append it to each pipeline's `exporters:`
+list, and let the workflow deploy it — the worker is never touched.
 
 ## Notes
 

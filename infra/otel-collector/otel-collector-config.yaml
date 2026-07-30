@@ -89,11 +89,19 @@ exporters:
     headers:
       X-InfluxDB-API-Token: ${env:INFLUX_TOKEN}
 
-  # Bring-up aid, DELIBERATELY NOT WIRED INTO ANY PIPELINE. `verbosity: detailed`
-  # prints every record and is far too expensive under real traffic. Kept defined so
-  # a new environment's bring-up (prod: see docs/plans/production-otel.md B3) can
-  # prove worker→collector+auth by temporarily appending `debug` to a pipeline's
-  # `exporters:` list, then removing it again once the real sink is confirmed.
+  # DELIBERATELY NOT WIRED INTO ANY PIPELINE, and it must stay that way:
+  # `assert-collector-invariants.py` FAILS if `debug` appears in any pipeline, and every
+  # deploy job depends on that gate. So do NOT "just append it for a bring-up" — that
+  # config cannot be deployed, and hand-deploying around the gate is the anti-pattern the
+  # CI/CD boundary exists to prevent. `verbosity: detailed` is also far too expensive
+  # under real traffic.
+  #
+  # To prove a new environment's pipe, use `tools/send_trace.sh` (a real span + a unique
+  # marker to query in the sink) — see infra/otel-collector/README.md "Prove it". If
+  # record-level stdout is ever genuinely required, relax the assertion and wire this
+  # exporter in ONE reviewed PR, ship it through the workflow, then revert it.
+  #
+  # Kept defined (not deleted) so that exception is a two-line diff rather than a rewrite.
   debug:
     verbosity: detailed
 
