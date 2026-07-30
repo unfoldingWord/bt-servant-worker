@@ -29,19 +29,41 @@ fly secrets set \
 
 ```
 
-**Then let CI deploy it — do not run `fly deploy` from a laptop.** Config changes go
-PR → review → merge → [the workflow](#cicd) deploys, which is the whole point of the CI/CD
-gate (#324 item 1). The one legitimate manual use is **bootstrapping a brand-new app** before
-its repo variable exists, or a genuine emergency:
+**Then let CI deploy it. Never run `fly deploy` from a laptop — including the first
+deployment.** Config changes go PR → review → merge → [the workflow](#cicd) deploys. That is
+the whole point of the CI/CD gate (#324 item 1).
+
+**There is no bootstrap exception**, because there is no chicken-and-egg problem to solve:
+`fly launch --no-deploy` above already created the app, so the full first-deploy path is
+
+1. set the app's secrets (above),
+2. mint its app-scoped deploy token and store it as `FLY_API_TOKEN` (for a prod app: on the
+   `production` GitHub environment),
+3. set the `FLY_PROD_COLLECTOR_APP` repo variable,
+4. land a commit on `main` — the workflow performs the first deployment, gates included.
+
+### Break-glass only
+
+If a real incident makes waiting for CI untenable, run **both gates locally first** — they are
+the reason the boundary exists, and skipping them is how you ship a crash-looping config (the
+M0 lesson) or silently undo the `user_id` deletion:
 
 ```bash
-fly deploy --build-arg OTELCOL_VERSION=0.157.0   # bootstrap/emergency only; pin the tag
+# 1. Same image tag CI uses, from the Dockerfile — not :latest.
+docker run --rm -v "$PWD:/cfg:ro" \
+  -e OTEL_INGEST_TOKEN=x -e O2_ENDPOINT=https://x.invalid/api/default -e O2_AUTH=x \
+  -e INFLUX_TOKEN=x -e INFLUX_BUCKET=x \
+  otel/opentelemetry-collector-contrib:0.157.0 validate --config /cfg/otel-collector-config.yaml
+
+# 2. The privacy + parameterization invariants.
+python3 ../../.github/scripts/assert-collector-invariants.py otel-collector-config.yaml
+
+# 3. Only if both pass:
+fly deploy --build-arg OTELCOL_VERSION=0.157.0
 ```
 
-A manual deploy skips `otelcol validate` and `assert-collector-invariants.py`, so it can ship
-a crash-looping config (the M0 lesson) or silently undo the `user_id` deletion. If you use it,
-land the same config through a PR immediately afterwards so the deployed state and `main`
-agree.
+Then land the identical config through a PR **immediately**, so the deployed state and `main`
+cannot silently disagree.
 
 ### Required secrets
 
