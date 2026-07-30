@@ -9,7 +9,7 @@ import { Hono } from 'hono';
 import { Env } from './config/types.js';
 import { APP_VERSION } from './generated/version.js';
 import { UserDO as UserDOClass } from './durable-objects/index.js';
-import { discoverAllTools } from './services/mcp/index.js';
+import { discoverAllTools, listOrgResources } from './services/mcp/index.js';
 import { MCPServerConfig } from './services/mcp/types.js';
 import { ChatRequest, ChatTransport, ChatType } from './types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig, validateOrgConfig } from './types/org-config.js';
@@ -42,6 +42,7 @@ import {
   sanitizeScaffoldDocument,
   validateLanguageScaffold,
 } from './types/language-scaffold.js';
+import { validateResourceLanguage } from './types/resources.js';
 import { synthesizeModeDocument } from './types/mode-markdown.js';
 import { stripControlChars } from './types/prompt-overrides.js';
 import { constantTimeCompare } from './utils/crypto.js';
@@ -996,6 +997,45 @@ app.delete('/api/v1/admin/orgs/:org/languages/:languageName', async (c) => {
   } catch (error) {
     logger.error('admin_action', error, { action: 'delete_language', org });
     return c.json({ error: 'Failed to delete language from storage' }, 500);
+  }
+});
+
+/**
+ * Aggregated resource listing across the org's MCP servers (worker#257
+ * item 1; contract locked on admin-portal#230). Fans out to every enabled
+ * server, normalizes each listing into canonical subjects, and reports
+ * per-server capability honestly via `servers[]` (ok/unsupported/error).
+ */
+app.get('/api/v1/admin/orgs/:org/resources', async (c) => {
+  const org = c.req.param('org');
+  const language = c.req.query('language');
+  const logger = createRequestLogger(crypto.randomUUID());
+
+  const languageError = validateResourceLanguage(language);
+  if (languageError) {
+    return c.json({ error: languageError }, 400);
+  }
+  // validateResourceLanguage narrows: language is a non-empty string here
+  const lang = language as string;
+
+  try {
+    const servers = (await c.env.MCP_SERVERS.get<MCPServerConfig[]>(org, 'json')) ?? [];
+    const result = await listOrgResources(servers, lang, logger);
+
+    logger.log('admin_action', {
+      action: 'list_resources',
+      org,
+      language: lang,
+      server_count: servers.length,
+      ok_count: result.servers.filter((s) => s.status === 'ok').length,
+      unsupported_count: result.servers.filter((s) => s.status === 'unsupported').length,
+      error_count: result.servers.filter((s) => s.status === 'error').length,
+      subject_count: Object.keys(result.resources).length,
+    });
+    return c.json({ org, language: lang, resources: result.resources, servers: result.servers });
+  } catch (error) {
+    logger.error('admin_action', error, { action: 'list_resources', org, language: lang });
+    return c.json({ error: 'Failed to aggregate resources from MCP servers' }, 500);
   }
 });
 

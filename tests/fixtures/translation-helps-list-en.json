@@ -1,0 +1,88 @@
+{
+  "language": "en",
+  "organization": "all",
+  "stage": "prod",
+  "totalResources": 9,
+  "subjects": [
+    "Aligned Bible",
+    "Bible",
+    "TSV Translation Notes",
+    "TSV Translation Questions",
+    "TSV Translation Words Links",
+    "Translation Academy",
+    "Translation Words"
+  ],
+  "subjectCount": 7,
+  "resourcesBySubject": {
+    "Bible": [
+      { "name": "en_t4t", "subject": "Bible", "organization": "unfoldingWord", "version": "v1" }
+    ],
+    "Aligned Bible": [
+      {
+        "name": "en_ult",
+        "subject": "Aligned Bible",
+        "organization": "unfoldingWord",
+        "version": "v89"
+      },
+      {
+        "name": "en_ust",
+        "subject": "Aligned Bible",
+        "organization": "unfoldingWord",
+        "version": "v89"
+      },
+      { "name": "en_bsb", "subject": "Aligned Bible", "organization": "Worldview", "version": "v1" }
+    ],
+    "Translation Words": [
+      {
+        "name": "en_tw",
+        "subject": "Translation Words",
+        "organization": "unfoldingWord",
+        "version": "v89"
+      }
+    ],
+    "Translation Academy": [
+      {
+        "name": "en_ta",
+        "subject": "Translation Academy",
+        "organization": "unfoldingWord",
+        "version": "v89"
+      }
+    ],
+    "TSV Translation Notes": [
+      {
+        "name": "en_tn",
+        "subject": "TSV Translation Notes",
+        "organization": "unfoldingWord",
+        "version": "v89"
+      }
+    ],
+    "TSV Translation Questions": [
+      {
+        "name": "en_tq",
+        "subject": "TSV Translation Questions",
+        "organization": "unfoldingWord",
+        "version": "v89"
+      }
+    ],
+    "TSV Translation Words Links": [
+      {
+        "name": "en_twl",
+        "subject": "TSV Translation Words Links",
+        "organization": "unfoldingWord",
+        "version": "v89"
+      }
+    ]
+  },
+  "metadata": {
+    "responseTime": 1608,
+    "tokenEstimate": 212,
+    "timestamp": "2026-07-30T12:55:32.131Z",
+    "cached": false,
+    "endpoint": "list-resources-for-language",
+    "requestedLanguage": "en",
+    "actualLanguage": "en",
+    "languageFallbackUsed": false,
+    "resourceCount": 9,
+    "subjectCount": 7
+  }
+}
