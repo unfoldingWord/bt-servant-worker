@@ -182,6 +182,16 @@ describe('aquifer helpers', () => {
     expect(toAquiferLanguage('xx')).toBe('xx');
   });
 
+  it('falls back through the primary subtag for regional tags (PR #343 review)', () => {
+    expect(toAquiferLanguage('es-419')).toBe('spa');
+    expect(toAquiferLanguage('en-US')).toBe('eng');
+    expect(toAquiferLanguage('pt-BR')).toBe('por');
+    // Explicit script-specific mappings still win over the primary fallback.
+    expect(toAquiferLanguage('zh-hans')).toBe('zhs');
+    // Unknown primary subtags still pass through unchanged.
+    expect(toAquiferLanguage('xx-yy')).toBe('xx');
+  });
+
   it('slugifySubject falls back to "uncategorized" for degenerate input', () => {
     expect(slugifySubject('***')).toBe('uncategorized');
     expect(slugifySubject('Images, Maps, Videos')).toBe('images-maps-videos');

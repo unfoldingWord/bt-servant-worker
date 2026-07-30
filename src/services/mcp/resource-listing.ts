@@ -209,9 +209,18 @@ const AQUIFER_LANGUAGE_MAP: Record<string, string> = {
 
 export function toAquiferLanguage(language: string): string {
   const key = language.toLowerCase();
-  // Lookup in a module-const map with a validated language code; worst case is undefined.
+  // Lookups below are in a module-const map with a validated language code;
+  // worst case is undefined.
   // eslint-disable-next-line security/detect-object-injection
-  return AQUIFER_LANGUAGE_MAP[key] ?? key;
+  const exact = AQUIFER_LANGUAGE_MAP[key];
+  if (exact) return exact;
+  // Regional/script tags the exact map doesn't know (es-419, en-US, pt-BR)
+  // fall back through the primary subtag — aquifer only speaks ISO 639-3,
+  // so sending the raw tag would return a misleading "ok, zero resources".
+  // Explicit full-tag mappings (zh-hans/zh-hant) are preserved above.
+  const primary = key.split('-')[0] ?? key;
+  // eslint-disable-next-line security/detect-object-injection
+  return AQUIFER_LANGUAGE_MAP[primary] ?? primary;
 }
 
 function parseAquiferEntry(headerLine: string, detailLine: string): ResourceItem | undefined {
