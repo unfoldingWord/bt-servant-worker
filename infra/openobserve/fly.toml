@@ -1,5 +1,7 @@
-# fly.io app for self-hosted OpenObserve (the telemetry sink: store + web UI in one binary).
-# Adjust `app`/`primary_region` to your fly org before `fly launch`/`fly deploy`.
+# fly.io app for self-hosted OpenObserve (the telemetry sink: store + web UI in one binary)
+# — STAGING. The production instance is fly.prod.toml, a separate app: OpenObserve OSS has
+# `rbac_enabled: false`, so a shared instance would give every login read access to
+# production data.
 app = "bt-servant-openobserve"
 primary_region = "iad"
 
@@ -10,7 +12,15 @@ primary_region = "iad"
 
 [env]
   ZO_DATA_DIR = "/data"          # local-disk storage on the mounted volume (below).
-  # For higher volume later, switch to S3-compatible storage via ZO_S3_* env/secrets.
+  # Staging stays on local disk; prod uses R2 via ZO_S3_* (see fly.prod.toml).
+
+  # Bound the retention. Left unset this defaults to 3650 — ten years — which is what
+  # this instance has been reporting and nobody intended. Staging data has no value past
+  # the sprint that produced it. Minimum accepted by OpenObserve is 3.
+  #
+  # NOTE: this directory has no CI/CD, so this line changes nothing until someone
+  # hand-deploys the app; and retention already set per-stream in the UI overrides it.
+  ZO_COMPACT_DATA_RETENTION_DAYS = "7"
 
 [http_service]
   internal_port = 5080           # OpenObserve HTTP + UI; fly terminates TLS on 443.

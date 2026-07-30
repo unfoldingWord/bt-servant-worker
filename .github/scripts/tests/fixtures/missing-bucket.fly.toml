@@ -1,0 +1,8 @@
+# Fixture: [env] present but no INFLUX_BUCKET — the regression that moving the value out of
+# fly secrets makes possible. The collector resolves ${env:INFLUX_BUCKET} to "" and writes
+# every metric to bucket="", healthily, forever.
+app = "bt-servant-otel-collector"
+primary_region = "iad"
+
+[env]
+  SOMETHING_ELSE = "unrelated"

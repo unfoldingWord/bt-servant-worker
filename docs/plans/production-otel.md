@@ -220,33 +220,49 @@ same reviewed diff, shipped through the same workflow — then a second PR rever
 
 ## B2 — prod OpenObserve + prod collector config → **issue #340**
 
-- `infra/openobserve/fly.prod.toml`:
-  - **Machine:** staging runs `shared-cpu-1x` / 1 GB. Size CPU and RAM first — for
-    full-history scans those bind before disk does.
-  - **Storage:** R2 via `ZO_S3_*` (same Cloudflare account, zero egress). Keep a small local
-    volume for WAL/cache; it stops being the retention boundary.
-  - **Retention tiering.** Staging currently reports `data_retention_days: 3650` — ten
-    years, which is nobody's intent. Set per-stream: traces ~14d, logs ~30d, metrics ~13mo
-    (bounded-label, so tiny).
-- `infra/otel-collector/fly.prod.toml` (or an `--app` override in the B1 workflow).
-- Update `infra/README.md` and both `infra/*/README.md` for the two-environment topology.
-- **Move `INFLUX_BUCKET` out of fly secrets into `[env]` in each app's `fly.toml`.** Surfaced
-  during B1: it is a bucket _name_, not a secret, and as a fly secret it is the single value
-  distinguishing the two environments while being invisible and unreviewable (`fly secrets
-list` shows only a digest). In `fly.toml [env]` the bucket↔environment mapping lives in git
-  and is code-reviewed; only the door43 _token_ needs to stay secret. If done:
-  - Teach `assert-collector-invariants.py` to assert each `fly.toml`'s bucket matches its app,
-    and drop `INFLUX_BUCKET` from `check-collector-secrets.sh`'s required list.
-  - **`flyctl secrets unset INFLUX_BUCKET` on every app that carries it** (the staging
-    collector does, from B1). **A fly secret takes precedence over `[env]`**, so leaving the
-    old one behind silently shadows the new code-reviewed value — the move would look done
-    and change nothing. B3's checklist is conditional on this decision for the same reason.
+**Decisions taken** (they are now facts the rest of this document depends on):
+
+- Prod apps are `bt-servant-otel-collector-prod` and `bt-servant-openobserve-prod`; the R2
+  bucket is `bt-servant-openobserve-prod`. The unsuffixed apps are the staging pair.
+- **`INFLUX_BUCKET` moved into `fly.toml [env]`.** This resolves the conditional B3 was
+  carrying — see its credentials list.
+- Prod OpenObserve is `shared-cpu-2x` / 4 GB, R2 for stream storage, volume for WAL/cache.
+- Retention: the `[env]` ceiling is the _longest_ tier (metrics, 395d) and the shorter tiers
+  (traces 14d, logs 30d) are per-stream UI overrides — `ZO_COMPACT_DATA_RETENTION_DAYS` is a
+  single global value, not per-signal. Set that way round so a missed override over-retains
+  cheap trace data instead of silently deleting metrics history.
+
+Because each collector app now carries environment-specific `[env]`, the prod deploy uses a
+real `fly.prod.toml` rather than an `--app` override — an override cannot carry `[env]`.
+`FLY_PROD_COLLECTOR_APP` degrades to a pure enable switch, and the job fails if it disagrees
+with the app name in `fly.prod.toml`.
+
+**The `INFLUX_BUCKET` move ships in two parts, and the order is load-bearing.** A fly secret
+takes precedence over `[env]`, so the staging app's leftover secret shadows the new reviewed
+value; but a pre-flight that _rejects_ the leftover would block the very deploy that installs
+`[env]` in the machine config, and unsetting it first would leave the running collector
+writing to `bucket=""`. So:
+
+1. **PR A** (this one) — `[env]` in both fly configs, the bucket↔app assertion in
+   `assert-collector-invariants.py` + its self-test, `INFLUX_BUCKET` dropped from
+   `check-collector-secrets.sh`'s required list and **warned** on if present. Merging
+   deploys `[env]`; the secret still shadows it with an identical value, so nothing changes
+   behaviourally.
+2. **Manual** — `flyctl secrets unset INFLUX_BUCKET --app bt-servant-otel-collector`. The
+   restart re-reads a machine config that now has `[env]`, so the bucket stays correct.
+3. **PR B** — promote that warning to a hard failure, so no future app can reintroduce the
+   invisible mapping. Marked `TODO(#340 follow-up)` in the script.
 
 ## B3 — provision + enable **[no code; runbook]** → **issue #341**
 
 Ordered, because each step proves the previous one.
 
-1. Provision the prod fly apps, the R2 bucket, and its access key.
+1. Provision the prod fly apps (`bt-servant-otel-collector-prod`,
+   `bt-servant-openobserve-prod`) with `fly launch --no-deploy`, plus the R2 bucket
+   `bt-servant-openobserve-prod` and its access key. B2 already wrote both `fly.prod.toml`
+   files; the collector's is deployed by CI, OpenObserve's is hand-deployed (no CI/CD there
+   yet). Apply the two per-stream retention overrides (traces 14d, logs 30d) in the
+   OpenObserve UI once the streams exist — the `[env]` ceiling is 395d by design.
 2. Create the prod OpenObserve root user. **Save the password before setting it** — fly
    secrets are write-only, and v0.91 enforces ≥8 chars with upper + lower + digit + special
    (a non-compliant value crash-loops the app on boot).
@@ -300,16 +316,14 @@ Ordered, because each step proves the previous one.
   staging app.
 - Set the **`FLY_PROD_COLLECTOR_APP`** repo variable — this is what un-skips the prod deploy
   job. It stays skipped until then, by design.
-- Give the prod app every secret its config dereferences. **`INFLUX_BUCKET` is conditional on
-  what B2 decided:**
-  - **If B2 left the bucket as a fly secret** — set `INFLUX_BUCKET=bt-servant` (NOT the
-    staging bucket), paired with a matching door43 token; their Nginx validates the two
-    against each other.
-  - **If B2 moved the bucket into `fly.toml [env]`** — do **not** set it as a secret here.
-    **A fly secret of the same name takes precedence over `[env]`**, so adding it back
-    silently shadows the code-reviewed mapping and lets the two drift apart invisibly —
-    undoing the entire reason for the move. Also `flyctl secrets unset INFLUX_BUCKET` on any
-    app that still carries the old one (the staging collector does, from B1).
+- Give the prod app the four secrets its config dereferences: `OTEL_INGEST_TOKEN`,
+  `O2_ENDPOINT`, `O2_AUTH`, `INFLUX_TOKEN`. The door43 token must be the one mapped to
+  `bt-servant`, since their Nginx validates the token against the bucket.
+- **Do NOT set `INFLUX_BUCKET` as a secret** — B2 moved it to `fly.prod.toml [env]`, where it
+  is already `bt-servant`. **A fly secret of the same name takes precedence over `[env]`**, so
+  adding it back silently shadows the code-reviewed mapping and lets the two drift apart
+  invisibly, undoing the entire reason for the move. The deploy pre-flight warns if it finds
+  one; B2's PR B turns that into a hard failure.
 - Prefer `fly secrets set --stage` so secrets apply on the next deploy instead of restarting a
   live pipe. Staged secrets still appear in `flyctl secrets list --json`, so the pre-flight
   passes.
@@ -453,7 +467,8 @@ persist.
 
 ## Asks for infra
 
-- R2 bucket + access key for the prod OpenObserve (blocks B2).
+- R2 bucket `bt-servant-openobserve-prod` + access key for the prod OpenObserve (blocks B3;
+  B2 wrote the config that consumes it).
 - Retention period on the door43 `bt-servant` prod bucket once it auto-creates (B3 step 3).
 - fly.io org access, if he is going to own any of B2 / B3.
 
