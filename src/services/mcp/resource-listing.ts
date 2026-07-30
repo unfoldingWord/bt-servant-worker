@@ -205,22 +205,33 @@ const AQUIFER_LANGUAGE_MAP: Record<string, string> = {
   zh: 'zhs',
   'zh-hans': 'zhs',
   'zh-hant': 'zht',
+  // Region conventions for Chinese where the script is implied by region.
+  'zh-cn': 'zhs',
+  'zh-sg': 'zhs',
+  'zh-tw': 'zht',
+  'zh-hk': 'zht',
+  'zh-mo': 'zht',
 };
 
 export function toAquiferLanguage(language: string): string {
   const key = language.toLowerCase();
-  // Lookups below are in a module-const map with a validated language code;
-  // worst case is undefined.
-  // eslint-disable-next-line security/detect-object-injection
-  const exact = AQUIFER_LANGUAGE_MAP[key];
-  if (exact) return exact;
-  // Regional/script tags the exact map doesn't know (es-419, en-US, pt-BR)
-  // fall back through the primary subtag — aquifer only speaks ISO 639-3,
-  // so sending the raw tag would return a misleading "ok, zero resources".
-  // Explicit full-tag mappings (zh-hans/zh-hant) are preserved above.
-  const primary = key.split('-')[0] ?? key;
-  // eslint-disable-next-line security/detect-object-injection
-  return AQUIFER_LANGUAGE_MAP[primary] ?? primary;
+  // IETF fallback truncation (BCP 47 §4.3-style): try the full tag, then
+  // progressively drop trailing subtags (zh-hant-tw → zh-hant → zh) so
+  // script-specific mappings win before the bare primary. Aquifer only
+  // speaks ISO 639-3, so sending an unmapped regional tag verbatim would
+  // return a misleading "ok, zero resources".
+  const parts = key.split('-');
+  for (let end = parts.length; end >= 1; end--) {
+    const candidate = parts.slice(0, end).join('-');
+    // Lookup in a module-const map with a validated language code; worst
+    // case is undefined.
+    // eslint-disable-next-line security/detect-object-injection
+    const mapped = AQUIFER_LANGUAGE_MAP[candidate];
+    if (mapped) return mapped;
+  }
+  // Unknown primary subtag: pass it through unchanged (the server then
+  // simply returns no matches, reported as ok/empty).
+  return parts[0] ?? key;
 }
 
 function parseAquiferEntry(headerLine: string, detailLine: string): ResourceItem | undefined {

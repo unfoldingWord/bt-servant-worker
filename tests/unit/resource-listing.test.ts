@@ -192,6 +192,18 @@ describe('aquifer helpers', () => {
     expect(toAquiferLanguage('xx-yy')).toBe('xx');
   });
 
+  it('truncates subtags progressively so script mappings beat the primary (re-review)', () => {
+    // zh-Hant-TW must hit zh-hant (Traditional) before falling to zh (Simplified).
+    expect(toAquiferLanguage('zh-Hant-TW')).toBe('zht');
+    expect(toAquiferLanguage('zh-Hans-CN')).toBe('zhs');
+    // Region conventions where the script is implied by region.
+    expect(toAquiferLanguage('zh-TW')).toBe('zht');
+    expect(toAquiferLanguage('zh-HK')).toBe('zht');
+    expect(toAquiferLanguage('zh-CN')).toBe('zhs');
+    // Truncation also works for non-Chinese multi-subtag tags.
+    expect(toAquiferLanguage('es-419-x-priv')).toBe('spa');
+  });
+
   it('slugifySubject falls back to "uncategorized" for degenerate input', () => {
     expect(slugifySubject('***')).toBe('uncategorized');
     expect(slugifySubject('Images, Maps, Videos')).toBe('images-maps-videos');
