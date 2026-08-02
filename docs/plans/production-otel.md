@@ -228,11 +228,19 @@ same reviewed diff, shipped through the same workflow — then a second PR rever
   bucket is `bt-servant-openobserve-prod`. The unsuffixed apps are the staging pair.
 - **`INFLUX_BUCKET` moved into `fly.toml [env]`.** This resolves the conditional B3 was
   carrying — see its credentials list.
-- Prod OpenObserve is `shared-cpu-2x` / 4 GB, R2 for stream storage, volume for WAL/cache.
-- Retention: the `[env]` ceiling is the _longest_ tier (metrics, 395d) and the shorter tiers
-  (traces 14d, logs 30d) are per-stream UI overrides — `ZO_COMPACT_DATA_RETENTION_DAYS` is a
-  single global value, not per-signal. Set that way round so a missed override over-retains
-  cheap trace data instead of silently deleting metrics history.
+- Prod OpenObserve is `shared-cpu-2x` / 4 GB with R2 for stream data. **The volume stays
+  durable regardless:** local mode defaults `ZO_META_STORE=sqlite`, and `ZO_DATA_DB_DIR`
+  under `ZO_DATA_DIR` holds the meta store _and_ the `file_list` index that maps a query to
+  the R2 objects. Losing it loses users/config and **orphans everything in R2** — the bytes
+  survive, billed and unfindable. Snapshots required; it is not a cache.
+- Retention: `ZO_COMPACT_DATA_RETENTION_DAYS` is a **fallback, not a ceiling.** The compactor
+  prefers a stream's own `stream_settings.data_retention` whenever it is > 0 and only falls
+  back to the env value — it does **not** take the minimum. So the env var governs only
+  streams with no setting of their own, and **all three tiers must be set per-stream and read
+  back** (traces 14d, logs 30d, metrics 395d). The env value is the longest of the three so
+  an unconfigured new stream errs toward over-retaining cheap data rather than deleting it.
+  This also means staging's new `= "7"` does **not** fix its existing 3650-day streams — they
+  need the same explicit per-stream treatment.
 
 Because each collector app now carries environment-specific `[env]`, the prod deploy uses a
 real `fly.prod.toml` rather than an `--app` override — an override cannot carry `[env]`.
@@ -290,9 +298,10 @@ Ordered, because each step proves the previous one.
    `bt-servant-openobserve-prod` and its access key. B2 wrote both `fly.prod.toml` files and
    B2.5 gives each directory a workflow, so **neither app is ever deployed by hand — not
    even its first deploy.** Mint three app-scoped tokens in this sitting: one per prod app,
-   plus the staging OpenObserve one B2.5 needs. Apply the two per-stream retention overrides
-   (traces 14d, logs 30d) in the OpenObserve UI once the streams exist — the `[env]` ceiling
-   is 395d by design.
+   plus the staging OpenObserve one B2.5 needs. Enable **fly volume snapshots** on both
+   OpenObserve volumes — they hold the sqlite meta store and the `file_list` index, so an
+   unbacked volume means an unrecoverable instance and an orphaned R2 bucket.
+   Retention is **not** set here — the streams do not exist yet; see step 8.
 2. Create the prod OpenObserve root user. **Save the password before setting it** — fly
    secrets are write-only, and v0.91 enforces ≥8 chars with upper + lower + digit + special
    (a non-compliant value crash-loops the app on boot).
@@ -336,6 +345,24 @@ Ordered, because each step proves the previous one.
    worker. **This is the switch.** Telemetry starts flowing here and nowhere earlier.
 7. Watch one full traffic cycle in the prod UI, checking that `user_id` is absent and
    `user_hash` is present on the arriving records.
+8. **Set retention on every stream, explicitly, and read it back.** Last, because a stream
+   has to exist before it can be configured — prod's are created by the first ingest above.
+   The env fallback does **not** do this for you: the compactor prefers a stream's own
+   `stream_settings.data_retention` whenever it is > 0 and never takes the minimum.
+
+   | Instance | Stream                      | Set to |
+   | -------- | --------------------------- | ------ |
+   | prod     | `traces`                    | 14d    |
+   | prod     | `logs`                      | 30d    |
+   | prod     | `metrics`                   | 395d   |
+   | staging  | `traces`, `logs`, `metrics` | 7d     |
+
+   **Staging is not optional here.** Its streams report **3650** today and will keep doing so
+   forever — B2's new `ZO_COMPACT_DATA_RETENTION_DAYS = "7"` cannot touch a stream that
+   already carries a value. Setting the env var was only half the fix; this is the other half.
+
+   Then read every stream back (the `curl … /api/default/streams | jq` snippet in
+   `infra/openobserve/README.md` → Retention). Anything still showing 3650 did not take.
 
 **Credentials for B3** (see B1's carry-forward notes above for why):
 

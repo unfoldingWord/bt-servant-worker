@@ -32,23 +32,36 @@ primary_region = "iad"
   # ZO_S3_SERVER_URL, ZO_S3_ACCESS_KEY, ZO_S3_SECRET_KEY are fly secrets — the URL
   # embeds the Cloudflare account id, and the keys are credentials. See README.md.
 
-  # Local volume below is now WAL + query cache only, not the retention boundary.
+  # ── The volume is DURABLE METADATA, not a cache ───────────────────────────────────
+  # Moving stream data to R2 does NOT make /data disposable. In local mode
+  # ZO_META_STORE defaults to sqlite, and ZO_DATA_DB_DIR (under ZO_DATA_DIR) holds
+  # metadata.sqlite: users, orgs, stream settings — and the file_list index, which is
+  # what maps a query to the parquet objects in R2.
+  #
+  # So losing or recreating this volume does not lose "cache". It loses the instance's
+  # identity and configuration, and it orphans every byte in R2: the objects survive and
+  # become unqueryable, because nothing knows they exist. Back it up (fly volume
+  # snapshots) and treat a restore as a real procedure — see README.md "The volume".
   ZO_DATA_DIR = "/data"
 
   # ── Retention ─────────────────────────────────────────────────────────────────────
-  # The default is 3650 (ten years), which is how the staging instance ended up
-  # effectively unbounded. This is a CEILING, not the intent: it is deliberately set to
-  # the LONGEST tier we want (metrics, ~13 months) and the shorter tiers are per-stream
-  # overrides, which are UI/API settings rather than env vars:
+  # This is a FALLBACK, not a ceiling. The compactor uses a stream's own
+  # stream_settings.data_retention whenever that is greater than zero, and only falls
+  # back to this value otherwise — it does not take the minimum of the two. A stream
+  # carrying a 3650-day setting therefore ignores this line completely, which is exactly
+  # how the staging instance stayed at ten years.
   #
-  #     traces   14 days
-  #     logs     30 days
+  # Consequence: this value governs only streams with NO explicit setting, i.e. new ones.
+  # The three tiers we actually want must each be set ON THE STREAM and then verified:
+  #
+  #     traces   14 days   ← must be set per-stream; this line will not impose it
+  #     logs     30 days   ← must be set per-stream; this line will not impose it
   #     metrics  395 days  (bounded-label, so tiny)
   #
-  # Set that way round on purpose. If the per-stream step is ever missed, the failure is
-  # over-retaining traces in cheap object storage — not silently deleting the metrics
-  # history, which is the one signal here that cannot be reconstructed after the fact.
-  # Applying the two overrides is a step in production-otel.md B3.
+  # It is set to the longest of the three so that a stream nobody has configured yet errs
+  # toward over-retaining cheap data rather than deleting it — but that is a default for
+  # the unconfigured case, NOT enforcement of a maximum. production-otel.md B3 sets and
+  # verifies all three explicitly.
   ZO_COMPACT_DATA_RETENTION_DAYS = "395"
 
 [http_service]
@@ -59,12 +72,15 @@ primary_region = "iad"
   min_machines_running = 1
 
 [[mounts]]
-  source = "openobserve_data"    # `fly volumes create openobserve_data --size 10` first.
+  # `fly volumes create openobserve_data --size 10` first. NOT scratch space — see the
+  # ZO_DATA_DIR note above. This holds the sqlite meta store and the file_list index, so
+  # it needs snapshots and a tested restore, not just a size.
+  source = "openobserve_data"
   destination = "/data"
 
 [[vm]]
-  # Sized above staging's shared-cpu-1x/1gb. With bulk storage in R2 this is query
-  # working set, WAL, and cache — CPU and RAM bind on a wide time-range scan long before
-  # disk does. A bump is this stanza plus a redeploy.
+  # Sized above staging's shared-cpu-1x/1gb. With bulk stream data in R2 this is the
+  # query working set, the meta store, and cache — CPU and RAM bind on a wide time-range
+  # scan long before disk does. A bump is this stanza plus a redeploy.
   size = "shared-cpu-2x"
   memory = "4gb"

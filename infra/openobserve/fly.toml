@@ -14,12 +14,18 @@ primary_region = "iad"
   ZO_DATA_DIR = "/data"          # local-disk storage on the mounted volume (below).
   # Staging stays on local disk; prod uses R2 via ZO_S3_* (see fly.prod.toml).
 
-  # Bound the retention. Left unset this defaults to 3650 — ten years — which is what
-  # this instance has been reporting and nobody intended. Staging data has no value past
-  # the sprint that produced it. Minimum accepted by OpenObserve is 3.
+  # Bound the retention for streams that have no setting of their own. Left unset this
+  # defaults to 3650 — ten years. Staging data has no value past the sprint that produced
+  # it. Minimum accepted by OpenObserve is 3.
   #
-  # NOTE: this directory has no CI/CD, so this line changes nothing until someone
-  # hand-deploys the app; and retention already set per-stream in the UI overrides it.
+  # ⚠ THIS LINE ALONE DOES NOT FIX THIS INSTANCE. Two reasons, both required:
+  #   1. The compactor prefers a stream's own stream_settings.data_retention whenever it
+  #      is > 0 and only falls back to this value — it does not take the minimum. The
+  #      streams here already report 3650, so they will keep ignoring this.
+  #   2. This directory has no CI/CD (see README.md), so nothing applies until someone
+  #      hand-deploys the app.
+  # Setting the existing traces/logs/metrics streams to 7 in the UI is what actually
+  # bounds them; this line only stops the NEXT new stream from starting at ten years.
   ZO_COMPACT_DATA_RETENTION_DAYS = "7"
 
 [http_service]

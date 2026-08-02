@@ -5,10 +5,14 @@ dashboards, alerting). Operated and queried only by us — governance stays in o
 
 ## Two instances
 
-| Instance   | fly app                       | config          | stream storage            | retention ceiling |
-| ---------- | ----------------------------- | --------------- | ------------------------- | ----------------- |
-| Staging    | `bt-servant-openobserve`      | `fly.toml`      | local volume              | 7 days            |
-| Production | `bt-servant-openobserve-prod` | `fly.prod.toml` | Cloudflare R2 (`ZO_S3_*`) | 395 days          |
+| Instance   | fly app                       | config          | stream storage            | retention fallback |
+| ---------- | ----------------------------- | --------------- | ------------------------- | ------------------ |
+| Staging    | `bt-servant-openobserve`      | `fly.toml`      | local volume              | 7 days             |
+| Production | `bt-servant-openobserve-prod` | `fly.prod.toml` | Cloudflare R2 (`ZO_S3_*`) | 395 days           |
+
+That last column is what a stream gets when it has **no** retention setting of its own — it
+is not a cap on the ones that do. See [Retention](#retention). Both instances keep a durable
+volume regardless of where stream data lives; see [The volume](#the-volume).
 
 Separate instances, not two streams on one box: the OSS build reports `rbac_enabled: false`,
 so there is no per-stream scoping and every login on an instance can read all of it.
@@ -27,7 +31,8 @@ prevent, and its deployed state starts out unreconcilable with `main`.
 # Staging uses fly.toml (the default); for production pass --config fly.prod.toml to every
 # command below, and use the app name from that file.
 fly launch --no-deploy                       # edit fly.toml app/region first
-fly volumes create openobserve_data --size 3 # persistent storage for /data
+fly volumes create openobserve_data --size 3 # durable metadata — see "The volume" below;
+                                             # prod wants --size 10 and snapshots enabled
 
 # Root user is created on first boot. Choose a password and SAVE IT first — Fly secrets are
 # write-only, so a value you can't read back locks you out of the UI login below.
@@ -73,24 +78,58 @@ The server URL is a secret only because it embeds the Cloudflare account id.
 - **`ZO_LOCAL_MODE_STORAGE=s3` is the switch.** Without it the other `ZO_S3_*` values are
   read and ignored, and everything keeps landing on the local volume — which looks fine
   until the volume fills.
-- The volume stays mounted either way; on prod it is WAL + query cache, not the retention
-  boundary.
+
+### The volume
+
+**Moving stream data to R2 does not make `/data` disposable.** In local mode `ZO_META_STORE`
+defaults to `sqlite`, and `ZO_DATA_DB_DIR` — under `ZO_DATA_DIR` — holds `metadata.sqlite`:
+users, orgs, stream settings (including the retention values below), and the **`file_list`
+index**, which is what maps a query to the parquet objects sitting in R2.
+
+So the failure mode of losing this volume is not "cold cache". It is:
+
+- every login, org, and stream setting on the instance, gone; and
+- **every byte in R2 orphaned** — the objects are still there and still billed, and nothing
+  can find them, because the index that knew about them was the thing you lost.
+
+Treat it as the durable component it is: take fly volume snapshots, and treat restore as a
+real procedure rather than an assumption. Moving the meta store to an external Postgres
+(`ZO_META_STORE=postgres` + `ZO_META_POSTGRES_DSN`) is the alternative if we ever want the
+instance itself to be disposable; we are not doing that yet.
 
 ### Retention
 
-`ZO_COMPACT_DATA_RETENTION_DAYS` is a single global value (default **3650** — ten years,
-which is how staging ended up effectively unbounded). Per-signal tiers are **per-stream
-overrides set in the UI**, so the env var is deliberately the _longest_ tier and the shorter
-ones are applied on top:
+`ZO_COMPACT_DATA_RETENTION_DAYS` (default **3650** — ten years) is a **fallback, not a
+ceiling.** The compactor uses a stream's own `stream_settings.data_retention` whenever that
+is greater than zero and only falls back to the env value otherwise — **it does not take the
+minimum of the two.**
 
-| Stream    | Target   | Set where                     |
-| --------- | -------- | ----------------------------- |
-| `traces`  | 14 days  | per-stream override in the UI |
-| `logs`    | 30 days  | per-stream override in the UI |
-| `metrics` | 395 days | the `[env]` ceiling           |
+That distinction is the whole game here, because it means:
 
-Set that way round so a missed override over-retains cheap trace data rather than silently
-deleting the metrics history, which is the one signal here that cannot be reconstructed.
+- A stream already carrying 3650 **ignores the env var entirely.** This is why staging has
+  stayed at ten years, and why setting `ZO_COMPACT_DATA_RETENTION_DAYS = "7"` there does not
+  by itself fix the existing streams.
+- The env var governs only streams with no setting of their own — in practice, new ones.
+
+So every tier has to be set **on the stream** and then read back:
+
+| Stream    | Target   | Set where                                          |
+| --------- | -------- | -------------------------------------------------- |
+| `traces`  | 14 days  | per-stream, in the UI — the env var will not do it |
+| `logs`    | 30 days  | per-stream, in the UI — the env var will not do it |
+| `metrics` | 395 days | per-stream, in the UI (matches the env fallback)   |
+
+The env fallback is set to the longest of the three so that a stream nobody has configured
+yet errs toward over-retaining cheap data rather than deleting it. That is a default for the
+unconfigured case — it is **not** enforcement of a maximum, and nothing in the config
+prevents a stream from being set to ten years. Verify, don't assume:
+
+```bash
+# Read back what each stream is ACTUALLY set to — the only proof that matters.
+curl -s -u "$O2_USER:$O2_PASS" \
+  "https://<instance>.fly.dev/api/default/streams" \
+  | jq -r '.list[] | "\(.name)\t\(.stream_type)\tretention=\(.settings.data_retention // "unset -> env fallback")"'
+```
 
 ## Notes
 
