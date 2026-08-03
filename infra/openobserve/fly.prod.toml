@@ -6,8 +6,10 @@
 # available, so production data gets its own box rather than a shared sink with a
 # "staging" stream next to it.
 #
-# The app does not exist yet. `fly launch --no-deploy` creates it (see README.md); this
-# directory has no CI/CD, so unlike the collector it is hand-deployed for now.
+# The app does not exist yet. `fly launch --no-deploy` creates it (see README.md), and
+# .github/workflows/deploy-openobserve.yml deploys it — its production job stays skipped
+# until the FLY_PROD_OPENOBSERVE_APP repo variable is set to the app name above (B3).
+# There is no hand-deploy, not even the first one.
 app = "bt-servant-openobserve-prod"
 primary_region = "iad"
 

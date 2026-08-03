@@ -17,20 +17,47 @@ volume regardless of where stream data lives; see [The volume](#the-volume).
 Separate instances, not two streams on one box: the OSS build reports `rbac_enabled: false`,
 so there is no per-stream scoping and every login on an instance can read all of it.
 
-**Neither instance has CI/CD yet** — unlike the collector, this directory is hand-deployed,
-so a change to either `fly.toml` does nothing until someone runs `fly deploy`. That is
-[`docs/plans/production-otel.md`](../../docs/plans/production-otel.md) **B2.5**, and it must
-land **before** B3 provisions the production app: otherwise prod OpenObserve gets
-bootstrapped by a laptop `fly deploy`, which is exactly what the CI/CD boundary exists to
-prevent, and its deployed state starts out unreconcilable with `main`.
+## CI/CD
 
-## Deploy
+[`.github/workflows/deploy-openobserve.yml`](../../.github/workflows/deploy-openobserve.yml)
+is this directory's entire CI/CD (the main CI/Deploy workflows never touch it), mirroring
+the collector's. **Deploys happen on merge to `main`** for any change under
+`infra/openobserve/**`, the workflow itself, or `.github/scripts/**` — never by a laptop
+`fly deploy`, and there is no bootstrap exception: even a brand-new app's first deploy goes
+through the workflow (provisioning with `fly launch --no-deploy` creates the app without
+deploying it).
+
+- **validate** (every PR): parses `ARG OPENOBSERVE_VERSION` from the Dockerfile (the deploy
+  jobs pass it as `--build-arg`, so the pin has one source of truth), asserts
+  `fly.prod.toml` keeps `ZO_LOCAL_MODE_STORAGE = "s3"` (see
+  [Production extras](#production-extras)), and runs the secrets pre-flight's self-test.
+  There is no `otelcol validate` equivalent — OpenObserve is configured entirely by `[env]`
+  and secrets, so the pre-flight and the pin parse are what this workflow gates on.
+- **deploy jobs**: [`check-openobserve-secrets.sh`](../../.github/scripts/check-openobserve-secrets.sh)
+  pre-flights each app before deploying — required secrets present (per-app list; prod adds
+  the `ZO_S3_*` trio), and **no fly secret shadowing an `[env]` key** (a fly secret silently
+  takes precedence over `[env]`, the `INFLUX_BUCKET` lesson from #340 — here the banned
+  list is parsed from the toml so it cannot drift).
+- **Tokens**: both deploy jobs read `FLY_OPENOBSERVE_API_TOKEN` — app-scoped deploy tokens,
+  not the collector's `FLY_API_TOKEN`. Staging's lives at repo level; prod's on the
+  `production` GitHub environment, which wins over the repo-level name for that job.
+- **Prod gate**: the production job is skipped until the `FLY_PROD_OPENOBSERVE_APP` repo
+  variable is set to the app name in `fly.prod.toml` (B3 step 1). The variable only enables
+  the job — the app name always comes from `fly.prod.toml`, and the job fails if they
+  disagree.
+
+**A deploy restarts a stateful app.** Unlike the stateless collector pipe, rolling this
+machine briefly interrupts ingest and queries; the collector's exporter queue absorbs the
+ingest gap. That is the accepted cost of deploy-on-merge — the alternative is `main` and
+the running sink drifting apart, which is how staging's retention sat wrong for weeks.
+
+## Provisioning (once per instance)
 
 ```bash
 # from infra/openobserve/
 # Staging uses fly.toml (the default); for production pass --config fly.prod.toml to every
 # command below, and use the app name from that file.
-fly launch --no-deploy                       # edit fly.toml app/region first
+fly launch --no-deploy                       # creates the app only — the WORKFLOW deploys
 fly volumes create openobserve_data --size 3 # durable metadata — see "The volume" below;
                                              # prod wants --size 10 and snapshots enabled
 
@@ -45,7 +72,9 @@ fly secrets set \
   ZO_ROOT_USER_EMAIL="you@example.com" \
   ZO_ROOT_USER_PASSWORD="$ZO_ROOT_USER_PASSWORD"
 
-fly deploy --build-arg OPENOBSERVE_VERSION=v0.91.0   # pin a stable tag; see Dockerfile
+# Then mint the app-scoped deploy token CI uses (see CI/CD above) and let the workflow
+# deploy — do NOT run `fly deploy` from a laptop:
+fly tokens create deploy --app <app-name>
 ```
 
 Open `https://bt-servant-openobserve.fly.dev` and log in with those credentials.
