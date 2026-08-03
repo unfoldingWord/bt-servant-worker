@@ -22,6 +22,39 @@ separately deployed services (fly.io) and their configs.
                                    governance = ours
 ```
 
+## Two environments, four apps
+
+Staging and production run **entirely separate** collectors and sinks. Nothing is shared
+between the columns below — not the app, not the OpenObserve instance, not the fly deploy
+token, not the door43 bucket.
+
+| Thing               | Staging                     | Production                       |
+| ------------------- | --------------------------- | -------------------------------- |
+| Collector fly app   | `bt-servant-otel-collector` | `bt-servant-otel-collector-prod` |
+| Collector config    | `otel-collector/fly.toml`   | `otel-collector/fly.prod.toml`   |
+| OpenObserve fly app | `bt-servant-openobserve`    | `bt-servant-openobserve-prod`    |
+| OpenObserve config  | `openobserve/fly.toml`      | `openobserve/fly.prod.toml`      |
+| OpenObserve storage | local volume                | Cloudflare R2 (`ZO_S3_*`)        |
+| door43 bucket       | `bt-servant-staging`        | `bt-servant`                     |
+| Deploy token        | `FLY_API_TOKEN` (repo)      | `FLY_API_TOKEN` (`production`)   |
+
+**Why two OpenObserve instances rather than one with two streams?** The OSS build reports
+`rbac_enabled: false` — there is no per-stream or per-org scoping, so any login on an
+instance can read everything on it. Instance separation is the only access control on
+offer, so production data gets its own box.
+
+**Why two fly tokens under one name?** Each is app-scoped, so a leak in CI reaches one app
+instead of the org. The collector workflow's `environment: staging` / `environment:
+production` job declarations are what select between them: GitHub resolves an
+environment-scoped secret over a repo-level one, so the same `${{ secrets.FLY_API_TOKEN }}`
+expression yields a different token per job. **Those two lines are load-bearing** — deleting
+them silently repoints production at the staging token.
+
+Both collector apps run the **same** `otel-collector-config.yaml` from the same pinned
+image. The only difference between the two environments is each app's `fly.toml [env]` plus
+its own secrets, and `assert-collector-invariants.py` fails the build if an app's declared
+bucket is not the one the reviewed map assigns it.
+
 **Why a collector at all** (when there's only one sink today)? The worker only ever talks
 to the collector — one endpoint, one secret. Everything downstream (which sink(s),
 redaction, retry) is a **collector-config-only** change the worker never sees. Adding a
@@ -64,6 +97,15 @@ more. (A 3rd-party SaaS sink like Axiom was considered and dropped.)
 > [`otel-collector/README.md`](otel-collector/README.md) for the reviewed exception route if
 > stdout is ever genuinely required.
 
-All secrets live in the respective fly app (`fly secrets set ...`), never in git — except
-values that are not actually secret; see the `INFLUX_BUCKET` discussion in
-`docs/plans/production-otel.md` B2.
+Run the bring-up once per environment. Staging is already live; production is
+`docs/plans/production-otel.md` B3.
+
+All **secrets** live in the respective fly app (`fly secrets set ...`), never in git. Values
+that are not actually secret do not belong there: `INFLUX_BUCKET` is a bucket name and now
+lives in each app's `fly.toml [env]`, where the bucket↔environment mapping is diffable and
+code-reviewed instead of being a digest in `fly secrets list`.
+
+> **A fly secret of a given name takes precedence over `[env]` of the same name.** Setting
+> `INFLUX_BUCKET` as a secret on a collector app does not "also" set it — it overrides the
+> reviewed value in git and nothing anywhere reports the difference. The deploy pre-flight
+> warns when it finds one.

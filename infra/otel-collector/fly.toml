@@ -1,5 +1,6 @@
-# fly.io app for the OpenTelemetry Collector.
-# Adjust `app` and `primary_region` to your fly org before `fly launch`/`fly deploy`.
+# fly.io app for the OpenTelemetry Collector — STAGING.
+# The production app is fly.prod.toml; both deploy the same config from the same image,
+# and this [env] block is the only difference between them.
 app = "bt-servant-otel-collector"
 primary_region = "iad"
 
@@ -7,6 +8,19 @@ primary_region = "iad"
   dockerfile = "Dockerfile"
   # Pin the collector version at build time:
   #   fly deploy --build-arg OTELCOL_VERSION=<stable-tag>
+
+[env]
+  # The door43 InfluxDB bucket this app writes metrics to. NOT a secret — it is a bucket
+  # name, and only the paired INFLUX_TOKEN is sensitive. It lives here rather than in fly
+  # secrets because it is the single value that distinguishes staging from production, and
+  # as a secret it was invisible: `fly secrets list` shows a digest, never the value, so
+  # nothing could tell you which bucket an app was really writing to.
+  # `assert-collector-invariants.py` asserts this matches the app above.
+  #
+  # A fly SECRET of the same name takes precedence over this block. If `flyctl secrets list
+  # --app bt-servant-otel-collector` still shows INFLUX_BUCKET, that leftover is what the
+  # collector is using and this line is dead — `flyctl secrets unset INFLUX_BUCKET`.
+  INFLUX_BUCKET = "bt-servant-staging"
 
 [http_service]
   internal_port = 4318          # OTLP/HTTP; fly terminates TLS on 443 in front of this

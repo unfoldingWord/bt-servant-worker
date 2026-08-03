@@ -1,0 +1,6 @@
+# Fixture: a well-formed prod collector fly.toml. See good-staging.fly.toml.
+app = "bt-servant-otel-collector-prod"
+primary_region = "iad"
+
+[env]
+  INFLUX_BUCKET = "bt-servant"

@@ -1,0 +1,86 @@
+# fly.io app for self-hosted OpenObserve — PRODUCTION telemetry sink.
+#
+# A SEPARATE instance from staging on purpose. OpenObserve OSS reports
+# `rbac_enabled: false`, so there is no per-stream or per-org access scoping: any login on
+# an instance can read every stream on it. Instance separation is the only access control
+# available, so production data gets its own box rather than a shared sink with a
+# "staging" stream next to it.
+#
+# The app does not exist yet. `fly launch --no-deploy` creates it (see README.md); this
+# directory has no CI/CD, so unlike the collector it is hand-deployed for now.
+app = "bt-servant-openobserve-prod"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+  # Pin the image at deploy time (do NOT ship :latest):
+  #   fly deploy --build-arg OPENOBSERVE_VERSION=<stable-tag>
+
+[env]
+  # ── Storage: Cloudflare R2 via the S3 API ──────────────────────────────────────────
+  # Same Cloudflare account as the Worker, so egress is free. `ZO_S3_PROVIDER` has no r2
+  # value — R2 is S3-compatible and `s3` is correct. Path-style addressing is what R2
+  # serves, which is the default here (ZO_S3_FEATURE_FORCE_HOSTED_STYLE stays false).
+  #
+  # ZO_LOCAL_MODE stays true (single node, SQLite metadata); only the STREAM data moves
+  # to object storage. Without ZO_LOCAL_MODE_STORAGE the other ZO_S3_* values are read
+  # and then ignored, and everything silently keeps landing on the volume.
+  ZO_LOCAL_MODE_STORAGE = "s3"
+  ZO_S3_PROVIDER = "s3"
+  ZO_S3_BUCKET_NAME = "bt-servant-openobserve-prod"
+  ZO_S3_REGION_NAME = "auto"     # R2's region identifier
+  # ZO_S3_SERVER_URL, ZO_S3_ACCESS_KEY, ZO_S3_SECRET_KEY are fly secrets — the URL
+  # embeds the Cloudflare account id, and the keys are credentials. See README.md.
+
+  # ── The volume is DURABLE METADATA, not a cache ───────────────────────────────────
+  # Moving stream data to R2 does NOT make /data disposable. In local mode
+  # ZO_META_STORE defaults to sqlite, and ZO_DATA_DB_DIR (under ZO_DATA_DIR) holds
+  # metadata.sqlite: users, orgs, stream settings — and the file_list index, which is
+  # what maps a query to the parquet objects in R2.
+  #
+  # So losing or recreating this volume does not lose "cache". It loses the instance's
+  # identity and configuration, and it orphans every byte in R2: the objects survive and
+  # become unqueryable, because nothing knows they exist. Back it up (fly volume
+  # snapshots) and treat a restore as a real procedure — see README.md "The volume".
+  ZO_DATA_DIR = "/data"
+
+  # ── Retention ─────────────────────────────────────────────────────────────────────
+  # This is a FALLBACK, not a ceiling. The compactor uses a stream's own
+  # stream_settings.data_retention whenever that is greater than zero, and only falls
+  # back to this value otherwise — it does not take the minimum of the two. A stream
+  # carrying a 3650-day setting therefore ignores this line completely, which is exactly
+  # how the staging instance stayed at ten years.
+  #
+  # Consequence: this value governs only streams with NO explicit setting, i.e. new ones.
+  # The three tiers we actually want must each be set ON THE STREAM and then verified:
+  #
+  #     traces   14 days   ← must be set per-stream; this line will not impose it
+  #     logs     30 days   ← must be set per-stream; this line will not impose it
+  #     metrics  395 days  (bounded-label, so tiny)
+  #
+  # It is set to the longest of the three so that a stream nobody has configured yet errs
+  # toward over-retaining cheap data rather than deleting it — but that is a default for
+  # the unconfigured case, NOT enforcement of a maximum. production-otel.md B3 sets and
+  # verifies all three explicitly.
+  ZO_COMPACT_DATA_RETENTION_DAYS = "395"
+
+[http_service]
+  internal_port = 5080           # OpenObserve HTTP + UI; fly terminates TLS on 443.
+  force_https = true
+  auto_stop_machines = "off"     # keep the store queryable + able to receive ingest.
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[mounts]]
+  # `fly volumes create openobserve_data --size 10` first. NOT scratch space — see the
+  # ZO_DATA_DIR note above. This holds the sqlite meta store and the file_list index, so
+  # it needs snapshots and a tested restore, not just a size.
+  source = "openobserve_data"
+  destination = "/data"
+
+[[vm]]
+  # Sized above staging's shared-cpu-1x/1gb. With bulk stream data in R2 this is the
+  # query working set, the meta store, and cache — CPU and RAM bind on a wide time-range
+  # scan long before disk does. A bump is this stanza plus a redeploy.
+  size = "shared-cpu-2x"
+  memory = "4gb"
