@@ -19,13 +19,13 @@ overrides:
   fast-uri: '>=3.1.4 <4'
   body-parser: '>=2.3.0'
   js-yaml: '>=4.3.0 <5'
-  brace-expansion: 5.0.8
+  brace-expansion: 5.0.9
   sharp: '>=0.35.0 <0.36'
 
 patchedDependencies:
-  brace-expansion@5.0.8:
-    hash: 6wb5wx2vxacf3ii27zkisg5m7y
-    path: patches/brace-expansion@5.0.8.patch
+  brace-expansion@5.0.9:
+    hash: fnlo44q7jxioilxvotsirr5ej4
+    path: patches/brace-expansion@5.0.9.patch
 
 importers:
 
@@ -1087,8 +1087,8 @@ packages:
     resolution: {integrity: sha512-2cGmJupaNgg+QUwVLAucDuWuoMZ6EX9iHDRswZ5lsNYEmwPaRknMPCLZz07yTzVq/83p4o/wzbDZbBrTvGGTIw==}
     engines: {node: '>=18'}
 
-  brace-expansion@5.0.8:
-    resolution: {integrity: sha512-JZyDyq3D4AUifKTPOB7DELf6XsB3WdPuNxCtob1vFXPsSXhdAiHBWJ/tJ8HAc9aH84BK+5JFZLNkJKx3G9kzQg==}
+  brace-expansion@5.0.9:
+    resolution: {integrity: sha512-ScQ4IuvIEF1TMlP7Zt+vjJ//9zlPb2SDcxWxM3bk8s6t6GGdJ7KO1dCcTidOPJKePW30LE/2cT7wCyPho9/Wxg==}
     engines: {node: 20 || >=22}
 
   braces@3.0.3:
@@ -3108,7 +3108,7 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  brace-expansion@5.0.8(patch_hash=6wb5wx2vxacf3ii27zkisg5m7y):
+  brace-expansion@5.0.9(patch_hash=fnlo44q7jxioilxvotsirr5ej4):
     dependencies:
       balanced-match: 4.0.4
 
@@ -3731,11 +3731,11 @@ snapshots:
 
   minimatch@10.2.5:
     dependencies:
-      brace-expansion: 5.0.8(patch_hash=6wb5wx2vxacf3ii27zkisg5m7y)
+      brace-expansion: 5.0.9(patch_hash=fnlo44q7jxioilxvotsirr5ej4)
 
   minimatch@3.1.5:
     dependencies:
-      brace-expansion: 5.0.8(patch_hash=6wb5wx2vxacf3ii27zkisg5m7y)
+      brace-expansion: 5.0.9(patch_hash=fnlo44q7jxioilxvotsirr5ej4)
 
   minimist@1.2.8: {}
 
