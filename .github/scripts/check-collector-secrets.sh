@@ -12,6 +12,11 @@ set -euo pipefail
 
 app="${1:?usage: check-collector-secrets.sh <fly-app-name>}"
 
+# Overridable so tests/test-check-collector-secrets.sh can stub it. This gate can fail a
+# deploy in two directions and had no test until it grew teeth in #340 PR B; hardcoding
+# `flyctl` meant the only way to exercise it was against a real, authenticated fly org.
+FLYCTL="${FLYCTL:-flyctl}"
+
 # Every ${env:...} referenced by infra/otel-collector/otel-collector-config.yaml that is
 # actually SECRET. INFLUX_BUCKET is deliberately absent: it is a bucket name, not a
 # credential, and since B2 it lives in each app's `fly.toml [env]` where it is reviewable.
@@ -25,13 +30,16 @@ required=(
 
 # Secrets that must NOT exist, because a fly secret silently takes precedence over
 # `fly.toml [env]`. A leftover here does not break the deploy — it makes the reviewed
-# value in git dead code while everything still looks correct, which is worse.
+# value in git dead code while everything still looks correct, which is worse: the bucket
+# an app writes to becomes invisible again, and the two environments can drift apart with
+# nothing to show for it. `fly secrets list` prints digests, never values, so there is no
+# way to notice by looking.
 banned=(
   INFLUX_BUCKET
 )
 
 echo "Checking secrets on fly app: $app"
-present="$(flyctl secrets list --app "$app" --json | jq -r '.[] | (.Name // .name)')"
+present="$("$FLYCTL" secrets list --app "$app" --json | jq -r '.[] | (.Name // .name)')"
 
 missing=()
 for secret in "${required[@]}"; do
@@ -43,13 +51,12 @@ for secret in "${required[@]}"; do
   fi
 done
 
-# WARNING, not a failure, and only until the staging app's leftover is cleared. Failing
-# here today would deadlock the very deploy that puts [env] INFLUX_BUCKET into the machine
-# config: the pre-flight would block it, and unsetting the secret first would leave the
-# running collector with no bucket at all (writing every metric to bucket="") until some
-# later deploy landed. Order is: this PR deploys [env] -> `flyctl secrets unset
-# INFLUX_BUCKET` -> the follow-up PR turns this into a hard failure.
-# TODO(#340 follow-up): promote to `exit 1` once no collector app carries INFLUX_BUCKET.
+# A hard failure since #340 PR B. It was a warning for exactly one release, because a
+# failure here would have deadlocked its own fix: the gate would have blocked the very
+# deploy that put [env] INFLUX_BUCKET into the machine config, and unsetting the secret
+# beforehand would have left the running collector writing every metric to bucket="".
+# That window is closed — no collector app carries the secret now — so the trap is shut
+# permanently rather than left as a note someone has to remember.
 shadowed=()
 for secret in "${banned[@]}"; do
   if grep -qxF "$secret" <<<"$present"; then
@@ -58,19 +65,32 @@ for secret in "${banned[@]}"; do
   fi
 done
 
-if [ ${#shadowed[@]} -gt 0 ]; then
-  echo "::warning::fly app '$app' still has secret(s) that shadow fly.toml [env]: ${shadowed[*]}"
-  echo "The value in git is NOT what this app is using. Clear it with:"
-  for secret in "${shadowed[@]}"; do
-    echo "  flyctl secrets unset --app $app $secret"
-  done
-fi
+# Both lists are reported before exiting. Failing on the first problem found would hide
+# the second, and an operator fixing a missing secret should not then discover a shadowed
+# one on the next run.
+status=0
 
 if [ ${#missing[@]} -gt 0 ]; then
   echo "::error::fly app '$app' is missing required secret(s): ${missing[*]}"
-  echo "Set them before deploying:"
-  echo "  flyctl secrets set --app $app ${missing[*]/%/=<value>}"
+  echo "An unset \${env:...} resolves to an empty string and the collector still boots, so"
+  echo "this cannot be caught after deploy. Set them first:"
+  echo "  $FLYCTL secrets set --app $app ${missing[*]/%/=<value>}"
+  status=1
+fi
+
+if [ ${#shadowed[@]} -gt 0 ]; then
+  echo "::error::fly app '$app' has secret(s) that shadow fly.toml [env]: ${shadowed[*]}"
+  echo "A fly secret takes precedence over [env], so the reviewed value in git is NOT what"
+  echo "this app would use — and 'secrets list' shows only a digest, so nothing would show"
+  echo "the difference. Clear it, then re-run:"
+  for secret in "${shadowed[@]}"; do
+    echo "  $FLYCTL secrets unset --app $app $secret"
+  done
+  status=1
+fi
+
+if [ "$status" -ne 0 ]; then
   exit 1
 fi
 
-echo "All ${#required[@]} required secrets present on $app."
+echo "All ${#required[@]} required secrets present on $app, and nothing shadowing [env]."

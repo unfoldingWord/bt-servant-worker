@@ -101,6 +101,14 @@ jobs:
       - name: Self-test the invariant checker
         run: .github/scripts/tests/test-assert-collector-invariants.sh
 
+      # Runs in `validate`, not in the deploy jobs, because it stubs flyctl — no fly
+      # credentials, no network, nothing to authenticate. Which is the point: this gate
+      # can fail a deploy in two directions (required secret missing, banned secret
+      # present) and both are invisible from reading it. A gate that has stopped failing
+      # waves bad configs through; one that always fails blocks every collector deploy.
+      - name: Self-test the secrets pre-flight
+        run: .github/scripts/tests/test-check-collector-secrets.sh
+
   deploy-staging:
     name: Deploy Collector (Staging)
     needs: [validate]
