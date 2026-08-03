@@ -274,31 +274,41 @@ satisfiable, and clearing the secret first would have left the collector writing
 `bucket=""`. Any future "move a fly secret into `[env]`" needs the same three beats —
 deploy the `[env]` value, clear the secret, then tighten the gate.
 
-## B2.5 — CI/CD for `infra/openobserve/` **[must land before B3]**
+## B2.5 — CI/CD for `infra/openobserve/` **[shipped]** → **issue #345**
 
-`infra/openobserve/**` has no workflow: both instances are hand-deployed. That was a
+`infra/openobserve/**` had no workflow: both instances were hand-deployed. That was a
 tolerable gap while OpenObserve was one staging box, and stops being one the moment B3
-creates the production sink — **B3 would have to bootstrap it with a laptop `fly deploy`,
-which is precisely the anti-pattern #324 item 1 removed for the collector**, and the
-deployed sink would start out unreconcilable with `main`.
+creates the production sink — **B3 would have had to bootstrap it with a laptop
+`fly deploy`, which is precisely the anti-pattern #324 item 1 removed for the collector**,
+and the deployed sink would have started out unreconcilable with `main`. Hence the hard
+ordering: this landed **before B3 provisions anything**.
 
-So this lands as its own PR, **before B3 provisions anything**:
+What shipped (names are load-bearing for B3):
 
-- `.github/workflows/deploy-openobserve.yml`, mirroring the collector's: validate → deploy
-  on push to `main` touching `infra/openobserve/**`, `--config fly.toml` for staging and
-  `--config fly.prod.toml` for production, each job declaring its `environment:` so it
-  resolves its own scoped token. **Deploy-on-merge, same as the collector** — the store
-  restarts, which the collector's exporter queue absorbs, and the alternative is letting
-  `main` and the running sink drift.
-- Parse `ARG OPENOBSERVE_VERSION` out of the Dockerfile and pass it as the build arg, so the
-  version pin is enforced by CI instead of by remembering to type it (the collector already
-  does this with `OTELCOL_VERSION`).
-- A secrets pre-flight for the prod app's `ZO_S3_ACCESS_KEY` / `ZO_S3_SECRET_KEY` /
-  `ZO_S3_SERVER_URL`. Same failure shape as `INFLUX_BUCKET`: wrong or missing R2 credentials
-  are not a boot failure, they surface on a write path later.
-- Two **new app-scoped deploy tokens** — the existing `FLY_API_TOKEN` is scoped to
-  `bt-servant-otel-collector` and cannot see either OpenObserve app. Mint them alongside
-  B3's collector token rather than in a separate sitting.
+- **`.github/workflows/deploy-openobserve.yml`**, mirroring the collector's: validate →
+  deploy on push to `main` touching `infra/openobserve/**` / the workflow / `.github/scripts/**`,
+  `--config fly.toml` for staging and `--config fly.prod.toml` for production, each job
+  declaring its `environment:` so it resolves its own scoped token. **Deploy-on-merge,
+  same as the collector** — the store restarts, which the collector's exporter queue
+  absorbs, and the alternative is letting `main` and the running sink drift.
+- Validate parses `ARG OPENOBSERVE_VERSION` out of the Dockerfile and the deploy jobs pass
+  it as `--build-arg`, so the pin has one enforced source of truth (the collector's
+  `OTELCOL_VERSION` pattern), and **asserts `fly.prod.toml` keeps
+  `ZO_LOCAL_MODE_STORAGE = "s3"`** — the switch without which every other `ZO_S3_*` value
+  is read and silently ignored.
+- **`check-openobserve-secrets.sh`** pre-flights each app before its deploy: per-app
+  required lists (staging: the two `ZO_ROOT_USER_*`; prod adds `ZO_S3_SERVER_URL` /
+  `ZO_S3_ACCESS_KEY` / `ZO_S3_SECRET_KEY` — wrong or missing R2 credentials are not a boot
+  failure, they surface on a write path later), plus a **shadow gate derived from the
+  toml's `[env]` keys** — the `INFLUX_BUCKET` lesson generalized, with no hand-list to
+  drift. Self-tested in `validate` with a stubbed flyctl, like the collector's gates.
+- **Token: `FLY_OPENOBSERVE_API_TOKEN`** (not the collector's `FLY_API_TOKEN` — those
+  environment secrets are the collector apps' tokens). Staging's is an app-scoped deploy
+  token at repo level; prod's goes on the `production` GitHub environment in B3, where
+  environment scoping wins over the repo-level name.
+- **Prod enable switch: repo variable `FLY_PROD_OPENOBSERVE_APP`** (the
+  `FLY_PROD_COLLECTOR_APP` pattern) — the job stays skipped until B3 sets it, and fails if
+  it disagrees with `fly.prod.toml`'s `app`.
 
 ## B3 — provision + enable **[no code; runbook]** → **issue #341**
 
@@ -307,9 +317,11 @@ Ordered, because each step proves the previous one.
 1. Provision the prod fly apps (`bt-servant-otel-collector-prod`,
    `bt-servant-openobserve-prod`) with `fly launch --no-deploy`, plus the R2 bucket
    `bt-servant-openobserve-prod` and its access key. B2 wrote both `fly.prod.toml` files and
-   B2.5 gives each directory a workflow, so **neither app is ever deployed by hand — not
-   even its first deploy.** Mint three app-scoped tokens in this sitting: one per prod app,
-   plus the staging OpenObserve one B2.5 needs. Enable **fly volume snapshots** on both
+   B2.5 gave each directory a workflow, so **neither app is ever deployed by hand — not
+   even its first deploy.** Mint the two prod app-scoped tokens in this sitting (the
+   staging OpenObserve one was minted when B2.5 merged — its deploy job needed it
+   immediately); prod OpenObserve's goes on the `production` GitHub environment as
+   `FLY_OPENOBSERVE_API_TOKEN`. Enable **fly volume snapshots** on both
    OpenObserve volumes — they hold the sqlite meta store and the `file_list` index, so an
    unbacked volume means an unrecoverable instance and an orphaned R2 bucket.
    Retention is **not** set here — the streams do not exist yet; see step 8.
