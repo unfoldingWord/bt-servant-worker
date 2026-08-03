@@ -253,15 +253,26 @@ value; but a pre-flight that _rejects_ the leftover would block the very deploy 
 `[env]` in the machine config, and unsetting it first would leave the running collector
 writing to `bucket=""`. So:
 
-1. **PR A** (this one) — `[env]` in both fly configs, the bucket↔app assertion in
-   `assert-collector-invariants.py` + its self-test, `INFLUX_BUCKET` dropped from
-   `check-collector-secrets.sh`'s required list and **warned** on if present. Merging
-   deploys `[env]`; the secret still shadows it with an identical value, so nothing changes
-   behaviourally.
-2. **Manual** — `flyctl secrets unset INFLUX_BUCKET --app bt-servant-otel-collector`. The
-   restart re-reads a machine config that now has `[env]`, so the bucket stays correct.
-3. **PR B** — promote that warning to a hard failure, so no future app can reintroduce the
-   invisible mapping. Marked `TODO(#340 follow-up)` in the script.
+1. **PR A** ✅ — PR #344, `4cbdac9`, `v2.36.2`. `[env]` in both fly configs, the bucket↔app
+   assertion in `assert-collector-invariants.py` + its self-test, `INFLUX_BUCKET` dropped
+   from `check-collector-secrets.sh`'s required list and **warned** on if present. The merge
+   deployed `[env]`; the secret still shadowed it with an identical value, so nothing changed
+   behaviourally — and the deploy's pre-flight printed `SHADOW INFLUX_BUCKET` as designed.
+2. **Manual** ✅ **done 2026-08-03** — `flyctl secrets unset --app bt-servant-otel-collector
+INFLUX_BUCKET`. Verified afterwards that both machines report
+   `INFLUX_BUCKET=bt-servant-staging` sourced from `[env]`
+   (`flyctl machines list --json | jq '.[].config.env'`), and the collector stayed up
+   throughout (401 on every probe across a 10-minute window).
+3. **PR B** ✅ — the warning is now a hard failure, so no future app can reintroduce the
+   invisible mapping. The pre-flight also gained a self-test with a stubbed `flyctl`: it can
+   now fail a deploy in two directions, and until PR B it had no test at all.
+
+**The whole sequence is done.** It is written up here because the ordering is the
+interesting part and it is not obvious in hindsight: the end state (a hard gate) could not
+be reached directly, because the gate would have blocked the deploy that made the gate
+satisfiable, and clearing the secret first would have left the collector writing to
+`bucket=""`. Any future "move a fly secret into `[env]`" needs the same three beats —
+deploy the `[env]` value, clear the secret, then tighten the gate.
 
 ## B2.5 — CI/CD for `infra/openobserve/` **[must land before B3]**
 

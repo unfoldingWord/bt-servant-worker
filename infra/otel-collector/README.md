@@ -111,8 +111,10 @@ mandatory on every collector app**; the fifth, `INFLUX_BUCKET`, comes from `fly.
 > [`check-collector-secrets.sh`](../../.github/scripts/check-collector-secrets.sh) queries the
 > live fly app for the four secrets before shipping, and
 > [`assert-collector-invariants.py`](../../.github/scripts/assert-collector-invariants.py)
-> asserts the bucket in git. The pre-flight also **warns if `INFLUX_BUCKET` still exists as a
-> secret**, because that would shadow the reviewed `[env]` value.
+> asserts the bucket in git. The pre-flight also **fails the deploy if `INFLUX_BUCKET` exists
+> as a secret on the app**, because a fly secret takes precedence over `[env]` — so a leftover
+> would make the reviewed value in git dead code while `secrets list` showed only a digest.
+> Setting that secret is not a way to override the bucket; it is a way to hide it.
 
 ## CI/CD
 
@@ -128,8 +130,11 @@ ignore it entirely.
   supposed to write to, there is exactly one `user_id` action and it is `delete` on a
   processor every pipeline runs, and no pipeline exports to `debug`. `validate` type-checks
   the config but has no opinion on which values are load-bearing, so it catches none of
-  these. Then [the checker's own self-test](../../.github/scripts/tests/) runs against
-  fixtures it must reject — a gate that has stopped asserting still reports green.
+  these. Then [both gates' self-tests](../../.github/scripts/tests/) run — the invariant
+  checker against fixtures it must reject, and the secrets pre-flight against a stubbed
+  `flyctl` (so it needs no credentials) in both directions: required-secret-missing and
+  banned-secret-present. A gate that has quietly stopped asserting still reports green,
+  which reads as proof.
 - **On push to `main` only** — pre-flight the fly secrets, then `flyctl deploy --remote-only`.
   Deploy jobs are pinned to `refs/heads/main`, so a `workflow_dispatch` from another branch
   cannot ship an unmerged ref, and each is serialized on a per-app concurrency group.
