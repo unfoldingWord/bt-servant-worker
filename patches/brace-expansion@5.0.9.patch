@@ -1,17 +1,16 @@
 diff --git a/dist/commonjs/index.js b/dist/commonjs/index.js
-index 869a6bee23807b9f01c18c99ab8e952b4b242f97..5a7b0bafa64c2376c863442a1dc45d20077db8f1 100644
+index 869a6bee23807b9f01c18c99ab8e952b4b242f97..3e1d85ee92e600cbe38d715b80029a3a2c1afc03 100644
 --- a/dist/commonjs/index.js
 +++ b/dist/commonjs/index.js
-@@ -286,4 +286,10 @@ function expand_(str, max, maxLength, isTop) {
+@@ -286,4 +286,11 @@ function expand_(str, max, maxLength, isTop) {
      }
      return acc;
  }
--//# sourceMappingURL=index.js.map
-\ No newline at end of file
-+//# sourceMappingURL=index.js.map// [bt-servant patch] Restore the callable CommonJS default export. Upstream 5.x
++// [bt-servant patch] Restore the callable CommonJS default export. Upstream 5.x
 +// ships an object-only CJS export (`exports.expand = expand`), which breaks
 +// consumers that call `require('brace-expansion')` directly — notably
 +// minimatch@3, pinned by ESLint 9 internals (@eslint/config-array, eslintrc).
 +// Make the default export the `expand` function while preserving the named
 +// `expand`/`EXPANSION_MAX*` properties that minimatch@10+ destructure.
 +module.exports = Object.assign(expand, module.exports);
+ //# sourceMappingURL=index.js.map

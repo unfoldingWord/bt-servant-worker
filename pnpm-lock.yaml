@@ -24,7 +24,7 @@ overrides:
 
 patchedDependencies:
   brace-expansion@5.0.9:
-    hash: fnlo44q7jxioilxvotsirr5ej4
+    hash: jvwg6ff4kko5qvsitawsfjwfgq
     path: patches/brace-expansion@5.0.9.patch
 
 importers:
@@ -3108,7 +3108,7 @@ snapshots:
     transitivePeerDependencies:
       - supports-color
 
-  brace-expansion@5.0.9(patch_hash=fnlo44q7jxioilxvotsirr5ej4):
+  brace-expansion@5.0.9(patch_hash=jvwg6ff4kko5qvsitawsfjwfgq):
     dependencies:
       balanced-match: 4.0.4
 
@@ -3731,11 +3731,11 @@ snapshots:
 
   minimatch@10.2.5:
     dependencies:
-      brace-expansion: 5.0.9(patch_hash=fnlo44q7jxioilxvotsirr5ej4)
+      brace-expansion: 5.0.9(patch_hash=jvwg6ff4kko5qvsitawsfjwfgq)
 
   minimatch@3.1.5:
     dependencies:
-      brace-expansion: 5.0.9(patch_hash=fnlo44q7jxioilxvotsirr5ej4)
+      brace-expansion: 5.0.9(patch_hash=jvwg6ff4kko5qvsitawsfjwfgq)
 
   minimist@1.2.8: {}
 
