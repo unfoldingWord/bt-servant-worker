@@ -89,6 +89,42 @@ export interface ChatRequest {
 
   /** Internal: Org languages injected by worker from KV (not from client) */
   _org_languages?: OrgLanguages;
+
+  /**
+   * Internal: ISO 3166-1 country of the originating request's Cloudflare edge
+   * entry (`request.cf.country`), injected by the worker (not from client).
+   * For gateway-relayed clients this is the gateway's location, not the
+   * user's — the user-level truth lives in phone-prefix analysis. Carried so
+   * the DO's per-turn telemetry can record it without a second cf lookup.
+   */
+  _request_country?: string;
+
+  /**
+   * Internal: transport this request arrived on, stamped by the DO's chat
+   * dispatcher so queued entries retain it when drained later (not from
+   * client).
+   */
+  _transport?: ChatTransport;
+}
+
+/**
+ * Identity persisted by the DO on each chat turn under the `identity` storage
+ * key. Exists to make the DO population enumerable: the Cloudflare REST API
+ * lists namespace objects as one-way 64-hex ids, and `idFromName` is not
+ * reversible, so without this record a DO reached via `idFromString` cannot
+ * be attributed to a user or group. `do_name` mirrors the exact key passed to
+ * `idFromName` (`user:{org}:{user_id}` or `group:{org}:{chat_id}[:{thread_id}]`).
+ */
+export interface StoredIdentity {
+  do_name: string;
+  org: string;
+  chat_type: string;
+  /** Present for private chats only; group DOs are shared across senders. */
+  user_id?: string;
+  chat_id?: string;
+  thread_id?: string;
+  client_id?: string;
+  updated_at: number;
 }
 
 /**

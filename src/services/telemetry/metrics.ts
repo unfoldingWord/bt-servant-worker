@@ -91,6 +91,7 @@ export const ALLOWED_LABEL_KEYS = new Set<string>([
   'language',
   'source_language',
   'target_language',
+  'country',
   'model',
   'server',
   'tool',
@@ -143,6 +144,8 @@ export interface MetricLabels {
   language?: string;
   source_language?: string;
   target_language?: string;
+  /** ISO 3166-1 alpha-2 from `request.cf.country` — bounded by the country-code set. */
+  country?: string;
   model?: string;
   server?: string;
   tool?: string;

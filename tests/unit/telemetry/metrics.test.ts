@@ -72,6 +72,23 @@ describe('sanitizeMetricLabels', () => {
     });
   });
 
+  it('keeps the chat-turn language/country labels (bounded dimensions)', () => {
+    expect(ALLOWED_LABEL_KEYS.has('language')).toBe(true);
+    expect(ALLOWED_LABEL_KEYS.has('country')).toBe(true);
+    const safe = sanitizeMetricLabels({
+      language: 'pt',
+      country: 'BR',
+      chat_type: 'private',
+      transport: 'callback',
+    });
+    expect(safe).toEqual({
+      language: 'pt',
+      country: 'BR',
+      chat_type: 'private',
+      transport: 'callback',
+    });
+  });
+
   it('drops unbounded / content-bearing keys (fail closed)', () => {
     // These are NOT in the typed MetricLabels, but a dynamically-built object or an
     // `as` cast could carry them — the runtime allow-list must still strip them.
