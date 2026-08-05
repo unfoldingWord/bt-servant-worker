@@ -279,16 +279,17 @@ first ingest.
 
 | Instance    | Streams                     | Outcome                                      |
 | ----------- | --------------------------- | -------------------------------------------- |
-| production  | all (~30, incl. new ones)   | **1825d (5 years)** via the `[env]` fallback |
+| production  | all (46 and growing)        | **1825d (5 years)** via the `[env]` fallback |
 | **staging** | `traces`, `logs`, `metrics` | left at 3650d, deliberately                  |
 
 The original three-tier plan (traces 14d / logs 30d / metrics 395d) did not survive contact
 with the instance:
 
 - **`metrics` is not one stream.** OpenObserve splits every OTel metric into its own stream
-  and fans each histogram into `_bucket/_count/_max/_min/_sum` — ~28 metric streams on day
-  one, plus a new one for every metric added later. Per-stream retention would need
-  re-applying forever; the `[env]` fallback covers new streams automatically.
+  and fans each histogram into `_bucket/_count/_max/_min/_sum` — **46 metric streams on
+  bring-up day**, plus a new one for every metric added later (#349 added two within hours).
+  Per-stream retention would need re-applying forever; the `[env]` fallback covers new
+  streams automatically.
 - **Volume made the tiering pointless.** 168 spans measured 0.086 MB compressed
   (~0.51 KB/span). At ~5–10k spans/day, five years is roughly 4.6–9.4 GB — under
   $0.15/month of R2. Retention here is a data-policy and query-performance question, not a

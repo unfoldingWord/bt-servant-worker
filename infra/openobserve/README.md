@@ -149,9 +149,9 @@ That distinction is the whole game here, because it means:
 
 The earlier three-tier plan (traces 14d / logs 30d / metrics 395d) was dropped because
 **`metrics` is not one stream**: OpenObserve splits every OTel metric into its own stream and
-fans each histogram into `_bucket/_count/_max/_min/_sum` — about 28 streams on day one, and a
-new one every time a metric is added. Per-stream retention would have to be re-applied
-forever, while the fallback covers new streams automatically. At measured volume
+fans each histogram into `_bucket/_count/_max/_min/_sum` — **46 metric streams on bring-up
+day**, and a new one every time a metric is added. Per-stream retention would have to be
+re-applied forever, while the fallback covers new streams automatically. At measured volume
 (~0.51 KB/span compressed) five years is single-digit GB, so cost was not the deciding factor.
 
 > **Editing the fallback is destructive.** Since no production stream carries its own value,
@@ -164,10 +164,23 @@ ended up there. Verify, don't assume:
 
 ```bash
 # Read back what each stream is ACTUALLY set to — the only proof that matters.
+#
+# v0.91.0 serializes an UNSET data_retention as 0, not null, so `// "fallback"` never
+# fires — jq's `//` only substitutes on null/false. Test `> 0` instead, which is also
+# exactly how the compactor decides (it uses the stream's own value only when > 0).
 curl -s -u "$O2_USER:$O2_PASS" \
   "https://<instance>.fly.dev/api/default/streams" \
-  | jq -r '.list[] | "\(.name)\t\(.stream_type)\tretention=\(.settings.data_retention // "unset -> env fallback")"'
+  | jq -r '.list[]
+      | "\(.name)\t\(.stream_type)\t"
+        + (if (.settings.data_retention // 0) > 0
+           then "retention=\(.settings.data_retention)d (explicit, overrides the env fallback)"
+           else "retention=unset -> env fallback" end)'
 ```
+
+Expected on **production** today: every stream prints `unset -> env fallback`, i.e. all of
+them follow `ZO_COMPACT_DATA_RETENTION_DAYS`. Any stream printing `explicit` has escaped the
+single-tier policy and no longer tracks that variable. On **staging**, all three print
+`retention=3650d (explicit)`.
 
 ## Notes
 

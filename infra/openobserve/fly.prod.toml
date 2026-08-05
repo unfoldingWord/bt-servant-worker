@@ -61,9 +61,11 @@ primary_region = "iad"
   # dropped for two reasons found while walking docs/telemetry_rollout_soe.md:
   #
   #   1. "metrics" is not one stream. OpenObserve splits every OTel metric into its own
-  #      stream and fans each histogram out into _bucket/_count/_max/_min/_sum — ~28
-  #      streams on day one, growing whenever a new metric is added. Setting retention
-  #      per-stream means re-doing it forever; the fallback covers new streams for free.
+  #      stream and fans each histogram out into _bucket/_count/_max/_min/_sum — 46 of
+  #      them on bring-up day, and the count grows whenever a new metric is added (#349
+  #      alone added chat_turns_total and auth_rejections_total hours later). Setting
+  #      retention per-stream means re-doing it forever; the fallback covers new streams
+  #      for free.
   #   2. At observed volume the whole thing is pennies. 168 spans measured 0.086 MB
   #      compressed (~0.51 KB/span); at ~5-10k spans/day, five years lands around
   #      4.6-9.4 GB, i.e. well under $0.15/month of R2. Retention here is a data-policy

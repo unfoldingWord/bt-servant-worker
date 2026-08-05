@@ -238,7 +238,7 @@ same reviewed diff, shipped through the same workflow — then a second PR rever
   back to the env value — it does **not** take the minimum. So the env var governs only
   streams with no setting of their own. **Superseded 2026-08-05:** the three-tier plan
   (traces 14d / logs 30d / metrics 395d) was dropped during bring-up — `metrics` turned out
-  to be ~28 streams, not one, so production now runs a single **1825-day (5-year)** fallback
+  to be 46 streams, not one, so production now runs a single **1825-day (5-year)** fallback
   with no stream carrying its own value. This also means staging's `= "7"` does **not** fix
   its existing 3650-day streams; they were deliberately left alone.
 
@@ -378,14 +378,14 @@ Ordered, because each step proves the previous one.
 
    | Instance | Streams                     | Outcome                                      |
    | -------- | --------------------------- | -------------------------------------------- |
-   | prod     | all (~30, incl. new ones)   | **1825d (5 years)** via the `[env]` fallback |
+   | prod     | all (46 and growing)        | **1825d (5 years)** via the `[env]` fallback |
    | staging  | `traces`, `logs`, `metrics` | left at 3650d, deliberately                  |
 
    Two findings killed the three-tier plan. **`metrics` is not one stream** — OpenObserve
    splits every OTel metric into its own stream and fans each histogram into
-   `_bucket/_count/_max/_min/_sum`, so day one had ~28 metric streams and a new one appears
-   with every new metric; per-stream retention would need re-applying forever, whereas the
-   fallback covers new streams for free. And **volume made it moot**: 168 spans measured
+   `_bucket/_count/_max/_min/_sum`, so bring-up day already had **46 metric streams**, with a
+   new one appearing for every new metric; per-stream retention would need re-applying
+   forever, whereas the fallback covers new streams for free. And **volume made it moot**: 168 spans measured
    0.086 MB compressed (~0.51 KB/span), so five years is single-digit GB and well under
    $0.15/month of R2.
 
