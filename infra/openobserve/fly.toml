@@ -1,5 +1,7 @@
-# fly.io app for self-hosted OpenObserve (the telemetry sink: store + web UI in one binary).
-# Adjust `app`/`primary_region` to your fly org before `fly launch`/`fly deploy`.
+# fly.io app for self-hosted OpenObserve (the telemetry sink: store + web UI in one binary)
+# — STAGING. The production instance is fly.prod.toml, a separate app: OpenObserve OSS has
+# `rbac_enabled: false`, so a shared instance would give every login read access to
+# production data.
 app = "bt-servant-openobserve"
 primary_region = "iad"
 
@@ -10,7 +12,19 @@ primary_region = "iad"
 
 [env]
   ZO_DATA_DIR = "/data"          # local-disk storage on the mounted volume (below).
-  # For higher volume later, switch to S3-compatible storage via ZO_S3_* env/secrets.
+  # Staging stays on local disk; prod uses R2 via ZO_S3_* (see fly.prod.toml).
+
+  # Bound the retention for streams that have no setting of their own. Left unset this
+  # defaults to 3650 — ten years. Staging data has no value past the sprint that produced
+  # it. Minimum accepted by OpenObserve is 3.
+  #
+  # ⚠ THIS LINE ALONE DOES NOT FIX THIS INSTANCE. The compactor prefers a stream's own
+  # stream_settings.data_retention whenever it is > 0 and only falls back to this value —
+  # it does not take the minimum. The streams here already report 3650, so they will keep
+  # ignoring this. Setting the existing traces/logs/metrics streams to 7 in the UI is what
+  # actually bounds them; this line only stops the NEXT new stream from starting at ten
+  # years. (production-otel.md B3 step 8 does the per-stream settings.)
+  ZO_COMPACT_DATA_RETENTION_DAYS = "7"
 
 [http_service]
   internal_port = 5080           # OpenObserve HTTP + UI; fly terminates TLS on 443.

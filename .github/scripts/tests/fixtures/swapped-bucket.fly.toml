@@ -1,0 +1,8 @@
+# Fixture: THE bug this check exists to catch — the staging app pointed at the PRODUCTION
+# door43 bucket. Nothing else in the repo would notice: the collector boots healthy,
+# `otelcol validate` passes, and staging metrics quietly land in the prod bucket.
+app = "bt-servant-otel-collector"
+primary_region = "iad"
+
+[env]
+  INFLUX_BUCKET = "bt-servant"

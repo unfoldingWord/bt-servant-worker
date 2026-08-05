@@ -12,23 +12,24 @@ name: Deploy OTel Collector
 on:
   push:
     branches: [main]
-    # Both helper scripts are load-bearing gates, so they must trigger their own
-    # workflow — otherwise a script-only edit could weaken the invariant check or the
-    # secrets pre-flight with nothing running to catch it.
+    # `.github/scripts/**` is a glob, not a list of filenames, and deliberately so:
+    # everything in that directory is a load-bearing gate for this workflow (the
+    # invariant check, the secrets pre-flight, and the invariant check's own self-test),
+    # so a script-only edit must trigger the workflow that depends on it. A glob means a
+    # NEW gate helper cannot be added without running here either — the enumerated list
+    # this replaced would have let one land untested.
     # (Duplicated below rather than using a YAML anchor — the Actions workflow parser
     # does not reliably support anchors, and this list is a gate.)
     paths:
       - 'infra/otel-collector/**'
       - '.github/workflows/deploy-collector.yml'
-      - '.github/scripts/assert-collector-invariants.py'
-      - '.github/scripts/check-collector-secrets.sh'
+      - '.github/scripts/**'
   pull_request:
     branches: [main]
     paths:
       - 'infra/otel-collector/**'
       - '.github/workflows/deploy-collector.yml'
-      - '.github/scripts/assert-collector-invariants.py'
-      - '.github/scripts/check-collector-secrets.sh'
+      - '.github/scripts/**'
   workflow_dispatch:
 
 # Least privilege: nothing here writes to the repo. The deploy jobs hand
@@ -87,8 +88,26 @@ jobs:
       # healthy and writes every metric to bucket="". Likewise it does not care
       # whether user_id is deleted, hashed, or forwarded untouched. Hence exact
       # assertions on the parsed YAML. The deploy jobs guard the fly-secret side.
+      # Runs with no --fly-toml flags, so it checks BOTH real fly.tomls by default:
+      # every collector app must declare its own INFLUX_BUCKET in [env] and it must be
+      # the bucket the reviewed map assigns that app.
       - name: Assert collector invariants
         run: python3 .github/scripts/assert-collector-invariants.py infra/otel-collector/otel-collector-config.yaml
+
+      # The gate has to be gated too. It is the only thing standing between a PR and a
+      # collector that hashes user_id or writes staging metrics into the prod bucket, and
+      # a check that has quietly stopped asserting still reports green — which reads as
+      # proof. These fixtures are configs it MUST reject.
+      - name: Self-test the invariant checker
+        run: .github/scripts/tests/test-assert-collector-invariants.sh
+
+      # Runs in `validate`, not in the deploy jobs, because it stubs flyctl — no fly
+      # credentials, no network, nothing to authenticate. Which is the point: this gate
+      # can fail a deploy in two directions (required secret missing, banned secret
+      # present) and both are invisible from reading it. A gate that has stopped failing
+      # waves bad configs through; one that always fails blocks every collector deploy.
+      - name: Self-test the secrets pre-flight
+        run: .github/scripts/tests/test-check-collector-secrets.sh
 
   deploy-staging:
     name: Deploy Collector (Staging)
@@ -146,8 +165,12 @@ jobs:
     needs: [validate]
     # Skipped until the prod collector app exists (production-otel.md B3 step 1).
     # Provision it, then set the FLY_PROD_COLLECTOR_APP repo variable to its app name
-    # and this job starts deploying — no workflow edit needed. B2 may replace the
-    # --app override with a dedicated fly.prod.toml.
+    # and this job starts deploying — no workflow edit needed.
+    #
+    # Since B2 the app NAME comes from infra/otel-collector/fly.prod.toml, not from that
+    # variable, because the app now has environment-specific config ([env] INFLUX_BUCKET)
+    # that an --app override cannot carry. The variable is purely the enable switch, and
+    # the step below fails if the two disagree rather than deploying to whichever one won.
     if: github.ref == 'refs/heads/main' && vars.FLY_PROD_COLLECTOR_APP != ''
     runs-on: ubuntu-latest
     environment: production
@@ -162,13 +185,38 @@ jobs:
         with:
           version: 0.4.75
 
+      # fly.prod.toml is the source of truth for the app name; FLY_PROD_COLLECTOR_APP only
+      # decides WHETHER this job runs. If someone sets the variable to a different app
+      # expecting that to redirect the deploy, it will not — so fail loudly here instead
+      # of shipping prod config to an app nobody reviewed.
+      - name: Resolve app name
+        id: app
+        working-directory: infra/otel-collector
+        # Read through the environment rather than interpolating ${{ vars.… }} into the
+        # script body: an expression is substituted before bash sees the line, so its
+        # contents would be executed as shell, not compared as a string.
+        env:
+          ENABLED_APP: ${{ vars.FLY_PROD_COLLECTOR_APP }}
+        run: |
+          set -euo pipefail
+          app="$(sed -n 's/^app *= *"\(.*\)"/\1/p' fly.prod.toml)"
+          if [ -z "$app" ]; then
+            echo "::error file=infra/otel-collector/fly.prod.toml::could not parse app name"
+            exit 1
+          fi
+          if [ "$app" != "$ENABLED_APP" ]; then
+            echo "::error file=infra/otel-collector/fly.prod.toml::app is '$app' but the FLY_PROD_COLLECTOR_APP variable is '$ENABLED_APP'. The variable is the enable switch only — the deploy always follows fly.prod.toml. Make them match."
+            exit 1
+          fi
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+
       - name: Pre-flight required secrets
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: .github/scripts/check-collector-secrets.sh "${{ vars.FLY_PROD_COLLECTOR_APP }}"
+        run: .github/scripts/check-collector-secrets.sh "${{ steps.app.outputs.app }}"
 
       - name: Deploy
         working-directory: infra/otel-collector
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: flyctl deploy --remote-only --config fly.toml --app "${{ vars.FLY_PROD_COLLECTOR_APP }}"
+        run: flyctl deploy --remote-only --config fly.prod.toml

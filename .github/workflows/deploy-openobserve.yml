@@ -1,0 +1,206 @@
+name: Deploy OpenObserve
+
+# OpenObserve is the telemetry sink (infra/openobserve/): store + web UI in one binary,
+# one fly app per environment. It is NOT part of the Worker bundle, so the main CI/Deploy
+# workflows never touch it — this workflow is its entire CI/CD.
+#
+# Two things make it different from deploy-collector.yml, its template:
+#
+#   1. There is no `otelcol validate` equivalent. OpenObserve is configured entirely by
+#      [env] vars and fly secrets, and wrong values are not boot failures — missing R2
+#      credentials surface later on a write path. So validate gates on the secrets
+#      pre-flight's self-test and on static config invariants instead of a config parse.
+#   2. The app is STATEFUL (mounted volume; on prod an R2 bucket too). A deploy rolls the
+#      machine and briefly interrupts ingest and queries — the collector's exporter queue
+#      absorbs the ingest gap. Deploy-on-merge anyway: the alternative is letting `main`
+#      and the running sink drift apart, which is how staging's retention sat wrong for
+#      weeks (see infra/openobserve/README.md "Retention").
+
+on:
+  push:
+    branches: [main]
+    # `.github/scripts/**` is a glob, not a list of filenames, and deliberately so:
+    # everything in that directory is a load-bearing gate for this workflow (the secrets
+    # pre-flight and its self-test), so a script-only edit must trigger the workflow that
+    # depends on it. A glob means a NEW gate helper cannot be added without running here
+    # either — an enumerated list would let one land untested.
+    # (Duplicated below rather than using a YAML anchor — the Actions workflow parser
+    # does not reliably support anchors, and this list is a gate.)
+    paths:
+      - 'infra/openobserve/**'
+      - '.github/workflows/deploy-openobserve.yml'
+      - '.github/scripts/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'infra/openobserve/**'
+      - '.github/workflows/deploy-openobserve.yml'
+      - '.github/scripts/**'
+  workflow_dispatch:
+
+# Least privilege: nothing here writes to the repo. The deploy jobs hand a fly deploy
+# token to a third-party binary, so the ambient GITHUB_TOKEN should carry as little
+# authority as possible alongside it.
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Config
+    runs-on: ubuntu-latest
+    outputs:
+      # Consumed by both deploy jobs as the --build-arg, so the image version has exactly
+      # one source of truth: the Dockerfile's ARG. (The ARG carries a default, so a bare
+      # `fly deploy` is already pinned — what this buys is a loud failure if the ARG is
+      # ever renamed or removed, instead of a silent fall-through to whatever FROM says.)
+      version: ${{ steps.openobserve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve pinned OpenObserve version
+        id: openobserve
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^ARG OPENOBSERVE_VERSION=//p' infra/openobserve/Dockerfile)"
+          if [ -z "$version" ]; then
+            echo "::error file=infra/openobserve/Dockerfile::could not parse ARG OPENOBSERVE_VERSION"
+            exit 1
+          fi
+          echo "Pinned OpenObserve version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # ZO_LOCAL_MODE_STORAGE=s3 is the SWITCH that makes prod's other ZO_S3_* values do
+      # anything. Without it they are read and silently ignored, and every byte of stream
+      # data lands on the local volume instead of R2 — which looks fine until the volume
+      # fills. Nothing at runtime reports the mismatch, so the reviewed config is the only
+      # place to catch the line going missing.
+      - name: Assert prod keeps R2 storage switched on
+        run: |
+          set -euo pipefail
+          if ! grep -Eq '^[[:space:]]*ZO_LOCAL_MODE_STORAGE[[:space:]]*=[[:space:]]*"s3"' infra/openobserve/fly.prod.toml; then
+            echo "::error file=infra/openobserve/fly.prod.toml::ZO_LOCAL_MODE_STORAGE = \"s3\" is missing. It is the switch that makes the other ZO_S3_* values take effect — without it stream data silently lands on the volume until it fills."
+            exit 1
+          fi
+          echo 'fly.prod.toml keeps ZO_LOCAL_MODE_STORAGE = "s3"'
+
+      # Runs in `validate`, not in the deploy jobs, because it stubs flyctl — no fly
+      # credentials, no network, nothing to authenticate. Which is the point: this gate
+      # can fail a deploy in two directions (required secret missing, [env]-shadowing
+      # secret present) and both are invisible from reading it. A gate that has stopped
+      # failing waves bad configs through; one that always fails blocks every deploy.
+      - name: Self-test the secrets pre-flight
+        run: .github/scripts/tests/test-check-openobserve-secrets.sh
+
+  deploy-staging:
+    name: Deploy OpenObserve (Staging)
+    needs: [validate]
+    # Deploy ONLY from main. workflow_dispatch lets a caller pick any branch, so
+    # `event_name != pull_request` alone would ship unmerged refs to a live app.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging
+    # Keyed on the APP, not github.ref — two dispatched refs sharing a ref-scoped
+    # group would still race onto the same fly app.
+    concurrency:
+      group: deploy-openobserve-app-staging
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to a reviewed commit, not @master: this action installs the flyctl
+      # binary that is handed the deploy token two steps later, so a mutable upstream
+      # tag is a path to the deployment credential.
+      #
+      # `version` matters as much as the action SHA — its default is `latest`, so
+      # pinning only the action still installs an unreviewed binary. Kept in lockstep
+      # with deploy-collector.yml; bump both workflows deliberately, together.
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # master @ 2026-04-08
+        with:
+          version: 0.4.75
+
+      - name: Resolve app name
+        id: app
+        working-directory: infra/openobserve
+        run: |
+          set -euo pipefail
+          app="$(sed -n 's/^app *= *"\(.*\)"/\1/p' fly.toml)"
+          if [ -z "$app" ]; then
+            echo "::error file=infra/openobserve/fly.toml::could not parse app name"
+            exit 1
+          fi
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+
+      # FLY_OPENOBSERVE_API_TOKEN, not the collector's FLY_API_TOKEN: fly deploy tokens
+      # are app-scoped, and the staging/production environment secrets named
+      # FLY_API_TOKEN are already the collector apps' tokens. Staging's OpenObserve
+      # token lives at repo level; prod's will live on the `production` environment
+      # (minted in B3), where environment scoping makes it win over the repo-level one
+      # for that job. Do not consolidate onto one org-wide token — a CI leak would then
+      # reach every app in the org.
+      - name: Pre-flight required secrets
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_OPENOBSERVE_API_TOKEN }}
+        run: .github/scripts/check-openobserve-secrets.sh "${{ steps.app.outputs.app }}" infra/openobserve/fly.toml
+
+      - name: Deploy
+        working-directory: infra/openobserve
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_OPENOBSERVE_API_TOKEN }}
+        run: flyctl deploy --remote-only --config fly.toml --build-arg OPENOBSERVE_VERSION="${{ needs.validate.outputs.version }}"
+
+  deploy-production:
+    name: Deploy OpenObserve (Production)
+    needs: [validate]
+    # Skipped until the prod OpenObserve app exists (production-otel.md B3 step 1).
+    # Provision it, then set the FLY_PROD_OPENOBSERVE_APP repo variable to its app name
+    # and this job starts deploying — no workflow edit needed.
+    #
+    # The app NAME comes from infra/openobserve/fly.prod.toml, not from that variable,
+    # because the app has environment-specific config ([env] ZO_S3_* wiring) that an
+    # --app override cannot carry. The variable is purely the enable switch, and the
+    # step below fails if the two disagree rather than deploying to whichever one won.
+    if: github.ref == 'refs/heads/main' && vars.FLY_PROD_OPENOBSERVE_APP != ''
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: deploy-openobserve-app-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      # Action SHA and CLI version both pinned, same reasoning as the staging job.
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1 # master @ 2026-04-08
+        with:
+          version: 0.4.75
+
+      - name: Resolve app name
+        id: app
+        working-directory: infra/openobserve
+        # Read through the environment rather than interpolating ${{ vars.… }} into the
+        # script body: an expression is substituted before bash sees the line, so its
+        # contents would be executed as shell, not compared as a string.
+        env:
+          ENABLED_APP: ${{ vars.FLY_PROD_OPENOBSERVE_APP }}
+        run: |
+          set -euo pipefail
+          app="$(sed -n 's/^app *= *"\(.*\)"/\1/p' fly.prod.toml)"
+          if [ -z "$app" ]; then
+            echo "::error file=infra/openobserve/fly.prod.toml::could not parse app name"
+            exit 1
+          fi
+          if [ "$app" != "$ENABLED_APP" ]; then
+            echo "::error file=infra/openobserve/fly.prod.toml::app is '$app' but the FLY_PROD_OPENOBSERVE_APP variable is '$ENABLED_APP'. The variable is the enable switch only — the deploy always follows fly.prod.toml. Make them match."
+            exit 1
+          fi
+          echo "app=$app" >> "$GITHUB_OUTPUT"
+
+      - name: Pre-flight required secrets
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_OPENOBSERVE_API_TOKEN }}
+        run: .github/scripts/check-openobserve-secrets.sh "${{ steps.app.outputs.app }}" infra/openobserve/fly.prod.toml
+
+      - name: Deploy
+        working-directory: infra/openobserve
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_OPENOBSERVE_API_TOKEN }}
+        run: flyctl deploy --remote-only --config fly.prod.toml --build-arg OPENOBSERVE_VERSION="${{ needs.validate.outputs.version }}"

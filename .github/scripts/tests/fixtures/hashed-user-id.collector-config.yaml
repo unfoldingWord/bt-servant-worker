@@ -1,0 +1,18 @@
+# Fixture: the privacy regression the script was originally written for — user_id hashed
+# rather than deleted. The collector's `hash` is an unsalted digest, reversible by brute
+# force for enumerable ids (phone numbers). Kept here so the fly.toml work below cannot
+# quietly break the assertion that matters most.
+processors:
+  attributes/redact:
+    actions:
+      - { key: user_id, action: hash }
+
+exporters:
+  influxdb/door43_metrics:
+    bucket: ${env:INFLUX_BUCKET}
+
+service:
+  pipelines:
+    traces:
+      processors: [attributes/redact]
+      exporters: [otlp_http/openobserve_traces]

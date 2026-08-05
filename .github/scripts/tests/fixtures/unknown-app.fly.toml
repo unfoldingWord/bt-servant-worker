@@ -1,0 +1,7 @@
+# Fixture: an app name the reviewed map has never heard of. A new collector app must land its
+# bucket mapping in the script (i.e. get reviewed) rather than inherit one by accident.
+app = "bt-servant-otel-collector-experiment"
+primary_region = "iad"
+
+[env]
+  INFLUX_BUCKET = "bt-servant-staging"

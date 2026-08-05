@@ -1,0 +1,7 @@
+# Fixture: a well-formed staging collector fly.toml. Paired with good-prod.fly.toml,
+# this is the shape assert-collector-invariants.py must accept.
+app = "bt-servant-otel-collector"
+primary_region = "iad"
+
+[env]
+  INFLUX_BUCKET = "bt-servant-staging"
