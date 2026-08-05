@@ -33,6 +33,7 @@ import {
   ChatResponse,
   ChatTransport,
   SSEEvent,
+  StoredIdentity,
   StreamCallbacks,
   UpdatePreferencesRequest,
   UserPreferencesAPI,
@@ -68,6 +69,7 @@ import {
 import { AttachmentsContext, createAttachmentsContext } from '../services/ptxprint/index.js';
 import { AppError, AudioTranscriptionError, ValidationError } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
+import { countryFromPhoneUserId } from '../utils/phone-country.js';
 import { applyTemplateVariables } from '../utils/template.js';
 import { createTimingContext, timePhase, TimingContext } from '../utils/timing.js';
 import {
@@ -88,6 +90,7 @@ import { InternalQueueEntry } from '../types/queue.js';
 
 // ── Storage keys ───────────────────────────────────────────────────────────────
 const HISTORY_KEY = 'history';
+const IDENTITY_KEY = 'identity';
 const PREFERENCES_KEY = 'preferences';
 const PROMPT_OVERRIDES_KEY = 'prompt_overrides';
 const SELECTED_MODE_KEY = 'selected_mode';
@@ -167,9 +170,7 @@ const AUDIO_FORMAT_MIME_MAP: Readonly<Record<string, string>> = Object.freeze({
 });
 
 export type ModePersistenceAction =
-  | { kind: 'put'; mode: string }
-  | { kind: 'delete' }
-  | { kind: 'none' };
+  { kind: 'put'; mode: string } | { kind: 'delete' } | { kind: 'none' };
 
 /**
  * Decide whether a classifier turn should persist or clear the user's selected
@@ -190,9 +191,7 @@ export function decideModePersistence(
 }
 
 export type LanguagePersistenceAction =
-  | { kind: 'put'; language: string }
-  | { kind: 'delete' }
-  | { kind: 'none' };
+  { kind: 'put'; language: string } | { kind: 'delete' } | { kind: 'none' };
 
 /**
  * Decide whether a classifier turn should persist or clear the user's selected
@@ -254,6 +253,72 @@ function logLanguagePersistenceChange(
   }
 }
 
+/**
+ * Fail-closed shape guard for the edge country before it becomes a metric
+ * label. `cf.country` is Cloudflare-controlled (ISO 3166 alpha-2 plus the
+ * `T1`/`XX` sentinels), and the worker always overwrites any client-supplied
+ * value — this is defense in depth so a malformed value can never open an
+ * unbounded label dimension.
+ */
+function isCountryCode(value: string | undefined): value is string {
+  return typeof value === 'string' && /^[A-Z0-9]{2}$/.test(value);
+}
+
+/**
+ * Resolve the bounded dimensions a `chat_turn` record reports.
+ *
+ * `userCountry` and `edgeCountry` are deliberately SEPARATE and neither falls
+ * back to the other: for gateway-relayed traffic the edge country is the
+ * gateway's egress location, so substituting it for user geography would
+ * misattribute every WhatsApp/Telegram user to wherever the gateway runs.
+ */
+function buildChatTurnDimensions(
+  body: ChatRequest,
+  defaultOrg: string
+): {
+  org: string;
+  chatType: string;
+  transport: ChatTransport | undefined;
+  userCountry: string | undefined;
+  edgeCountry: string | undefined;
+} {
+  return {
+    org: body.org ?? body.org_id ?? defaultOrg,
+    chatType: body.chat_type ?? 'private',
+    transport: body._transport,
+    userCountry: countryFromPhoneUserId(body.user_id, body.client_id),
+    edgeCountry: isCountryCode(body._edge_country) ? body._edge_country : undefined,
+  };
+}
+
+/**
+ * Reconstruct the exact `idFromName` key the worker used to route to this DO
+ * (mirrors `resolveDOId` in index.ts).
+ */
+function chatDoName(org: string, chatType: string, body: ChatRequest): string {
+  if (chatType !== 'group' && chatType !== 'supergroup') return `user:${org}:${body.user_id}`;
+  return body.thread_id
+    ? `group:${org}:${body.chat_id}:${body.thread_id}`
+    : `group:${org}:${body.chat_id}`;
+}
+
+/** Build the identity record a chat turn persists (see StoredIdentity). */
+function buildStoredIdentity(body: ChatRequest, defaultOrg: string): StoredIdentity {
+  const org = body.org ?? body.org_id ?? defaultOrg;
+  const chatType = body.chat_type ?? 'private';
+  const isGroup = chatType === 'group' || chatType === 'supergroup';
+  return {
+    do_name: chatDoName(org, chatType, body),
+    org,
+    chat_type: chatType,
+    ...(isGroup ? {} : { user_id: body.user_id }),
+    ...(body.chat_id ? { chat_id: body.chat_id } : {}),
+    ...(body.thread_id ? { thread_id: body.thread_id } : {}),
+    ...(body.client_id ? { client_id: body.client_id } : {}),
+    updated_at: Date.now(),
+  };
+}
+
 export class UserDO {
   private state: DurableObjectState;
   private env: Env;
@@ -283,6 +348,7 @@ export class UserDO {
     this.app.delete('/mode', () => this.handleDeleteMode());
     this.app.get('/memory', () => this.handleGetMemory());
     this.app.delete('/memory', () => this.handleDeleteMemory());
+    this.app.get('/identity', () => this.handleGetIdentity());
   }
 
   private getLogger(): RequestLogger {
@@ -489,6 +555,14 @@ export class UserDO {
     transport: ChatTransport,
     logger: RequestLogger
   ): Promise<Response> {
+    // Stamp the transport onto the body so queued entries retain it when the
+    // queue drains in a later invocation (chat_turn telemetry reads it there).
+    body._transport = transport;
+
+    // Persist identity BEFORE rate limiting or orchestration: the record must
+    // exist even for turns that fail downstream, or the DO stays unattributable.
+    await this.persistIdentity(body, logger);
+
     // Rate limiting
     const rateLimited = this.enforceEnqueueRateLimit(body, transport, logger);
     if (rateLimited) return rateLimited;
@@ -1216,6 +1290,78 @@ export class UserDO {
     });
   }
 
+  /**
+   * Persist this DO's identity under the `identity` storage key. The stored
+   * `do_name` is what makes a hex id from the REST object-listing API
+   * attributable to a user or group via the admin snapshot endpoint. Skips
+   * the write when nothing changed so steady-state turns cost a read, not a
+   * write.
+   */
+  private async persistIdentity(body: ChatRequest, logger: RequestLogger): Promise<void> {
+    try {
+      const identity = buildStoredIdentity(body, this.env.DEFAULT_ORG);
+      const existing = await this.state.storage.get<StoredIdentity>(IDENTITY_KEY);
+      if (
+        existing &&
+        existing.do_name === identity.do_name &&
+        existing.client_id === identity.client_id
+      ) {
+        return;
+      }
+      await this.state.storage.put(IDENTITY_KEY, identity);
+      logger.log('identity_persisted', {
+        do_name: identity.do_name,
+        org: identity.org,
+        chat_type: identity.chat_type,
+        client_id: body.client_id,
+      });
+    } catch (error) {
+      logger.warn('identity_persist_failed', {
+        error: error instanceof Error ? error.message : String(error),
+        user_id: body.user_id,
+      });
+      // Explicitly continue — identity is enumeration metadata; the chat turn
+      // itself must not fail because this bookkeeping write did.
+    }
+  }
+
+  /**
+   * Emit the per-turn language/geography telemetry: one `chat_turn` log record
+   * and one bounded-label counter per ADDRESSED chat turn (the ambient
+   * short-circuit path produces no response, so `response_language` would be
+   * meaningless there and it is deliberately excluded).
+   */
+  private logChatTurn(body: ChatRequest, responseLanguage: string, logger: RequestLogger): void {
+    try {
+      const dims = buildChatTurnDimensions(body, this.env.DEFAULT_ORG);
+      logger.log('chat_turn', {
+        user_id: body.user_id,
+        org: dims.org,
+        client_id: body.client_id,
+        transport: dims.transport ?? null,
+        chat_type: dims.chatType,
+        response_language: responseLanguage,
+        user_country: dims.userCountry ?? null,
+        edge_country: dims.edgeCountry ?? null,
+      });
+      countMetric('chat_turns_total', {
+        language: responseLanguage,
+        chat_type: dims.chatType,
+        ...(dims.transport ? { transport: dims.transport } : {}),
+        ...(dims.userCountry ? { user_country: dims.userCountry } : {}),
+        ...(dims.edgeCountry ? { edge_country: dims.edgeCountry } : {}),
+      });
+    } catch (error) {
+      logger.warn('chat_turn_telemetry_failed', {
+        error: error instanceof Error ? error.message : String(error),
+        user_id: body.user_id,
+      });
+      // Explicitly continue — this is observability for an ALREADY-COMPLETED
+      // turn (history is saved, the response is assembled). It must never
+      // convert a successful chat into a failed one.
+    }
+  }
+
   // ── Chat processing pipeline ──────────────────────────────────────────────────
 
   private async processChat(
@@ -1262,6 +1408,8 @@ export class UserDO {
     await this.tracedPhase(ctx, 'save_conversation', () =>
       this.saveConversation(triggerCtx.messageText, orchResult.responses, loaded.preferences, body._org_config ?? {}, { logger, audioKey, inboundVoiceKey: loaded.inboundVoiceKey, speaker: body.speaker, attachments: attachmentsContext.list() })
     );
+
+    this.logChatTurn(body, effectivePreferences.response_language, logger);
 
     // prettier-ignore
     return this.assembleChatResponse({ responses: orchResult.responses, audioKey, workerOrigin, attachmentsContext, effectivePreferences, logger, startTime: ctx.startTime });
@@ -2185,6 +2333,18 @@ export class UserDO {
       async () => {
         await this.state.storage.delete(HISTORY_KEY);
         return Response.json({ message: 'User history cleared' });
+      },
+      storageErrorResponse
+    );
+  }
+
+  private async handleGetIdentity(): Promise<Response> {
+    return withEndpointLogging(
+      this.getLogger(),
+      'get_identity',
+      async () => {
+        const identity = (await this.state.storage.get<StoredIdentity>(IDENTITY_KEY)) ?? null;
+        return Response.json({ identity });
       },
       storageErrorResponse
     );

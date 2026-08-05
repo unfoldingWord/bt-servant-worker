@@ -1,0 +1,116 @@
+/* eslint-disable max-lines-per-function -- table-driven assertions in one describe block */
+import { describe, it, expect } from 'vitest';
+import { countryFromPhoneUserId } from '../../src/utils/phone-country.js';
+
+/** WhatsApp is the canonical E.164 client; most cases below exercise it. */
+const WA = 'whatsapp';
+
+describe('countryFromPhoneUserId', () => {
+  it('maps real observed production user ids to their countries', () => {
+    // Sampled from the live user roster — the exact ids this must get right.
+    expect(countryFromPhoneUserId('559291836442', WA)).toBe('BR');
+    expect(countryFromPhoneUserId('6281319183761', WA)).toBe('ID');
+    expect(countryFromPhoneUserId('233542129377', WA)).toBe('GH');
+    expect(countryFromPhoneUserId('255767580503', WA)).toBe('TZ');
+    expect(countryFromPhoneUserId('85512763123', WA)).toBe('KH');
+    expect(countryFromPhoneUserId('917848079325', WA)).toBe('IN');
+    expect(countryFromPhoneUserId('60178234842', WA)).toBe('MY');
+    expect(countryFromPhoneUserId('421915338496', WA)).toBe('SK');
+    expect(countryFromPhoneUserId('447865333212', WA)).toBe('GB');
+  });
+
+  it('prefers the longest matching calling code', () => {
+    // 670 (Timor-Leste) must win over a naive '6' match, and 1876 (Jamaica)
+    // over bare '1'.
+    expect(countryFromPhoneUserId('67075146433', WA)).toBe('TL');
+    expect(countryFromPhoneUserId('18765551234', WA)).toBe('JM');
+    expect(countryFromPhoneUserId('21612345678', WA)).toBe('TN');
+    expect(countryFromPhoneUserId('211912345678', WA)).toBe('SS');
+  });
+
+  it('distinguishes Canada from the US inside the +1 NANP block', () => {
+    expect(countryFromPhoneUserId('16479141705', WA)).toBe('CA'); // 647 = Toronto
+    expect(countryFromPhoneUserId('14038675309', WA)).toBe('CA'); // 403 = Calgary
+    expect(countryFromPhoneUserId('12125551234', WA)).toBe('US'); // 212 = New York
+    expect(countryFromPhoneUserId('14782274867', WA)).toBe('US'); // 478 = Georgia
+  });
+
+  it('splits +7 between Kazakhstan and Russia', () => {
+    expect(countryFromPhoneUserId('77012345678', WA)).toBe('KZ');
+    expect(countryFromPhoneUserId('76012345678', WA)).toBe('KZ');
+    expect(countryFromPhoneUserId('79161234567', WA)).toBe('RU');
+  });
+
+  // ── The client gate ────────────────────────────────────────────────────────
+  // Regression guard: a numeric id is NOT evidence of a phone number. The
+  // Telegram gateway sends String(from.id) — a numeric ACCOUNT id — so
+  // inference must be gated on the client's identifier contract, not on shape.
+
+  it('does NOT infer a country from a numeric Telegram account id', () => {
+    // Real production Telegram id. Ungated it parses as calling code 56 = Chile.
+    expect(countryFromPhoneUserId('5671505928', 'telegram-gateway')).toBeUndefined();
+    // The reviewer's examples: would otherwise read as US and Indonesia.
+    expect(countryFromPhoneUserId('1234567890', 'telegram-gateway')).toBeUndefined();
+    expect(countryFromPhoneUserId('6281319183', 'telegram-gateway')).toBeUndefined();
+  });
+
+  it('infers only for clients whose user_id contract is E.164', () => {
+    expect(countryFromPhoneUserId('559291836442', 'whatsapp')).toBe('BR');
+    expect(countryFromPhoneUserId('559291836442', 'signal-gateway')).toBe('BR');
+    // Same digits, non-E.164 clients — must stay undefined.
+    for (const client of ['telegram-gateway', 'web', 'shema', 'admin-portal', 'matrix']) {
+      expect(countryFromPhoneUserId('559291836442', client)).toBeUndefined();
+    }
+  });
+
+  it('fails closed for an unknown or missing client_id', () => {
+    expect(countryFromPhoneUserId('559291836442', undefined)).toBeUndefined();
+    expect(countryFromPhoneUserId('559291836442', '')).toBeUndefined();
+    expect(countryFromPhoneUserId('559291836442', 'some-future-gateway')).toBeUndefined();
+  });
+
+  it('rejects Signal UUID-shaped ids while accepting its E.164 fallback', () => {
+    // Signal prefers sourceUuid; the dashes make it self-reject.
+    expect(
+      countryFromPhoneUserId('8a1b2c3d-4e5f-6789-abcd-ef0123456789', 'signal-gateway')
+    ).toBeUndefined();
+    expect(countryFromPhoneUserId('+14155551234', 'signal-gateway')).toBe('US');
+  });
+
+  it('tolerates a leading + but rejects other formatting', () => {
+    expect(countryFromPhoneUserId('+559291836442', WA)).toBe('BR');
+    // Spaces/dashes are not an id format this system produces; refuse to guess.
+    expect(countryFromPhoneUserId('+55 92 9183 6442', WA)).toBeUndefined();
+  });
+
+  it('returns undefined for non-phone identities rather than guessing', () => {
+    expect(countryFromPhoneUserId('addie.cooper@unfoldingword.org', WA)).toBeUndefined();
+    expect(countryFromPhoneUserId('web-user-abc123', WA)).toBeUndefined();
+    expect(countryFromPhoneUserId('', WA)).toBeUndefined();
+    expect(countryFromPhoneUserId(undefined, WA)).toBeUndefined();
+  });
+
+  it('rejects ids outside E.164 length bounds', () => {
+    expect(countryFromPhoneUserId('123456', WA)).toBeUndefined(); // too short
+    expect(countryFromPhoneUserId('1234567890123456', WA)).toBeUndefined(); // too long
+  });
+
+  it('returns undefined for unassigned calling codes', () => {
+    expect(countryFromPhoneUserId('99912345678', WA)).toBeUndefined();
+  });
+
+  it('never throws for arbitrary input', () => {
+    const inputs = ['', '+', '++', 'null', '\u0000', '9'.repeat(50), '😀😀😀😀😀😀😀'];
+    for (const input of inputs) {
+      expect(() => countryFromPhoneUserId(input, WA)).not.toThrow();
+      expect(() => countryFromPhoneUserId(input, 'telegram-gateway')).not.toThrow();
+    }
+  });
+
+  it('only ever returns two-letter uppercase codes (bounded label set)', () => {
+    const samples = ['559291836442', '16479141705', '6281319183761', '77012345678'];
+    for (const s of samples) {
+      expect(countryFromPhoneUserId(s, WA)).toMatch(/^[A-Z]{2}$/);
+    }
+  });
+});

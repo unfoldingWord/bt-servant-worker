@@ -544,8 +544,7 @@ interface AnthropicAttemptFailure {
 }
 
 type AnthropicAttemptOutcome =
-  | { ok: true; result: AnthropicFetchResult }
-  | ({ ok: false } & AnthropicAttemptFailure);
+  { ok: true; result: AnthropicFetchResult } | ({ ok: false } & AnthropicAttemptFailure);
 
 /** Perform a single Anthropic fetch attempt with its own hang-guard signal. */
 async function attemptAnthropicFetch(

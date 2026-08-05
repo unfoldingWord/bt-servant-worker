@@ -10,6 +10,7 @@ import { Env } from './config/types.js';
 import { APP_VERSION } from './generated/version.js';
 import { UserDO as UserDOClass } from './durable-objects/index.js';
 import { discoverAllTools, listOrgResources } from './services/mcp/index.js';
+import { readDoSnapshot } from './services/admin/do-snapshot.js';
 import { MCPServerConfig } from './services/mcp/types.js';
 import { ChatRequest, ChatTransport, ChatType } from './types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig, validateOrgConfig } from './types/org-config.js';
@@ -1168,6 +1169,68 @@ app.delete('/api/v1/admin/orgs/:org/users/:userId/history', async (c) => {
   return handleUserRequest(c.req.raw, c.env, org, userId, '/history');
 });
 
+// Admin endpoint: open a DO directly by the 64-hex object id the Cloudflare
+// REST API's namespace object listing returns, and report its stored identity
+// plus chat history. This is the only path into a DO whose
+// `user:{org}:{user_id}` name is unknown — listing ids are one-way and
+// `idFromName` is not reversible — which is what makes the DO population
+// retroactively enumerable. Reaches the DO's own /identity and /history
+// handlers; identity is null for DOs that predate identity persistence and
+// have not chatted since. Super-admin only: the path sits outside
+// /api/v1/admin/orgs/*, so the global /api/* middleware (ENGINE_API_KEY)
+// is the sole gate.
+app.get('/api/v1/admin/do/:hexId/snapshot', async (c) => {
+  const hexId = c.req.param('hexId');
+  const logger = createRequestLogger(crypto.randomUUID());
+  if (!/^[0-9a-f]{64}$/.test(hexId)) {
+    logger.warn('admin_do_snapshot_rejected', {
+      reason: 'malformed_hex_id',
+      hex_length: hexId.length,
+    });
+    return c.json({ error: 'hexId must be a 64-character lowercase hex Durable Object id' }, 400);
+  }
+  try {
+    const stub = c.env.USER_DO.get(c.env.USER_DO.idFromString(hexId));
+    const limit = c.req.query('limit') ?? '100';
+    const [identityRes, historyRes] = await Promise.all([
+      stub.fetch('http://do/identity'),
+      stub.fetch(`http://do/history?limit=${encodeURIComponent(limit)}`),
+    ]);
+
+    // A non-2xx from either subrequest must NOT be decoded as a result — see
+    // readDoSnapshot for why an incomplete snapshot must never look complete.
+    const snapshot = await readDoSnapshot(identityRes, historyRes);
+    if (!snapshot.ok) {
+      logger.error('admin_action', new Error('do_snapshot_subrequest_failed'), {
+        action: 'do_snapshot',
+        do_id: hexId,
+        identity_status: snapshot.identityStatus,
+        history_status: snapshot.historyStatus,
+      });
+      return c.json(
+        {
+          error: 'Durable Object snapshot incomplete',
+          identity_status: snapshot.identityStatus,
+          history_status: snapshot.historyStatus,
+        },
+        502
+      );
+    }
+
+    const { identity, history } = snapshot;
+    logger.log('admin_action', {
+      action: 'do_snapshot',
+      do_id: hexId,
+      has_identity: !!identity,
+      history_count: history.entries?.length ?? 0,
+    });
+    return c.json({ do_id: hexId, identity, history });
+  } catch (error) {
+    logger.error('admin_action', error, { action: 'do_snapshot', do_id: hexId });
+    return c.json({ error: 'Failed to snapshot Durable Object' }, 500);
+  }
+});
+
 // ── Group/thread admin helpers ──────────────────────────────────────────────────
 
 /** Handle a group admin request with chatId validation. */
@@ -1781,6 +1844,11 @@ async function buildDOChatRequest(
       _org_prompt_overrides: promptOverrides,
       _org_modes: orgModes,
       _org_languages: orgLanguages,
+      // Edge country of the ORIGINAL request — the DO cannot see request.cf
+      // across the stub boundary, so it rides in the body. This key is set
+      // AFTER the spread, so a client-supplied `_edge_country` in the inbound
+      // body is always overwritten and can never reach telemetry.
+      _edge_country: (request.cf as { country?: string } | undefined)?.country,
     }),
   });
 

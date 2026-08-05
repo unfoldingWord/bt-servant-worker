@@ -44,10 +44,7 @@ export class UsfmSourceError extends Error {
   constructor(
     message: string,
     public readonly cause:
-      | 'unsupported_translation'
-      | 'unknown_book'
-      | 'fetch_failed'
-      | 'r2_upload_failed'
+      'unsupported_translation' | 'unknown_book' | 'fetch_failed' | 'r2_upload_failed'
   ) {
     super(message);
     this.name = 'UsfmSourceError';

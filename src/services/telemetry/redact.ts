@@ -59,6 +59,8 @@ const SAFE_STRING_ATTRIBUTE_KEYS = new Set<string>([
   'source_language',
   'target_language',
   'response_language',
+  'user_country',
+  'edge_country',
   'book',
   'chapter',
   'verse',

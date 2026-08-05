@@ -89,6 +89,45 @@ export interface ChatRequest {
 
   /** Internal: Org languages injected by worker from KV (not from client) */
   _org_languages?: OrgLanguages;
+
+  /**
+   * Internal: ISO 3166-1 country where the request ENTERED Cloudflare's edge
+   * (`request.cf.country`), injected by the worker (not from client).
+   *
+   * This is NOT user geography for gateway-relayed traffic (WhatsApp/Telegram/
+   * Signal) — it is the gateway's egress location. It is only meaningful as
+   * user location for clients that connect directly (web). End-user country
+   * for phone-based platforms comes from `countryFromPhoneUserId`. Named
+   * `_edge_country` so no consumer mistakes it for the user's country.
+   */
+  _edge_country?: string;
+
+  /**
+   * Internal: transport this request arrived on, stamped by the DO's chat
+   * dispatcher so queued entries retain it when drained later (not from
+   * client).
+   */
+  _transport?: ChatTransport;
+}
+
+/**
+ * Identity persisted by the DO on each chat turn under the `identity` storage
+ * key. Exists to make the DO population enumerable: the Cloudflare REST API
+ * lists namespace objects as one-way 64-hex ids, and `idFromName` is not
+ * reversible, so without this record a DO reached via `idFromString` cannot
+ * be attributed to a user or group. `do_name` mirrors the exact key passed to
+ * `idFromName` (`user:{org}:{user_id}` or `group:{org}:{chat_id}[:{thread_id}]`).
+ */
+export interface StoredIdentity {
+  do_name: string;
+  org: string;
+  chat_type: string;
+  /** Present for private chats only; group DOs are shared across senders. */
+  user_id?: string;
+  chat_id?: string;
+  thread_id?: string;
+  client_id?: string;
+  updated_at: number;
 }
 
 /**
@@ -244,12 +283,7 @@ export interface UpdatePreferencesRequest {
  * SSE event types for streaming endpoint
  */
 export type SSEEventType =
-  | 'status'
-  | 'progress'
-  | 'complete'
-  | 'error'
-  | 'tool_use'
-  | 'tool_result';
+  'status' | 'progress' | 'complete' | 'error' | 'tool_use' | 'tool_result';
 
 export interface SSEStatusEvent {
   type: 'status';
