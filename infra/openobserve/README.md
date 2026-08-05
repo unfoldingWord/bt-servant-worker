@@ -8,7 +8,7 @@ dashboards, alerting). Operated and queried only by us — governance stays in o
 | Instance   | fly app                       | config          | stream storage            | retention fallback |
 | ---------- | ----------------------------- | --------------- | ------------------------- | ------------------ |
 | Staging    | `bt-servant-openobserve`      | `fly.toml`      | local volume              | 7 days             |
-| Production | `bt-servant-openobserve-prod` | `fly.prod.toml` | Cloudflare R2 (`ZO_S3_*`) | 395 days           |
+| Production | `bt-servant-openobserve-prod` | `fly.prod.toml` | Cloudflare R2 (`ZO_S3_*`) | 1825 days (5 yrs)  |
 
 That last column is what a stream gets when it has **no** retention setting of its own — it
 is not a cap on the ones that do. See [Retention](#retention). Both instances keep a durable
@@ -140,25 +140,47 @@ That distinction is the whole game here, because it means:
   by itself fix the existing streams.
 - The env var governs only streams with no setting of their own — in practice, new ones.
 
-So every tier has to be set **on the stream** and then read back:
+**Production runs one tier, via the fallback** (decided 2026-08-05):
 
-| Stream    | Target   | Set where                                          |
-| --------- | -------- | -------------------------------------------------- |
-| `traces`  | 14 days  | per-stream, in the UI — the env var will not do it |
-| `logs`    | 30 days  | per-stream, in the UI — the env var will not do it |
-| `metrics` | 395 days | per-stream, in the UI (matches the env fallback)   |
+| Instance     | Streams                   | Retention               | How                                |
+| ------------ | ------------------------- | ----------------------- | ---------------------------------- |
+| `production` | all, incl. new ones       | **1825 days (5 years)** | `[env]` fallback; no stream is set |
+| `staging`    | `traces`,`logs`,`metrics` | 3650 days (unchanged)   | per-stream values set before B2    |
 
-The env fallback is set to the longest of the three so that a stream nobody has configured
-yet errs toward over-retaining cheap data rather than deleting it. That is a default for the
-unconfigured case — it is **not** enforcement of a maximum, and nothing in the config
-prevents a stream from being set to ten years. Verify, don't assume:
+The earlier three-tier plan (traces 14d / logs 30d / metrics 395d) was dropped because
+**`metrics` is not one stream**: OpenObserve splits every OTel metric into its own stream and
+fans each histogram into `_bucket/_count/_max/_min/_sum` — **46 metric streams on bring-up
+day**, and a new one every time a metric is added. Per-stream retention would have to be
+re-applied forever, while the fallback covers new streams automatically. At measured volume
+(~0.51 KB/span compressed) five years is single-digit GB, so cost was not the deciding factor.
+
+> **Editing the fallback is destructive.** Since no production stream carries its own value,
+> this variable is evaluated live by the compactor rather than stamped at write time.
+> Lowering it retroactively deletes everything older than the new value, across every
+> stream, on the next compaction — silently, with no alert and no archive.
+
+Nothing in the config prevents a stream from being set to ten years, which is how staging
+ended up there. Verify, don't assume:
 
 ```bash
 # Read back what each stream is ACTUALLY set to — the only proof that matters.
+#
+# v0.91.0 serializes an UNSET data_retention as 0, not null, so `// "fallback"` never
+# fires — jq's `//` only substitutes on null/false. Test `> 0` instead, which is also
+# exactly how the compactor decides (it uses the stream's own value only when > 0).
 curl -s -u "$O2_USER:$O2_PASS" \
   "https://<instance>.fly.dev/api/default/streams" \
-  | jq -r '.list[] | "\(.name)\t\(.stream_type)\tretention=\(.settings.data_retention // "unset -> env fallback")"'
+  | jq -r '.list[]
+      | "\(.name)\t\(.stream_type)\t"
+        + (if (.settings.data_retention // 0) > 0
+           then "retention=\(.settings.data_retention)d (explicit, overrides the env fallback)"
+           else "retention=unset -> env fallback" end)'
 ```
+
+Expected on **production** today: every stream prints `unset -> env fallback`, i.e. all of
+them follow `ZO_COMPACT_DATA_RETENTION_DAYS`. Any stream printing `explicit` has escaped the
+single-tier policy and no longer tracks that variable. On **staging**, all three print
+`retention=3650d (explicit)`.
 
 ## Notes
 
