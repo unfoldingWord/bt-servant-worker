@@ -54,17 +54,29 @@ primary_region = "iad"
   # how the staging instance stayed at ten years.
   #
   # Consequence: this value governs only streams with NO explicit setting, i.e. new ones.
-  # The three tiers we actually want must each be set ON THE STREAM and then verified:
   #
-  #     traces   14 days   ← must be set per-stream; this line will not impose it
-  #     logs     30 days   ← must be set per-stream; this line will not impose it
-  #     metrics  395 days  (bounded-label, so tiny)
+  # DECIDED 2026-08-05, at the end of the production bring-up: production runs a SINGLE
+  # retention tier and every stream stays unset, so this line governs all of them. The
+  # earlier plan of three per-stream tiers (traces 14d / logs 30d / metrics 395d) was
+  # dropped for two reasons found while walking docs/telemetry_rollout_soe.md:
   #
-  # It is set to the longest of the three so that a stream nobody has configured yet errs
-  # toward over-retaining cheap data rather than deleting it — but that is a default for
-  # the unconfigured case, NOT enforcement of a maximum. production-otel.md B3 sets and
-  # verifies all three explicitly.
-  ZO_COMPACT_DATA_RETENTION_DAYS = "395"
+  #   1. "metrics" is not one stream. OpenObserve splits every OTel metric into its own
+  #      stream and fans each histogram out into _bucket/_count/_max/_min/_sum — ~28
+  #      streams on day one, growing whenever a new metric is added. Setting retention
+  #      per-stream means re-doing it forever; the fallback covers new streams for free.
+  #   2. At observed volume the whole thing is pennies. 168 spans measured 0.086 MB
+  #      compressed (~0.51 KB/span); at ~5-10k spans/day, five years lands around
+  #      4.6-9.4 GB, i.e. well under $0.15/month of R2. Retention here is a data-policy
+  #      and query-performance question, not a cost one.
+  #
+  # THE TRADE-OFF THIS ACCEPTS: because no stream carries its own value, this variable is
+  # live rather than stamped at write time. Lowering it does not just change future
+  # behaviour — the next compaction RETROACTIVELY deletes everything older than the new
+  # value, across every stream, with no alert. Treat edits to this line as destructive.
+  #
+  # 1825 days = 5 years. Data only accumulates from 2026-08-05 forward; retention is a
+  # ceiling, not a time machine.
+  ZO_COMPACT_DATA_RETENTION_DAYS = "1825"
 
 [http_service]
   internal_port = 5080           # OpenObserve HTTP + UI; fly terminates TLS on 443.

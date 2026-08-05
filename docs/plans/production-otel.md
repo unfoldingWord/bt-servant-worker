@@ -236,11 +236,11 @@ same reviewed diff, shipped through the same workflow — then a second PR rever
 - Retention: `ZO_COMPACT_DATA_RETENTION_DAYS` is a **fallback, not a ceiling.** The compactor
   prefers a stream's own `stream_settings.data_retention` whenever it is > 0 and only falls
   back to the env value — it does **not** take the minimum. So the env var governs only
-  streams with no setting of their own, and **all three tiers must be set per-stream and read
-  back** (traces 14d, logs 30d, metrics 395d). The env value is the longest of the three so
-  an unconfigured new stream errs toward over-retaining cheap data rather than deleting it.
-  This also means staging's new `= "7"` does **not** fix its existing 3650-day streams — they
-  need the same explicit per-stream treatment.
+  streams with no setting of their own. **Superseded 2026-08-05:** the three-tier plan
+  (traces 14d / logs 30d / metrics 395d) was dropped during bring-up — `metrics` turned out
+  to be ~28 streams, not one, so production now runs a single **1825-day (5-year)** fallback
+  with no stream carrying its own value. This also means staging's `= "7"` does **not** fix
+  its existing 3650-day streams; they were deliberately left alone.
 
 Because each collector app now carries environment-specific `[env]`, the prod deploy uses a
 real `fly.prod.toml` rather than an `--app` override — an override cannot carry `[env]`.
@@ -373,19 +373,29 @@ Ordered, because each step proves the previous one.
    The env fallback does **not** do this for you: the compactor prefers a stream's own
    `stream_settings.data_retention` whenever it is > 0 and never takes the minimum.
 
-   | Instance | Stream                      | Set to |
-   | -------- | --------------------------- | ------ |
-   | prod     | `traces`                    | 14d    |
-   | prod     | `logs`                      | 30d    |
-   | prod     | `metrics`                   | 395d   |
-   | staging  | `traces`, `logs`, `metrics` | 7d     |
+   **SUPERSEDED 2026-08-05 — this step was closed by decision, not executed.** What was
+   actually found and chosen while walking `docs/telemetry_rollout_soe.md`:
 
-   **Staging is not optional here.** Its streams report **3650** today and will keep doing so
-   forever — B2's new `ZO_COMPACT_DATA_RETENTION_DAYS = "7"` cannot touch a stream that
-   already carries a value. Setting the env var was only half the fix; this is the other half.
+   | Instance | Streams                     | Outcome                                      |
+   | -------- | --------------------------- | -------------------------------------------- |
+   | prod     | all (~30, incl. new ones)   | **1825d (5 years)** via the `[env]` fallback |
+   | staging  | `traces`, `logs`, `metrics` | left at 3650d, deliberately                  |
 
-   Then read every stream back (the `curl … /api/default/streams | jq` snippet in
-   `infra/openobserve/README.md` → Retention). Anything still showing 3650 did not take.
+   Two findings killed the three-tier plan. **`metrics` is not one stream** — OpenObserve
+   splits every OTel metric into its own stream and fans each histogram into
+   `_bucket/_count/_max/_min/_sum`, so day one had ~28 metric streams and a new one appears
+   with every new metric; per-stream retention would need re-applying forever, whereas the
+   fallback covers new streams for free. And **volume made it moot**: 168 spans measured
+   0.086 MB compressed (~0.51 KB/span), so five years is single-digit GB and well under
+   $0.15/month of R2.
+
+   **The trade-off accepted:** with no stream carrying its own value, the env var is live
+   rather than write-time. Lowering it retroactively deletes everything older than the new
+   value on the next compaction — silently, across every stream. Edits to that line are
+   destructive.
+
+   The read-back snippet in `infra/openobserve/README.md` → Retention is still the way to
+   verify; `unset -> env fallback` is now the expected result for every production stream.
 
 **Credentials for B3** (see B1's carry-forward notes above for why):
 

@@ -126,7 +126,12 @@ Nothing in this SOE modifies them, which is exactly why a snapshot is cheap insu
 ### 1.4 Confirm the pseudonym salt exists on prod
 
 ```bash
-wrangler secret list --env production   # expect TELEMETRY_USER_ID_SALT present
+# NOTE: there is no [env.production] section — production IS the top-level config
+# (only `staging` is a named environment). Use --env="" or omit the flag entirely.
+# You also need CLOUDFLARE_ACCOUNT_ID, or wrangler silently targets whichever account
+# your ambient environment points at.
+CLOUDFLARE_ACCOUNT_ID=<unfoldingWord account id> \
+  npx wrangler secret list --env=""    # expect TELEMETRY_USER_ID_SALT present
 ```
 
 Without it, A1 **fails closed**: no `user_hash` egresses at all.
@@ -159,8 +164,13 @@ gh run watch <run-id> -R unfoldingWord/bt-servant-worker --exit-status
 ### 2.3 Verify the version flipped
 
 ```bash
-curl -s https://bt-servant-worker.unfoldingword.workers.dev/health   # expect 2.37.0
+curl -s "https://bt-servant-worker.unfoldingword.workers.dev/health?cb=$(date +%s)"
 ```
+
+> **Cache-bust it.** For a minute or two after deploy, `/health` on `workers.dev` can serve
+> the **previous** version from the edge while the custom domain already reports the new one.
+> Reading that as a failed deploy would send you into a rollback you do not need. Confirm
+> with a cache-busting query param, or by agreeing readings across both hostnames.
 
 **Telemetry is still OFF at this point** — `isTelemetryEnabled()` requires both OTLP secrets
 and prod has neither. This phase is a pure code change, judgeable on its own.
@@ -265,20 +275,32 @@ immediately**, this is a privacy regression rather than a cosmetic bug.
 Last, because streams must exist before they can be configured — production's are created by
 first ingest.
 
-| Instance    | Stream                      | Set to |
-| ----------- | --------------------------- | ------ |
-| production  | `traces`                    | 14d    |
-| production  | `logs`                      | 30d    |
-| production  | `metrics`                   | 395d   |
-| **staging** | `traces`, `logs`, `metrics` | **7d** |
+**CLOSED BY DECISION 2026-08-05 — no per-stream retention was set.**
 
-**Staging is not optional and does not depend on any other phase.** Its streams report 3650
-days today and always will: `ZO_COMPACT_DATA_RETENTION_DAYS` is a **fallback, not a ceiling** —
-the compactor prefers a stream's own `stream_settings.data_retention` whenever it is > 0 and
-never takes the minimum.
+| Instance    | Streams                     | Outcome                                      |
+| ----------- | --------------------------- | -------------------------------------------- |
+| production  | all (~30, incl. new ones)   | **1825d (5 years)** via the `[env]` fallback |
+| **staging** | `traces`, `logs`, `metrics` | left at 3650d, deliberately                  |
 
-Read every stream back afterwards (`infra/openobserve/README.md` → Retention). Anything still
-showing 3650 did not take.
+The original three-tier plan (traces 14d / logs 30d / metrics 395d) did not survive contact
+with the instance:
+
+- **`metrics` is not one stream.** OpenObserve splits every OTel metric into its own stream
+  and fans each histogram into `_bucket/_count/_max/_min/_sum` — ~28 metric streams on day
+  one, plus a new one for every metric added later. Per-stream retention would need
+  re-applying forever; the `[env]` fallback covers new streams automatically.
+- **Volume made the tiering pointless.** 168 spans measured 0.086 MB compressed
+  (~0.51 KB/span). At ~5–10k spans/day, five years is roughly 4.6–9.4 GB — under
+  $0.15/month of R2. Retention here is a data-policy and query-performance question, not a
+  cost one.
+
+> **Editing `ZO_COMPACT_DATA_RETENTION_DAYS` is destructive.** No production stream carries
+> its own value, so the compactor evaluates that variable live rather than at write time.
+> Lowering it retroactively deletes everything older than the new value, across every stream,
+> on the next compaction — silently, with no alert and no archive.
+
+The read-back snippet in `infra/openobserve/README.md` → Retention still applies;
+`unset -> env fallback` is the expected result for every production stream.
 
 ---
 
