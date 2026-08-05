@@ -69,6 +69,7 @@ import {
 import { AttachmentsContext, createAttachmentsContext } from '../services/ptxprint/index.js';
 import { AppError, AudioTranscriptionError, ValidationError } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
+import { countryFromPhoneUserId } from '../utils/phone-country.js';
 import { applyTemplateVariables } from '../utils/template.js';
 import { createTimingContext, timePhase, TimingContext } from '../utils/timing.js';
 import {
@@ -169,9 +170,7 @@ const AUDIO_FORMAT_MIME_MAP: Readonly<Record<string, string>> = Object.freeze({
 });
 
 export type ModePersistenceAction =
-  | { kind: 'put'; mode: string }
-  | { kind: 'delete' }
-  | { kind: 'none' };
+  { kind: 'put'; mode: string } | { kind: 'delete' } | { kind: 'none' };
 
 /**
  * Decide whether a classifier turn should persist or clear the user's selected
@@ -192,9 +191,7 @@ export function decideModePersistence(
 }
 
 export type LanguagePersistenceAction =
-  | { kind: 'put'; language: string }
-  | { kind: 'delete' }
-  | { kind: 'none' };
+  { kind: 'put'; language: string } | { kind: 'delete' } | { kind: 'none' };
 
 /**
  * Decide whether a classifier turn should persist or clear the user's selected
@@ -254,6 +251,44 @@ function logLanguagePersistenceChange(
       source: 'trigger',
     });
   }
+}
+
+/**
+ * Fail-closed shape guard for the edge country before it becomes a metric
+ * label. `cf.country` is Cloudflare-controlled (ISO 3166 alpha-2 plus the
+ * `T1`/`XX` sentinels), and the worker always overwrites any client-supplied
+ * value — this is defense in depth so a malformed value can never open an
+ * unbounded label dimension.
+ */
+function isCountryCode(value: string | undefined): value is string {
+  return typeof value === 'string' && /^[A-Z0-9]{2}$/.test(value);
+}
+
+/**
+ * Resolve the bounded dimensions a `chat_turn` record reports.
+ *
+ * `userCountry` and `edgeCountry` are deliberately SEPARATE and neither falls
+ * back to the other: for gateway-relayed traffic the edge country is the
+ * gateway's egress location, so substituting it for user geography would
+ * misattribute every WhatsApp/Telegram user to wherever the gateway runs.
+ */
+function buildChatTurnDimensions(
+  body: ChatRequest,
+  defaultOrg: string
+): {
+  org: string;
+  chatType: string;
+  transport: ChatTransport | undefined;
+  userCountry: string | undefined;
+  edgeCountry: string | undefined;
+} {
+  return {
+    org: body.org ?? body.org_id ?? defaultOrg,
+    chatType: body.chat_type ?? 'private',
+    transport: body._transport,
+    userCountry: countryFromPhoneUserId(body.user_id),
+    edgeCountry: isCountryCode(body._edge_country) ? body._edge_country : undefined,
+  };
 }
 
 /**
@@ -1297,22 +1332,34 @@ export class UserDO {
    * meaningless there and it is deliberately excluded).
    */
   private logChatTurn(body: ChatRequest, responseLanguage: string, logger: RequestLogger): void {
-    const chatType = body.chat_type ?? 'private';
-    logger.log('chat_turn', {
-      user_id: body.user_id,
-      org: body.org ?? body.org_id ?? this.env.DEFAULT_ORG,
-      client_id: body.client_id,
-      transport: body._transport ?? null,
-      chat_type: chatType,
-      response_language: responseLanguage,
-      country: body._request_country ?? null,
-    });
-    countMetric('chat_turns_total', {
-      language: responseLanguage,
-      chat_type: chatType,
-      ...(body._transport ? { transport: body._transport } : {}),
-      ...(body._request_country ? { country: body._request_country } : {}),
-    });
+    try {
+      const dims = buildChatTurnDimensions(body, this.env.DEFAULT_ORG);
+      logger.log('chat_turn', {
+        user_id: body.user_id,
+        org: dims.org,
+        client_id: body.client_id,
+        transport: dims.transport ?? null,
+        chat_type: dims.chatType,
+        response_language: responseLanguage,
+        user_country: dims.userCountry ?? null,
+        edge_country: dims.edgeCountry ?? null,
+      });
+      countMetric('chat_turns_total', {
+        language: responseLanguage,
+        chat_type: dims.chatType,
+        ...(dims.transport ? { transport: dims.transport } : {}),
+        ...(dims.userCountry ? { user_country: dims.userCountry } : {}),
+        ...(dims.edgeCountry ? { edge_country: dims.edgeCountry } : {}),
+      });
+    } catch (error) {
+      logger.warn('chat_turn_telemetry_failed', {
+        error: error instanceof Error ? error.message : String(error),
+        user_id: body.user_id,
+      });
+      // Explicitly continue — this is observability for an ALREADY-COMPLETED
+      // turn (history is saved, the response is assembled). It must never
+      // convert a successful chat into a failed one.
+    }
   }
 
   // ── Chat processing pipeline ──────────────────────────────────────────────────

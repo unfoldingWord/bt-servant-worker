@@ -91,13 +91,16 @@ export interface ChatRequest {
   _org_languages?: OrgLanguages;
 
   /**
-   * Internal: ISO 3166-1 country of the originating request's Cloudflare edge
-   * entry (`request.cf.country`), injected by the worker (not from client).
-   * For gateway-relayed clients this is the gateway's location, not the
-   * user's — the user-level truth lives in phone-prefix analysis. Carried so
-   * the DO's per-turn telemetry can record it without a second cf lookup.
+   * Internal: ISO 3166-1 country where the request ENTERED Cloudflare's edge
+   * (`request.cf.country`), injected by the worker (not from client).
+   *
+   * This is NOT user geography for gateway-relayed traffic (WhatsApp/Telegram/
+   * Signal) — it is the gateway's egress location. It is only meaningful as
+   * user location for clients that connect directly (web). End-user country
+   * for phone-based platforms comes from `countryFromPhoneUserId`. Named
+   * `_edge_country` so no consumer mistakes it for the user's country.
    */
-  _request_country?: string;
+  _edge_country?: string;
 
   /**
    * Internal: transport this request arrived on, stamped by the DO's chat
@@ -280,12 +283,7 @@ export interface UpdatePreferencesRequest {
  * SSE event types for streaming endpoint
  */
 export type SSEEventType =
-  | 'status'
-  | 'progress'
-  | 'complete'
-  | 'error'
-  | 'tool_use'
-  | 'tool_result';
+  'status' | 'progress' | 'complete' | 'error' | 'tool_use' | 'tool_result';
 
 export interface SSEStatusEvent {
   type: 'status';

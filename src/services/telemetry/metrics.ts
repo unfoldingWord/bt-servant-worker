@@ -91,7 +91,8 @@ export const ALLOWED_LABEL_KEYS = new Set<string>([
   'language',
   'source_language',
   'target_language',
-  'country',
+  'user_country',
+  'edge_country',
   'model',
   'server',
   'tool',
@@ -144,8 +145,17 @@ export interface MetricLabels {
   language?: string;
   source_language?: string;
   target_language?: string;
-  /** ISO 3166-1 alpha-2 from `request.cf.country` — bounded by the country-code set. */
-  country?: string;
+  /**
+   * End-user country derived from the platform-verified phone number
+   * (`countryFromPhoneUserId`) — bounded by that module's static table.
+   */
+  user_country?: string;
+  /**
+   * Country where the request entered Cloudflare's edge (`request.cf.country`).
+   * Gateway egress location for relayed traffic, NOT user geography — see
+   * `user_country`. Bounded by the ISO 3166 alpha-2 set.
+   */
+  edge_country?: string;
   model?: string;
   server?: string;
   tool?: string;

@@ -10,14 +10,9 @@ import { Env } from './config/types.js';
 import { APP_VERSION } from './generated/version.js';
 import { UserDO as UserDOClass } from './durable-objects/index.js';
 import { discoverAllTools, listOrgResources } from './services/mcp/index.js';
+import { readDoSnapshot } from './services/admin/do-snapshot.js';
 import { MCPServerConfig } from './services/mcp/types.js';
-import {
-  ChatHistoryResponse,
-  ChatRequest,
-  ChatTransport,
-  ChatType,
-  StoredIdentity,
-} from './types/engine.js';
+import { ChatRequest, ChatTransport, ChatType } from './types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig, validateOrgConfig } from './types/org-config.js';
 import {
   checkModeSlugUniqueness,
@@ -1201,8 +1196,28 @@ app.get('/api/v1/admin/do/:hexId/snapshot', async (c) => {
       stub.fetch('http://do/identity'),
       stub.fetch(`http://do/history?limit=${encodeURIComponent(limit)}`),
     ]);
-    const { identity } = (await identityRes.json()) as { identity: StoredIdentity | null };
-    const history = (await historyRes.json()) as ChatHistoryResponse;
+
+    // A non-2xx from either subrequest must NOT be decoded as a result — see
+    // readDoSnapshot for why an incomplete snapshot must never look complete.
+    const snapshot = await readDoSnapshot(identityRes, historyRes);
+    if (!snapshot.ok) {
+      logger.error('admin_action', new Error('do_snapshot_subrequest_failed'), {
+        action: 'do_snapshot',
+        do_id: hexId,
+        identity_status: snapshot.identityStatus,
+        history_status: snapshot.historyStatus,
+      });
+      return c.json(
+        {
+          error: 'Durable Object snapshot incomplete',
+          identity_status: snapshot.identityStatus,
+          history_status: snapshot.historyStatus,
+        },
+        502
+      );
+    }
+
+    const { identity, history } = snapshot;
     logger.log('admin_action', {
       action: 'do_snapshot',
       do_id: hexId,
@@ -1829,10 +1844,11 @@ async function buildDOChatRequest(
       _org_prompt_overrides: promptOverrides,
       _org_modes: orgModes,
       _org_languages: orgLanguages,
-      // Edge country of the ORIGINAL request (gateway location for relayed
-      // clients, user location for direct web clients) — the DO cannot see
-      // request.cf across the stub boundary, so it rides in the body.
-      _request_country: (request.cf as { country?: string } | undefined)?.country,
+      // Edge country of the ORIGINAL request — the DO cannot see request.cf
+      // across the stub boundary, so it rides in the body. This key is set
+      // AFTER the spread, so a client-supplied `_edge_country` in the inbound
+      // body is always overwritten and can never reach telemetry.
+      _edge_country: (request.cf as { country?: string } | undefined)?.country,
     }),
   });
 
