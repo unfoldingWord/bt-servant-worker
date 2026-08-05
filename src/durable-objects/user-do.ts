@@ -286,7 +286,7 @@ function buildChatTurnDimensions(
     org: body.org ?? body.org_id ?? defaultOrg,
     chatType: body.chat_type ?? 'private',
     transport: body._transport,
-    userCountry: countryFromPhoneUserId(body.user_id),
+    userCountry: countryFromPhoneUserId(body.user_id, body.client_id),
     edgeCountry: isCountryCode(body._edge_country) ? body._edge_country : undefined,
   };
 }

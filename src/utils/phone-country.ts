@@ -19,6 +19,27 @@
  */
 
 /**
+ * Clients whose `user_id` contract is a verified E.164 phone number. This gate
+ * is REQUIRED and fails closed — "looks numeric" is NOT sufficient evidence
+ * that an id is a phone number.
+ *
+ * The concrete counter-example this guards against: the Telegram gateway sends
+ * `String(from.id)` (bt-servant-telegram-gateway/src/core/models.ts), a numeric
+ * Telegram ACCOUNT id. A real one observed in production, `5671505928`, would
+ * otherwise parse as calling code `56` and be reported as Chile.
+ *
+ * Included:
+ *   - `whatsapp`       — wa_id is always the sender's E.164 number.
+ *   - `signal-gateway` — user_id is `sourceUuid or sourceNumber or source`;
+ *                        the UUID forms carry dashes and self-reject below, so
+ *                        anything that survives the digit check is a real
+ *                        number.
+ * Deliberately excluded: `telegram-gateway` (numeric account ids), `web` /
+ * `shema` / `admin-portal` (emails and opaque ids), and all smoke/test clients.
+ */
+const E164_CLIENT_IDS: ReadonlySet<string> = new Set(['whatsapp', 'signal-gateway']);
+
+/**
  * Canadian NANP area codes. `+1` is shared across the North American Numbering
  * Plan, so a bare `1` prefix cannot distinguish US from Canada; the area code
  * can. Caribbean NANP members (`1242` Bahamas, `1876` Jamaica, …) are handled
@@ -340,22 +361,35 @@ const MIN_E164_DIGITS = 7;
 const MAX_E164_DIGITS = 15;
 
 /**
+ * Return the bare digits of an id that is shaped like an E.164 number, or
+ * `undefined`. Rejects anything carrying non-digit characters beyond a leading
+ * `+` (so Signal's dashed UUIDs and email ids fall out here) and anything
+ * outside E.164 length bounds.
+ */
+function e164Digits(userId: string | undefined): string | undefined {
+  if (!userId) return undefined;
+  const digits = userId.replace(/[^0-9]/g, '');
+  const withoutPlus = userId.replace(/^\+/, '');
+  if (digits.length !== withoutPlus.length) return undefined;
+  if (digits.length < MIN_E164_DIGITS || digits.length > MAX_E164_DIGITS) return undefined;
+  return digits;
+}
+
+/**
  * Map a messaging-platform user id to an ISO 3166-1 alpha-2 country, or
  * `undefined` when the id is not a phone number or its calling code is not
  * recognized. Never throws.
  */
-export function countryFromPhoneUserId(userId: string | undefined): string | undefined {
-  if (!userId) return undefined;
-
-  // Platform ids arrive bare ("559291836442"); tolerate a leading + or spacing.
-  const digits = userId.replace(/[^0-9]/g, '');
-  if (
-    digits.length !== userId.replace(/^\+/, '').length ||
-    digits.length < MIN_E164_DIGITS ||
-    digits.length > MAX_E164_DIGITS
-  ) {
-    return undefined;
-  }
+export function countryFromPhoneUserId(
+  userId: string | undefined,
+  clientId: string | undefined
+): string | undefined {
+  // Fail closed: infer ONLY for clients contractually supplying E.164. A
+  // numeric-looking id from any other client (notably a Telegram account id)
+  // must never be read as a phone number.
+  if (!clientId || !E164_CLIENT_IDS.has(clientId)) return undefined;
+  const digits = e164Digits(userId);
+  if (!digits) return undefined;
 
   for (const [prefix, country] of CALLING_CODES) {
     if (!digits.startsWith(prefix)) continue;
