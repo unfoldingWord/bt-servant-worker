@@ -170,9 +170,7 @@ const AUDIO_FORMAT_MIME_MAP: Readonly<Record<string, string>> = Object.freeze({
 });
 
 export type ModePersistenceAction =
-  | { kind: 'put'; mode: string }
-  | { kind: 'delete' }
-  | { kind: 'none' };
+  { kind: 'put'; mode: string } | { kind: 'delete' } | { kind: 'none' };
 
 /**
  * Decide whether a classifier turn should persist or clear the user's selected
@@ -193,9 +191,7 @@ export function decideModePersistence(
 }
 
 export type LanguagePersistenceAction =
-  | { kind: 'put'; language: string }
-  | { kind: 'delete' }
-  | { kind: 'none' };
+  { kind: 'put'; language: string } | { kind: 'delete' } | { kind: 'none' };
 
 /**
  * Decide whether a classifier turn should persist or clear the user's selected
