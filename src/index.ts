@@ -34,6 +34,7 @@ import {
   MAX_LANGUAGES_PER_ORG,
   OrgLanguages,
   sanitizeLanguageDocument,
+  validateDefaultLanguageUpdate,
   validateLanguage,
   validateLanguageName,
 } from './types/languages.js';
@@ -979,6 +980,21 @@ app.delete('/api/v1/admin/orgs/:org/languages/:languageName', async (c) => {
       languages: [],
     };
 
+    if (orgLanguages.defaultLanguage === languageName) {
+      logger.warn('admin_action', {
+        action: 'delete_language',
+        org,
+        language_name: languageName,
+        rejected: 'is_org_default',
+      });
+      return c.json(
+        {
+          error: `Language '${languageName}' is the org default language — unset or reassign the default first`,
+        },
+        409
+      );
+    }
+
     const filtered = orgLanguages.languages.filter((l) => l.name !== languageName);
     const removed = filtered.length !== orgLanguages.languages.length;
 
@@ -998,6 +1014,76 @@ app.delete('/api/v1/admin/orgs/:org/languages/:languageName', async (c) => {
   } catch (error) {
     logger.error('admin_action', error, { action: 'delete_language', org });
     return c.json({ error: 'Failed to delete language from storage' }, 500);
+  }
+});
+
+// Org default language (worker#356): the chat-time fallback when a turn has
+// no `@`-trigger and no per-user persisted selection. A sibling route rather
+// than `/languages/default` because `default` is a legal language slug under
+// LANGUAGE_NAME_PATTERN and would collide with `/languages/:languageName`.
+app.get('/api/v1/admin/orgs/:org/languages-default', async (c) => {
+  const org = c.req.param('org');
+  const logger = createRequestLogger(crypto.randomUUID());
+
+  try {
+    const orgLanguages = (await c.env.PROMPT_OVERRIDES.get<OrgLanguages>(
+      `${org}:languages`,
+      'json'
+    )) ?? {
+      languages: [],
+    };
+
+    const name = orgLanguages.defaultLanguage ?? null;
+    logger.log('admin_action', { action: 'get_default_language', org, language_name: name });
+    return c.json({ org, name });
+  } catch (error) {
+    logger.error('admin_action', error, { action: 'get_default_language', org });
+    return c.json({ error: 'Failed to read default language from storage' }, 500);
+  }
+});
+
+app.put('/api/v1/admin/orgs/:org/languages-default', async (c) => {
+  const org = c.req.param('org');
+  const logger = createRequestLogger(crypto.randomUUID());
+
+  const body = await c.req.json();
+
+  try {
+    // NOTE: This read-modify-write pattern can race with concurrent requests (last write wins).
+    // This is acceptable for admin endpoints which are low-volume and authenticated.
+    const orgLanguages = (await c.env.PROMPT_OVERRIDES.get<OrgLanguages>(
+      `${org}:languages`,
+      'json'
+    )) ?? {
+      languages: [],
+    };
+
+    const result = validateDefaultLanguageUpdate(body, orgLanguages);
+    if (!result.ok) {
+      return c.json({ error: result.error }, 400);
+    }
+
+    if (result.name === null) {
+      delete orgLanguages.defaultLanguage;
+    } else {
+      orgLanguages.defaultLanguage = result.name;
+    }
+    await c.env.PROMPT_OVERRIDES.put(`${org}:languages`, JSON.stringify(orgLanguages));
+
+    logger.log('admin_action', {
+      action: 'set_default_language',
+      org,
+      language_name: result.name,
+      cleared: result.name === null,
+    });
+    return c.json({
+      org,
+      name: result.name,
+      message: result.name === null ? 'Default language cleared' : 'Default language set',
+    });
+  } catch (error) {
+    logger.error('admin_action', error, { action: 'set_default_language', org });
+    return c.json({ error: 'Failed to save default language to storage' }, 500);
   }
 });
 
