@@ -27,27 +27,29 @@
 # session used in parallel" from "many sessions in parallel". G shows whether a tool
 # call is needed at all or the handshake alone suffices.
 #
-# Measured at 12 ops/arm, two independent runs. Concurrency sweep on ONE shared
+# Measured at 12 ops/arm, three independent runs. Concurrency sweep on ONE shared
 # session, no session creation in the measured phase:
 #
-#            conc 1     conc 2     conc 3     conc 4
-#   run 1      0.0%       8.3%      25.0%      50.0%
-#   run 2      0.0%       8.3%      16.7%      41.7%    (SDK-accurate lifecycle)
+#              conc 1    conc 2    conc 3    conc 4
+#   run 1        0.0%      8.3%     25.0%     50.0%
+#   run 2        0.0%      8.3%     16.7%     41.7%
+#   run 3        0.0%      8.3%     25.0%     41.7%
+#   ---------------------------------------------------
+#   pooled      0/36      3/36      8/36     16/36
+#                0.0%      8.3%     22.2%     44.4%
 #
-# Run 2 other arms: A fresh/conc4 33.3%, F fresh/serial 0.0%, G initonly/conc4 50.0%,
+# Run 3 other arms: A fresh/conc4 58.3%, F fresh/serial 0.0%, G initonly/conc4 50.0%,
 # H session-per-worker/conc4 50.0%.
 #
 # What this supports:
-#   - Serial is clean: 0 failures in 24 operations across arms B and F, both runs.
-#   - Failures begin at concurrency 2 and rise monotonically. Both runs agree on the
-#     shape and on the 8.3% first step; the mid-sweep values differ by one operation,
-#     which is the sampling noise you should expect at n=12 per arm.
+#   - Serial is clean: 0 failures in 72 serial operations (arms B and F, three runs).
+#   - Failures begin at concurrency 2 — 1 in 12 in every single run — and rise
+#     monotonically from there.
 #   - Pooling one session does NOT help: arm E shares a single session established
-#     minutes earlier and still fails 42-50% under 4-way concurrency. The client-side
-#     fix we were considering would not have solved this.
-#   - Request rate does not order the failures across arms: in run 2 arm G was the
-#     fastest at 420 req/min with 50% failures while arm F ran 115 req/min clean, and
-#     in run 1 the fastest arm (A, 430 req/min) failed LESS than slower arms E and H.
+#     minutes earlier and still fails 42-50%. The client-side fix we were considering
+#     would not have solved this.
+#   - Request rate does not order the failures across arms: in run 3 arm G ran fastest
+#     at 810 req/min with 50% failures while arm F ran 144 req/min completely clean.
 #
 # What this does NOT establish: within the B-E sweep, concurrency and instantaneous
 # request rate co-vary, because each reused-session operation is exactly one request.
@@ -201,8 +203,10 @@ if kind == 'init':
     # SDK InitializeResultSchema also requires capabilities and serverInfo objects.
     if not isinstance(result.get('capabilities'), dict):
         print('BADRESULT'); sys.exit()
+    # serverInfo is ImplementationSchema = BaseMetadata + version.
     info = result.get('serverInfo')
-    if not isinstance(info, dict) or not isinstance(info.get('name'), str):
+    if not isinstance(info, dict) or not isinstance(info.get('name'), str) \
+            or not isinstance(info.get('version'), str):
         print('BADRESULT'); sys.exit()
     print('OK:' + pv); sys.exit()
 
@@ -214,11 +218,14 @@ if kind == 'call':
         print('BADRESULT'); sys.exit()
     # SDK CallToolResultSchema: content is z.array(ContentBlockSchema), a union of
     # TextContent / ImageContent / AudioContent / ResourceLink / EmbeddedResource.
+    # ResourceLink is ResourceSchema + type, and ResourceSchema spreads BaseMetadata,
+    # so it requires BOTH uri and name. EmbeddedResource's resource must be
+    # Text/BlobResourceContents: uri plus text or blob.
     REQUIRED = {
         'text':          [('text', str)],
         'image':         [('data', str), ('mimeType', str)],
         'audio':         [('data', str), ('mimeType', str)],
-        'resource_link': [('uri', str)],
+        'resource_link': [('uri', str), ('name', str)],
         'resource':      [('resource', dict)],
     }
     for block in content:
@@ -229,6 +236,12 @@ if kind == 'call':
             print('BADCONTENT'); sys.exit()
         for field, want in REQUIRED[btype]:
             if not isinstance(block.get(field), want):
+                print('BADCONTENT'); sys.exit()
+        if btype == 'resource':
+            res = block['resource']
+            if not isinstance(res.get('uri'), str):
+                print('BADCONTENT'); sys.exit()
+            if not isinstance(res.get('text'), str) and not isinstance(res.get('blob'), str):
                 print('BADCONTENT'); sys.exit()
 
 print('OK')
@@ -298,15 +311,15 @@ init_session() {
   do_post '{"jsonrpc":"2.0","method":"notifications/initialized"}' "$sid" "$pv"
   verdict=$(classify notify 0)
   if [[ "$verdict" != "OK" ]]; then
-    # The session exists even though the notification failed — release it rather than
-    # leaking server-side state into later arms.
-    close_session "$sid" "$pv"
+    # The session exists even though the notification failed. Hand it to post-arm
+    # cleanup rather than issuing a DELETE here: the real client never sends one, and
+    # doing so inside the measured window would alter the HTTP mix being measured.
+    echo "$sid $pv" >>"$LEAKED"
     echo "FAIL INIT_NOTIFY_$verdict"
     return
   fi
-  local sse
-  sse=$(open_sse "$sid" "$pv")
-  echo "SID $sid $pv $sse"
+  open_sse "$sid" "$pv"
+  echo "SID $sid $pv $SSE_PID"
 }
 
 # $1=sid $2=negotiated protocol
@@ -321,12 +334,17 @@ call_tool() {
 
 # The SDK opens a GET SSE stream after notifications/initialized is accepted
 # (streamableHttp.js: 202 -> _startOrAuthSse). Emulate it so the HTTP mix matches.
+# NOTE the explicit >/dev/null 2>&1 on the background job. init_session runs inside
+# command substitution; a background child that inherits the captured stdout keeps the
+# pipe open, so $(...) would block until the stream ended and the GET would never
+# actually overlap the tool call — the opposite of what this arm is meant to measure.
 open_sse() {
   printf '.' >>"$REQ"
   curl -sN --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" -o /dev/null \
     -X GET "$URL" -H "Accept: text/event-stream" \
-    -H "mcp-session-id: $1" ${2:+-H "mcp-protocol-version: $2"} 2>/dev/null &
-  echo $!
+    -H "mcp-session-id: $1" ${2:+-H "mcp-protocol-version: $2"} \
+    >/dev/null 2>&1 &
+  SSE_PID=$!
 }
 
 # What client.close() actually does in SDK 1.29: abort the transport. It does NOT
