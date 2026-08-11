@@ -98,7 +98,9 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 }
             ).encode()
-            self._send(200, body, headers={"mcp-session-id": f"mock-{time.time_ns()}"})
+            sid = f"mock-{time.time_ns()}"
+            log("ISSUED", sid)
+            self._send(200, body, headers={"mcp-session-id": sid})
             return
 
         if method == "notifications/initialized":

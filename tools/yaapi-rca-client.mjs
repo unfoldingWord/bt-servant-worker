@@ -10,8 +10,10 @@
  * Usage:  node tools/yaapi-rca-client.mjs <url> <fresh|initonly> <ops>
  *
  * Emits one line per event on stdout:
- *   SESSION <id>        a session was established (the shell releases it after the
- *                       arm finishes; note the SDK's close() does NOT send DELETE)
+ *   SESSION <id> <proto>  a session was established. Emitted from both the success and
+ *                         failure paths, since initialize can allocate a session that a
+ *                         later stage (notifications/initialized) then fails on. The
+ *                         shell releases these after the arm; close() sends no DELETE.
  *   RESULT OK
  *   RESULT FAIL <INIT_|CALL_><token>
  *
@@ -48,11 +50,23 @@ for (let i = 0; i < ops; i++) {
   const transport = new StreamableHTTPClientTransport(new URL(url));
   const client = new Client({ name: 'yaapi-rca', version: '4.0' });
   let phase = 'INIT';
+  let reported = false;
+
+  // The server issues a session id during initialize, so a session can exist even when
+  // connect() later rejects — for example when notifications/initialized returns 500.
+  // Report it exactly once, from success AND failure paths, or the shell's post-arm
+  // cleanup cannot DELETE it and failing arms leak sessions into later measurements.
+  const reportSession = () => {
+    if (reported || !transport.sessionId) return;
+    reported = true;
+    process.stdout.write(`SESSION ${transport.sessionId} ${transport.protocolVersion ?? ''}\n`);
+  };
+
   try {
     // connect() performs the whole lifecycle: initialize, protocol-version
     // negotiation and validation, notifications/initialized, and the SSE stream.
     await client.connect(transport);
-    if (transport.sessionId) process.stdout.write(`SESSION ${transport.sessionId}\n`);
+    reportSession();
     phase = 'CALL';
     if (mode === 'fresh') {
       // callTool validates against CallToolResultSchema by default, so a malformed
@@ -68,6 +82,8 @@ for (let i = 0; i < ops; i++) {
   } catch (error) {
     process.stdout.write(`RESULT FAIL ${phase}_${token(error)}\n`);
   } finally {
+    // Covers the case where connect() rejected after the session was allocated.
+    reportSession();
     // Mirrors the repo client: close() only. It aborts the transport and sends no
     // DELETE, which is why sessions are reported above for post-arm cleanup.
     try {

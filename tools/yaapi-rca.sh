@@ -426,7 +426,7 @@ run_sdk_arm() {
   local kind a b
   while read -r kind a b; do
     case "$kind" in
-      SESSION) echo "$a" >>"$LEAKED" ;;
+      SESSION) echo "$a $b" >>"$LEAKED" ;; # sid + negotiated protocol, for cleanup
       RESULT) [[ "$a" == "OK" ]] && echo "OK" >>"$out" || echo "$b" >>"$out" ;;
     esac
   done <"$raw"
@@ -470,6 +470,7 @@ run_arm() {
       pair=$(setup_session)
       if [[ -z "$pair" ]]; then
         for ((i = 0; i < ${#sids[@]}; i++)); do close_session "${sids[$i]}" "${protos[$i]}"; done
+        cleanup_leaked # failed setup can still have allocated sessions server-side
         printf '%-34s %s\n' "$label" "SETUP_FAILED — could not establish a session (twice)"
         return 0
       fi
@@ -535,6 +536,7 @@ sleep 10
 run_sdk_arm "G  SDK client,   handshake only" initonly 4
 sleep 10
 run_arm "H  synthetic, session/worker, c4" reuse 4 distinct
+cleanup_leaked # backstop: nothing should survive the last arm
 echo
 echo "A vs F isolates concurrency for the REAL SDK client.  B/C/D/E sweep concurrency"
 echo "on ONE shared session (synthetic HTTP): B vs E decides whether pooling would help,"

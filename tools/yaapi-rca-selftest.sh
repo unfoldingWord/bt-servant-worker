@@ -103,6 +103,28 @@ if grep -q 'INIT_NOTIFY_' "$OUT" || grep -q 'SETUP_FAILED' "$OUT"; then
 else
   no "failing notifications/initialized -> reported" "$(head -6 "$OUT")"
 fi
+# initialize allocates a session even when notifications/initialized then 500s. Every
+# session the server issued must still be DELETEd by post-arm cleanup, or failing arms
+# leak sessions and contaminate later measurements.
+leaked=$(python3 - "$LOG" <<'PYEOF'
+import sys
+
+issued, deleted = [], set()
+for line in open(sys.argv[1]):
+    parts = line.split()
+    if len(parts) >= 3 and parts[1] == 'ISSUED':
+        issued.append(parts[2])
+    elif len(parts) >= 3 and parts[1] == 'DELETE':
+        deleted.add(parts[2])
+missing = [s for s in issued if s not in deleted]
+print(f'{len(missing)}/{len(issued)}')
+PYEOF
+)
+if [[ "${leaked%%/*}" == "0" && "${leaked##*/}" != "0" ]]; then
+  ok "sessions from failed initialization are deleted after the arm ($leaked leaked)"
+else
+  no "sessions from failed initialization are deleted after the arm" "leaked $leaked"
+fi
 
 # ── 4. SSE lifetime (SDK arm opens a stream and closes it) ─────────────────────
 if command -v node >/dev/null && node -e "import('@modelcontextprotocol/sdk/client/index.js')" 2>/dev/null; then
