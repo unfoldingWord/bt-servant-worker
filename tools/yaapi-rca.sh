@@ -6,110 +6,104 @@
 # Why this exists: during the #245 retest, yaapi.bible failed 19 of 69 connection
 # attempts while the other four MCP servers failed zero times in the same window.
 # The obvious suspect was our own client, which opens a fresh MCP session for every
-# operation (initialize -> one call -> close; see src/services/mcp/streamable-http-client.ts)
+# operation (connect -> one call -> close; see src/services/mcp/streamable-http-client.ts)
 # instead of pooling one session per request. This script tests that.
 #
-# Eight arms over session handling and concurrency. Arms C/D/E sweep concurrency on a
-# single shared session so the threshold is measured rather than assumed:
+# TWO KINDS OF ARM. Read this before quoting any number from the output.
 #
-#   A  fresh session per call,  conc 4    our client's current pattern
-#   B  ONE shared session,      serial    control
-#   C  ONE shared session,      conc 2    threshold sweep
-#   D  ONE shared session,      conc 3    threshold sweep
-#   E  ONE shared session,      conc 4    what session pooling would look like
-#   F  fresh session per call,  serial    session churn WITHOUT concurrency
-#   G  initialize only,         conc 4    the handshake alone, no tools/call
-#   H  one session PER WORKER,  conc 4    concurrency across distinct sessions
+#   REAL-CLIENT arms (A, G) are driven by tools/yaapi-rca-client.mjs, which uses the
+#   @modelcontextprotocol/sdk this repository depends on. The SDK owns initialization,
+#   protocol negotiation, the post-initialize SSE stream, request ids, shutdown, and
+#   response schema validation. These arms are what our client actually does.
 #
-# A vs F isolates concurrency. B/C/D/E isolate concurrency alone on one shared session
-# with no session creation in the measured phase — B vs E decides whether pooling on
-# our side would help, and C/D locate where failures begin. E vs H separates "one
-# session used in parallel" from "many sessions in parallel". G shows whether a tool
-# call is needed at all or the handshake alone suffices.
+#   SYNTHETIC arms (B, C, D, E, H) are plain curl POSTs. They are NOT an emulation of
+#   the SDK and no claim is made that they reproduce it. They exist only to vary
+#   concurrency against a session while holding everything else still, which is what
+#   the core question needs. Their pass/fail checks are exactly, and only:
+#     HTTP status is 200/202; the body is not a Django HTML error page; the body
+#     parses as JSON; jsonrpc == "2.0"; a message carrying OUR request id came back;
+#     that message has no top-level error; it has an object result; for tools/call
+#     result.content is a list. That is a deliberately shallow check, sufficient to
+#     tell "the server answered" from "the server 500'd", and nothing more.
 #
-# Measured at 12 ops/arm, three independent runs. Concurrency sweep on ONE shared
-# session, no session creation in the measured phase:
+#   Arms:
+#     A  REAL CLIENT, fresh session per call,  conc 4    our client's actual pattern
+#     B  synthetic, ONE shared session,        serial    control
+#     C  synthetic, ONE shared session,        conc 2    threshold sweep
+#     D  synthetic, ONE shared session,        conc 3    threshold sweep
+#     E  synthetic, ONE shared session,        conc 4    what pooling would look like
+#     F  REAL CLIENT, fresh session per call,  serial    churn WITHOUT concurrency
+#     G  REAL CLIENT, handshake only,          conc 4    connect/close, no tool call
+#     H  synthetic, one session PER WORKER,    conc 4    concurrency across sessions
+#
+# A vs F isolates concurrency for the real client. B/C/D/E sweep concurrency on one
+# shared session with no session creation in the measured phase — B vs E decides
+# whether pooling on our side would help, and C/D locate where failures begin.
+# E vs H separates one-session-in-parallel from many. G tests the handshake alone.
+#
+# CLEANUP. The SDK's close() aborts the transport and sends no DELETE; terminateSession()
+# is a separate method this repo never calls, so the real client leaks its sessions and
+# so does arm A. Every session this script creates is queued and released only AFTER its
+# arm finishes, so cleanup traffic never enters a measured window.
+#
+# RESULTS at 12 ops/arm.
+#
+# Real client, driven by the installed SDK:
+#   F  serial            0.0%      A  concurrency 4    66.7%
+#   G  handshake only, concurrency 4        25.0%
+#
+# Synthetic sweep on ONE shared session, four independent runs:
 #
 #              conc 1    conc 2    conc 3    conc 4
 #   run 1        0.0%      8.3%     25.0%     50.0%
 #   run 2        0.0%      8.3%     16.7%     41.7%
 #   run 3        0.0%      8.3%     25.0%     41.7%
+#   run 4        0.0%      8.3%     25.0%     50.0%
 #   ---------------------------------------------------
-#   pooled      0/36      3/36      8/36     16/36
-#                0.0%      8.3%     22.2%     44.4%
-#
-# Run 3 other arms: A fresh/conc4 58.3%, F fresh/serial 0.0%, G initonly/conc4 50.0%,
-# H session-per-worker/conc4 50.0%.
+#   pooled      0/48      4/48     11/48     22/48
+#                0.0%      8.3%     22.9%     45.8%
 #
 # What this supports:
-#   - Serial is clean: 0 failures in 72 serial operations (arms B and F, three runs).
-#   - Failures begin at concurrency 2 — 1 in 12 in every single run — and rise
-#     monotonically from there.
+#   - The repo's own client, unmodified, is clean serially and fails two thirds of the
+#     time at concurrency 4. No emulation is involved in that comparison.
+#   - The synthetic sweep locates the onset: failures begin at concurrency 2, at
+#     exactly 1 in 12 in all four runs, and rise monotonically from there.
+#   - Serial is clean in every arm and every run.
 #   - Pooling one session does NOT help: arm E shares a single session established
 #     minutes earlier and still fails 42-50%. The client-side fix we were considering
 #     would not have solved this.
-#   - Request rate does not order the failures across arms: in run 3 arm G ran fastest
-#     at 810 req/min with 50% failures while arm F ran 144 req/min completely clean.
 #
 # What this does NOT establish: within the B-E sweep, concurrency and instantaneous
 # request rate co-vary, because each reused-session operation is exactly one request.
-# The cross-arm comparisons argue against rate being the driver, but a fully
-# rate-controlled design would pace requests at a fixed inter-arrival time. Treat the
-# claim as "failures begin at concurrency 2 and scale with it", not as a proof that
-# rate is irrelevant. Per-arm n is 12; raise OPS_PER_ARM for tighter intervals.
-#
-# Sessions for arms B/C/D/E/H are established SERIALLY before timing starts, so
-# concurrent session creation is never folded into an arm meant to measure something
-# else. If setup fails twice, the arm reports SETUP_FAILED rather than feeding a bad
-# session id into measured requests.
-#
-# Protocol fidelity. Arm A is billed as our client's current pattern, so the emulated
-# lifecycle tracks the installed SDK (1.29) rather than a plausible-looking approximation:
-#   - sends LATEST_PROTOCOL_VERSION ('2025-11-25', types.js), requires the negotiated
-#     version to be in SUPPORTED_PROTOCOL_VERSIONS, and stamps the negotiated
-#     'mcp-protocol-version' header on every subsequent request (setProtocolVersion).
-#   - sends the required notifications/initialized, then opens the GET SSE stream the
-#     SDK starts on a 202 (streamableHttp.js -> _startOrAuthSse).
-#   - closes the way client.close() actually closes: it ABORTS the transport and sends
-#     NO DELETE. terminateSession() is a separate method this repo never calls, so the
-#     real client leaks its sessions and so does this emulation.
-#   - gives every request a unique JSON-RPC id (the SDK increments _requestMessageId);
-#     a response counts only if a message with THAT id returns a result that satisfies
-#     the SDK's schema — InitializeResult needs capabilities and serverInfo, and
-#     CallToolResult's content must be ContentBlocks, not arbitrary values.
-# The DELETEs this script does send are harness cleanup, issued AFTER an arm finishes
-# so they never enter the measured window; without them a run would strand a session
-# on the server for every fresh-session operation.
+# A fully rate-controlled design would pace requests at a fixed inter-arrival time.
+# Treat the claim as "failures begin at concurrency 2 and scale with it", not as proof
+# that rate is irrelevant. Per-arm n is 12; raise OPS_PER_ARM for tighter intervals.
 #
 # Usage:
-#   ./tools/yaapi-rca.sh [OPS_PER_ARM]     # default 12, minimum 4
+#   ./tools/yaapi-rca.sh [OPS_PER_ARM]      # default 12, minimum 4
+#   ./tools/yaapi-rca-selftest.sh           # deterministic tests against a local mock
 #
-# Needs no credentials — it talks to yaapi.bible directly, not through bt-servant.
+# Needs no credentials for the target server. The real-client arms need node and this
+# repo's node_modules; if node or the SDK is missing those arms are skipped with a
+# notice and the synthetic arms still run.
 #
-# LOAD. Reported rates are HTTP requests/min, not operations/min, because the modes
-# differ: a fresh-session op costs 4 requests in the measured window (initialize +
-# notifications/initialized + GET SSE stream + tools/call), an initialize-only op costs
-# 3, and a reused-session op costs 1 plus per-session setup. Post-arm cleanup adds one
-# DELETE per session created. At the default of 12 ops/arm the eight arms issue roughly
-# 250 HTTP requests in total, more if setup retries. This points load at a third
-# party's production server, so keep the number modest and do not loop it.
+# LOAD. Synthetic arms count every HTTP request they issue and report requests/min.
+# Real-client arms are driven by the SDK, which issues requests this script does not
+# see, so their request count and rate show "n/a" rather than a number this script
+# cannot honestly produce. At the default of 12 ops/arm expect very roughly 250 HTTP
+# requests in total. This points load at a third party's production server, so keep the
+# number modest and do not loop it.
 #
 # Env overrides:
 #   YAAPI_URL          MCP endpoint                   (default: https://yaapi.bible/mcp)
 #   CONNECT_TIMEOUT    curl --connect-timeout seconds (default: 10)
 #   MAX_TIME           curl --max-time seconds        (default: 30)
 #
-# Requires: bash 4+, curl, python3 (responses are parsed structurally, not by
-# substring match, so whitespace variants, notifications, unmatched ids and top-level
-# JSON-RPC errors are not silently counted as successes).
+# Requires: bash 4+, curl, python3. Optional: node (real-client arms).
 #
-# Result tokens: OK, HTML500, HTTP<code>, RPCERR (JSON-RPC error), TOOLERR
-# (result.isError), NORESPONSE (no message with our request id), BADRESULT
-# (malformed result, or InitializeResult missing capabilities/serverInfo), BADCONTENT
-# (content is not a list of valid ContentBlocks), BADENVELOPE (jsonrpc != "2.0"),
-# BADPROTO (negotiated
-# version not in SUPPORTED_PROTOCOL_VERSIONS), BADJSON, EMPTY, TIMEOUT, CURLERR<exit>.
-# Failures are prefixed INIT_ or CALL_ to show which half of the exchange broke.
+# Synthetic-arm result tokens: OK, HTML500, HTTP<code>, RPCERR, TOOLERR, NORESPONSE,
+# BADRESULT, BADENVELOPE, BADJSON, EMPTY, TIMEOUT, CURLERR<exit>. Real-client tokens
+# come from the SDK and are prefixed INIT_ or CALL_ by the phase that raised them.
 
 set -uo pipefail
 
@@ -133,6 +127,13 @@ for dep in curl python3; do
     exit 2
   }
 done
+
+SDK_CLIENT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/yaapi-rca-client.mjs"
+SDK_OK=0
+if command -v node >/dev/null && [[ -f "$SDK_CLIENT" ]] &&
+  node -e "import('@modelcontextprotocol/sdk/client/index.js')" >/dev/null 2>&1; then
+  SDK_OK=1
+fi
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -318,8 +319,7 @@ init_session() {
     echo "FAIL INIT_NOTIFY_$verdict"
     return
   fi
-  open_sse "$sid" "$pv"
-  echo "SID $sid $pv $SSE_PID"
+  echo "SID $sid $pv"
 }
 
 # $1=sid $2=negotiated protocol
@@ -334,27 +334,6 @@ call_tool() {
 
 # The SDK opens a GET SSE stream after notifications/initialized is accepted
 # (streamableHttp.js: 202 -> _startOrAuthSse). Emulate it so the HTTP mix matches.
-# NOTE the explicit >/dev/null 2>&1 on the background job. init_session runs inside
-# command substitution; a background child that inherits the captured stdout keeps the
-# pipe open, so $(...) would block until the stream ended and the GET would never
-# actually overlap the tool call — the opposite of what this arm is meant to measure.
-open_sse() {
-  printf '.' >>"$REQ"
-  curl -sN --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" -o /dev/null \
-    -X GET "$URL" -H "Accept: text/event-stream" \
-    -H "mcp-session-id: $1" ${2:+-H "mcp-protocol-version: $2"} \
-    >/dev/null 2>&1 &
-  SSE_PID=$!
-}
-
-# What client.close() actually does in SDK 1.29: abort the transport. It does NOT
-# send DELETE — terminateSession() is a separate method this repo never calls.
-close_client() {
-  [[ -n "${1:-}" ]] && kill "$1" 2>/dev/null
-  wait "$1" 2>/dev/null
-  return 0
-}
-
 # Harness cleanup only, run AFTER an arm finishes so it never enters the measured
 # window. The emulated client leaks these sessions exactly as the real one does.
 close_session() {
@@ -377,9 +356,8 @@ worker() {
           echo "${r#FAIL }" >>"$out"
           continue
         fi
-        read -r _ s p sse <<<"$r"
+        read -r _ s p <<<"$r"
         call_tool "$s" "$p" >>"$out"
-        close_client "$sse"
         echo "$s $p" >>"$LEAKED"
         ;;
       reuse) call_tool "$sid" "$pv" >>"$out" ;;
@@ -389,8 +367,7 @@ worker() {
           echo "${r#FAIL }" >>"$out"
         else
           echo "OK" >>"$out"
-          read -r _ s p sse <<<"$r"
-          close_client "$sse"
+          read -r _ s p <<<"$r"
           echo "$s $p" >>"$LEAKED"
         fi
         ;;
@@ -417,6 +394,59 @@ cleanup_leaked() {
   : >"$LEAKED"
 }
 
+# Real-client arm: concurrency and collection here, MCP protocol entirely in the SDK.
+# $1=label $2=mode(fresh|initonly) $3=concurrency
+run_sdk_arm() {
+  local label="$1" mode="$2" conc="$3"
+  local out="$TMP/sdk.$RANDOM.out" raw="$TMP/raw.$RANDOM"
+  : >"$out"
+  : >"$raw"
+  if ((SDK_OK == 0)); then
+    printf '%-36s %s\n' "$label" "SKIPPED — needs node + @modelcontextprotocol/sdk"
+    return 0
+  fi
+
+  local -a ops=()
+  local w base=$((N / conc)) rem=$((N % conc)) eff=0
+  for ((w = 0; w < conc; w++)); do
+    ops+=($((base + (w < rem ? 1 : 0))))
+    ((ops[w] > 0)) && ((eff++))
+  done
+
+  local t0
+  t0=$(date +%s)
+  for ((w = 0; w < conc; w++)); do
+    ((ops[w] == 0)) && continue
+    node "$SDK_CLIENT" "$URL" "$mode" "${ops[$w]}" >>"$raw" 2>/dev/null &
+  done
+  wait
+  local el=$(($(date +%s) - t0))
+  ((el == 0)) && el=1
+
+  local kind a b
+  while read -r kind a b; do
+    case "$kind" in
+      SESSION) echo "$a" >>"$LEAKED" ;;
+      RESULT) [[ "$a" == "OK" ]] && echo "OK" >>"$out" || echo "$b" >>"$out" ;;
+    esac
+  done <"$raw"
+  cleanup_leaked # SDK close() sends no DELETE; release sessions now the arm is done
+
+  local tot bad init call
+  tot=$(wc -l <"$out")
+  bad=$(grep -cv '^OK$' "$out" || true)
+  init=$(grep -c '^INIT_' "$out" || true)
+  call=$(grep -c '^CALL_' "$out" || true)
+  if ((tot == 0)); then
+    printf '%-36s %s\n' "$label" "no operations recorded (node worker produced nothing)"
+    return 0
+  fi
+  printf '%-36s c=%d %3d ops  n/a req %4ds       n/a       fail %2d/%-3d (%5.1f%%)  init:%-3d call:%-3d\n' \
+    "$label" "$eff" "$tot" "$el" "$bad" "$tot" \
+    "$(awk "BEGIN{print $bad*100/$tot}")" "$init" "$call"
+  sort "$out" | uniq -c | grep -v ' OK$' | sed 's/^/                                       /' || true
+}
+
 # $1=label $2=mode $3=concurrency $4=sessions(shared|distinct)
 run_arm() {
   local label="$1" mode="$2" conc="$3" share="${4:-shared}"
@@ -431,25 +461,21 @@ run_arm() {
     ((ops[w] > 0)) && ((eff++))
   done
 
-  local -a sids=() protos=() sses=()
-  local s p sse pair
+  local -a sids=() protos=()
+  local s p pair
   if [[ "$mode" == "reuse" ]]; then
     local want=1
     [[ "$share" == "distinct" ]] && want=$conc
     for ((w = 0; w < want; w++)); do
       pair=$(setup_session)
       if [[ -z "$pair" ]]; then
-        for ((i = 0; i < ${#sids[@]}; i++)); do
-          close_client "${sses[$i]:-}"
-          close_session "${sids[$i]}" "${protos[$i]}"
-        done
+        for ((i = 0; i < ${#sids[@]}; i++)); do close_session "${sids[$i]}" "${protos[$i]}"; done
         printf '%-34s %s\n' "$label" "SETUP_FAILED — could not establish a session (twice)"
         return 0
       fi
-      read -r s p sse <<<"$pair"
+      read -r s p <<<"$pair"
       sids+=("$s")
       protos+=("$p")
-      sses+=("$sse")
       sleep 1
     done
   fi
@@ -473,10 +499,7 @@ run_arm() {
   local reqs
   reqs=$(wc -c <"$REQ")
 
-  for ((i = 0; i < ${#sids[@]}; i++)); do
-    close_client "${sses[$i]:-}"
-    close_session "${sids[$i]}" "${protos[$i]}"
-  done
+  for ((i = 0; i < ${#sids[@]}; i++)); do close_session "${sids[$i]}" "${protos[$i]}"; done
   cleanup_leaked
 
   local tot bad init call
@@ -497,25 +520,26 @@ run_arm() {
 echo "yaapi.bible concurrency RCA — $N ops/arm, url=$URL, client protocol $CLIENT_PROTOCOL"
 echo "                                   eff  ops  requests  time      rate       failures        where"
 echo "-------------------------------------------------------------------------------------------------------"
-run_arm "A  fresh/call,     conc 4" fresh 4
+run_sdk_arm "A  SDK client,   fresh, conc 4" fresh 4
 sleep 10
-run_arm "B  ONE shared,     serial" reuse 1 shared
+run_arm "B  synthetic, ONE shared, serial" reuse 1 shared
 sleep 10
-run_arm "C  ONE shared,     conc 2" reuse 2 shared
+run_arm "C  synthetic, ONE shared, conc 2" reuse 2 shared
 sleep 10
-run_arm "D  ONE shared,     conc 3" reuse 3 shared
+run_arm "D  synthetic, ONE shared, conc 3" reuse 3 shared
 sleep 10
-run_arm "E  ONE shared,     conc 4" reuse 4 shared
+run_arm "E  synthetic, ONE shared, conc 4" reuse 4 shared
 sleep 10
-run_arm "F  fresh/call,     serial" fresh 1
+run_sdk_arm "F  SDK client,   fresh, serial" fresh 1
 sleep 10
-run_arm "G  initialize only, conc 4" initonly 4
+run_sdk_arm "G  SDK client,   handshake only" initonly 4
 sleep 10
-run_arm "H  session/worker,  conc 4" reuse 4 distinct
+run_arm "H  synthetic, session/worker, c4" reuse 4 distinct
 echo
-echo "A vs F isolates concurrency.  B/C/D/E sweep concurrency on ONE shared session:"
-echo "B vs E decides whether pooling would help; C and D locate where failures begin."
-echo "E vs H separates one-session-in-parallel from many.  G tests the handshake alone."
+echo "A vs F isolates concurrency for the REAL SDK client.  B/C/D/E sweep concurrency"
+echo "on ONE shared session (synthetic HTTP): B vs E decides whether pooling would help,"
+echo "C and D locate where failures begin.  E vs H separates one-session-in-parallel from"
+echo "many.  G tests the SDK handshake alone.  Rates/requests are n/a for SDK arms."
 echo
 echo "Note: 'eff' is the effective concurrency actually reached. Rates are HTTP"
 echo "requests/min, not ops/min — modes differ in requests per operation."
