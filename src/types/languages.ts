@@ -51,6 +51,15 @@ export interface Language {
 export interface OrgLanguages {
   /** All defined languages for this org */
   languages: Language[];
+  /**
+   * Org default language: the `name` slug of one entry in `languages`,
+   * used as the chat-time fallback when a turn has no `@`-trigger and no
+   * per-user persisted selection (worker#356, rung 3 of the cascade).
+   * A reference, not a copy — absent means no default (pre-#356 behavior).
+   * May point at an unpublished language so admins can stage-then-publish;
+   * end users are protected by the published filter at resolution time.
+   */
+  defaultLanguage?: string;
 }
 
 // ─── Validation ───────────────────────────────────────────────────────────────
@@ -142,6 +151,37 @@ export function validateLanguage(language: unknown): string | null {
  */
 export function sanitizeLanguageDocument(document: string): string {
   return stripControlChars(document);
+}
+
+/**
+ * Validate a `PUT .../languages-default` request body against the org's
+ * current languages. `{name: null}` clears the default; a string must be a
+ * valid slug that references an existing entry (published or not — admins
+ * may stage an unpublished default; see `OrgLanguages.defaultLanguage`).
+ */
+export function validateDefaultLanguageUpdate(
+  body: unknown,
+  orgLanguages: OrgLanguages
+): { ok: true; name: string | null } | { ok: false; error: string } {
+  const obj = asPlainObject(body);
+  if (!obj || !('name' in obj)) {
+    return {
+      ok: false,
+      error: 'Body must be a JSON object with a "name" field (string to set, null to clear)',
+    };
+  }
+  const name = obj.name;
+  if (name === null) {
+    return { ok: true, name: null };
+  }
+  const nameError = validateLanguageName(name);
+  if (nameError) {
+    return { ok: false, error: nameError };
+  }
+  if (!orgLanguages.languages.some((l) => l.name === name)) {
+    return { ok: false, error: `Language '${String(name)}' not found` };
+  }
+  return { ok: true, name: name as string };
 }
 
 // ─── Effective-language resolution ────────────────────────────────────────────

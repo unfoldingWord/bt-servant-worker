@@ -34,6 +34,7 @@ import {
   MAX_LANGUAGES_PER_ORG,
   OrgLanguages,
   sanitizeLanguageDocument,
+  validateDefaultLanguageUpdate,
   validateLanguage,
   validateLanguageName,
 } from './types/languages.js';
@@ -858,6 +859,28 @@ app.post('/api/v1/admin/orgs/:org/modes/:modeName/_retire', async (c) => {
   }
 });
 
+/**
+ * Parse a JSON request body at an admin route boundary. A malformed body is a
+ * client error: it must surface as a 400 with route-scoped logging, never
+ * escape to Hono's default handler as a generic 500 (PR #357 review finding).
+ */
+async function readJsonBody(
+  req: Request,
+  logger: RequestLogger,
+  logContext: Record<string, unknown>
+): Promise<{ ok: true; body: unknown } | { ok: false; error: string }> {
+  try {
+    return { ok: true, body: await req.json() };
+  } catch (error) {
+    logger.warn('admin_action', {
+      ...logContext,
+      rejected: 'invalid_json_body',
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return { ok: false, error: 'Request body must be valid JSON' };
+  }
+}
+
 // Admin endpoints for org-level language management
 app.get('/api/v1/admin/orgs/:org/languages', async (c) => {
   const org = c.req.param('org');
@@ -923,8 +946,15 @@ app.put('/api/v1/admin/orgs/:org/languages/:languageName', async (c) => {
     return c.json({ error: nameError }, 400);
   }
 
-  const body = await c.req.json();
-  const languageInput = { ...body, name: languageName };
+  const parsed = await readJsonBody(c.req.raw, logger, {
+    action: 'upsert_language',
+    org,
+    language_name: languageName,
+  });
+  if (!parsed.ok) {
+    return c.json({ error: parsed.error }, 400);
+  }
+  const languageInput = { ...(parsed.body as Record<string, unknown>), name: languageName };
   const languageError = validateLanguage(languageInput);
   if (languageError) {
     return c.json({ error: languageError }, 400);
@@ -979,6 +1009,21 @@ app.delete('/api/v1/admin/orgs/:org/languages/:languageName', async (c) => {
       languages: [],
     };
 
+    if (orgLanguages.defaultLanguage === languageName) {
+      logger.warn('admin_action', {
+        action: 'delete_language',
+        org,
+        language_name: languageName,
+        rejected: 'is_org_default',
+      });
+      return c.json(
+        {
+          error: `Language '${languageName}' is the org default language — unset or reassign the default first`,
+        },
+        409
+      );
+    }
+
     const filtered = orgLanguages.languages.filter((l) => l.name !== languageName);
     const removed = filtered.length !== orgLanguages.languages.length;
 
@@ -998,6 +1043,79 @@ app.delete('/api/v1/admin/orgs/:org/languages/:languageName', async (c) => {
   } catch (error) {
     logger.error('admin_action', error, { action: 'delete_language', org });
     return c.json({ error: 'Failed to delete language from storage' }, 500);
+  }
+});
+
+// Org default language (worker#356): the chat-time fallback when a turn has
+// no `@`-trigger and no per-user persisted selection. A sibling route rather
+// than `/languages/default` because `default` is a legal language slug under
+// LANGUAGE_NAME_PATTERN and would collide with `/languages/:languageName`.
+app.get('/api/v1/admin/orgs/:org/languages-default', async (c) => {
+  const org = c.req.param('org');
+  const logger = createRequestLogger(crypto.randomUUID());
+
+  try {
+    const orgLanguages = (await c.env.PROMPT_OVERRIDES.get<OrgLanguages>(
+      `${org}:languages`,
+      'json'
+    )) ?? {
+      languages: [],
+    };
+
+    const name = orgLanguages.defaultLanguage ?? null;
+    logger.log('admin_action', { action: 'get_default_language', org, language_name: name });
+    return c.json({ org, name });
+  } catch (error) {
+    logger.error('admin_action', error, { action: 'get_default_language', org });
+    return c.json({ error: 'Failed to read default language from storage' }, 500);
+  }
+});
+
+app.put('/api/v1/admin/orgs/:org/languages-default', async (c) => {
+  const org = c.req.param('org');
+  const logger = createRequestLogger(crypto.randomUUID());
+
+  const parsed = await readJsonBody(c.req.raw, logger, { action: 'set_default_language', org });
+  if (!parsed.ok) {
+    return c.json({ error: parsed.error }, 400);
+  }
+
+  try {
+    // NOTE: This read-modify-write pattern can race with concurrent requests (last write wins).
+    // This is acceptable for admin endpoints which are low-volume and authenticated.
+    const orgLanguages = (await c.env.PROMPT_OVERRIDES.get<OrgLanguages>(
+      `${org}:languages`,
+      'json'
+    )) ?? {
+      languages: [],
+    };
+
+    const result = validateDefaultLanguageUpdate(parsed.body, orgLanguages);
+    if (!result.ok) {
+      return c.json({ error: result.error }, 400);
+    }
+
+    if (result.name === null) {
+      delete orgLanguages.defaultLanguage;
+    } else {
+      orgLanguages.defaultLanguage = result.name;
+    }
+    await c.env.PROMPT_OVERRIDES.put(`${org}:languages`, JSON.stringify(orgLanguages));
+
+    logger.log('admin_action', {
+      action: 'set_default_language',
+      org,
+      language_name: result.name,
+      cleared: result.name === null,
+    });
+    return c.json({
+      org,
+      name: result.name,
+      message: result.name === null ? 'Default language cleared' : 'Default language set',
+    });
+  } catch (error) {
+    logger.error('admin_action', error, { action: 'set_default_language', org });
+    return c.json({ error: 'Failed to save default language to storage' }, 500);
   }
 });
 

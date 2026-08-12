@@ -215,6 +215,34 @@ export function decideLanguagePersistence(
   return { kind: 'none' };
 }
 
+/** Where the turn's requested language came from (rung of the cascade). */
+export type LanguageSource = 'trigger' | 'persisted' | 'org_default' | 'none';
+
+/**
+ * Select the requested language name for a turn by walking the cascade:
+ * `@`-trigger → per-user persisted selection → org default (worker#356).
+ * Pure: no I/O, no logging. The org default is a fallback only — callers
+ * must never persist it per-user (default-riding users track org-level
+ * changes live). An empty-string default (drifted KV state) is treated as
+ * absent rather than resolved to a guaranteed `missing` warn.
+ */
+export function selectRequestedLanguage(
+  triggerLanguageName: string | undefined,
+  selectedLanguageName: string | undefined,
+  defaultLanguageName: string | undefined
+): { requestedName: string | undefined; source: LanguageSource } {
+  if (triggerLanguageName !== undefined) {
+    return { requestedName: triggerLanguageName, source: 'trigger' };
+  }
+  if (selectedLanguageName !== undefined) {
+    return { requestedName: selectedLanguageName, source: 'persisted' };
+  }
+  if (defaultLanguageName) {
+    return { requestedName: defaultLanguageName, source: 'org_default' };
+  }
+  return { requestedName: undefined, source: 'none' };
+}
+
 function logModePersistenceChange(
   logger: RequestLogger,
   action: ModePersistenceAction,
@@ -1457,6 +1485,7 @@ export class UserDO {
       requested_language: classified.languageName ?? null,
       effective_mode: result.activeModeName ?? null,
       effective_language: result.activeLanguageName ?? null,
+      language_source: result.languageSource,
       language_document_injected: !!result.languageDocument,
       unmatched_count: classified.unmatchedTriggers.length,
       unmatched_kinds: unmatchedKinds,
@@ -1548,31 +1577,36 @@ export class UserDO {
       loaded.activeModeName,
       newEffectiveModeName
     );
-    if (modePersistence.kind === 'put') {
-      await this.state.storage.put(SELECTED_MODE_KEY, modePersistence.mode);
-    } else if (modePersistence.kind === 'delete') {
-      await this.state.storage.delete(SELECTED_MODE_KEY);
-    }
+    await this.dispatchSelectionPersistence(SELECTED_MODE_KEY, modePersistence);
 
     const languagePersistence = decideLanguagePersistence(
       classified,
       loaded.selectedLanguageName,
       language.newEffectiveLanguageName
     );
-    if (languagePersistence.kind === 'put') {
-      await this.state.storage.put(SELECTED_LANGUAGE_KEY, languagePersistence.language);
-    } else if (languagePersistence.kind === 'delete') {
-      await this.state.storage.delete(SELECTED_LANGUAGE_KEY);
-    }
+    await this.dispatchSelectionPersistence(SELECTED_LANGUAGE_KEY, languagePersistence);
 
     return {
       resolved,
       activeModeName,
       languageDocument: language.languageDocument,
       activeLanguageName: language.activeLanguageName,
+      languageSource: language.languageSource,
       modePersistence,
       languagePersistence,
     };
+  }
+
+  /** Apply a mode/language selection persistence decision to DO storage. */
+  private async dispatchSelectionPersistence(
+    storageKey: string,
+    action: ModePersistenceAction | LanguagePersistenceAction
+  ): Promise<void> {
+    if (action.kind === 'put') {
+      await this.state.storage.put(storageKey, 'mode' in action ? action.mode : action.language);
+    } else if (action.kind === 'delete') {
+      await this.state.storage.delete(storageKey);
+    }
   }
 
   /**
@@ -1597,16 +1631,22 @@ export class UserDO {
     activeLanguageName: string | undefined;
     languageDocument: string | undefined;
     newEffectiveLanguageName: string | undefined;
+    languageSource: LanguageSource;
   } {
     if (classified.clearLanguage) {
       return {
         activeLanguageName: undefined,
         languageDocument: undefined,
         newEffectiveLanguageName: undefined,
+        languageSource: 'none',
       };
     }
-    const requestedName = classified.languageName ?? loaded.selectedLanguageName;
-    const triggerActivated = classified.languageName !== undefined;
+    const { requestedName, source } = selectRequestedLanguage(
+      classified.languageName,
+      loaded.selectedLanguageName,
+      loaded.orgLanguages.defaultLanguage
+    );
+    const triggerActivated = source === 'trigger';
     const resolution = resolveEffectiveLanguage(loaded.orgLanguages, requestedName, {
       includeUnpublished: loaded.isAdmin,
     });
@@ -1617,13 +1657,14 @@ export class UserDO {
           ? loaded.orgLanguages.languages.map((l) => l.name)
           : loaded.orgLanguages.languages.filter((l) => l.published === true).map((l) => l.name),
         reason: resolution.reason,
-        source: triggerActivated ? 'trigger' : 'persisted',
+        source,
       });
     }
     return {
       activeLanguageName: resolution.effectiveLanguageName,
       languageDocument: resolution.languageDocument,
       newEffectiveLanguageName: triggerActivated ? resolution.effectiveLanguageName : undefined,
+      languageSource: source,
     };
   }
 

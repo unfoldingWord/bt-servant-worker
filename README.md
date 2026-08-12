@@ -195,6 +195,7 @@ All admin endpoints require Bearer token authentication (super admin or org-spec
 | `/api/v1/admin/orgs/:org/modes/:modeName/_retire`                      | POST         | Retire a mode, forwarding its slug to another mode  |
 | `/api/v1/admin/orgs/:org/languages`                                    | GET          | List org languages                                  |
 | `/api/v1/admin/orgs/:org/languages/:languageName`                      | GET/PUT/DEL  | Manage individual language document                 |
+| `/api/v1/admin/orgs/:org/languages-default`                            | GET/PUT      | Org default language (chat-time fallback, #356)     |
 | `/api/v1/admin/orgs/:org/language-scaffold`                            | GET/PUT/DEL  | Org language scaffold template                      |
 | `/api/v1/admin/orgs/:org/users/:userId/mode`                           | GET/PUT/DEL  | User's active mode                                  |
 | `/api/v1/admin/orgs/:org/users/:userId/prompt-overrides`               | GET/PUT/DEL  | User-level prompt overrides                         |
