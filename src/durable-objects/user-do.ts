@@ -231,8 +231,6 @@ export type LanguageSource = 'trigger' | 'persisted' | 'org_default' | 'none';
  * transpose at the call site.
  */
 export interface LanguageOrchestrationContext {
-  /** Display label of the active language, e.g. `Hindi`. */
-  languageLabel?: string | undefined;
   /** Set when the user's whole message was routing tokens (#360). */
   triggerOnly?: TriggerOnlyContext | undefined;
 }
@@ -1485,7 +1483,7 @@ export class UserDO {
     const audioContext = this.buildAudioContext();
     const attachmentsContext = createAttachmentsContext();
     // prettier-ignore
-    const orchOpts = this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, triggerCtx.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, triggerCtx.activeModeName, audioContext, attachmentsContext, workerOrigin, logger, callbacks, groupContext, triggerCtx.languageDocument, triggerCtx.unmatchedTriggers, loaded.inboundVoiceKey, { languageLabel: triggerCtx.languageLabel, triggerOnly: triggerCtx.triggerOnly });
+    const orchOpts = this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, triggerCtx.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, triggerCtx.activeModeName, audioContext, attachmentsContext, workerOrigin, logger, callbacks, groupContext, triggerCtx.languageDocument, triggerCtx.unmatchedTriggers, loaded.inboundVoiceKey, { triggerOnly: triggerCtx.triggerOnly });
 
     const orchResult = await this.tracedPhase(ctx, 'orchestration', () =>
       this.runOrchestration(triggerCtx.messageText, orchOpts)
@@ -1544,7 +1542,6 @@ export class UserDO {
     return {
       ...result,
       messageText,
-      languageLabel: this.languageLabelFor(loaded, result.activeLanguageName),
       triggerOnly,
       unmatchedTriggers: classified.unmatchedTriggers,
     };

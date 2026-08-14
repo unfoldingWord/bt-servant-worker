@@ -49,9 +49,6 @@ interface SystemPromptOptions {
   isVoiceMessage?: boolean | undefined;
   /** Per-turn language document to inject into the system prompt */
   languageDocument?: string | undefined;
-  /** Display label of the active language (e.g. `Hindi`). Drives the
-   *  respond-in-this-language directive that accompanies the document. */
-  languageLabel?: string | undefined;
   /** Set when the user's whole message was routing triggers. */
   triggerOnly?: TriggerOnlyContext | undefined;
   /** Triggers from the user's leading `#<mode>` / `@<language>` tokens that
@@ -225,31 +222,14 @@ function buildConditionalSections(
 /**
  * Inject the per-turn language guidance section if a language document is active.
  *
- * The document itself is authored as a STYLE guide — tone, register, word
- * choice, pronoun conventions for writing that language well. It presupposes
- * the reply is in that language but never says so, which left `@hindi` loading
- * Hindi register rules onto an English answer (#360). The directive below
- * closes that gap: selecting a language governs what language we write in, and
- * the document governs how we write it.
- *
- * `languageLabel` is omitted only when a document is active without a resolved
- * label; the section then degrades to the pre-#360 document-only behavior
- * rather than emitting a directive naming no language.
+ * The document is org-authored content and is passed through verbatim. What it
+ * does or does not instruct — including whether to reply in that language — is
+ * the org's call to write into the document, not this builder's to inject.
  */
-function pushLanguageSection(
-  sections: string[],
-  languageDocument: string | undefined,
-  languageLabel: string | undefined
-): void {
-  if (!languageDocument) return;
-  const directive = languageLabel
-    ? `**Write your replies in ${languageLabel}**, including short acknowledgements and ` +
-      `clarifying questions, unless the user explicitly asks for a different language. The ` +
-      `user may write to you in any language; that does not change the language you reply ` +
-      `in. The guidance below describes HOW to write ${languageLabel} well — it applies to ` +
-      `the text you produce.\n\n`
-    : '';
-  sections.push(`## Language Guidance\n\n${directive}${languageDocument}`);
+function pushLanguageSection(sections: string[], languageDocument: string | undefined): void {
+  if (languageDocument) {
+    sections.push(`## Language Guidance\n\n${languageDocument}`);
+  }
 }
 
 /** Format an available-option list as `name ("label"), name2 ("label2"), …` */
@@ -357,7 +337,10 @@ function pushTriggerOnlyMessageSection(
   const applied: string[] = [];
   if (triggerOnly.mode) applied.push(`- Mode is now: **${triggerOnly.mode}**`);
   if (triggerOnly.clearedMode) applied.push('- Mode was cleared, back to the default assistant');
-  if (triggerOnly.language) applied.push(`- Response language is now: **${triggerOnly.language}**`);
+  // "Selected language", not "response language": the selection loads that
+  // language's guidance document and nothing more. Claiming it changes the
+  // reply language would promise behavior this system does not implement.
+  if (triggerOnly.language) applied.push(`- Selected language is now: **${triggerOnly.language}**`);
   if (triggerOnly.clearedLanguage) {
     applied.push('- Language selection was cleared, back to the default');
   }
@@ -374,9 +357,7 @@ function pushTriggerOnlyMessageSection(
       '',
       '**Reply with a single short sentence confirming the change, and nothing else.** Do not ' +
         'call any tools, do not look anything up, do not answer the previous turn again, and ' +
-        'do not ask what they would like to do next — they will tell you. If a language is ' +
-        'now active, write the confirmation IN that language, since that is the whole point ' +
-        'of what they just did.',
+        'do not ask what they would like to do next — they will tell you.',
     ].join('\n')
   );
 }
@@ -401,7 +382,7 @@ export function buildSystemPrompt(
   const groupSection = buildGroupSection(groupContext);
   if (groupSection) sections.push(groupSection);
 
-  pushLanguageSection(sections, options?.languageDocument, options?.languageLabel);
+  pushLanguageSection(sections, options?.languageDocument);
   pushAddressedStatusSection(sections, options?.addressedToBot);
   pushInboundVoiceSection(sections, options?.inboundVoiceKey);
   pushUnmatchedTriggersSection(sections, options?.unmatchedTriggers);
