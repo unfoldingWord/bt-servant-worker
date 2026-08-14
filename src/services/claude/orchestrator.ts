@@ -54,6 +54,7 @@ import {
   GroupChatContext,
   historyToMessages,
   sanitizeSpeaker,
+  TriggerOnlyContext,
   VOICE_WRITING_RULES,
 } from './system-prompt.js';
 import {
@@ -188,6 +189,10 @@ interface OrchestratorOptions {
   isVoiceMessage?: boolean | undefined;
   /** Per-turn language document to inject into the system prompt */
   languageDocument?: string | undefined;
+  /** Set when the user's whole message was routing triggers (`@hindi` alone).
+   *  Forwarded to the system prompt so the reply is a short confirmation of the
+   *  switch rather than an improvised answer to a bare token. */
+  triggerOnly?: TriggerOnlyContext | undefined;
   /** Triggers from the user's leading `#<mode>` / `@<language>` tokens that
    *  could not be resolved. Forwarded to the system prompt so the orchestrator
    *  can compose a contextual "did you mean…" reply. */
@@ -1232,7 +1237,7 @@ function createOrchestrationContext(
     model: config.model,
     maxTokens: config.maxTokens,
     // prettier-ignore
-    systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument, unmatchedTriggers: options.unmatchedTriggers, addressedToBot: options.addressedToBot, inboundVoiceKey: options.inboundVoiceKey }),
+    systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument, triggerOnly: options.triggerOnly, unmatchedTriggers: options.unmatchedTriggers, addressedToBot: options.addressedToBot, inboundVoiceKey: options.inboundVoiceKey }),
     tools: buildAllTools(catalog, {
       hasModes: (options.modeContext?.availableModes.length ?? 0) > 0,
     }),
@@ -1348,6 +1353,16 @@ function handleOrchestrationError(error: unknown, logger: RequestLogger): never 
 }
 
 /**
+ * Placeholder substituted for an empty user turn at the orchestration boundary.
+ *
+ * See `orchestrate`. Deliberately reads as an instruction rather than as user
+ * speech, so a model that receives it produces a sensible clarifying reply
+ * instead of hallucinating a question the user never asked.
+ */
+const EMPTY_MESSAGE_PLACEHOLDER =
+  '(The user sent a message with no readable content. Ask them briefly what they need.)';
+
+/**
  * Main orchestration function
  */
 export async function orchestrate(
@@ -1355,7 +1370,27 @@ export async function orchestrate(
   options: OrchestratorOptions
 ): Promise<OrchestrationResult> {
   const config = parseEnvConfig(options.env, options.logger);
-  const ctx = createOrchestrationContext(userMessage, options, config);
+
+  // Backstop for #360: the Anthropic API rejects the ENTIRE request when any
+  // user turn has empty content ("messages.N: user messages must have
+  // non-empty content"), so one empty string here costs the whole turn — the
+  // user sees a 502 and no reply. The known producer (trigger-only messages)
+  // is fixed upstream in UserDO, but this path has no business trusting its
+  // caller for something that fails this loudly and this far from the cause.
+  // Logged at error level, never silently: reaching this means an upstream
+  // caller has a bug that needs finding.
+  let effectiveMessage = userMessage;
+  if (userMessage.trim().length === 0) {
+    options.logger.error('empty_user_message', new Error('Empty user message at orchestrate()'), {
+      client_id: options.clientId ?? null,
+      org: options.org ?? null,
+      has_trigger_only: !!options.triggerOnly,
+      history_length: options.history.length,
+    });
+    effectiveMessage = EMPTY_MESSAGE_PLACEHOLDER;
+  }
+
+  const ctx = createOrchestrationContext(effectiveMessage, options, config);
 
   notifyCallback(ctx.logger, () => ctx.callbacks?.onStatus('Processing your request...'));
 

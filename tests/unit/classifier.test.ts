@@ -523,3 +523,56 @@ describe('classifyTriggers — mode aliases', () => {
     expect(result.modeName).toBe('cbbt-mentoring');
   });
 });
+
+// ─── Token-only messages (#360) ─────────────────────────────────────────────
+
+/**
+ * A message consisting ONLY of trigger tokens strips to the empty string.
+ *
+ * This is the classifier behaving correctly — the tokens matched, so the
+ * stripping policy removes them and there is nothing left — but it is the
+ * input that produced #360: UserDO forwarded the empty string as the user
+ * turn and the Anthropic API rejected the whole request. These tests pin the
+ * contract so the caller-side fix keeps being necessary and visible.
+ */
+describe('classifyTriggers — token-only messages (#360)', () => {
+  it('strips a lone matched @language to the empty string', () => {
+    const result = classifyTriggers('@spanish', buildCtx());
+    expect(result.languageName).toBe('spanish');
+    expect(result.strippedMessage).toBe('');
+    expect(result.unmatchedTriggers).toEqual([]);
+  });
+
+  it('strips a lone matched #mode to the empty string', () => {
+    const result = classifyTriggers('#spoken', buildCtx());
+    expect(result.modeName).toBe('spoken');
+    expect(result.strippedMessage).toBe('');
+  });
+
+  it('strips a combined #mode @language to the empty string', () => {
+    const result = classifyTriggers('#spoken @spanish', buildCtx());
+    expect(result.modeName).toBe('spoken');
+    expect(result.languageName).toBe('spanish');
+    expect(result.strippedMessage).toBe('');
+  });
+
+  it('strips a lone clear-intent token to the empty string', () => {
+    const result = classifyTriggers('@clear', buildCtx());
+    expect(result.clearLanguage).toBe(true);
+    expect(result.strippedMessage).toBe('');
+  });
+
+  it('strips trailing whitespace after a lone token to the empty string', () => {
+    const result = classifyTriggers('@spanish   ', buildCtx());
+    expect(result.languageName).toBe('spanish');
+    expect(result.strippedMessage).toBe('');
+  });
+
+  it('leaves an UNMATCHED lone token in place (not empty)', () => {
+    // The preserve-unmatched-content policy means `@nosuchlang` alone is not a
+    // token-only message at all — the text survives, so the turn has content.
+    const result = classifyTriggers('@nosuchlang', buildCtx());
+    expect(result.languageName).toBeUndefined();
+    expect(result.strippedMessage).toBe('@nosuchlang');
+  });
+});

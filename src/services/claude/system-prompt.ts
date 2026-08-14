@@ -22,6 +22,26 @@ export interface GroupChatContext {
   currentSpeaker?: string;
 }
 
+/**
+ * Description of a turn whose message consisted ONLY of routing triggers
+ * (e.g. `@hindi`, `#dbs-coach`) with no other content.
+ *
+ * The selections have already been applied and persisted by the time this is
+ * built — it exists so the orchestrator knows there is no question to answer
+ * and should reply with a short confirmation instead of improvising against a
+ * bare token. See `pushTriggerOnlyMessageSection`.
+ */
+export interface TriggerOnlyContext {
+  /** Display label of the language applied this turn, if any. */
+  language?: string | undefined;
+  /** Display label of the mode applied this turn, if any. */
+  mode?: string | undefined;
+  /** Whether the turn cleared a previously-selected language. */
+  clearedLanguage?: boolean | undefined;
+  /** Whether the turn cleared a previously-active mode. */
+  clearedMode?: boolean | undefined;
+}
+
 interface SystemPromptOptions {
   memoryTOC?: string | undefined;
   clientId?: string | undefined;
@@ -29,6 +49,8 @@ interface SystemPromptOptions {
   isVoiceMessage?: boolean | undefined;
   /** Per-turn language document to inject into the system prompt */
   languageDocument?: string | undefined;
+  /** Set when the user's whole message was routing triggers. */
+  triggerOnly?: TriggerOnlyContext | undefined;
   /** Triggers from the user's leading `#<mode>` / `@<language>` tokens that
    *  could not be resolved. When non-empty, the orchestrator is instructed to
    *  compose a contextual "did you mean…" reply. */
@@ -197,7 +219,13 @@ function buildConditionalSections(
   return sections;
 }
 
-/** Inject the per-turn language guidance section if a language document is active. */
+/**
+ * Inject the per-turn language guidance section if a language document is active.
+ *
+ * The document is org-authored content and is passed through verbatim. What it
+ * does or does not instruct — including whether to reply in that language — is
+ * the org's call to write into the document, not this builder's to inject.
+ */
 function pushLanguageSection(sections: string[], languageDocument: string | undefined): void {
   if (languageDocument) {
     sections.push(`## Language Guidance\n\n${languageDocument}`);
@@ -290,6 +318,50 @@ function pushMiddleSections(
   if (isVoiceMessage) sections.push(VOICE_RESPONSE_GUIDANCE);
 }
 
+/**
+ * Inject the trigger-only directive when the user's entire message was routing
+ * tokens (`@hindi`, `#dbs-coach`, `@clear`).
+ *
+ * Without this the model would see a bare `@hindi` as the user turn — the raw
+ * token is preserved as the turn precisely because an empty one is rejected by
+ * the API (#360) — and would have to guess what it means. The section tells it
+ * the switch already happened and that the only appropriate reply is a short
+ * confirmation.
+ */
+function pushTriggerOnlyMessageSection(
+  sections: string[],
+  triggerOnly: TriggerOnlyContext | undefined
+): void {
+  if (!triggerOnly) return;
+
+  const applied: string[] = [];
+  if (triggerOnly.mode) applied.push(`- Mode is now: **${triggerOnly.mode}**`);
+  if (triggerOnly.clearedMode) applied.push('- Mode was cleared, back to the default assistant');
+  // "Selected language", not "response language": the selection loads that
+  // language's guidance document and nothing more. Claiming it changes the
+  // reply language would promise behavior this system does not implement.
+  if (triggerOnly.language) applied.push(`- Selected language is now: **${triggerOnly.language}**`);
+  if (triggerOnly.clearedLanguage) {
+    applied.push('- Language selection was cleared, back to the default');
+  }
+
+  sections.push(
+    [
+      '## Trigger-Only Message',
+      '',
+      "The user's message consisted ONLY of routing tokens — no question, no request. The " +
+        'tokens have ALREADY been applied and saved; nothing further is required of you to ' +
+        'make them take effect. What changed:',
+      '',
+      ...applied,
+      '',
+      '**Reply with a single short sentence confirming the change, and nothing else.** Do not ' +
+        'call any tools, do not look anything up, do not answer the previous turn again, and ' +
+        'do not ask what they would like to do next — they will tell you.',
+    ].join('\n')
+  );
+}
+
 export function buildSystemPrompt(
   catalog: ToolCatalog,
   preferences: OrchestrationPreferences,
@@ -314,6 +386,7 @@ export function buildSystemPrompt(
   pushAddressedStatusSection(sections, options?.addressedToBot);
   pushInboundVoiceSection(sections, options?.inboundVoiceKey);
   pushUnmatchedTriggersSection(sections, options?.unmatchedTriggers);
+  pushTriggerOnlyMessageSection(sections, options?.triggerOnly);
 
   pushMiddleSections(sections, resolvedPromptValues, catalog, memoryTOC, isVoiceMessage);
   sections.push(...buildConditionalSections(preferences, history));
