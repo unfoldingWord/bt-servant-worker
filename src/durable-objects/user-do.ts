@@ -15,7 +15,12 @@
 
 import { Hono } from 'hono';
 import { Env } from '../config/types.js';
-import { GroupChatContext, orchestrate, OrchestrationResult } from '../services/claude/index.js';
+import {
+  GroupChatContext,
+  orchestrate,
+  OrchestrationResult,
+  TriggerOnlyContext,
+} from '../services/claude/index.js';
 import { formatTOCForPrompt, JsonMemoryStore } from '../services/memory/index.js';
 import { buildToolCatalog, discoverAllTools } from '../services/mcp/index.js';
 import { MCPServerConfig } from '../services/mcp/types.js';
@@ -217,6 +222,66 @@ export function decideLanguagePersistence(
 
 /** Where the turn's requested language came from (rung of the cascade). */
 export type LanguageSource = 'trigger' | 'persisted' | 'org_default' | 'none';
+
+/**
+ * Per-turn language/trigger context handed to the orchestrator.
+ *
+ * Grouped rather than passed positionally: `buildOrchOpts` already takes
+ * enough trailing optionals that two more adjacent ones would be easy to
+ * transpose at the call site.
+ */
+export interface LanguageOrchestrationContext {
+  /** Display label of the active language, e.g. `Hindi`. */
+  languageLabel?: string | undefined;
+  /** Set when the user's whole message was routing tokens (#360). */
+  triggerOnly?: TriggerOnlyContext | undefined;
+}
+
+/**
+ * Describe a turn whose message was nothing but routing tokens, or `undefined`
+ * when the turn has real content for the orchestrator to answer.
+ *
+ * Only reports what changed on THIS turn: an `@hindi` sent while a mode is
+ * already active must not claim the mode was just switched, so the applied
+ * selections are gated on the classifier's own signals rather than read off the
+ * resulting active state.
+ *
+ * A message that is empty for any OTHER reason (blank input, whitespace only)
+ * returns `undefined` — no tokens resolved, so there is nothing to confirm —
+ * and is caught by the empty-message backstop in `orchestrate()` instead.
+ */
+export function buildTriggerOnlyContext(
+  classified: ClassifierResult,
+  active: { modeLabel: string | undefined; languageLabel: string | undefined }
+): TriggerOnlyContext | undefined {
+  if (classified.strippedMessage.trim().length > 0) return undefined;
+
+  const triggerOnly: TriggerOnlyContext = {};
+  if (classified.modeName && active.modeLabel) triggerOnly.mode = active.modeLabel;
+  if (classified.languageName && active.languageLabel) {
+    triggerOnly.language = active.languageLabel;
+  }
+  if (classified.clearMode) triggerOnly.clearedMode = true;
+  if (classified.clearLanguage) triggerOnly.clearedLanguage = true;
+
+  return Object.keys(triggerOnly).length > 0 ? triggerOnly : undefined;
+}
+
+/**
+ * Pick the text sent onward as the user turn.
+ *
+ * The whole of #360: a trigger-only message strips to `''`, and an empty user
+ * turn makes the Anthropic API reject the entire request, so the raw text the
+ * user typed is sent instead. Every other turn uses the stripped message, which
+ * is what keeps resolved routing tokens out of the model's view.
+ */
+export function resolveTurnMessage(
+  rawMessage: string,
+  classified: ClassifierResult,
+  triggerOnly: TriggerOnlyContext | undefined
+): string {
+  return triggerOnly ? rawMessage : classified.strippedMessage;
+}
 
 /**
  * Select the requested language name for a turn by walking the cascade:
@@ -1420,7 +1485,7 @@ export class UserDO {
     const audioContext = this.buildAudioContext();
     const attachmentsContext = createAttachmentsContext();
     // prettier-ignore
-    const orchOpts = this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, triggerCtx.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, triggerCtx.activeModeName, audioContext, attachmentsContext, workerOrigin, logger, callbacks, groupContext, triggerCtx.languageDocument, triggerCtx.unmatchedTriggers, loaded.inboundVoiceKey);
+    const orchOpts = this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, triggerCtx.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, triggerCtx.activeModeName, audioContext, attachmentsContext, workerOrigin, logger, callbacks, groupContext, triggerCtx.languageDocument, triggerCtx.unmatchedTriggers, loaded.inboundVoiceKey, { languageLabel: triggerCtx.languageLabel, triggerOnly: triggerCtx.triggerOnly });
 
     const orchResult = await this.tracedPhase(ctx, 'orchestration', () =>
       this.runOrchestration(triggerCtx.messageText, orchOpts)
@@ -1463,13 +1528,58 @@ export class UserDO {
     });
 
     const result = await this.applyTriggerOverrides(body, loaded, classified, logger);
-    this.logTriggerOutcome(loaded, classified, result, logger);
+
+    // #360: when the message was ONLY trigger tokens, the classifier strips it
+    // to the empty string — and an empty user turn makes the Anthropic API
+    // reject the ENTIRE request ("messages.N: user messages must have non-empty
+    // content"), so the user got a 502 instead of the language they asked for.
+    // Send the raw text they typed instead: non-empty, truthful, and it keeps
+    // the saved transcript matching what they actually sent. `triggerOnly` then
+    // tells the orchestrator the switch already happened so it confirms rather
+    // than improvising against a bare `@hindi`.
+    const triggerOnly = this.buildTriggerOnlyContext(loaded, classified, result);
+    const messageText = resolveTurnMessage(loaded.messageText, classified, triggerOnly);
+    this.logTriggerOutcome(loaded, classified, result, !!triggerOnly, logger);
 
     return {
       ...result,
-      messageText: classified.strippedMessage,
+      messageText,
+      languageLabel: this.languageLabelFor(loaded, result.activeLanguageName),
+      triggerOnly,
       unmatchedTriggers: classified.unmatchedTriggers,
     };
+  }
+
+  /** Display label for an org language slug, falling back to the slug itself. */
+  private languageLabelFor(
+    loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
+    languageName: string | undefined
+  ): string | undefined {
+    if (!languageName) return undefined;
+    const lang = loaded.orgLanguages.languages.find((l) => l.name === languageName);
+    return lang?.label || languageName;
+  }
+
+  /** Display label for an org mode slug, falling back to the slug itself. */
+  private modeLabelFor(
+    loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
+    modeName: string | undefined
+  ): string | undefined {
+    if (!modeName) return undefined;
+    const mode = loaded.orgModes.modes.find((m) => m.name === modeName);
+    return mode?.label || modeName;
+  }
+
+  /** Resolve display labels for this turn's selections and describe it. */
+  private buildTriggerOnlyContext(
+    loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
+    classified: ClassifierResult,
+    result: Awaited<ReturnType<UserDO['applyTriggerOverrides']>>
+  ): TriggerOnlyContext | undefined {
+    return buildTriggerOnlyContext(classified, {
+      modeLabel: this.modeLabelFor(loaded, result.activeModeName),
+      languageLabel: this.languageLabelFor(loaded, result.activeLanguageName),
+    });
   }
 
   /** Emit the classifier-result + persistence telemetry for one chat turn. */
@@ -1477,6 +1587,7 @@ export class UserDO {
     loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
     classified: ClassifierResult,
     result: Awaited<ReturnType<UserDO['applyTriggerOverrides']>>,
+    triggerOnly: boolean,
     logger: RequestLogger
   ): void {
     const unmatchedKinds = [...new Set(classified.unmatchedTriggers.map((t) => t.kind))].sort();
@@ -1490,6 +1601,10 @@ export class UserDO {
       unmatched_count: classified.unmatchedTriggers.length,
       unmatched_kinds: unmatchedKinds,
       message_stripped: classified.strippedMessage !== loaded.messageText,
+      // #360: the message was nothing but routing tokens. Greppable so the
+      // rate of this path — and any recurrence of the empty-turn 400 — stays
+      // visible in production.
+      trigger_only: triggerOnly,
     });
     logModePersistenceChange(logger, result.modePersistence, loaded.activeModeName);
     logLanguagePersistenceChange(logger, result.languagePersistence, loaded.selectedLanguageName);
@@ -2185,7 +2300,8 @@ export class UserDO {
     groupContext?: GroupChatContext,
     languageDocument?: string,
     unmatchedTriggers?: UnmatchedTrigger[],
-    inboundVoiceKey?: string | undefined
+    inboundVoiceKey?: string | undefined,
+    languageContext?: LanguageOrchestrationContext
   ): Parameters<typeof orchestrate>[1] {
     return {
       env: this.env,
@@ -2207,6 +2323,7 @@ export class UserDO {
       groupContext,
       isVoiceMessage: body.message_type === 'audio',
       languageDocument,
+      ...languageContext,
       unmatchedTriggers,
       addressedToBot: body.addressed_to_bot,
       inboundVoiceKey,

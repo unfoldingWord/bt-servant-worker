@@ -22,6 +22,26 @@ export interface GroupChatContext {
   currentSpeaker?: string;
 }
 
+/**
+ * Description of a turn whose message consisted ONLY of routing triggers
+ * (e.g. `@hindi`, `#dbs-coach`) with no other content.
+ *
+ * The selections have already been applied and persisted by the time this is
+ * built — it exists so the orchestrator knows there is no question to answer
+ * and should reply with a short confirmation instead of improvising against a
+ * bare token. See `pushTriggerOnlyMessageSection`.
+ */
+export interface TriggerOnlyContext {
+  /** Display label of the language applied this turn, if any. */
+  language?: string | undefined;
+  /** Display label of the mode applied this turn, if any. */
+  mode?: string | undefined;
+  /** Whether the turn cleared a previously-selected language. */
+  clearedLanguage?: boolean | undefined;
+  /** Whether the turn cleared a previously-active mode. */
+  clearedMode?: boolean | undefined;
+}
+
 interface SystemPromptOptions {
   memoryTOC?: string | undefined;
   clientId?: string | undefined;
@@ -29,6 +49,11 @@ interface SystemPromptOptions {
   isVoiceMessage?: boolean | undefined;
   /** Per-turn language document to inject into the system prompt */
   languageDocument?: string | undefined;
+  /** Display label of the active language (e.g. `Hindi`). Drives the
+   *  respond-in-this-language directive that accompanies the document. */
+  languageLabel?: string | undefined;
+  /** Set when the user's whole message was routing triggers. */
+  triggerOnly?: TriggerOnlyContext | undefined;
   /** Triggers from the user's leading `#<mode>` / `@<language>` tokens that
    *  could not be resolved. When non-empty, the orchestrator is instructed to
    *  compose a contextual "did you mean…" reply. */
@@ -197,11 +222,34 @@ function buildConditionalSections(
   return sections;
 }
 
-/** Inject the per-turn language guidance section if a language document is active. */
-function pushLanguageSection(sections: string[], languageDocument: string | undefined): void {
-  if (languageDocument) {
-    sections.push(`## Language Guidance\n\n${languageDocument}`);
-  }
+/**
+ * Inject the per-turn language guidance section if a language document is active.
+ *
+ * The document itself is authored as a STYLE guide — tone, register, word
+ * choice, pronoun conventions for writing that language well. It presupposes
+ * the reply is in that language but never says so, which left `@hindi` loading
+ * Hindi register rules onto an English answer (#360). The directive below
+ * closes that gap: selecting a language governs what language we write in, and
+ * the document governs how we write it.
+ *
+ * `languageLabel` is omitted only when a document is active without a resolved
+ * label; the section then degrades to the pre-#360 document-only behavior
+ * rather than emitting a directive naming no language.
+ */
+function pushLanguageSection(
+  sections: string[],
+  languageDocument: string | undefined,
+  languageLabel: string | undefined
+): void {
+  if (!languageDocument) return;
+  const directive = languageLabel
+    ? `**Write your replies in ${languageLabel}**, including short acknowledgements and ` +
+      `clarifying questions, unless the user explicitly asks for a different language. The ` +
+      `user may write to you in any language; that does not change the language you reply ` +
+      `in. The guidance below describes HOW to write ${languageLabel} well — it applies to ` +
+      `the text you produce.\n\n`
+    : '';
+  sections.push(`## Language Guidance\n\n${directive}${languageDocument}`);
 }
 
 /** Format an available-option list as `name ("label"), name2 ("label2"), …` */
@@ -290,6 +338,49 @@ function pushMiddleSections(
   if (isVoiceMessage) sections.push(VOICE_RESPONSE_GUIDANCE);
 }
 
+/**
+ * Inject the trigger-only directive when the user's entire message was routing
+ * tokens (`@hindi`, `#dbs-coach`, `@clear`).
+ *
+ * Without this the model would see a bare `@hindi` as the user turn — the raw
+ * token is preserved as the turn precisely because an empty one is rejected by
+ * the API (#360) — and would have to guess what it means. The section tells it
+ * the switch already happened and that the only appropriate reply is a short
+ * confirmation.
+ */
+function pushTriggerOnlyMessageSection(
+  sections: string[],
+  triggerOnly: TriggerOnlyContext | undefined
+): void {
+  if (!triggerOnly) return;
+
+  const applied: string[] = [];
+  if (triggerOnly.mode) applied.push(`- Mode is now: **${triggerOnly.mode}**`);
+  if (triggerOnly.clearedMode) applied.push('- Mode was cleared, back to the default assistant');
+  if (triggerOnly.language) applied.push(`- Response language is now: **${triggerOnly.language}**`);
+  if (triggerOnly.clearedLanguage) {
+    applied.push('- Language selection was cleared, back to the default');
+  }
+
+  sections.push(
+    [
+      '## Trigger-Only Message',
+      '',
+      "The user's message consisted ONLY of routing tokens — no question, no request. The " +
+        'tokens have ALREADY been applied and saved; nothing further is required of you to ' +
+        'make them take effect. What changed:',
+      '',
+      ...applied,
+      '',
+      '**Reply with a single short sentence confirming the change, and nothing else.** Do not ' +
+        'call any tools, do not look anything up, do not answer the previous turn again, and ' +
+        'do not ask what they would like to do next — they will tell you. If a language is ' +
+        'now active, write the confirmation IN that language, since that is the whole point ' +
+        'of what they just did.',
+    ].join('\n')
+  );
+}
+
 export function buildSystemPrompt(
   catalog: ToolCatalog,
   preferences: OrchestrationPreferences,
@@ -310,10 +401,11 @@ export function buildSystemPrompt(
   const groupSection = buildGroupSection(groupContext);
   if (groupSection) sections.push(groupSection);
 
-  pushLanguageSection(sections, options?.languageDocument);
+  pushLanguageSection(sections, options?.languageDocument, options?.languageLabel);
   pushAddressedStatusSection(sections, options?.addressedToBot);
   pushInboundVoiceSection(sections, options?.inboundVoiceKey);
   pushUnmatchedTriggersSection(sections, options?.unmatchedTriggers);
+  pushTriggerOnlyMessageSection(sections, options?.triggerOnly);
 
   pushMiddleSections(sections, resolvedPromptValues, catalog, memoryTOC, isVoiceMessage);
   sections.push(...buildConditionalSections(preferences, history));

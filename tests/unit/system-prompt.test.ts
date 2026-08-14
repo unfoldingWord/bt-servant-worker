@@ -524,3 +524,76 @@ describe('buildSystemPrompt - unmatched triggers section: empty options', () => 
     expect(prompt).toContain('(none configured)');
   });
 });
+
+// ─── Respond-in-this-language directive + trigger-only section (#360) ────────
+
+/** Build a prompt with default fixtures, varying only the options under test. */
+function promptWith(options: Parameters<typeof buildSystemPrompt>[4]): string {
+  return buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES, options);
+}
+
+describe('buildSystemPrompt - language directive (#360)', () => {
+  it('instructs the model to write in the language when a label is supplied', () => {
+    const prompt = promptWith({
+      languageDocument: '## Tone\nUse aap as the default pronoun.',
+      languageLabel: 'Hindi',
+    });
+    expect(prompt).toContain('## Language Guidance');
+    expect(prompt).toContain('**Write your replies in Hindi**');
+    // The document still rides along underneath the directive.
+    expect(prompt).toContain('Use aap as the default pronoun.');
+  });
+
+  it('states that the user writing another language does not change the reply language', () => {
+    const prompt = promptWith({ languageDocument: 'DOC', languageLabel: 'Hindi' });
+    expect(prompt).toContain('that does not change the language you reply');
+  });
+
+  it('degrades to document-only when no label is resolved', () => {
+    const prompt = promptWith({ languageDocument: 'DOC' });
+    expect(prompt).toContain('## Language Guidance');
+    expect(prompt).not.toContain('Write your replies in');
+  });
+
+  it('emits no directive when no language document is active', () => {
+    const prompt = promptWith({ languageLabel: 'Hindi' });
+    expect(prompt).not.toContain('## Language Guidance');
+    expect(prompt).not.toContain('Write your replies in Hindi');
+  });
+});
+
+describe('buildSystemPrompt - trigger-only section (#360)', () => {
+  it('is absent for an ordinary turn', () => {
+    expect(promptWith(undefined)).not.toContain('## Trigger-Only Message');
+  });
+
+  it('names the applied language and demands a one-sentence confirmation', () => {
+    const prompt = promptWith({ triggerOnly: { language: 'Hindi' } });
+    expect(prompt).toContain('## Trigger-Only Message');
+    expect(prompt).toContain('Response language is now: **Hindi**');
+    expect(prompt).toContain('single short sentence confirming the change');
+    expect(prompt).toContain('write the confirmation IN that language');
+  });
+
+  it('names the applied mode', () => {
+    expect(promptWith({ triggerOnly: { mode: 'DBS Coach' } })).toContain(
+      'Mode is now: **DBS Coach**'
+    );
+  });
+
+  it('reports both selections when a combined trigger applied both', () => {
+    const prompt = promptWith({ triggerOnly: { mode: 'Spoken', language: 'Hindi' } });
+    expect(prompt).toContain('Mode is now: **Spoken**');
+    expect(prompt).toContain('Response language is now: **Hindi**');
+  });
+
+  it('describes clear-intent tokens as reverting to the default', () => {
+    const prompt = promptWith({ triggerOnly: { clearedLanguage: true, clearedMode: true } });
+    expect(prompt).toContain('Mode was cleared');
+    expect(prompt).toContain('Language selection was cleared');
+  });
+
+  it('tells the model not to call tools for a trigger-only turn', () => {
+    expect(promptWith({ triggerOnly: { language: 'Hindi' } })).toContain('Do not call any tools');
+  });
+});
