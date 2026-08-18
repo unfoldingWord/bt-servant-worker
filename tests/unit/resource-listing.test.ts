@@ -2,21 +2,25 @@
  * Aggregated resource listing (worker#257 item 1).
  *
  * Parser tests run against fixtures captured verbatim from the live
- * production servers (2026-07-30): translation-helps
- * `list_resources_for_language(en)` and aquifer `list(eng)`. If a server
- * changes its format, refresh the fixture and these tests show the drift.
+ * servers: translation-helps `list_resources_for_language(en)` and aquifer
+ * `list(eng)` (production, 2026-07-30), and translation-helps v2
+ * `list_resources(en)` (staging, 2026-08-18). If a server changes its format,
+ * refresh the fixture and these tests show the drift.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 // Vite ?raw imports — the workers test pool has no filesystem access.
 // @ts-expect-error -- ?raw module resolution is handled by Vite, not tsc
 import AQUIFER_FIXTURE from '../fixtures/aquifer-list-eng.md?raw';
 // @ts-expect-error -- ?raw module resolution is handled by Vite, not tsc
 import TH_FIXTURE from '../fixtures/translation-helps-list-en.json?raw';
+// @ts-expect-error -- ?raw module resolution is handled by Vite, not tsc
+import TH_V2_FIXTURE from '../fixtures/translation-helps-v2-list-en.txt?raw';
 import {
   deriveAquiferOrganization,
   listOrgResources,
   parseAquiferListing,
   parseTranslationHelpsListing,
+  parseTranslationHelpsV2Listing,
   selectListingAdapter,
   slugifySubject,
   toAquiferLanguage,
@@ -110,6 +114,86 @@ describe('parseTranslationHelpsListing errors', () => {
 });
 
 // ─── aquifer parser ───────────────────────────────────────────────────────────
+
+describe('parseTranslationHelpsV2Listing', () => {
+  it('parses the live fixture into normalized items', () => {
+    const items = parseTranslationHelpsV2Listing(TH_V2_FIXTURE, 'th-v2');
+    expect(items).toHaveLength(11);
+    expect(items.every((i) => i.serverId === 'th-v2')).toBe(true);
+    // name comes from `abbreviation`, not the subject label.
+    expect(items.map((i) => i.name)).toContain('ult');
+    expect(items.map((i) => i.name)).toContain('uhb');
+  });
+
+  it('maps the seven known v2 subjects onto canonical slugs', () => {
+    const items = parseTranslationHelpsV2Listing(TH_V2_FIXTURE, 'th-v2');
+    const subjects = new Set(items.map((i) => i.subject));
+    for (const known of [
+      'aligned-bible',
+      'bible',
+      'translation-notes',
+      'translation-words-links',
+      'translation-words',
+      'translation-academy',
+      'translation-questions',
+    ]) {
+      expect(subjects).toContain(known);
+      expect(KNOWN_SUBJECTS).toContain(known);
+    }
+  });
+
+  it('slugifies the two unmapped original-language subjects instead of dropping them', () => {
+    const items = parseTranslationHelpsV2Listing(TH_V2_FIXTURE, 'th-v2');
+    const subjects = items.map((i) => i.subject);
+    // v2 ships Greek New Testament / Hebrew Old Testament, which the shared
+    // subject map does not cover — they must degrade visibly, not vanish.
+    expect(subjects).toContain('greek-new-testament');
+    expect(subjects).toContain('hebrew-old-testament');
+    expect(KNOWN_SUBJECTS).not.toContain('greek-new-testament');
+  });
+
+  it('omits organization and version, which v2 does not send', () => {
+    const items = parseTranslationHelpsV2Listing(TH_V2_FIXTURE, 'th-v2');
+    expect(items.every((i) => i.organization === undefined)).toBe(true);
+    expect(items.every((i) => i.version === undefined)).toBe(true);
+  });
+
+  it('ignores the summary block and locates the JSON by its first brace', () => {
+    const jsonOnly = TH_V2_FIXTURE.slice(TH_V2_FIXTURE.indexOf('{'));
+    expect(parseTranslationHelpsV2Listing(jsonOnly, 'th-v2')).toHaveLength(11);
+  });
+});
+
+describe('parseTranslationHelpsV2Listing errors', () => {
+  it('throws when the declared count does not match parsed items', () => {
+    const drifted = TH_V2_FIXTURE.replace('11 resource(s) available', '12 resource(s) available');
+    expect(() => parseTranslationHelpsV2Listing(drifted, 'th-v2')).toThrow(/declared 12/);
+  });
+
+  it('throws on payloads with no JSON at all', () => {
+    expect(() => parseTranslationHelpsV2Listing('0 resource(s) available for zz', 'th-v2')).toThrow(
+      /no JSON payload/
+    );
+  });
+
+  it('throws on malformed JSON', () => {
+    expect(() => parseTranslationHelpsV2Listing('summary\n\n{"available":', 'th-v2')).toThrow(
+      /not valid JSON/
+    );
+  });
+
+  it('throws when the available array is missing', () => {
+    expect(() => parseTranslationHelpsV2Listing('{"language":"en"}', 'th-v2')).toThrow(
+      /missing "available"/
+    );
+  });
+
+  it('throws when an item is missing abbreviation/subject', () => {
+    expect(() =>
+      parseTranslationHelpsV2Listing('{"available":[{"type":"scripture"}]}', 'th-v2')
+    ).toThrow(/missing abbreviation\/subject/);
+  });
+});
 
 describe('parseAquiferListing', () => {
   it('parses all 35 entries of the live fixture', () => {
@@ -218,6 +302,28 @@ describe('selectListingAdapter', () => {
     expect(adapter?.id).toBe('translation-helps');
   });
 
+  it('picks translation-helps-v2 for a list_resources tool', () => {
+    expect(selectListingAdapter([tool('list_resources'), tool('get_passage')])?.id).toBe(
+      'translation-helps-v2'
+    );
+  });
+
+  it('prefers v1 over v2 when a server exposes both listing tools', () => {
+    // Ordering guard: v1 carries organization/version that v2 drops, so a
+    // server offering both must keep the richer payload. This protects the
+    // adapter that serves production today.
+    const adapter = selectListingAdapter([
+      tool('list_resources'),
+      tool('list_resources_for_language'),
+    ]);
+    expect(adapter?.id).toBe('translation-helps');
+  });
+
+  it('passes the language tag through untranslated for v2', () => {
+    const adapter = selectListingAdapter([tool('list_resources')]);
+    expect(adapter?.buildArgs('en-US')).toEqual({ language: 'en-US' });
+  });
+
   it('picks aquifer for a generic list tool', () => {
     expect(selectListingAdapter([tool('list'), tool('search')])?.id).toBe('aquifer');
   });
@@ -300,6 +406,35 @@ describe('listOrgResources', () => {
   it('returns empty aggregation for an org with no servers', async () => {
     const result = await listOrgResources([], 'en', logger, makeDeps());
     expect(result).toEqual({ resources: {}, servers: [] });
+  });
+});
+
+describe('listOrgResources unsupported observability', () => {
+  it('warns with the discovered tool names when no adapter matches', async () => {
+    // Regression guard for #354: this path used to return zero resources with
+    // no telemetry at all, making "unrecognized listing tool" look identical to
+    // "server has none" and forcing a manual probe session to tell them apart.
+    const warn = vi.spyOn(logger, 'warn');
+    try {
+      const result = await listOrgResources([server('fia')], 'en', logger, makeDeps());
+      expect(result.servers[0]?.status).toBe('unsupported');
+      expect(warn).toHaveBeenCalledWith(
+        'resource_listing_unsupported',
+        expect.objectContaining({ server_id: 'fia', tools: ['get_pericope'] })
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('does not warn for servers that do have a matching adapter', async () => {
+    const warn = vi.spyOn(logger, 'warn');
+    try {
+      await listOrgResources([server('aquifer')], 'en', logger, makeDeps());
+      expect(warn).not.toHaveBeenCalledWith('resource_listing_unsupported', expect.anything());
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 

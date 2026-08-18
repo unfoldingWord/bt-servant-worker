@@ -128,6 +128,92 @@ export function parseTranslationHelpsListing(text: string, serverId: string): Re
   return items;
 }
 
+// ─── translation-helps v2 adapter ─────────────────────────────────────────────
+
+/**
+ * translation-helps v2 (`list_resources`) is a separate rewrite of the server,
+ * not an older deployment of the 7.x app — it answers on the same host under
+ * /v2 and numbers itself from 2.0.0. Its payload arrives as two text blocks
+ * that extractTextContent joins with a blank line:
+ *
+ *   11 resource(s) available for en
+ *
+ *   {"language":"en","available":[{type,subject,abbreviation,role}, ...], ...}
+ *
+ * The JSON is located by its first brace rather than by splitting on the blank
+ * line, so the parser is indifferent to whether the summary block is present.
+ */
+const TRANSLATION_HELPS_V2_COUNT_PATTERN = /^(\d+) resource\(s\) available/m;
+
+/**
+ * Cross-check the declared count against what we parsed. v2 hands us the one
+ * piece of self-validating data in the payload; discarding it would let a
+ * format drift return a short catalog as a confident success. Same contract as
+ * assertAquiferCount.
+ */
+function assertTranslationHelpsV2Count(text: string, parsedCount: number): void {
+  const countMatch = TRANSLATION_HELPS_V2_COUNT_PATTERN.exec(text);
+  if (!countMatch) return;
+  const declared = Number(countMatch[1]);
+  if (declared !== parsedCount) {
+    throw new Error(
+      `translation-helps v2 listing declared ${declared} resources but ${parsedCount} parsed — format may have changed`
+    );
+  }
+}
+
+/** Pull the `available` array out of the v2 payload, throwing on any drift. */
+function extractV2Available(text: string): unknown[] {
+  const start = text.indexOf('{');
+  if (start === -1) {
+    throw new Error('translation-helps v2 listing contained no JSON payload');
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text.slice(start));
+  } catch {
+    throw new Error('translation-helps v2 listing was not valid JSON');
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('translation-helps v2 listing JSON was not an object');
+  }
+  // `available` and `resources` have been byte-identical in every probe;
+  // prefer the semantically named one.
+  const available = (parsed as { available?: unknown }).available;
+  if (!Array.isArray(available)) {
+    throw new Error('translation-helps v2 listing missing "available" array');
+  }
+  return available;
+}
+
+/**
+ * v2 items carry {type, subject, abbreviation, role} — no organization, version
+ * or url, so v2 rows are sparser than v1's and consumers must not assume those
+ * fields are populated.
+ */
+function normalizeTranslationHelpsV2Item(raw: unknown, serverId: string): ResourceItem {
+  if (typeof raw !== 'object' || raw === null) {
+    throw new Error('translation-helps v2 listing item was not an object');
+  }
+  const item = raw as Record<string, unknown>;
+  if (typeof item.abbreviation !== 'string' || typeof item.subject !== 'string') {
+    throw new Error('translation-helps v2 listing item missing abbreviation/subject');
+  }
+  return {
+    name: item.abbreviation,
+    subject: normalizeSubject(item.subject, TRANSLATION_HELPS_SUBJECT_MAP),
+    serverId,
+  };
+}
+
+export function parseTranslationHelpsV2Listing(text: string, serverId: string): ResourceItem[] {
+  const items = extractV2Available(text).map((raw) =>
+    normalizeTranslationHelpsV2Item(raw, serverId)
+  );
+  assertTranslationHelpsV2Count(text, items.length);
+  return items;
+}
+
 // ─── aquifer adapter ──────────────────────────────────────────────────────────
 
 /**
@@ -287,7 +373,7 @@ export function parseAquiferListing(text: string, serverId: string): ResourceIte
 
 export interface ResourceListingAdapter {
   /** Which adapter matched (for logs). */
-  id: 'translation-helps' | 'aquifer';
+  id: 'translation-helps' | 'translation-helps-v2' | 'aquifer';
   toolName: string;
   buildArgs(language: string): Record<string, unknown>;
   parse(text: string, serverId: string): ResourceItem[];
@@ -298,6 +384,17 @@ const TRANSLATION_HELPS_ADAPTER: ResourceListingAdapter = {
   toolName: 'list_resources_for_language',
   buildArgs: (language) => ({ language }),
   parse: parseTranslationHelpsListing,
+};
+
+const TRANSLATION_HELPS_V2_ADAPTER: ResourceListingAdapter = {
+  id: 'translation-helps-v2',
+  toolName: 'list_resources',
+  // v2 speaks BCP-47 directly and parses region variants itself, so the tag is
+  // passed through untranslated. It answers region tags literally (en-US has
+  // its own, much smaller catalog than en) — that is the server's real answer,
+  // not a miss, so we do not truncate the way toAquiferLanguage has to.
+  buildArgs: (language) => ({ language }),
+  parse: parseTranslationHelpsV2Listing,
 };
 
 const AQUIFER_ADAPTER: ResourceListingAdapter = {
@@ -316,7 +413,11 @@ export function selectListingAdapter(
   tools: MCPToolDefinition[]
 ): ResourceListingAdapter | undefined {
   const names = new Set(tools.map((t) => t.name));
+  // Order matters: a server exposing both list_resources_for_language and
+  // list_resources must keep the v1 payload, which carries organization and
+  // version that v2 drops.
   if (names.has(TRANSLATION_HELPS_ADAPTER.toolName)) return TRANSLATION_HELPS_ADAPTER;
+  if (names.has(TRANSLATION_HELPS_V2_ADAPTER.toolName)) return TRANSLATION_HELPS_V2_ADAPTER;
   if (names.has(AQUIFER_ADAPTER.toolName)) return AQUIFER_ADAPTER;
   return undefined;
 }
@@ -337,6 +438,26 @@ export interface ListOrgResourcesResult {
 interface ServerListingOutcome {
   report: ResourceServerReport;
   items: ResourceItem[];
+}
+
+/**
+ * No adapter matched this server's tool manifest. Logged rather than returned
+ * silently: without it a server drops to zero resources with no trace, so "we
+ * don't recognize its listing tool" (#354 — translation-helps v2, yaapi) is
+ * indistinguishable from "it genuinely has none" (FIA). The discovered tool
+ * names are what make the grey chip in the admin portal diagnosable from logs.
+ */
+function unsupportedOutcome(
+  server: MCPServerConfig,
+  manifest: MCPServerManifest,
+  base: { serverId: string; serverName: string },
+  logger: RequestLogger
+): ServerListingOutcome {
+  logger.warn('resource_listing_unsupported', {
+    server_id: server.id,
+    tools: manifest.tools.map((t) => t.name),
+  });
+  return { report: { ...base, status: 'unsupported' }, items: [] };
 }
 
 /** List one server's resources, degrading every failure to a report. */
@@ -361,9 +482,7 @@ async function listServerResources(
     };
   }
   const adapter = selectListingAdapter(manifest.tools);
-  if (!adapter) {
-    return { report: { ...base, status: 'unsupported' }, items: [] };
-  }
+  if (!adapter) return unsupportedOutcome(server, manifest, base, logger);
   try {
     const call = await deps.callMCPTool(
       server,
