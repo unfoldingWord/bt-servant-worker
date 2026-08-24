@@ -214,6 +214,70 @@ export function parseTranslationHelpsV2Listing(text: string, serverId: string): 
   return items;
 }
 
+// ─── obs-5m (OBS Five Movements / OBS-TF MCP) adapter ─────────────────────────
+
+/**
+ * obs-5m's `list_resources` shares a tool name with translation-helps v2 but
+ * returns `{ language, resources: [{ id, type, available, source, description }] }`
+ * — no top-level `available` array. Staging currently classifies that as
+ * `translation-helps v2 listing missing "available" array`, so OBS-TF never
+ * appears in Resource priorities and the 5M coach falls through to classic
+ * OBS TH tools (`get_obs_story` / notes / questions).
+ *
+ * Detected by the presence of `fetch_obs_study_manual` on the same server
+ * (capability-based, same pattern as the other adapters).
+ */
+const OBS_5M_TYPE_MAP: Record<string, string> = {
+  structured: 'bible-stories',
+  pdf: 'media',
+};
+
+function extractObs5mResources(text: string): unknown[] {
+  const start = text.indexOf('{');
+  if (start === -1) {
+    throw new Error('obs-5m listing contained no JSON payload');
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text.slice(start));
+  } catch {
+    throw new Error('obs-5m listing was not valid JSON');
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('obs-5m listing JSON was not an object');
+  }
+  const resources = (parsed as { resources?: unknown }).resources;
+  if (!Array.isArray(resources)) {
+    throw new Error('obs-5m listing missing "resources" array');
+  }
+  return resources;
+}
+
+function normalizeObs5mItem(raw: unknown, serverId: string): ResourceItem | null {
+  if (typeof raw !== 'object' || raw === null) {
+    throw new Error('obs-5m listing item was not an object');
+  }
+  const item = raw as Record<string, unknown>;
+  if (typeof item.id !== 'string' || typeof item.type !== 'string') {
+    throw new Error('obs-5m listing item missing id/type');
+  }
+  if (item.available === false) return null;
+  const normalized: ResourceItem = {
+    name: item.id,
+    subject: normalizeSubject(item.type, OBS_5M_TYPE_MAP),
+    serverId,
+  };
+  if (typeof item.description === 'string') normalized.label = item.description;
+  if (typeof item.source === 'string') normalized.organization = item.source;
+  return normalized;
+}
+
+export function parseObs5mListing(text: string, serverId: string): ResourceItem[] {
+  return extractObs5mResources(text)
+    .map((raw) => normalizeObs5mItem(raw, serverId))
+    .filter((item): item is ResourceItem => item !== null);
+}
+
 // ─── aquifer adapter ──────────────────────────────────────────────────────────
 
 /**
@@ -373,7 +437,7 @@ export function parseAquiferListing(text: string, serverId: string): ResourceIte
 
 export interface ResourceListingAdapter {
   /** Which adapter matched (for logs). */
-  id: 'translation-helps' | 'translation-helps-v2' | 'aquifer';
+  id: 'translation-helps' | 'translation-helps-v2' | 'obs-5m' | 'aquifer';
   toolName: string;
   buildArgs(language: string): Record<string, unknown>;
   parse(text: string, serverId: string): ResourceItem[];
@@ -404,6 +468,13 @@ const AQUIFER_ADAPTER: ResourceListingAdapter = {
   parse: parseAquiferListing,
 };
 
+const OBS_5M_ADAPTER: ResourceListingAdapter = {
+  id: 'obs-5m',
+  toolName: 'list_resources',
+  buildArgs: (language) => ({ language }),
+  parse: parseObs5mListing,
+};
+
 /**
  * Pick the adapter for a server from its discovered tool manifest. The
  * specific tool name is checked before the generic one; a server exposing
@@ -416,7 +487,12 @@ export function selectListingAdapter(
   // Order matters: a server exposing both list_resources_for_language and
   // list_resources must keep the v1 payload, which carries organization and
   // version that v2 drops.
+  // obs-5m also exposes list_resources, but its payload is not TH v2 — detect
+  // it by the study-manual tool before falling through to the v2 parser.
   if (names.has(TRANSLATION_HELPS_ADAPTER.toolName)) return TRANSLATION_HELPS_ADAPTER;
+  if (names.has('fetch_obs_study_manual') && names.has(OBS_5M_ADAPTER.toolName)) {
+    return OBS_5M_ADAPTER;
+  }
   if (names.has(TRANSLATION_HELPS_V2_ADAPTER.toolName)) return TRANSLATION_HELPS_V2_ADAPTER;
   if (names.has(AQUIFER_ADAPTER.toolName)) return AQUIFER_ADAPTER;
   return undefined;

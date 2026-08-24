@@ -15,10 +15,15 @@ import AQUIFER_FIXTURE from '../fixtures/aquifer-list-eng.md?raw';
 import TH_FIXTURE from '../fixtures/translation-helps-list-en.json?raw';
 // @ts-expect-error -- ?raw module resolution is handled by Vite, not tsc
 import TH_V2_FIXTURE from '../fixtures/translation-helps-v2-list-en.txt?raw';
+// @ts-expect-error -- ?raw module resolution is handled by Vite, not tsc
+import OBS_5M_EN_FIXTURE from '../fixtures/obs-5m-list-en.txt?raw';
+// @ts-expect-error -- ?raw module resolution is handled by Vite, not tsc
+import OBS_5M_ID_FIXTURE from '../fixtures/obs-5m-list-id.txt?raw';
 import {
   deriveAquiferOrganization,
   listOrgResources,
   parseAquiferListing,
+  parseObs5mListing,
   parseTranslationHelpsListing,
   parseTranslationHelpsV2Listing,
   selectListingAdapter,
@@ -195,6 +200,46 @@ describe('parseTranslationHelpsV2Listing errors', () => {
   });
 });
 
+describe('parseObs5mListing', () => {
+  it('parses the live English listing into bible-stories', () => {
+    const items = parseObs5mListing(OBS_5M_EN_FIXTURE, 'obs-5m');
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      name: 'obs-tf',
+      subject: 'bible-stories',
+      serverId: 'obs-5m',
+      organization: 'door43',
+    });
+    expect(KNOWN_SUBJECTS).toContain(items[0]?.subject);
+  });
+
+  it('maps Indonesian structured + pdf rows', () => {
+    const items = parseObs5mListing(OBS_5M_ID_FIXTURE, 'obs-5m');
+    expect(items.map((i) => i.name)).toEqual(['obs-tf', 'obs-tf-pdf']);
+    expect(items.map((i) => i.subject)).toEqual(['bible-stories', 'media']);
+  });
+
+  it('drops unavailable rows', () => {
+    const text =
+      '{"language":"es","resources":[{"id":"obs-tf","type":"structured","available":false,"source":"none","description":"missing"}]}';
+    expect(parseObs5mListing(text, 'obs-5m')).toEqual([]);
+  });
+});
+
+describe('parseObs5mListing errors', () => {
+  it('throws when the payload has no JSON object', () => {
+    expect(() => parseObs5mListing('1 resource type(s) for zz', 'obs-5m')).toThrow(
+      /no JSON payload/
+    );
+  });
+
+  it('throws when resources is missing', () => {
+    expect(() => parseObs5mListing('{"language":"en"}', 'obs-5m')).toThrow(
+      /missing "resources" array/
+    );
+  });
+});
+
 describe('parseAquiferListing', () => {
   it('parses all 35 entries of the live fixture', () => {
     const items = parseAquiferListing(AQUIFER_FIXTURE, 'aquifer');
@@ -305,6 +350,12 @@ describe('selectListingAdapter', () => {
   it('picks translation-helps-v2 for a list_resources tool', () => {
     expect(selectListingAdapter([tool('list_resources'), tool('get_passage')])?.id).toBe(
       'translation-helps-v2'
+    );
+  });
+
+  it('picks obs-5m when list_resources is paired with fetch_obs_study_manual', () => {
+    expect(selectListingAdapter([tool('list_resources'), tool('fetch_obs_study_manual')])?.id).toBe(
+      'obs-5m'
     );
   });
 

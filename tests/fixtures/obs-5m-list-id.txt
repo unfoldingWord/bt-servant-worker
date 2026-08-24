@@ -1,0 +1,3 @@
+2 resource type(s) for id
+
+{"language":"id","resources":[{"id":"obs-tf","type":"structured","available":true,"source":"door43","description":"OBS + Theological Formation from DCS catalog (subject=OBS Theological Formation, topic=tc-ready)"},{"id":"obs-tf-pdf","type":"pdf","available":true,"source":"self-hosted","description":"Self-hosted Indonesian OBS Five Movements PDFs (R2) — use when you need the file; text is also available via fetch_obs_study_manual"}],"_meta":{"downstream_api_calls":0,"cache_status":"hit"}}
