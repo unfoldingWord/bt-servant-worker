@@ -50,7 +50,7 @@ import {
   isPrepareUsfmSourceInput,
 } from '../ptxprint/index.js';
 import {
-  buildSystemPrompt,
+  buildSystemPromptBlocks,
   GroupChatContext,
   historyToMessages,
   sanitizeSpeaker,
@@ -268,7 +268,17 @@ interface OrchestrationContext {
   apiKey: string;
   model: string;
   maxTokens: number;
-  systemPrompt: string;
+  /**
+   * Org/mode-scoped system prefix, byte-identical for every user in that scope.
+   * Carries the cache breakpoint — see {@link buildMessageBody}.
+   */
+  systemStable: string;
+  /** Per-request remainder of the system prompt, separator-prefixed. */
+  systemVolatile: string;
+  /** FNV-1a of `systemStable`, for attributing cache-rate changes. */
+  systemStableHash: string;
+  /** Active mode slug, used as a metric dimension — the dominant cost driver. */
+  activeMode: string | undefined;
   tools: Anthropic.Tool[];
   messages: Anthropic.MessageParam[];
   responses: string[];
@@ -328,16 +338,159 @@ function extractTextResponses(content: Anthropic.ContentBlock[]): string[] {
   return texts;
 }
 
-/** Build the JSON request body for the Anthropic Messages API. */
-function buildMessageBody(ctx: OrchestrationContext, stream: boolean): string {
+/**
+ * Render `system` as content blocks with the cache breakpoint on the stable
+ * prefix (issue #333).
+ *
+ * `cache_control` cannot attach to a bare string, so `system` has to be an
+ * array. The breakpoint goes on the FIRST block — the org/mode-scoped prefix
+ * that is byte-identical for every user — because caching is a prefix match and
+ * a write only happens at the breakpoint. Marking the last block instead would
+ * key the entry to per-request content and never produce a read.
+ *
+ * The volatile block is omitted rather than emitted empty: empty text blocks
+ * cannot be cached and are rejected by the API.
+ */
+function buildSystemBlocks(ctx: OrchestrationContext): Anthropic.TextBlockParam[] {
+  return [
+    {
+      type: 'text',
+      text: ctx.systemStable,
+      cache_control: { type: 'ephemeral' },
+    },
+    ...(ctx.systemVolatile ? [{ type: 'text' as const, text: ctx.systemVolatile }] : []),
+  ];
+}
+
+/**
+ * Build the JSON request body for the Anthropic Messages API.
+ *
+ * Two cache breakpoints, using 2 of the 4 available slots:
+ *
+ * 1. Explicit, on the stable system block. Render order is `tools` -> `system`
+ *    -> `messages`, so this one entry covers the tool definitions AND the
+ *    org/mode prompt prefix — the bulk of what we re-send every call.
+ * 2. Top-level `cache_control`, which is automatic caching: the API places a
+ *    breakpoint on the last cacheable block and advances it as the conversation
+ *    grows. That is what pays for the orchestration loop, where each iteration
+ *    re-sends every tool result accumulated so far. Because the breakpoint moves
+ *    every iteration, consecutive writes stay a few content blocks apart and
+ *    comfortably inside the API's 20-block lookback window.
+ *
+ * Prompt caching is GA — no beta header is required.
+ */
+export function buildMessageBody(ctx: OrchestrationContext, stream: boolean): string {
   return JSON.stringify({
     model: ctx.model,
     max_tokens: ctx.maxTokens,
-    system: ctx.systemPrompt,
+    system: buildSystemBlocks(ctx),
     messages: ctx.messages,
     ...(ctx.tools.length > 0 ? { tools: ctx.tools } : {}),
+    cache_control: { type: 'ephemeral' },
     stream,
   });
+}
+
+/**
+ * Anthropic's cache pricing multipliers, relative to the base input rate.
+ *
+ * These are multipliers, not prices: they are identical across every model, so
+ * encoding them here does not create a price table that goes stale when
+ * Anthropic reprices. The dollar rate is applied at report time, never here.
+ */
+const CACHE_WRITE_5M_MULTIPLIER = 1.25;
+const CACHE_WRITE_1H_MULTIPLIER = 2.0;
+const CACHE_READ_MULTIPLIER = 0.1;
+
+/** Token accounting for one Anthropic call, including what caching saved. */
+export interface UsageSummary {
+  /** Uncached remainder only — everything AFTER the last breakpoint. */
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
+  cache_write_5m_tokens: number;
+  cache_write_1h_tokens: number;
+  /**
+   * What this call actually costs, expressed in base-rate-equivalent input
+   * tokens. Subtract it from the true prompt size
+   * (`input + cache_creation + cache_read`) to get the savings, then multiply
+   * by the model's $/MTok. Caching does not change the prompt, so that
+   * subtraction is an exact counterfactual, not an estimate — which is why we
+   * can report savings without ever having measured a pre-caching baseline.
+   */
+  billable_input_tokens: number;
+}
+
+const EMPTY_USAGE: UsageSummary = {
+  input_tokens: 0,
+  output_tokens: 0,
+  cache_creation_input_tokens: 0,
+  cache_read_input_tokens: 0,
+  cache_write_5m_tokens: 0,
+  cache_write_1h_tokens: 0,
+  billable_input_tokens: 0,
+};
+
+/** Coerce a possibly-null/absent token count to a number. */
+function tokenCount(value: number | null | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+/**
+ * Reduce an Anthropic `usage` block to the token accounting we report on.
+ *
+ * Tolerant by design: `usage` is telemetry, and a malformed or partial block
+ * must never break a chat turn that otherwise succeeded.
+ */
+export function summarizeUsage(usage: Anthropic.Usage | undefined | null): UsageSummary {
+  if (!usage) return { ...EMPTY_USAGE };
+
+  const read = tokenCount(usage.cache_read_input_tokens);
+  const writeTotal = tokenCount(usage.cache_creation_input_tokens);
+
+  // Newer responses break the write down by TTL. When that breakdown is absent,
+  // attribute the whole write to the 5-minute bucket — the only TTL we request.
+  const breakdown = usage.cache_creation;
+  const write1h = tokenCount(breakdown?.ephemeral_1h_input_tokens);
+  const write5m = breakdown
+    ? tokenCount(breakdown.ephemeral_5m_input_tokens)
+    : writeTotal - write1h;
+
+  const input = tokenCount(usage.input_tokens);
+
+  return {
+    input_tokens: input,
+    output_tokens: tokenCount(usage.output_tokens),
+    cache_creation_input_tokens: writeTotal || write5m + write1h,
+    cache_read_input_tokens: read,
+    cache_write_5m_tokens: write5m,
+    cache_write_1h_tokens: write1h,
+    billable_input_tokens: Math.round(
+      input +
+        CACHE_WRITE_5M_MULTIPLIER * write5m +
+        CACHE_WRITE_1H_MULTIPLIER * write1h +
+        CACHE_READ_MULTIPLIER * read
+    ),
+  };
+}
+
+/**
+ * FNV-1a over the stable system block, logged once per request.
+ *
+ * When the cache hit rate dips, this is what separates "an MCP server was down
+ * so the tool catalog shrank" from "an admin edited a prompt override in the
+ * portal". Both change the cached prefix; without a fingerprint both are
+ * invisible. Non-cryptographic and synchronous on purpose — `crypto.subtle` is
+ * async and this sits on the request path.
+ */
+function fingerprint(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, '0');
 }
 
 /**
@@ -1001,11 +1154,79 @@ async function executeIterationTools(
   }
 }
 
+/**
+ * Emit per-call token counters (issue #333).
+ *
+ * Labelled by `model` and `mode`: caches are model-scoped, and the active mode
+ * swings the cached prefix by roughly 3.5x between the smallest and largest
+ * mode documents, so a savings number that is not broken down by mode is not
+ * actionable. `org` is deliberately not a dimension, matching the precedent set
+ * by `chat_turns_total`, which logs org but does not meter it.
+ *
+ * Zero-valued counters are skipped — an `add(0)` produces a series carrying no
+ * information while still costing cardinality.
+ */
+function emitUsageMetrics(ctx: OrchestrationContext, usage: UsageSummary): void {
+  const labels = { model: ctx.model, ...(ctx.activeMode ? { mode: ctx.activeMode } : {}) };
+
+  const counters: Array<[string, number, Record<string, string>]> = [
+    ['claude_input_tokens_total', usage.input_tokens, labels],
+    ['claude_output_tokens_total', usage.output_tokens, labels],
+    ['claude_cache_read_tokens_total', usage.cache_read_input_tokens, labels],
+    ['claude_billable_input_tokens_total', usage.billable_input_tokens, labels],
+    ['claude_cache_write_tokens_total', usage.cache_write_5m_tokens, { ...labels, type: '5m' }],
+    ['claude_cache_write_tokens_total', usage.cache_write_1h_tokens, { ...labels, type: '1h' }],
+  ];
+
+  for (const [name, value, metricLabels] of counters) {
+    if (value > 0) countMetric(name, metricLabels, value);
+  }
+}
+
+/**
+ * Log and meter one Claude response, including its token accounting.
+ *
+ * Token usage is reported here rather than swallowed (it previously was) so
+ * cache performance and spend are observable — `cache_read_input_tokens > 0` is
+ * the acceptance signal for prompt caching, and `billable_input_tokens` against
+ * the true prompt size is how savings are reported. See issue #333.
+ */
+function reportClaudeResponse(
+  ctx: OrchestrationContext,
+  args: {
+    iteration: number;
+    response: Anthropic.Message;
+    toolCalls: ToolUseBlock[];
+    iterStart: number;
+  }
+): void {
+  const { iteration, response, toolCalls, iterStart } = args;
+  const usage = summarizeUsage(response.usage);
+  ctx.logger.log('claude_response', {
+    iteration,
+    stop_reason: response.stop_reason,
+    tool_calls_count: toolCalls.length,
+    text_blocks_count: response.content.filter((b) => b.type === 'text').length,
+    duration_ms: Date.now() - iterStart,
+    input_tokens: usage.input_tokens,
+    output_tokens: usage.output_tokens,
+    cache_creation_input_tokens: usage.cache_creation_input_tokens,
+    cache_read_input_tokens: usage.cache_read_input_tokens,
+    billable_input_tokens: usage.billable_input_tokens,
+  });
+  emitUsageMetrics(ctx, usage);
+}
+
 function processIteration(ctx: OrchestrationContext, iteration: number): Promise<boolean> {
   return withSpan('iteration', { iteration }, async () => {
     const iterStart = Date.now();
     ctx.logger.log('iteration_start', { iteration, message_count: ctx.messages.length });
-    ctx.logger.log('claude_request', { iteration, message_count: ctx.messages.length });
+    ctx.logger.log('claude_request', {
+      iteration,
+      message_count: ctx.messages.length,
+      system_stable_hash: ctx.systemStableHash,
+      system_stable_chars: ctx.systemStable.length,
+    });
 
     if (iteration > 0 && ctx.callbacks) {
       notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress('\n'));
@@ -1014,13 +1235,7 @@ function processIteration(ctx: OrchestrationContext, iteration: number): Promise
 
     const response = await callClaudeForIteration(ctx, iteration, iterStart);
     const toolCalls = extractToolCalls(response.content);
-    ctx.logger.log('claude_response', {
-      iteration,
-      stop_reason: response.stop_reason,
-      tool_calls_count: toolCalls.length,
-      text_blocks_count: response.content.filter((b) => b.type === 'text').length,
-      duration_ms: Date.now() - iterStart,
-    });
+    reportClaudeResponse(ctx, { iteration, response, toolCalls, iterStart });
 
     ctx.lastIterationStartIndex = ctx.responses.length;
     ctx.responses.push(...extractTextResponses(response.content));
@@ -1231,13 +1446,18 @@ function createOrchestrationContext(
   );
   const llmMax = orgConfig?.max_history_llm ?? DEFAULT_ORG_CONFIG.max_history_llm;
 
+  // prettier-ignore
+  const systemBlocks = buildSystemPromptBlocks(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument, triggerOnly: options.triggerOnly, unmatchedTriggers: options.unmatchedTriggers, addressedToBot: options.addressedToBot, inboundVoiceKey: options.inboundVoiceKey });
+
   return {
     client: new Anthropic({ apiKey: env.ANTHROPIC_API_KEY }),
     apiKey: env.ANTHROPIC_API_KEY,
     model: config.model,
     maxTokens: config.maxTokens,
-    // prettier-ignore
-    systemPrompt: buildSystemPrompt(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument, triggerOnly: options.triggerOnly, unmatchedTriggers: options.unmatchedTriggers, addressedToBot: options.addressedToBot, inboundVoiceKey: options.inboundVoiceKey }),
+    systemStable: systemBlocks.stable,
+    systemVolatile: systemBlocks.volatile,
+    systemStableHash: fingerprint(systemBlocks.stable),
+    activeMode: options.modeContext?.activeModeName,
     tools: buildAllTools(catalog, {
       hasModes: (options.modeContext?.availableModes.length ?? 0) > 0,
     }),
@@ -1318,7 +1538,11 @@ async function runOrchestrationLoop(
   });
   // Iterations actually run this request (lastIteration is 0-based), labeled by how
   // the loop exited — bounded reason enum, no ids.
-  recordMetric('orchestration_iterations', lastIteration + 1, { reason: exitReason });
+  recordMetric('orchestration_iterations', lastIteration + 1, {
+    reason: exitReason,
+    model: ctx.model,
+    ...(ctx.activeMode ? { mode: ctx.activeMode } : {}),
+  });
 
   // Log health summary at end of orchestration
   logOrchestrationSummary(ctx);

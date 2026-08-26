@@ -362,20 +362,60 @@ function pushTriggerOnlyMessageSection(
   );
 }
 
-export function buildSystemPrompt(
+/**
+ * The system prompt, split into a cacheable prefix and a per-request remainder
+ * (issue #333).
+ *
+ * Prompt caching is a prefix match: the API caches everything from the start of
+ * the request up to a `cache_control` breakpoint, and a single differing byte
+ * before that point invalidates the whole entry. So the prompt has to be cut
+ * into "identical for everyone in this org+mode" and "differs per request".
+ *
+ * `stable` is that shared prefix — the org's configured prompt slots plus the
+ * MCP tool catalog. It is the same bytes for every user, every client and every
+ * conversation in an (org, mode), which is what makes the cache entry worth
+ * writing. `volatile` is everything downstream of it.
+ *
+ * NOTHING IS REORDERED. The cut lands on a seam that already existed in the
+ * assembly order below, and `stable + volatile` reproduces `buildSystemPrompt()`
+ * byte for byte — see `tests/unit/prompt-caching.test.ts`. The savings come
+ * from marking the prefix cacheable, not from rewriting the prompt.
+ *
+ * The `'\n\n'` section separator is carried as the LEADING characters of
+ * `volatile` rather than re-joined by the caller. Putting it in the join would
+ * let a lost separator pass an equality test that re-adds it.
+ */
+export interface SystemPromptBlocks {
+  /** org/mode-scoped prefix; carries the cache breakpoint. */
+  stable: string;
+  /** Per-request remainder, separator-prefixed. Empty string when there is none. */
+  volatile: string;
+}
+
+export function buildSystemPromptBlocks(
   catalog: ToolCatalog,
   preferences: OrchestrationPreferences,
   history: ChatHistoryEntry[],
   resolvedPromptValues: Required<Record<PromptSlot, string>>,
   options?: SystemPromptOptions
-): string {
+): SystemPromptBlocks {
   const { memoryTOC, clientId, groupContext, isVoiceMessage } = options ?? {};
-  const sections: string[] = [
+
+  // ── Cacheable: derived only from org/mode config and the MCP catalog ──
+  const stableSections: string[] = [
     resolvedPromptValues.identity,
     resolvedPromptValues.methodology,
     resolvedPromptValues.tool_guidance,
     generateToolCatalog(catalog),
     resolvedPromptValues.instructions,
+  ];
+
+  // ── Per-request: anything that can differ between two users or two turns ──
+  // `buildClientSection` leads because it interpolates `clientId`. That drags
+  // the otherwise-stable `client_instructions` slot across the line with it;
+  // recovering those tokens needs actual prompt reordering and is deliberately
+  // out of scope here (see docs/plans/prompt-caching.md).
+  const sections: string[] = [
     buildClientSection(clientId, resolvedPromptValues.client_instructions),
   ];
 
@@ -395,7 +435,27 @@ export function buildSystemPrompt(
   }
   sections.push(resolvedPromptValues.closing);
 
-  return sections.join('\n\n');
+  return {
+    stable: stableSections.join('\n\n'),
+    volatile: sections.length > 0 ? `\n\n${sections.join('\n\n')}` : '',
+  };
+}
+
+export function buildSystemPrompt(
+  catalog: ToolCatalog,
+  preferences: OrchestrationPreferences,
+  history: ChatHistoryEntry[],
+  resolvedPromptValues: Required<Record<PromptSlot, string>>,
+  options?: SystemPromptOptions
+): string {
+  const blocks = buildSystemPromptBlocks(
+    catalog,
+    preferences,
+    history,
+    resolvedPromptValues,
+    options
+  );
+  return blocks.stable + blocks.volatile;
 }
 
 /**

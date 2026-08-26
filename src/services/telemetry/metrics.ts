@@ -94,6 +94,7 @@ export const ALLOWED_LABEL_KEYS = new Set<string>([
   'user_country',
   'edge_country',
   'model',
+  'mode',
   'server',
   'tool',
   'tool_name',
@@ -157,6 +158,15 @@ export interface MetricLabels {
    */
   edge_country?: string;
   model?: string;
+  /**
+   * Active prompt mode slug. Bounded by CONFIGURATION (`MAX_MODES_PER_ORG` is
+   * 20), not by request traffic — same class as `tool_name`/`server`/`model`,
+   * so it is deliberately NOT in `BOUNDED_LABEL_VALUES`: clamping org-defined
+   * mode names to `other` would destroy the dimension's purpose. It is the
+   * dominant driver of cached-prefix size, hence a first-class dimension for
+   * the prompt-cache savings metrics (issue #333).
+   */
+  mode?: string;
   server?: string;
   tool?: string;
   tool_name?: string;

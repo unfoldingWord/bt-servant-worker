@@ -79,6 +79,22 @@ async function readMockRequestBody(
   return '';
 }
 
+/**
+ * Flatten the wire form of `system` back to the prompt text.
+ *
+ * Since prompt caching (issue #333) the worker sends `system` as an array of
+ * text blocks — a stable, cache-marked prefix plus the per-request remainder —
+ * rather than one string. The blocks concatenate back to exactly the same
+ * prompt (the `'\n\n'` separator is carried inside the volatile block), so
+ * these assertions are unchanged in meaning. The string form is still handled
+ * so this helper does not care which shape it is handed.
+ */
+function renderSystem(system: unknown): string {
+  if (typeof system === 'string') return system;
+  if (!Array.isArray(system)) return '';
+  return system.map((block) => (block as { text?: string }).text ?? '').join('');
+}
+
 function setupAnthropicFetchCapture(): {
   calls: CapturedAnthropicCall[];
   warnLogs: Array<{ event: string; payload: Record<string, unknown> | undefined }>;
@@ -99,7 +115,7 @@ function setupAnthropicFetchCapture(): {
     if (url.includes(ANTHROPIC_MARKER_HOST)) {
       const rawBody = await readMockRequestBody(input, init);
       const parsed = rawBody ? (JSON.parse(rawBody) as Record<string, unknown>) : {};
-      calls.push({ system: String(parsed.system ?? ''), body: parsed });
+      calls.push({ system: renderSystem(parsed.system), body: parsed });
       return new Response(
         JSON.stringify({
           id: `msg_${calls.length}`,
