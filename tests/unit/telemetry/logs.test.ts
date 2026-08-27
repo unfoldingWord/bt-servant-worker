@@ -250,6 +250,21 @@ describe('redactLogRecord', () => {
   it('tolerates a record with no attributes', () => {
     expect(() => redactLogRecord({} as unknown as ReadableLogRecord)).not.toThrow();
   });
+
+  // Must apply the same numeric carve-out as attributeValueFor, or the exporter
+  // pass would silently undo it and re-mask the counters on the way out.
+  it('leaves allow-listed NUMERIC token counts intact', () => {
+    const r = record({ request_id: 'r1', input_tokens: 1420, output_tokens: 87 });
+    redactLogRecord(r);
+    expect(r.attributes.input_tokens).toBe(1420);
+    expect(r.attributes.output_tokens).toBe(87);
+  });
+
+  it('still masks a string under an allow-listed token key', () => {
+    const r = record({ request_id: 'r1', input_tokens: 'sk-ant-leaked' });
+    redactLogRecord(r);
+    expect(r.attributes.input_tokens).toBe('[REDACTED]');
+  });
 });
 
 describe('BufferingLogRecordProcessor', () => {

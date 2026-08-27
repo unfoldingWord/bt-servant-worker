@@ -126,6 +126,39 @@ function isSafeStringKey(key: string): boolean {
   return SAFE_STRING_KEY_SUFFIXES.some((suffix) => key.endsWith(suffix));
 }
 
+/**
+ * Exact keys whose NUMERIC values are exempt from the sensitive-key mask.
+ *
+ * `SENSITIVE_KEY_PATTERN` matches any key containing "token". That is correct
+ * for credentials, but it also catches the Anthropic usage counters, which are
+ * small integers describing billing volume and cannot carry a credential or
+ * message content. Masking them is worse than data loss: it replaces a number
+ * with the string `[REDACTED]`, flipping the attribute's type in the sink.
+ *
+ * Renaming the fields is not an option — `/token/i` matches any substring, and
+ * these names are the ones the downstream tail consumer and D1 schema use.
+ *
+ * The exemption is deliberately narrow, and both halves matter:
+ *   - an EXACT key allow-list, not a suffix or pattern; and
+ *   - numbers only, so a credential mistakenly logged under `input_tokens`
+ *     is still masked.
+ */
+const SAFE_NUMERIC_ATTRIBUTE_KEYS = new Set([
+  'input_tokens',
+  'output_tokens',
+  'cache_creation_input_tokens',
+  'cache_read_input_tokens',
+]);
+
+/**
+ * True when a key/value pair is an allow-listed numeric counter and may bypass
+ * the sensitive-key mask. Exported so the exporter-side pass in `logs.ts` applies
+ * exactly the same rule — the two must not drift.
+ */
+export function isSafeNumericAttribute(key: string, value: unknown): boolean {
+  return typeof value === 'number' && SAFE_NUMERIC_ATTRIBUTE_KEYS.has(key);
+}
+
 /** Reduce an http(s) URL to `scheme://host`; undefined if the value is not such a URL. */
 function urlToOrigin(value: string): string | undefined {
   try {
@@ -145,14 +178,15 @@ function truncateAttribute(value: string): string {
 
 /**
  * Classify a single value into a safe OTLP attribute under the FAIL-CLOSED policy.
- * - sensitive-named key → `[REDACTED]`.
+ * - sensitive-named key → `[REDACTED]`, except an allow-listed numeric counter
+ *   (see `SAFE_NUMERIC_ATTRIBUTE_KEYS`).
  * - number / boolean → raw (never content).
  * - http(s) URL string → origin only (drops path + signed query creds), any key.
  * - other string → raw (truncated) only if the key is allow-listed, else `string(<len>)`.
  * - object / array → keys+types summary, never nested raw values.
  */
 export function attributeValueFor(key: string, value: unknown): AttributeValue {
-  if (SENSITIVE_KEY_PATTERN.test(key)) return '[REDACTED]';
+  if (SENSITIVE_KEY_PATTERN.test(key) && !isSafeNumericAttribute(key, value)) return '[REDACTED]';
   if (typeof value === 'number' || typeof value === 'boolean') return value;
   if (typeof value === 'string') {
     const origin = urlToOrigin(value);

@@ -51,7 +51,7 @@ import {
   type LogLevel,
 } from '../../utils/logger.js';
 import { isTelemetryEnabled, TELEMETRY_SERVICE_NAME } from './config.js';
-import { attributeValueFor, type AttributeValue } from './redact.js';
+import { attributeValueFor, isSafeNumericAttribute, type AttributeValue } from './redact.js';
 import { getUserPseudonym } from './pseudonym.js';
 
 /** Instrumentation scope name reported for every emitted log record. */
@@ -114,7 +114,9 @@ export function redactLogRecord(record: ReadableLogRecord): void {
   const attrs = (record as MutableLogRecord).attributes;
   if (!attrs) return;
   for (const key of Object.keys(attrs)) {
-    if (SENSITIVE_KEY_PATTERN.test(key)) attrs[key] = '[REDACTED]';
+    if (SENSITIVE_KEY_PATTERN.test(key) && !isSafeNumericAttribute(key, attrs[key])) {
+      attrs[key] = '[REDACTED]';
+    }
   }
 }
 
