@@ -68,6 +68,8 @@ Full C4 ecosystem diagrams (system context + container) live in [docs/architectu
 
 **MCP Catalog & Health Tracking** — Tool manifests from all configured MCP servers are merged into a single catalog, grouped by server in the system prompt so Claude can honor source-ordered fallback between overlapping servers. Health tracking blocks unhealthy servers; per-execution and per-request MCP call caps prevent runaway fan-out.
 
+**MCP Servers (global pool)** — The MCP server list is one library shared by every organization (admin-portal#278), unlike modes and languages, which are per org. It is stored under the reserved `MCP_SERVERS` key `__global__`; the `:org` segment of the admin routes keeps the URL shape and is echoed in responses but does not select data, and an org literally named `__global__` is rejected with 400. Responses never include a server's `authToken` — they carry `hasAuthToken: boolean` instead — and writes merge the token by server `id`: omit the field to keep the stored token, send `null` or `""` to clear it, or a string to set it. Until a namespace has the `__global__` key, reads fall back to the legacy `unfoldingWord` key and log `mcp_global_key_missing`. Max 50 servers.
+
 **Persistent Memory** — Schema-free sectioned memory per conversation (user, group, or thread). A deterministic TOC is injected into the system prompt; Claude reads/writes specific sections via tools. Sections can be pinned; when the 128KB cap is exceeded, the oldest non-pinned sections are auto-evicted so writes never fail.
 
 **Dynamic Prompt Overrides** — 7 customizable prompt slots with 4-tier resolution: user → mode → org → default. Each slot is capped at 8,000 characters. Ulysses-style comments (`%% ... %%`) are stripped before system prompt assembly.
@@ -182,32 +184,32 @@ Authorization: Bearer <ENGINE_API_KEY or org-specific admin key>
 
 All admin endpoints require Bearer token authentication (super admin or org-specific admin key).
 
-| Endpoint                                                               | Method       | Description                                         |
-| ---------------------------------------------------------------------- | ------------ | --------------------------------------------------- |
-| `/api/v1/admin/orgs/:org/mcp-servers`                                  | GET/PUT/POST | MCP server management (`?discover=true` for status) |
-| `/api/v1/admin/orgs/:org/mcp-servers/:serverId`                        | DELETE       | Remove MCP server                                   |
-| `/api/v1/admin/orgs/:org/config`                                       | GET/PUT/DEL  | Org config (history limits)                         |
-| `/api/v1/admin/orgs/:org/prompt-overrides`                             | GET/PUT/DEL  | Org-level prompt overrides                          |
-| `/api/v1/admin/orgs/:org/modes`                                        | GET          | List org modes (markdown view)                      |
-| `/api/v1/admin/orgs/:org/modes/:modeName`                              | GET/PUT/DEL  | Manage individual mode (aliases resolve)            |
-| `/api/v1/admin/orgs/:org/modes/:modeName/_rename`                      | POST         | Rename a mode; old slug retained as alias           |
-| `/api/v1/admin/orgs/:org/modes/:modeName/_clone`                       | POST         | Clone a mode (clone starts unpublished)             |
-| `/api/v1/admin/orgs/:org/modes/:modeName/_retire`                      | POST         | Retire a mode, forwarding its slug to another mode  |
-| `/api/v1/admin/orgs/:org/languages`                                    | GET          | List org languages                                  |
-| `/api/v1/admin/orgs/:org/languages/:languageName`                      | GET/PUT/DEL  | Manage individual language document                 |
-| `/api/v1/admin/orgs/:org/languages-default`                            | GET/PUT      | Org default language (chat-time fallback, #356)     |
-| `/api/v1/admin/orgs/:org/language-scaffold`                            | GET/PUT/DEL  | Org language scaffold template                      |
-| `/api/v1/admin/orgs/:org/users/:userId/mode`                           | GET/PUT/DEL  | User's active mode                                  |
-| `/api/v1/admin/orgs/:org/users/:userId/prompt-overrides`               | GET/PUT/DEL  | User-level prompt overrides                         |
-| `/api/v1/admin/orgs/:org/users/:userId/memory`                         | GET/DEL      | User persistent memory                              |
-| `/api/v1/admin/orgs/:org/users/:userId/history`                        | DEL          | Delete user history                                 |
-| `/api/v1/admin/orgs/:org/groups/:chatId/preferences`                   | GET/PUT      | Group preferences (response_language)               |
-| `/api/v1/admin/orgs/:org/groups/:chatId/history`                       | GET/DEL      | Group chat history                                  |
-| `/api/v1/admin/orgs/:org/groups/:chatId/memory`                        | GET/DEL      | Group shared memory                                 |
-| `/api/v1/admin/orgs/:org/groups/:chatId/mode`                          | GET/PUT/DEL  | Group's active mode                                 |
-| `/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/preferences` | GET/PUT      | Thread preferences                                  |
-| `/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/history`     | GET/DEL      | Thread chat history                                 |
-| `/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/memory`      | GET/DEL      | Thread shared memory                                |
+| Endpoint                                                               | Method       | Description                                                                      |
+| ---------------------------------------------------------------------- | ------------ | -------------------------------------------------------------------------------- |
+| `/api/v1/admin/orgs/:org/mcp-servers`                                  | GET/PUT/POST | Global MCP server pool (`:org` ignored for storage; `?discover=true` for status) |
+| `/api/v1/admin/orgs/:org/mcp-servers/:serverId`                        | DELETE       | Remove MCP server from the global pool                                           |
+| `/api/v1/admin/orgs/:org/config`                                       | GET/PUT/DEL  | Org config (history limits)                                                      |
+| `/api/v1/admin/orgs/:org/prompt-overrides`                             | GET/PUT/DEL  | Org-level prompt overrides                                                       |
+| `/api/v1/admin/orgs/:org/modes`                                        | GET          | List org modes (markdown view)                                                   |
+| `/api/v1/admin/orgs/:org/modes/:modeName`                              | GET/PUT/DEL  | Manage individual mode (aliases resolve)                                         |
+| `/api/v1/admin/orgs/:org/modes/:modeName/_rename`                      | POST         | Rename a mode; old slug retained as alias                                        |
+| `/api/v1/admin/orgs/:org/modes/:modeName/_clone`                       | POST         | Clone a mode (clone starts unpublished)                                          |
+| `/api/v1/admin/orgs/:org/modes/:modeName/_retire`                      | POST         | Retire a mode, forwarding its slug to another mode                               |
+| `/api/v1/admin/orgs/:org/languages`                                    | GET          | List org languages                                                               |
+| `/api/v1/admin/orgs/:org/languages/:languageName`                      | GET/PUT/DEL  | Manage individual language document                                              |
+| `/api/v1/admin/orgs/:org/languages-default`                            | GET/PUT      | Org default language (chat-time fallback, #356)                                  |
+| `/api/v1/admin/orgs/:org/language-scaffold`                            | GET/PUT/DEL  | Org language scaffold template                                                   |
+| `/api/v1/admin/orgs/:org/users/:userId/mode`                           | GET/PUT/DEL  | User's active mode                                                               |
+| `/api/v1/admin/orgs/:org/users/:userId/prompt-overrides`               | GET/PUT/DEL  | User-level prompt overrides                                                      |
+| `/api/v1/admin/orgs/:org/users/:userId/memory`                         | GET/DEL      | User persistent memory                                                           |
+| `/api/v1/admin/orgs/:org/users/:userId/history`                        | DEL          | Delete user history                                                              |
+| `/api/v1/admin/orgs/:org/groups/:chatId/preferences`                   | GET/PUT      | Group preferences (response_language)                                            |
+| `/api/v1/admin/orgs/:org/groups/:chatId/history`                       | GET/DEL      | Group chat history                                                               |
+| `/api/v1/admin/orgs/:org/groups/:chatId/memory`                        | GET/DEL      | Group shared memory                                                              |
+| `/api/v1/admin/orgs/:org/groups/:chatId/mode`                          | GET/PUT/DEL  | Group's active mode                                                              |
+| `/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/preferences` | GET/PUT      | Thread preferences                                                               |
+| `/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/history`     | GET/DEL      | Thread chat history                                                              |
+| `/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/memory`      | GET/DEL      | Thread shared memory                                                             |
 
 ### Chat Request/Response
 
@@ -561,7 +563,7 @@ These have sensible defaults and only need to be set to override:
 | `AUDIO_BUCKET`     | R2 Bucket      | TTS audio + archived voice submissions                                    |
 | `PTXPRINT_BUCKET`  | R2 Bucket      | USFM sources, generated PDFs, fonts (served at `/public/ptxprint/*`)      |
 | `ORG_ADMIN_KEYS`   | KV Namespace   | Per-org admin Bearer tokens                                               |
-| `MCP_SERVERS`      | KV Namespace   | MCP server configurations per org                                         |
+| `MCP_SERVERS`      | KV Namespace   | MCP server configurations — one global pool under key `__global__` (#278) |
 | `ORG_CONFIG`       | KV Namespace   | Org-level configuration (history limits, etc.)                            |
 | `PROMPT_OVERRIDES` | KV Namespace   | Org-level prompt overrides, modes, languages                              |
 

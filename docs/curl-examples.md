@@ -171,6 +171,17 @@ data: {"type":"complete","response":{...}}
 
 ## Admin: MCP Server Management
 
+The MCP server list is a **single global pool** shared by every organization
+(admin-portal#278). The `:org` segment in these URLs keeps the route shape and
+is echoed back in the `org` field, but it does not select data: every org sees
+and edits the same list, stored under the reserved `MCP_SERVERS` key
+`__global__`. Requests whose `:org` is literally `__global__` get `400`.
+
+Responses never include a server's `authToken`; they report
+`hasAuthToken: boolean` instead. On write (`POST` / `PUT`) the token is merged
+by server `id`: omit `authToken` to keep whatever is stored, send `null` or
+`""` to clear it, or a non-empty string to set it.
+
 Admin endpoints require either:
 
 - `ENGINE_API_KEY` (super admin - manages all orgs)
@@ -207,12 +218,21 @@ curl "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers" \
   -H "Authorization: Bearer $API_KEY"
 ```
 
-**Response:**
+**Response** (`org` echoes the URL; the list is the same for every org):
 
 ```json
 {
   "org": "unfoldingWord",
-  "servers": []
+  "servers": [
+    {
+      "id": "translation-helps",
+      "name": "Translation Helps MCP",
+      "url": "https://translation-helps-mcp.pages.dev/api/mcp",
+      "enabled": true,
+      "priority": 1,
+      "hasAuthToken": false
+    }
+  ]
 }
 ```
 
@@ -237,6 +257,7 @@ curl "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers?discove
       "url": "https://translation-helps-mcp.pages.dev/api/mcp",
       "enabled": true,
       "priority": 1,
+      "hasAuthToken": false,
       "discovery_status": "ok",
       "discovery_error": null,
       "tools_count": 5
@@ -247,6 +268,7 @@ curl "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers?discove
       "url": "https://invalid.example.com/mcp",
       "enabled": true,
       "priority": 2,
+      "hasAuthToken": true,
       "discovery_status": "error",
       "discovery_error": "MCP server returned 404: Not Found",
       "tools_count": 0
@@ -270,7 +292,44 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers
   }'
 ```
 
+`POST` upserts by `id`: posting an existing `id` replaces that entry in place.
+Omitting `authToken` keeps the token already stored for that `id`.
+
+### Set or Clear a Server's authToken
+
+```bash
+# Set (or rotate) the token — the response only reports hasAuthToken: true
+curl -X POST "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "fia",
+    "name": "FIA Internalization",
+    "url": "https://fia.example.com/mcp",
+    "enabled": true,
+    "priority": 3,
+    "authToken": "new-upstream-secret"
+  }'
+
+# Clear the token: send null (or "")
+curl -X POST "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "fia",
+    "name": "FIA Internalization",
+    "url": "https://fia.example.com/mcp",
+    "enabled": true,
+    "priority": 3,
+    "authToken": null
+  }'
+```
+
 ### Replace All MCP Servers
+
+`PUT` replaces the whole pool with the array you send (servers you leave out
+are removed). Each entry's `authToken` is merged by `id` under the same rule as
+`POST`, so a redacted `GET` → edit → `PUT` round-trip keeps stored tokens.
 
 ```bash
 curl -X PUT "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers" \
@@ -313,7 +372,7 @@ curl -X DELETE "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-serve
 ### Prerequisite: verify MCP servers are registered on staging
 
 The mode's `tool_guidance` slot names `translation-helps` and `aquifer`
-explicitly. Confirm both are registered for `unfoldingWord` on staging
+explicitly. Confirm both are registered in the global pool on staging
 before pushing the mode — otherwise Claude will be instructed to call
 servers that don't exist.
 
