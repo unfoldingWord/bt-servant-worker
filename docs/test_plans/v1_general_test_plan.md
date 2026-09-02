@@ -169,11 +169,12 @@ curl -s https://api.btservant.ai/api/v1/admin/orgs/unfoldingWord/mcp-servers \
 ```json
 {
   "org": "unfoldingWord",
+  "migrated": true,
   "servers": [...]
 }
 ```
 
-**Pass Criteria**: Returns org and servers array.
+**Pass Criteria**: Returns org, `migrated: true` (the global `__global__` pool exists — admin-portal#278) and a servers array whose entries carry `hasAuthToken` and never `authToken`.
 
 ---
 

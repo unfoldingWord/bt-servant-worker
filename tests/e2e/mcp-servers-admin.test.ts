@@ -44,7 +44,15 @@ const server = (id: string, extra: Partial<MCPServerConfig> = {}): MCPServerConf
 });
 
 type PublicServer = { id: string; hasAuthToken: boolean; authToken?: unknown };
-type ListBody = { org: string; migrated: boolean; code?: string; servers: PublicServer[] };
+type ListBody = {
+  org: string;
+  migrated: boolean;
+  code?: string;
+  warning?: string;
+  fallback_found?: boolean;
+  legacy_keys?: string[];
+  servers: PublicServer[];
+};
 
 async function readKey(key: string): Promise<MCPServerConfig[] | null> {
   return env.MCP_SERVERS.get<MCPServerConfig[]>(key, 'json');
@@ -137,8 +145,57 @@ describe('transitional read fallback to the legacy DEFAULT_ORG key', () => {
       servers: [],
       migrated: false,
       code: 'MCP_POOL_NOT_MIGRATED',
+      fallback_found: false,
+      legacy_keys: [],
     });
-    expect(res.text).toContain('warning');
+    expect(typeof res.body.warning).toBe('string');
+    expect(res.body.warning).toContain(MCP_GLOBAL_KEY);
+    // Nothing to migrate → seeding [] is the right unlock, and is offered.
+    expect(res.body.warning).toContain("'[]'");
+  });
+});
+
+describe('unmigrated GET guidance', () => {
+  it('GET names the legacy keys to migrate and never suggests seeding [] while they exist', async () => {
+    await env.MCP_SERVERS.put(
+      OTHER_ORG_KEY,
+      JSON.stringify([server('theirs', { authToken: 'tok' })])
+    );
+    const res = await get(ORG_A);
+    expect(res.status).toBe(200);
+    expect(res.text).not.toContain('tok"');
+    expect(res.body).toMatchObject({
+      servers: [],
+      migrated: false,
+      fallback_found: false,
+      legacy_keys: [OTHER_ORG_KEY],
+    });
+    expect(res.body.warning).toContain(OTHER_ORG_KEY);
+    expect(res.body.warning).not.toContain("'[]'");
+    expect(res.body.warning).toContain('redacted');
+  });
+});
+
+describe('resources route migration state', () => {
+  it('GET …/resources carries the same migration state fields', async () => {
+    const unmigrated = await SELF.fetch(
+      `https://worker/api/v1/admin/orgs/${ORG_A}/resources?language=en`,
+      { headers: AUTH }
+    );
+    expect(unmigrated.status).toBe(200);
+    expect(await unmigrated.json()).toMatchObject({
+      org: ORG_A,
+      migrated: false,
+      code: 'MCP_POOL_NOT_MIGRATED',
+      servers: [],
+    });
+
+    await seedGlobal();
+    const migrated = await SELF.fetch(
+      `https://worker/api/v1/admin/orgs/${ORG_A}/resources?language=en`,
+      { headers: AUTH }
+    );
+    expect(await migrated.json()).toMatchObject({ org: ORG_A, migrated: true, servers: [] });
   });
 
   it('reads the legacy key while __global__ is absent, redacted and flagged', async () => {
@@ -157,7 +214,9 @@ describe('transitional read fallback to the legacy DEFAULT_ORG key', () => {
     // Reads never write: the global key is still absent.
     expect(await readKey(MCP_GLOBAL_KEY)).toBeNull();
   });
+});
 
+describe('__global__ precedence and corruption', () => {
   it('prefers __global__ over the legacy key once it exists, even when empty', async () => {
     await env.MCP_SERVERS.put(LEGACY_KEY, JSON.stringify([server('legacy')]));
     await seedGlobal();
@@ -193,10 +252,21 @@ describe('writes require __global__ to exist (409 MCP_POOL_NOT_MIGRATED)', () =>
     expect(await readKey(MCP_GLOBAL_KEY)).toBeNull();
   }
 
-  it('when the legacy key holds servers', async () => {
+  it('when the legacy key holds servers (409 body names the key, not the token)', async () => {
     await env.MCP_SERVERS.put(LEGACY_KEY, JSON.stringify([server('legacy', { authToken: 'tok' })]));
     await expectRefused();
     expect((await readKey(LEGACY_KEY))?.[0].authToken).toBe('tok');
+
+    const res = await post(ORG_A, server('new'));
+    const json = (await res.json()) as {
+      fallback_found: boolean;
+      legacy_keys: string[];
+      error: string;
+    };
+    expect(json.fallback_found).toBe(true);
+    expect(json.legacy_keys).toEqual([LEGACY_KEY]);
+    expect(json.error).toContain(LEGACY_KEY);
+    expect(json.error).not.toContain("'[]'");
   });
 
   it('when neither key exists (fresh namespace)', async () => {
@@ -210,6 +280,29 @@ describe('writes require __global__ to exist (409 MCP_POOL_NOT_MIGRATED)', () =>
     );
     await expectRefused();
     expect((await readKey(OTHER_ORG_KEY))?.map((s) => s.id)).toEqual(['theirs']);
+  });
+});
+
+describe('super-admin fence on writes', () => {
+  const ORG_KEY = 'org-admin-key-278';
+  afterEach(async () => {
+    await env.ORG_ADMIN_KEYS.delete(ORG_A);
+  });
+
+  it('an org-scoped admin key can never write the global pool', async () => {
+    await env.ORG_ADMIN_KEYS.put(ORG_A, ORG_KEY);
+    await seedGlobal([server('keep')]);
+    const headers = { Authorization: `Bearer ${ORG_KEY}`, 'Content-Type': 'application/json' };
+
+    const attempts = [
+      SELF.fetch(base(ORG_A), { method: 'PUT', headers, body: '[]' }),
+      SELF.fetch(base(ORG_A), { method: 'POST', headers, body: JSON.stringify(server('x')) }),
+      SELF.fetch(`${base(ORG_A)}/keep`, { method: 'DELETE', headers }),
+    ];
+    for (const res of await Promise.all(attempts)) {
+      expect(res.status).toBe(403);
+    }
+    expect((await readKey(MCP_GLOBAL_KEY))?.map((s) => s.id)).toEqual(['keep']);
   });
 });
 
@@ -414,6 +507,17 @@ describe('body validation', () => {
     await seedGlobal();
     const res = await post(ORG_A, [server('x')]);
     expect(res.status).toBe(400);
+    expect(await readKey(MCP_GLOBAL_KEY)).toEqual([]);
+  });
+
+  it('PUT with more than MAX_SERVERS entries → 400', async () => {
+    await seedGlobal();
+    const res = await put(
+      ORG_A,
+      Array.from({ length: 51 }, (_, i) => server(`s${String(i)}`))
+    );
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toContain('global pool');
     expect(await readKey(MCP_GLOBAL_KEY)).toEqual([]);
   });
 

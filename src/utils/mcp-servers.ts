@@ -35,6 +35,14 @@ export interface McpServerPool {
    * legacy view it had — and could seal off legacy keys of other orgs.
    */
   migrated: boolean;
+  /** True when the legacy DEFAULT_ORG key exists (only meaningful when !migrated). */
+  fallbackFound: boolean;
+  /**
+   * Names of every key in the namespace other than `__global__` — the legacy
+   * org lists the migration runbook must merge. Populated for admin reads
+   * while unmigrated; always `[]` for chat reads and for migrated pools.
+   */
+  legacyKeys: string[];
 }
 
 /** Once-per-isolate latch so the chat hot path does not log on every turn. */
@@ -48,12 +56,19 @@ export function resetChatFallbackWarning(): void {
 /** Upper bound on `kv.list` pages when enumerating legacy keys for the warn. */
 const MAX_LEGACY_KEY_PAGES = 10;
 
+/**
+ * Structural check for a stored entry: what the chat path and the public
+ * projection dereference. Deliberately looser than validateServerConfig so a
+ * pre-#278 record with, say, an out-of-range priority still serves; it only
+ * rejects shapes that would crash a caller or send `Bearer [object Object]`.
+ */
 function isStoredServer(value: unknown): value is MCPServerConfig {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const v = value as { id?: unknown; url?: unknown; authToken?: unknown };
   return (
-    value !== null &&
-    typeof value === 'object' &&
-    !Array.isArray(value) &&
-    typeof (value as { id?: unknown }).id === 'string'
+    typeof v.id === 'string' &&
+    typeof v.url === 'string' &&
+    (v.authToken === undefined || typeof v.authToken === 'string')
   );
 }
 
@@ -68,6 +83,21 @@ function assertPoolShape(value: unknown, key: string): MCPServerConfig[] {
     );
   }
   return value as MCPServerConfig[];
+}
+
+/**
+ * Read a key as text and parse it, so an absent key (`null` from KV) is
+ * distinguishable from a stored JSON `null` (corrupt — never written by the
+ * API, and `get(..., 'json')` would have made it look like a missing key).
+ */
+async function readPoolKey(kv: KVNamespace, key: string): Promise<MCPServerConfig[] | null> {
+  const raw = await kv.get(key, 'text');
+  if (raw === null) return null;
+  const parsed: unknown = JSON.parse(raw);
+  if (parsed === null) {
+    throw new Error(`MCP_SERVERS key '${key}' holds JSON null`);
+  }
+  return assertPoolShape(parsed, key);
 }
 
 /**
@@ -105,9 +135,9 @@ async function listLegacyKeys(kv: KVNamespace, logger: RequestLogger): Promise<s
  * staging redeploy on a PR push never blanks the pool. `[]` under `__global__`
  * is a real, empty pool and disables the fallback. Reads never write.
  *
- * Throws when KV fails or a stored value is not an array of server configs;
- * admin routes turn that into a 500 and the chat path degrades to an empty
- * pool.
+ * Throws when KV fails or a stored value is JSON null or not an array of
+ * server configs; admin routes turn that into a 500 and the chat path degrades
+ * to an empty pool.
  */
 export async function readMcpServerPool(
   kv: KVNamespace,
@@ -115,13 +145,15 @@ export async function readMcpServerPool(
   logger: RequestLogger,
   source: PoolReadSource
 ): Promise<McpServerPool> {
-  const global = await kv.get<unknown>(MCP_GLOBAL_KEY, 'json');
+  const global = await readPoolKey(kv, MCP_GLOBAL_KEY);
   if (global !== null) {
-    return { servers: assertPoolShape(global, MCP_GLOBAL_KEY), migrated: true };
+    // A successful global read re-arms the chat warning so a rollback that
+    // deletes `__global__` is reported again by reused isolates.
+    chatFallbackWarned = false;
+    return { servers: global, migrated: true, fallbackFound: false, legacyKeys: [] };
   }
 
-  const legacyRaw = await kv.get<unknown>(defaultOrg, 'json');
-  const legacy = legacyRaw === null ? null : assertPoolShape(legacyRaw, defaultOrg);
+  const legacy = await readPoolKey(kv, defaultOrg);
   const data = {
     global_key: MCP_GLOBAL_KEY,
     fallback_key: defaultOrg,
@@ -129,20 +161,20 @@ export async function readMcpServerPool(
     server_count: legacy?.length ?? 0,
   };
 
+  let legacyKeys: string[] = [];
   if (source === 'admin') {
     // Admin reads are rare: always warn, with the namespace's other keys so
-    // any legacy org list the runbook must merge is visible.
-    logger.warn('mcp_global_key_missing', {
-      ...data,
-      legacy_keys: await listLegacyKeys(kv, logger),
-    });
+    // any legacy org list the runbook must merge is visible (also returned
+    // to the caller for the GET warning and the 409 body).
+    legacyKeys = await listLegacyKeys(kv, logger);
+    logger.warn('mcp_global_key_missing', { ...data, legacy_keys: legacyKeys });
   } else if (!chatFallbackWarned) {
     // Chat is the hot path: one warn per isolate is the operator signal.
     chatFallbackWarned = true;
     logger.warn('mcp_global_key_missing', { ...data, once_per_isolate: true });
   }
 
-  return { servers: legacy ?? [], migrated: false };
+  return { servers: legacy ?? [], migrated: false, fallbackFound: legacy !== null, legacyKeys };
 }
 
 /**

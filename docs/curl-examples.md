@@ -184,28 +184,37 @@ by server `id`: omit `authToken` to keep whatever is stored, send `null` or
 (`id`, `name`, `url`, `enabled`, `priority`, `allowedTools`, `transport`,
 `authToken`) are persisted; anything else in the body is dropped.
 
-**Migration state.** While a namespace has no `__global__` key (JSON `null` —
-note that `[]` _is_ a key, meaning a real empty pool), reads fall back to the
-legacy `unfoldingWord` key, log `mcp_global_key_missing`, and the GET body
-carries `migrated: false`, `code: "MCP_POOL_NOT_MIGRATED"` and a `warning`.
-In that state every `POST`/`PUT`/`DELETE` returns
-`409 { code: "MCP_POOL_NOT_MIGRATED" }`. The API never creates `__global__`
-itself — create it with the runbook on admin-portal#278
-(`wrangler kv key put … __global__ --path …` from the legacy data), or, on a
-fresh/local namespace with nothing to migrate:
+**Migration state.** While a namespace has no `__global__` key (KV returns
+`null` — a stored value of `[]` is a real, empty pool, not a missing key),
+reads fall back to the legacy `unfoldingWord` key, log `mcp_global_key_missing`,
+and the GET body carries `migrated: false`, `code: "MCP_POOL_NOT_MIGRATED"`,
+`fallback_found`, `legacy_keys` (every other key in the namespace) and a
+`warning` that tells you what to do. In that state every `POST`/`PUT`/`DELETE`
+returns `409 { code: "MCP_POOL_NOT_MIGRATED", fallback_found, legacy_keys }`.
+The API never creates `__global__` itself:
+
+- **If `legacy_keys` is non-empty**, create `__global__` from the **raw KV
+  value(s)** with the runbook on admin-portal#278
+  (`wrangler kv key get … <legacy key>` → `wrangler kv key put … __global__ --path …`).
+  Never seed `[]` and never write an admin `GET` body back as the migration
+  payload: GET bodies are redacted (no `authToken`), so a `[]` seed followed by
+  a `PUT` of a saved GET body silently drops every stored token.
+- **If `legacy_keys` is empty** (fresh or local namespace, nothing to migrate):
 
 ```bash
 npx wrangler kv key put --binding=MCP_SERVERS --local __global__ '[]'
 ```
 
-The org-specific admin keys described next cannot currently reach these
-routes: the global `/api/*` middleware accepts only `ENGINE_API_KEY`. If that
-changes, writes to the global pool must stay super-admin only.
+Once migrated, the admin routes are ordinary read-modify-write over KV, which
+has no compare-and-swap: two admins writing at once (or a colo holding a stale
+copy of `__global__`) resolve last-write-wins, as with every other admin config
+route today.
 
-Admin endpoints require either:
-
-- `ENGINE_API_KEY` (super admin - manages all orgs)
-- Org-specific admin key stored in KV namespace `ORG_ADMIN_KEYS`
+**Authentication.** Every `/api/*` request must carry `ENGINE_API_KEY` — the
+global middleware accepts nothing else, and the MCP write routes additionally
+refuse anything but the super admin key (403). The `ORG_ADMIN_KEYS` mechanism
+below is defined in code but not currently reachable; it is kept here as a
+reference for the org-scoped routes, not as a way to reach the global pool.
 
 ### Setting Up Org-Specific Admin Keys
 
@@ -225,8 +234,8 @@ npx wrangler kv:key list --binding=ORG_ADMIN_KEYS
 ```
 
 Clients would then use the org-specific key instead of the super admin key —
-but see the note above: today every `/api/*` request must carry `ENGINE_API_KEY`,
-so all examples below use `$API_KEY`.
+but see **Authentication** above: today every `/api/*` request must carry
+`ENGINE_API_KEY`, so all examples below use `$API_KEY`.
 
 ### List MCP Servers
 
