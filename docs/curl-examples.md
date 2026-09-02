@@ -171,10 +171,70 @@ data: {"type":"complete","response":{...}}
 
 ## Admin: MCP Server Management
 
-Admin endpoints require either:
+The MCP server list is a **single global pool** shared by every organization
+(admin-portal#278). The `:org` segment in these URLs keeps the route shape and
+is echoed back in the `org` field, but it does not select data: every org sees
+and edits the same list, stored under the reserved `MCP_SERVERS` key
+`__global__`. Requests whose `:org` is literally `__global__` get `400`.
 
-- `ENGINE_API_KEY` (super admin - manages all orgs)
-- Org-specific admin key stored in KV namespace `ORG_ADMIN_KEYS`
+Responses never include a server's `authToken`; they report
+`hasAuthToken: boolean` instead. On write (`POST` / `PUT`) the token is merged
+by server `id`: omit `authToken` to keep whatever is stored, send `null` or
+`""` to clear it, or a non-empty string to set it. Only the known config fields
+(`id`, `name`, `url`, `enabled`, `priority`, `allowedTools`, `transport`,
+`authToken`) are persisted; anything else in the body is dropped.
+
+**Migration state.** While a namespace has no `__global__` key (KV returns
+`null` — a stored value of `[]` is a real, empty pool, not a missing key),
+reads fall back to the legacy `unfoldingWord` key, log `mcp_global_key_missing`,
+and the GET body carries `migrated: false`, `code: "MCP_POOL_NOT_MIGRATED"`,
+`fallback_found`, `legacy_keys` (every other key this read could see — the
+fallback key it actually read is always included), `legacy_listing`
+(`complete` / `truncated` / `failed` — `complete` means the server-side
+pagination finished, **not** that the namespace is empty: KV `list` is
+eventually consistent), `stale_global_suspected` (the listing showed
+`__global__` although this read missed it — a stale read, retry) and a
+`warning` that tells you what to do. In that state every `POST`/`PUT`/`DELETE`
+returns `409` with the same fields plus `error`. The API never creates
+`__global__` itself, and it never tells you the namespace is empty — you decide
+that from your own listing:
+
+```bash
+npx wrangler kv key list --binding=MCP_SERVERS            # add --env staging / --local as needed
+```
+
+- **If that listing shows `__global__`**, the API read was stale (KV eventual
+  consistency) — retry shortly. Do **not** seed `[]`, do **not** recreate the
+  key from leftovers; the pool is already migrated.
+- **If it shows other keys but not `__global__`**, create `__global__` from the
+  **raw KV value(s)** of those legacy keys with the runbook on admin-portal#278
+  (`wrangler kv key get … <legacy key>` → `wrangler kv key put … __global__ --path …`).
+  Never write an admin `GET` body back as the migration payload: GET bodies
+  are redacted (no `authToken`), so a `[]` seed followed by a `PUT` of a saved
+  GET body silently drops every stored token.
+- **Only if your listing shows no keys at all** (fresh or local namespace):
+
+```bash
+npx wrangler kv key put --binding=MCP_SERVERS --local __global__ '[]'
+```
+
+Once migrated, every admin GET carries `legacy_listing`; if the namespace still
+holds legacy keys (or the server-side listing was incomplete, so leftovers may
+exist unseen) it also carries `legacy_keys` and a `warning` that they are no
+longer read — if `__global__` was seeded with `[]` by mistake, restore it from
+the raw legacy value. Do not delete legacy keys until the global copy is
+confirmed.
+
+Once migrated, the admin routes are ordinary read-modify-write over KV, which
+has no compare-and-swap: two admins writing at once (or a colo holding a stale
+copy of `__global__`) resolve last-write-wins, as with every other admin config
+route today.
+
+**Authentication.** Every `/api/*` request must carry `ENGINE_API_KEY` — the
+global middleware accepts nothing else, and the MCP write routes additionally
+refuse anything but the super admin key (403). The `ORG_ADMIN_KEYS` mechanism
+below is defined in code but not currently reachable; it is kept here as a
+reference for the org-scoped routes, not as a way to reach the global pool.
 
 ### Setting Up Org-Specific Admin Keys
 
@@ -193,12 +253,9 @@ npx wrangler kv:key put --binding=ORG_ADMIN_KEYS "unfoldingWord" "your-org-speci
 npx wrangler kv:key list --binding=ORG_ADMIN_KEYS
 ```
 
-Clients can then use the org-specific key instead of the super admin key:
-
-```bash
-curl "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers" \
-  -H "Authorization: Bearer your-org-specific-api-key"
-```
+Clients would then use the org-specific key instead of the super admin key —
+but see **Authentication** above: today every `/api/*` request must carry
+`ENGINE_API_KEY`, so all examples below use `$API_KEY`.
 
 ### List MCP Servers
 
@@ -207,12 +264,25 @@ curl "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers" \
   -H "Authorization: Bearer $API_KEY"
 ```
 
-**Response:**
+**Response** (`org` echoes the URL; the list is the same for every org;
+`migrated: true` means `__global__` exists — see "Migration state" above;
+`legacy_listing` is always present on a migrated GET):
 
 ```json
 {
   "org": "unfoldingWord",
-  "servers": []
+  "migrated": true,
+  "legacy_listing": "complete",
+  "servers": [
+    {
+      "id": "translation-helps",
+      "name": "Translation Helps MCP",
+      "url": "https://translation-helps-mcp.pages.dev/api/mcp",
+      "enabled": true,
+      "priority": 1,
+      "hasAuthToken": false
+    }
+  ]
 }
 ```
 
@@ -230,6 +300,8 @@ curl "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers?discove
 ```json
 {
   "org": "unfoldingWord",
+  "migrated": true,
+  "legacy_listing": "complete",
   "servers": [
     {
       "id": "translation-helps",
@@ -237,6 +309,7 @@ curl "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers?discove
       "url": "https://translation-helps-mcp.pages.dev/api/mcp",
       "enabled": true,
       "priority": 1,
+      "hasAuthToken": false,
       "discovery_status": "ok",
       "discovery_error": null,
       "tools_count": 5
@@ -247,6 +320,7 @@ curl "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers?discove
       "url": "https://invalid.example.com/mcp",
       "enabled": true,
       "priority": 2,
+      "hasAuthToken": true,
       "discovery_status": "error",
       "discovery_error": "MCP server returned 404: Not Found",
       "tools_count": 0
@@ -270,7 +344,45 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers
   }'
 ```
 
+`POST` upserts by `id`: posting an existing `id` replaces that entry in place.
+Omitting `authToken` keeps the token already stored for that `id`.
+
+### Set or Clear a Server's authToken
+
+```bash
+# Set (or rotate) the token — the response only reports hasAuthToken: true
+curl -X POST "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "fia",
+    "name": "FIA Internalization",
+    "url": "https://fia.example.com/mcp",
+    "enabled": true,
+    "priority": 3,
+    "authToken": "new-upstream-secret"
+  }'
+
+# Clear the token: send null (or "")
+curl -X POST "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "fia",
+    "name": "FIA Internalization",
+    "url": "https://fia.example.com/mcp",
+    "enabled": true,
+    "priority": 3,
+    "authToken": null
+  }'
+```
+
 ### Replace All MCP Servers
+
+`PUT` replaces the whole pool with the array you send (servers you leave out
+are removed; `[]` empties the pool; duplicate `id`s are rejected). Each entry's
+`authToken` is merged by `id` under the same rule as `POST`, so a redacted
+`GET` → edit → `PUT` round-trip keeps stored tokens.
 
 ```bash
 curl -X PUT "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers" \
@@ -313,7 +425,7 @@ curl -X DELETE "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-serve
 ### Prerequisite: verify MCP servers are registered on staging
 
 The mode's `tool_guidance` slot names `translation-helps` and `aquifer`
-explicitly. Confirm both are registered for `unfoldingWord` on staging
+explicitly. Confirm both are registered in the global pool on staging
 before pushing the mode — otherwise Claude will be instructed to call
 servers that don't exist.
 

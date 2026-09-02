@@ -5,13 +5,13 @@
  * MCP server config is stored in KV and passed to DOs via request body.
  */
 
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { Env } from './config/types.js';
 import { APP_VERSION } from './generated/version.js';
 import { UserDO as UserDOClass } from './durable-objects/index.js';
 import { discoverAllTools, listOrgResources } from './services/mcp/index.js';
 import { readDoSnapshot } from './services/admin/do-snapshot.js';
-import { MCPServerConfig } from './services/mcp/types.js';
+import { MCPServerWrite } from './types/mcp.js';
 import { ChatRequest, ChatTransport, ChatType } from './types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig, validateOrgConfig } from './types/org-config.js';
 import {
@@ -53,10 +53,25 @@ import { getAudio, VOICE_SUBMISSION_PREFIX } from './services/audio/index.js';
 import { createRequestLogger, type RequestLogger } from './utils/logger.js';
 import { createTimingContext, timePhase, type TimingContext } from './utils/timing.js';
 import {
-  MAX_SERVERS_PER_ORG,
+  MAX_SERVERS,
+  MCP_GLOBAL_KEY,
+  findDuplicateServerIds,
+  validateOrgNotReserved,
   validateServerConfig,
   validateServerId,
 } from './utils/mcp-validation.js';
+import {
+  describeLeftoverLegacyKeys,
+  describeMigrationHint,
+  type McpServerPool,
+  mergeServerPool,
+  poolWriteAuthError,
+  readMcpServerPool,
+  readMcpServerPoolOrEmpty,
+  toPublicServerConfig,
+  toPublicServerConfigs,
+  upsertServer,
+} from './utils/mcp-servers.js';
 import { resolveOrgFromBody } from './utils/org.js';
 import { validateChatBody } from './utils/chat-validation.js';
 import { instrument, instrumentDO } from '@microlabs/otel-cf-workers';
@@ -315,20 +330,36 @@ app.use('/api/v1/admin/orgs/:org/*', async (c, next) => {
   return c.json({ error: 'Unauthorized for this organization' }, 403);
 });
 
-// Admin endpoints for MCP server management - now using KV directly
+// Admin endpoints for MCP server management - now using KV directly.
+//
+// The MCP server list is a single GLOBAL pool by decision (admin-portal#278):
+// it is one library shared by every organization, unlike modes/languages,
+// which stay per org. The `:org` path parameter keeps the route shape and is
+// echoed in responses, but storage always uses MCP_GLOBAL_KEY. See
+// readMcpServerPool (src/utils/mcp-servers.ts) for the transitional read
+// fallback to the legacy per-org key, and poolNotMigratedResponse for why
+// writes are refused while that fallback is what is serving the pool.
 app.get('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
   const org = c.req.param('org');
   const discover = c.req.query('discover') === 'true';
   const logger = createRequestLogger(crypto.randomUUID());
 
+  const orgError = validateOrgNotReserved(org);
+  if (orgError) {
+    return c.json({ error: orgError }, 400);
+  }
+
   try {
-    const servers = (await c.env.MCP_SERVERS.get<MCPServerConfig[]>(org, 'json')) ?? [];
+    const pool = await readMcpServerPool(c.env.MCP_SERVERS, c.env.DEFAULT_ORG, logger, 'admin');
+    const { servers } = pool;
+    const state = poolStateFields(c.env.DEFAULT_ORG, pool);
 
     logger.log('admin_action', {
       action: 'list_mcp_servers',
       org,
       server_count: servers.length,
       discover,
+      migrated: pool.migrated,
     });
 
     // If discover=true, run discovery and include status/errors in response
@@ -339,99 +370,262 @@ app.get('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
       const serverStatuses = servers.map((server) => {
         const manifest = manifests.find((m) => m.serverId === server.id);
         return {
-          ...server,
+          ...toPublicServerConfig(server),
           discovery_status: manifest ? (manifest.error ? 'error' : 'ok') : 'skipped',
           discovery_error: manifest?.error ?? null,
           tools_count: manifest?.tools.length ?? 0,
         };
       });
 
-      return c.json({ org, servers: serverStatuses });
+      return c.json({ org, ...state, servers: serverStatuses });
     }
 
-    return c.json({ org, servers });
+    return c.json({ org, ...state, servers: toPublicServerConfigs(servers) });
   } catch (error) {
     logger.error('admin_action', error, { action: 'list_mcp_servers', org });
     return c.json({ error: 'Failed to read MCP servers from storage' }, 500);
   }
 });
 
+/**
+ * Migration-state fields spread into admin GET bodies and the 409 body.
+ * Unmigrated: `migrated:false`, `code`, `fallback_found`, `legacy_keys`,
+ * `legacy_listing`, `stale_global_suspected`, `warning` (guidance from
+ * describeMigrationHint). Migrated: `migrated:true`, `legacy_listing`, plus
+ * `legacy_keys` and a `warning` when leftovers were seen or the listing was
+ * incomplete (describeLeftoverLegacyKeys).
+ */
+function poolStateFields(defaultOrg: string, pool: McpServerPool) {
+  if (!pool.migrated) {
+    return {
+      migrated: false,
+      code: 'MCP_POOL_NOT_MIGRATED',
+      fallback_found: pool.fallbackFound,
+      legacy_keys: pool.legacyKeys,
+      legacy_listing: pool.legacyListing,
+      stale_global_suspected: pool.staleGlobalSuspected,
+      warning: `The '${MCP_GLOBAL_KEY}' key was not found by this read; this list is served from the legacy '${defaultOrg}' key (or is empty) and writes are refused. ${describeMigrationHint(pool)}`,
+    };
+  }
+  const leftover = describeLeftoverLegacyKeys(pool);
+  return leftover === null
+    ? { migrated: true, legacy_listing: pool.legacyListing }
+    : {
+        migrated: true,
+        legacy_keys: pool.legacyKeys,
+        legacy_listing: pool.legacyListing,
+        warning: leftover,
+      };
+}
+
+/**
+ * 409 for a write attempted while `__global__` does not exist. Writes never
+ * create or merge from legacy data: with KV's eventual consistency a colo that
+ * still sees `__global__` as missing could otherwise rebuild the pool from a
+ * stale legacy view on top of a completed migration, and a first write could
+ * seal off legacy keys of other orgs. The runbook on admin-portal#278 is the
+ * single path that creates the key.
+ *
+ * Known residual (documented, not solved here): KV has no compare-and-swap,
+ * so once migrated a colo holding a stale *hit* on `__global__` can still
+ * overwrite a newer pool (last write wins) — the same read-modify-write
+ * limitation every admin config route in this file has today, now with a
+ * pool-wide blast radius. Closing it needs a version/generation guard or a
+ * Durable Object single writer, tracked with the config-versioning work
+ * (admin-portal#153/#154).
+ */
+function poolNotMigratedResponse(
+  c: Context<{ Bindings: Env }>,
+  logger: RequestLogger,
+  action: string,
+  org: string,
+  pool: McpServerPool
+) {
+  logger.warn('admin_action', {
+    action,
+    org,
+    rejected: 'mcp_pool_not_migrated',
+    global_key: MCP_GLOBAL_KEY,
+    fallback_key: c.env.DEFAULT_ORG,
+    fallback_found: pool.fallbackFound,
+    legacy_keys: pool.legacyKeys,
+    legacy_listing: pool.legacyListing,
+    stale_global_suspected: pool.staleGlobalSuspected,
+  });
+  // Same field set as an unmigrated GET so one client parser serves both.
+  return c.json(
+    {
+      error: `MCP server pool key '${MCP_GLOBAL_KEY}' does not exist in this namespace, so writes are refused. ${describeMigrationHint(pool)}`,
+      ...poolStateFields(c.env.DEFAULT_ORG, pool),
+    },
+    409
+  );
+}
+
+/**
+ * Common guard for the three pool write routes: the reserved-org 400 and the
+ * super-admin 403 (poolWriteAuthError). Today the global `/api/*` middleware
+ * already accepts nothing but ENGINE_API_KEY, so the 403 is a second fence
+ * rather than a live gate — it keeps the invariant next to the shared store in
+ * case org-scoped admin keys are ever honoured upstream.
+ */
+function rejectMcpWrite(
+  c: Context<{ Bindings: Env }>,
+  logger: RequestLogger,
+  action: string,
+  org: string
+) {
+  const orgError = validateOrgNotReserved(org);
+  if (orgError) {
+    return c.json({ error: orgError }, 400);
+  }
+  const authError = poolWriteAuthError(c.req.header('Authorization'), c.env.ENGINE_API_KEY);
+  if (authError === null) {
+    return null;
+  }
+  logger.warn('admin_action', { action, org, rejected: 'mcp_pool_write_requires_super_admin' });
+  return c.json({ error: authError }, 403);
+}
+
 app.put('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
   const org = c.req.param('org');
   const logger = createRequestLogger(crypto.randomUUID());
-  const servers = (await c.req.json()) as MCPServerConfig[];
 
-  if (!Array.isArray(servers)) {
-    return c.json({ error: 'Request body must be an array of server configs' }, 400);
+  const rejected = rejectMcpWrite(c, logger, 'replace_mcp_servers', org);
+  if (rejected) {
+    return rejected;
   }
 
-  if (servers.length > MAX_SERVERS_PER_ORG) {
-    return c.json({ error: `Cannot have more than ${MAX_SERVERS_PER_ORG} servers per org` }, 400);
+  const parsed = await readJsonBody(c.req.raw, logger, { action: 'replace_mcp_servers', org });
+  if (!parsed.ok) {
+    return c.json({ error: parsed.error }, 400);
   }
-
-  for (const server of servers) {
-    const error = validateServerConfig(server);
-    if (error) {
-      return c.json({ error, server_id: server.id }, 400);
-    }
+  const bodyError = validateServerListBody(parsed.body);
+  if (bodyError) {
+    return c.json(bodyError, 400);
   }
+  const writes = parsed.body as MCPServerWrite[];
 
   try {
-    await c.env.MCP_SERVERS.put(org, JSON.stringify(servers));
+    // Replace-all for the list; authToken merged by id against the stored
+    // pool (omitted → preserve, null/"" → clear, string → set).
+    // NOTE: read-modify-write without compare-and-swap — a stale read can
+    // overwrite a newer pool (last write wins); see poolNotMigratedResponse.
+    const pool = await readMcpServerPool(c.env.MCP_SERVERS, c.env.DEFAULT_ORG, logger, 'admin');
+    if (!pool.migrated) {
+      return poolNotMigratedResponse(c, logger, 'replace_mcp_servers', org, pool);
+    }
+    const servers = mergeServerPool(writes, pool.servers);
+
+    await c.env.MCP_SERVERS.put(MCP_GLOBAL_KEY, JSON.stringify(servers));
     logger.log('admin_action', {
       action: 'replace_mcp_servers',
       org,
+      storage_key: MCP_GLOBAL_KEY,
       server_count: servers.length,
       server_ids: servers.map((s) => s.id),
     });
-    return c.json({ org, servers, message: 'MCP servers updated' });
+    return c.json({ org, servers: toPublicServerConfigs(servers), message: 'MCP servers updated' });
   } catch (error) {
     logger.error('admin_action', error, { action: 'replace_mcp_servers', org });
     return c.json({ error: 'Failed to write MCP servers to storage' }, 500);
   }
 });
 
+/**
+ * Validate a PUT …/mcp-servers body: an array of at most MAX_SERVERS valid
+ * server configs with unique ids. Returns the 400 body, or null when valid.
+ */
+function validateServerListBody(body: unknown): Record<string, unknown> | null {
+  if (!Array.isArray(body)) {
+    return { error: 'Request body must be an array of server configs' };
+  }
+  if (body.length > MAX_SERVERS) {
+    return { error: `Cannot have more than ${MAX_SERVERS} servers in the global pool` };
+  }
+  for (const write of body) {
+    const error = validateServerConfig(write);
+    if (error) {
+      const id =
+        write !== null && typeof write === 'object' ? (write as { id?: unknown }).id : undefined;
+      return id === undefined ? { error } : { error, server_id: id };
+    }
+  }
+  const duplicates = findDuplicateServerIds(body as MCPServerWrite[]);
+  if (duplicates.length > 0) {
+    return { error: `Duplicate server id(s): ${duplicates.join(', ')}`, server_ids: duplicates };
+  }
+  return null;
+}
+
+/**
+ * Parse + validate a single-server write body for POST …/mcp-servers.
+ * Defaults `enabled` to true when absent (pre-#278 behaviour).
+ */
+async function readServerWriteBody(
+  req: Request,
+  logger: RequestLogger,
+  org: string
+): Promise<{ ok: true; write: MCPServerWrite } | { ok: false; error: string }> {
+  const parsed = await readJsonBody(req, logger, { action: 'add_mcp_server', org });
+  if (!parsed.ok) {
+    return parsed;
+  }
+  const body = parsed.body as Partial<MCPServerWrite> | null;
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    return { ok: false, error: 'Request body must be a server config object' };
+  }
+  const write = { ...body, enabled: body.enabled ?? true } as MCPServerWrite;
+  const error = validateServerConfig(write);
+  return error ? { ok: false, error } : { ok: true, write };
+}
+
 app.post('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
   const org = c.req.param('org');
   const logger = createRequestLogger(crypto.randomUUID());
-  const body = (await c.req.json()) as Partial<MCPServerConfig>;
 
-  // Default enabled to true if not specified
-  const server: MCPServerConfig = {
-    ...body,
-    enabled: body.enabled ?? true,
-  } as MCPServerConfig;
-
-  const error = validateServerConfig(server);
-  if (error) {
-    return c.json({ error }, 400);
+  const rejected = rejectMcpWrite(c, logger, 'add_mcp_server', org);
+  if (rejected) {
+    return rejected;
   }
 
+  const parsed = await readServerWriteBody(c.req.raw, logger, org);
+  if (!parsed.ok) {
+    return c.json({ error: parsed.error }, 400);
+  }
+  const { write } = parsed;
+
   try {
-    const existing = (await c.env.MCP_SERVERS.get<MCPServerConfig[]>(org, 'json')) ?? [];
-    if (existing.length >= MAX_SERVERS_PER_ORG) {
-      return c.json({ error: `Cannot have more than ${MAX_SERVERS_PER_ORG} servers per org` }, 400);
+    const pool = await readMcpServerPool(c.env.MCP_SERVERS, c.env.DEFAULT_ORG, logger, 'admin');
+    if (!pool.migrated) {
+      return poolNotMigratedResponse(c, logger, 'add_mcp_server', org, pool);
+    }
+    const existing = pool.servers;
+    const isUpdate = existing.some((s) => s.id === write.id);
+    if (!isUpdate && existing.length >= MAX_SERVERS) {
+      return c.json(
+        { error: `Cannot have more than ${MAX_SERVERS} servers in the global pool` },
+        400
+      );
     }
 
-    // Check for duplicate ID and update if exists
+    // Upsert by id; authToken merged against the stored entry (omitted →
+    // preserve, null/"" → clear, string → set).
     // NOTE: This read-modify-write pattern can race with concurrent requests (last write wins).
     // This is acceptable for admin endpoints which are low-volume and authenticated.
-    const existingIdx = existing.findIndex((s) => s.id === server.id);
-    if (existingIdx >= 0) {
-      existing.splice(existingIdx, 1, server);
-    } else {
-      existing.push(server);
-    }
+    const servers = upsertServer(write, existing);
 
-    await c.env.MCP_SERVERS.put(org, JSON.stringify(existing));
+    await c.env.MCP_SERVERS.put(MCP_GLOBAL_KEY, JSON.stringify(servers));
     logger.log('admin_action', {
       action: 'add_mcp_server',
       org,
-      server_id: server.id,
-      server_url: server.url,
-      server_count: existing.length,
+      storage_key: MCP_GLOBAL_KEY,
+      server_id: write.id,
+      server_url: write.url,
+      updated: isUpdate,
+      server_count: servers.length,
     });
-    return c.json({ org, servers: existing, message: 'MCP server added' });
+    return c.json({ org, servers: toPublicServerConfigs(servers), message: 'MCP server added' });
   } catch (error) {
     logger.error('admin_action', error, { action: 'add_mcp_server', org });
     return c.json({ error: 'Failed to update MCP servers in storage' }, 500);
@@ -443,23 +637,34 @@ app.delete('/api/v1/admin/orgs/:org/mcp-servers/:serverId', async (c) => {
   const serverId = c.req.param('serverId');
   const logger = createRequestLogger(crypto.randomUUID());
 
+  const rejected = rejectMcpWrite(c, logger, 'remove_mcp_server', org);
+  if (rejected) {
+    return rejected;
+  }
+
   const idError = validateServerId(serverId);
   if (idError) {
     return c.json({ error: idError }, 400);
   }
 
   try {
-    const existing = (await c.env.MCP_SERVERS.get<MCPServerConfig[]>(org, 'json')) ?? [];
-    const filtered = existing.filter((s) => s.id !== serverId);
+    const pool = await readMcpServerPool(c.env.MCP_SERVERS, c.env.DEFAULT_ORG, logger, 'admin');
+    if (!pool.migrated) {
+      return poolNotMigratedResponse(c, logger, 'remove_mcp_server', org, pool);
+    }
+    // NOTE: read-modify-write without compare-and-swap (last write wins); see
+    // poolNotMigratedResponse.
+    const filtered = pool.servers.filter((s) => s.id !== serverId);
 
-    await c.env.MCP_SERVERS.put(org, JSON.stringify(filtered));
+    await c.env.MCP_SERVERS.put(MCP_GLOBAL_KEY, JSON.stringify(filtered));
     logger.log('admin_action', {
       action: 'remove_mcp_server',
       org,
+      storage_key: MCP_GLOBAL_KEY,
       server_id: serverId,
       server_count: filtered.length,
     });
-    return c.json({ org, servers: filtered, message: 'MCP server removed' });
+    return c.json({ org, servers: toPublicServerConfigs(filtered), message: 'MCP server removed' });
   } catch (error) {
     logger.error('admin_action', error, { action: 'remove_mcp_server', org });
     return c.json({ error: 'Failed to update MCP servers in storage' }, 500);
@@ -1120,15 +1325,21 @@ app.put('/api/v1/admin/orgs/:org/languages-default', async (c) => {
 });
 
 /**
- * Aggregated resource listing across the org's MCP servers (worker#257
- * item 1; contract locked on admin-portal#230). Fans out to every enabled
- * server, normalizes each listing into canonical subjects, and reports
- * per-server capability honestly via `servers[]` (ok/unsupported/error).
+ * Aggregated resource listing across the global MCP server pool (worker#257
+ * item 1; contract locked on admin-portal#230; pool made global by
+ * admin-portal#278). Fans out to every enabled server, normalizes each
+ * listing into canonical subjects, and reports per-server capability
+ * honestly via `servers[]` (ok/unsupported/error).
  */
 app.get('/api/v1/admin/orgs/:org/resources', async (c) => {
   const org = c.req.param('org');
   const language = c.req.query('language');
   const logger = createRequestLogger(crypto.randomUUID());
+
+  const orgError = validateOrgNotReserved(org);
+  if (orgError) {
+    return c.json({ error: orgError }, 400);
+  }
 
   const languageError = validateResourceLanguage(language);
   if (languageError) {
@@ -1138,7 +1349,8 @@ app.get('/api/v1/admin/orgs/:org/resources', async (c) => {
   const lang = language as string;
 
   try {
-    const servers = (await c.env.MCP_SERVERS.get<MCPServerConfig[]>(org, 'json')) ?? [];
+    const pool = await readMcpServerPool(c.env.MCP_SERVERS, c.env.DEFAULT_ORG, logger, 'admin');
+    const { servers } = pool;
     const result = await listOrgResources(servers, lang, logger);
 
     logger.log('admin_action', {
@@ -1151,7 +1363,13 @@ app.get('/api/v1/admin/orgs/:org/resources', async (c) => {
       error_count: result.servers.filter((s) => s.status === 'error').length,
       subject_count: Object.keys(result.resources).length,
     });
-    return c.json({ org, language: lang, resources: result.resources, servers: result.servers });
+    return c.json({
+      org,
+      language: lang,
+      ...poolStateFields(c.env.DEFAULT_ORG, pool),
+      resources: result.resources,
+      servers: result.servers,
+    });
   } catch (error) {
     logger.error('admin_action', error, { action: 'list_resources', org, language: lang });
     return c.json({ error: 'Failed to aggregate resources from MCP servers' }, 500);
@@ -1835,7 +2053,8 @@ async function readOrgKV<T>(
 /** Read all org-level KV data needed for chat requests. */
 async function readAllOrgKV(env: Env, org: string, logger: ReturnType<typeof createRequestLogger>) {
   return Promise.all([
-    readOrgKV<MCPServerConfig[]>(env.MCP_SERVERS, org, [], 'mcp_kv_read_error', logger),
+    // MCP servers are a global pool, not per org (admin-portal#278).
+    readMcpServerPoolOrEmpty(env.MCP_SERVERS, env.DEFAULT_ORG, logger),
     readOrgKV<OrgConfig>(env.ORG_CONFIG, org, {}, 'org_config_kv_read_error', logger),
     readOrgKV<PromptOverrides>(
       env.PROMPT_OVERRIDES,

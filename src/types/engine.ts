@@ -42,7 +42,9 @@ export interface ChatRequest {
   progress_throttle_seconds?: number;
   progress_mode?: ProgressMode;
   message_key?: string; // WhatsApp message identifier for correlation
-  org?: string; // Organization for MCP server selection (defaults to DEFAULT_ORG)
+  // Organization for org config/modes/languages (defaults to DEFAULT_ORG).
+  // MCP servers are a global pool, not per org (admin-portal#278).
+  org?: string;
   org_id?: string; // Alias for org (backward compat with whatsapp gateway)
 
   /** Chat type. Defaults to 'private' when absent (backward compat). */

@@ -528,7 +528,8 @@ function groupBySubject(outcomes: ServerListingOutcome[]): Map<string, ResourceI
 }
 
 /**
- * Aggregate resource listings across an org's enabled MCP servers.
+ * Aggregate resource listings across the enabled servers of the global MCP
+ * pool (admin-portal#278: servers are one library shared by every org).
  *
  * Servers are processed in ascending `priority` order (the same comparator
  * the chat path uses), so within each subject the default item order is
