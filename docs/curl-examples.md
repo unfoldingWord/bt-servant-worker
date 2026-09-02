@@ -188,10 +188,12 @@ by server `id`: omit `authToken` to keep whatever is stored, send `null` or
 `null` — a stored value of `[]` is a real, empty pool, not a missing key),
 reads fall back to the legacy `unfoldingWord` key, log `mcp_global_key_missing`,
 and the GET body carries `migrated: false`, `code: "MCP_POOL_NOT_MIGRATED"`,
-`fallback_found`, `legacy_keys` (every other key in the namespace) and a
+`fallback_found`, `legacy_keys` (every other key in the namespace),
+`legacy_listing` (`complete` / `truncated` / `failed` — KV `list` is
+eventually consistent, so trust `legacy_keys` only when `complete`) and a
 `warning` that tells you what to do. In that state every `POST`/`PUT`/`DELETE`
-returns `409 { code: "MCP_POOL_NOT_MIGRATED", fallback_found, legacy_keys }`.
-The API never creates `__global__` itself:
+returns `409` with the same fields plus `error`. The API never creates
+`__global__` itself:
 
 - **If `legacy_keys` is non-empty**, create `__global__` from the **raw KV
   value(s)** with the runbook on admin-portal#278
@@ -199,11 +201,18 @@ The API never creates `__global__` itself:
   Never seed `[]` and never write an admin `GET` body back as the migration
   payload: GET bodies are redacted (no `authToken`), so a `[]` seed followed by
   a `PUT` of a saved GET body silently drops every stored token.
-- **If `legacy_keys` is empty** (fresh or local namespace, nothing to migrate):
+- **Only if `fallback_found` is `false`, `legacy_listing` is `complete` and
+  `legacy_keys` is empty** (fresh or local namespace, nothing to migrate) does
+  the warning offer:
 
 ```bash
 npx wrangler kv key put --binding=MCP_SERVERS --local __global__ '[]'
 ```
+
+Once migrated, a GET whose namespace still holds legacy keys reports them in
+`legacy_keys` with a `warning` that they are no longer read — if `__global__`
+was seeded with `[]` by mistake, restore it from the raw legacy value. Do not
+delete legacy keys until the global copy is confirmed.
 
 Once migrated, the admin routes are ordinary read-modify-write over KV, which
 has no compare-and-swap: two admins writing at once (or a colo holding a stale

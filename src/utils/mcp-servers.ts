@@ -14,6 +14,7 @@
  */
 
 import { MCPServerConfig, MCPServerConfigPublic, MCPServerWrite } from '../types/mcp.js';
+import { constantTimeCompare } from './crypto.js';
 import { RequestLogger } from './logger.js';
 import { MCP_GLOBAL_KEY } from './mcp-validation.js';
 
@@ -35,14 +36,27 @@ export interface McpServerPool {
    * legacy view it had — and could seal off legacy keys of other orgs.
    */
   migrated: boolean;
-  /** True when the legacy DEFAULT_ORG key exists (only meaningful when !migrated). */
+  /** True when the legacy DEFAULT_ORG key exists and was read as the fallback (unmigrated only). */
   fallbackFound: boolean;
   /**
-   * Names of every key in the namespace other than `__global__` — the legacy
-   * org lists the migration runbook must merge. Populated for admin reads
-   * while unmigrated; always `[]` for chat reads and for migrated pools.
+   * Names of every key in the namespace other than `__global__` — while
+   * unmigrated, the legacy org lists the runbook must merge; once migrated,
+   * leftovers that are no longer served. Populated for admin reads only
+   * (always `[]` for chat reads). Best-effort: see `legacyListing`.
    */
   legacyKeys: string[];
+  /**
+   * Whether `legacyKeys` is trustworthy. KV `list` is eventually consistent
+   * and can fail or lag `get`, so guidance that depends on "no legacy keys"
+   * must require `'complete'` — never infer emptiness from `'failed'`,
+   * `'truncated'`, or `'skipped'` (chat reads).
+   */
+  legacyListing: 'complete' | 'truncated' | 'failed' | 'skipped';
+}
+
+interface LegacyKeyListing {
+  names: string[];
+  status: 'complete' | 'truncated' | 'failed';
 }
 
 /** Once-per-isolate latch so the chat hot path does not log on every turn. */
@@ -105,7 +119,7 @@ async function readPoolKey(kv: KVNamespace, key: string): Promise<MCPServerConfi
  * runbook can see legacy org keys it must merge (admin-portal#278 Q#6). Purely
  * diagnostic: a listing failure is logged and must never fail the read.
  */
-async function listLegacyKeys(kv: KVNamespace, logger: RequestLogger): Promise<string[]> {
+async function listLegacyKeys(kv: KVNamespace, logger: RequestLogger): Promise<LegacyKeyListing> {
   const names: string[] = [];
   try {
     let cursor: string | undefined;
@@ -114,17 +128,18 @@ async function listLegacyKeys(kv: KVNamespace, logger: RequestLogger): Promise<s
         cursor === undefined ? { limit: 1000 } : { limit: 1000, cursor }
       );
       names.push(...result.keys.map((k) => k.name).filter((n) => n !== MCP_GLOBAL_KEY));
-      if (result.list_complete) return names;
+      if (result.list_complete) return { names, status: 'complete' };
       cursor = result.cursor;
     }
     logger.warn('mcp_legacy_key_list_truncated', {
       pages: MAX_LEGACY_KEY_PAGES,
       listed: names.length,
     });
+    return { names, status: 'truncated' };
   } catch (error) {
     logger.error('mcp_legacy_key_list_failed', error, { listed: names.length });
+    return { names, status: 'failed' };
   }
-  return names;
 }
 
 /**
@@ -147,34 +162,147 @@ export async function readMcpServerPool(
 ): Promise<McpServerPool> {
   const global = await readPoolKey(kv, MCP_GLOBAL_KEY);
   if (global !== null) {
-    // A successful global read re-arms the chat warning so a rollback that
-    // deletes `__global__` is reported again by reused isolates.
-    chatFallbackWarned = false;
-    return { servers: global, migrated: true, fallbackFound: false, legacyKeys: [] };
+    return migratedPool(global, kv, logger, source);
   }
+  return fallbackPool(await readPoolKey(kv, defaultOrg), defaultOrg, kv, logger, source);
+}
 
-  const legacy = await readPoolKey(kv, defaultOrg);
+const SKIPPED_LISTING = { names: [] as string[], status: 'skipped' as const };
+
+/** `__global__` exists: it is what is served; admin reads also surface leftovers. */
+async function migratedPool(
+  global: MCPServerConfig[],
+  kv: KVNamespace,
+  logger: RequestLogger,
+  source: PoolReadSource
+): Promise<McpServerPool> {
+  // A successful global read re-arms the chat warning so a rollback that
+  // deletes `__global__` is reported again by reused isolates.
+  chatFallbackWarned = false;
+  // Admin reads still enumerate leftovers so a mistaken migration (e.g. `[]`
+  // seeded over live legacy data) is visible on the API, not only in logs.
+  const leftovers = source === 'admin' ? await listLegacyKeys(kv, logger) : SKIPPED_LISTING;
+  if (leftovers.names.length > 0) {
+    logger.warn('mcp_legacy_keys_leftover', {
+      global_key: MCP_GLOBAL_KEY,
+      global_server_count: global.length,
+      legacy_keys: leftovers.names,
+    });
+  }
+  return {
+    servers: global,
+    migrated: true,
+    fallbackFound: false,
+    legacyKeys: leftovers.names,
+    legacyListing: leftovers.status,
+  };
+}
+
+/** `__global__` is absent: serve the legacy DEFAULT_ORG key (or nothing) and say so. */
+async function fallbackPool(
+  legacy: MCPServerConfig[] | null,
+  defaultOrg: string,
+  kv: KVNamespace,
+  logger: RequestLogger,
+  source: PoolReadSource
+): Promise<McpServerPool> {
+  const fallbackFound = legacy !== null;
   const data = {
     global_key: MCP_GLOBAL_KEY,
     fallback_key: defaultOrg,
-    fallback_found: legacy !== null,
+    fallback_found: fallbackFound,
     server_count: legacy?.length ?? 0,
   };
 
-  let legacyKeys: string[] = [];
-  if (source === 'admin') {
-    // Admin reads are rare: always warn, with the namespace's other keys so
-    // any legacy org list the runbook must merge is visible (also returned
-    // to the caller for the GET warning and the 409 body).
-    legacyKeys = await listLegacyKeys(kv, logger);
-    logger.warn('mcp_global_key_missing', { ...data, legacy_keys: legacyKeys });
-  } else if (!chatFallbackWarned) {
+  if (source === 'chat') {
     // Chat is the hot path: one warn per isolate is the operator signal.
-    chatFallbackWarned = true;
-    logger.warn('mcp_global_key_missing', { ...data, once_per_isolate: true });
+    if (!chatFallbackWarned) {
+      chatFallbackWarned = true;
+      logger.warn('mcp_global_key_missing', { ...data, once_per_isolate: true });
+    }
+    return {
+      servers: legacy ?? [],
+      migrated: false,
+      fallbackFound,
+      legacyKeys: [],
+      legacyListing: 'skipped',
+    };
   }
 
-  return { servers: legacy ?? [], migrated: false, fallbackFound: legacy !== null, legacyKeys };
+  // Admin reads are rare: always warn, with the namespace's other keys so any
+  // legacy org list the runbook must merge is visible (also returned to the
+  // caller for the GET warning and the 409 body). The key we just read is
+  // always included even if `list` has not caught up with `get`.
+  const listing = await listLegacyKeys(kv, logger);
+  const names =
+    fallbackFound && !listing.names.includes(defaultOrg)
+      ? [defaultOrg, ...listing.names]
+      : listing.names;
+  logger.warn('mcp_global_key_missing', {
+    ...data,
+    legacy_keys: names,
+    legacy_listing: listing.status,
+  });
+  return {
+    servers: legacy ?? [],
+    migrated: false,
+    fallbackFound,
+    legacyKeys: names,
+    legacyListing: listing.status,
+  };
+}
+
+// ─── Operator guidance ────────────────────────────────────────────────────────
+
+/**
+ * Human guidance for an unmigrated namespace, shared by the GET warning and the
+ * 409 body. Seeding `[]` is offered ONLY when there is provably nothing to
+ * migrate: the fallback key was not found AND the key listing completed AND it
+ * was empty. Any doubt (fallback found, listing failed/truncated/skipped, or
+ * any key present) names the keys — or the uncertainty — and forbids `[]` and
+ * GET-body write-back, because a GET body is redacted and writing it over a
+ * `[]` seed would drop every stored authToken (review rounds 3–4).
+ */
+export function describeMigrationHint(pool: McpServerPool): string {
+  const nothingToMigrate =
+    !pool.fallbackFound && pool.legacyListing === 'complete' && pool.legacyKeys.length === 0;
+  if (nothingToMigrate) {
+    return `No legacy keys exist in this namespace; seed '${MCP_GLOBAL_KEY}' with [] (wrangler kv key put … ${MCP_GLOBAL_KEY} '[]') to enable writes.`;
+  }
+  const known =
+    pool.legacyKeys.length > 0
+      ? `the legacy key(s) [${pool.legacyKeys.join(', ')}]`
+      : 'the legacy key(s) in this namespace';
+  const caveat =
+    pool.legacyListing === 'complete'
+      ? ''
+      : ` The key listing was ${pool.legacyListing === 'skipped' ? 'not run' : pool.legacyListing}; run wrangler kv key list to see every key.`;
+  return `Create '${MCP_GLOBAL_KEY}' from the RAW KV value(s) of ${known} with the admin-portal#278 runbook (wrangler kv key get … then wrangler kv key put … ${MCP_GLOBAL_KEY} --path …).${caveat} Do NOT seed [] and do NOT write an admin GET body back: GET bodies are redacted and carry no authToken.`;
+}
+
+/**
+ * Human warning for a migrated pool whose namespace still holds legacy keys.
+ * Not an error state: `__global__` is what is served. Returns null when there
+ * is nothing to say.
+ */
+export function describeLeftoverLegacyKeys(pool: McpServerPool): string | null {
+  if (!pool.migrated || pool.legacyKeys.length === 0) return null;
+  return `'${MCP_GLOBAL_KEY}' exists and is what is served; leftover legacy key(s) [${pool.legacyKeys.join(', ')}] are no longer read. If '${MCP_GLOBAL_KEY}' was seeded with [] by mistake, restore it from the RAW KV value of the legacy key (runbook on admin-portal#278). Do not delete legacy keys until the global copy is confirmed.`;
+}
+
+/**
+ * Writes to the global pool are super-admin only: an org-scoped admin key must
+ * never be able to replace every org's pool. Returns the 403 message, or null
+ * when the bearer token is ENGINE_API_KEY. Pure so it can be unit-tested even
+ * though the global `/api/*` middleware already rejects other tokens upstream.
+ */
+export function poolWriteAuthError(
+  authorizationHeader: string | undefined,
+  engineApiKey: string
+): string | null {
+  const token = authorizationHeader?.startsWith('Bearer ') ? authorizationHeader.slice(7) : '';
+  if (token.length > 0 && constantTimeCompare(token, engineApiKey)) return null;
+  return 'Writing the global MCP server pool requires the super admin key';
 }
 
 /**

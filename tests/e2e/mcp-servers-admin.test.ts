@@ -177,18 +177,31 @@ describe('unmigrated GET guidance', () => {
 });
 
 describe('resources route migration state', () => {
-  it('GET …/resources carries the same migration state fields', async () => {
+  it('GET …/resources carries the same migration state fields and no token', async () => {
+    // Disabled so listOrgResources skips it without touching the network.
+    await env.MCP_SERVERS.put(
+      LEGACY_KEY,
+      JSON.stringify([server('legacy', { authToken: 'tok-res', enabled: false })])
+    );
     const unmigrated = await SELF.fetch(
       `https://worker/api/v1/admin/orgs/${ORG_A}/resources?language=en`,
       { headers: AUTH }
     );
     expect(unmigrated.status).toBe(200);
-    expect(await unmigrated.json()).toMatchObject({
+    const text = await unmigrated.text();
+    expect(text).not.toContain('tok-res');
+    const body = JSON.parse(text) as ListBody;
+    expect(body).toMatchObject({
       org: ORG_A,
       migrated: false,
       code: 'MCP_POOL_NOT_MIGRATED',
+      fallback_found: true,
+      legacy_keys: [LEGACY_KEY],
       servers: [],
     });
+    expect(body.warning).toContain(LEGACY_KEY);
+    expect(body.warning).not.toContain("'[]'");
+    await env.MCP_SERVERS.delete(LEGACY_KEY);
 
     await seedGlobal();
     const migrated = await SELF.fetch(
@@ -217,12 +230,31 @@ describe('resources route migration state', () => {
 });
 
 describe('__global__ precedence and corruption', () => {
-  it('prefers __global__ over the legacy key once it exists, even when empty', async () => {
-    await env.MCP_SERVERS.put(LEGACY_KEY, JSON.stringify([server('legacy')]));
+  it('prefers __global__ over the legacy key once it exists, even when empty — and says so', async () => {
+    await env.MCP_SERVERS.put(
+      LEGACY_KEY,
+      JSON.stringify([server('legacy', { authToken: 'tok-l' })])
+    );
     await seedGlobal();
 
     const res = await get(ORG_A);
-    expect(res.body).toEqual({ org: ORG_A, migrated: true, servers: [] });
+    expect(res.text).not.toContain('tok-l');
+    expect(res.body).toMatchObject({
+      org: ORG_A,
+      migrated: true,
+      servers: [],
+      legacy_keys: [LEGACY_KEY],
+    });
+    expect(res.body.warning).toContain('no longer read');
+    expect(res.body.warning).toContain('Do not delete');
+  });
+
+  it('a migrated pool with no leftover keys carries no warning', async () => {
+    await seedGlobal([server('g')]);
+    const res = await get(ORG_A);
+    expect(res.body.migrated).toBe(true);
+    expect(res.body).not.toHaveProperty('warning');
+    expect(res.body).not.toHaveProperty('legacy_keys');
   });
 
   it('GET returns 500, not a token or a crash, when __global__ is corrupt', async () => {

@@ -61,8 +61,11 @@ import {
   validateServerId,
 } from './utils/mcp-validation.js';
 import {
+  describeLeftoverLegacyKeys,
+  describeMigrationHint,
   type McpServerPool,
   mergeServerPool,
+  poolWriteAuthError,
   readMcpServerPool,
   readMcpServerPoolOrEmpty,
   toPublicServerConfig,
@@ -385,32 +388,27 @@ app.get('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
 });
 
 /**
- * Operator guidance for an unmigrated namespace, shared by the GET warning and
- * the 409 body. Never recommends seeding `[]` while legacy data exists: a GET
- * body is redacted, so writing it back after an `[]` seed would drop every
- * stored authToken (review round 3, High).
+ * Migration-state fields spread into admin GET bodies and the 409 body.
+ * Unmigrated: `migrated:false`, `code`, `fallback_found`, `legacy_keys`,
+ * `legacy_listing`, `warning` (guidance from describeMigrationHint). Migrated:
+ * `migrated:true`, plus `legacy_keys` and a `warning` when the namespace still
+ * holds legacy keys that are no longer served (describeLeftoverLegacyKeys).
  */
-function poolMigrationHint(pool: McpServerPool): string {
-  if (pool.legacyKeys.length === 0) {
-    return `No legacy keys exist in this namespace; seed '${MCP_GLOBAL_KEY}' with [] (wrangler kv key put … ${MCP_GLOBAL_KEY} '[]') to enable writes.`;
-  }
-  return `Create '${MCP_GLOBAL_KEY}' from the RAW KV value(s) of the legacy key(s) [${pool.legacyKeys.join(', ')}] with the admin-portal#278 runbook (wrangler kv key get … then wrangler kv key put … ${MCP_GLOBAL_KEY} --path …). Do NOT seed [] and do NOT write an admin GET body back: GET bodies are redacted and carry no authToken.`;
-}
-
-/** Fields added to admin GET responses while the pool is served by fallback. */
-function poolNotMigratedFields(defaultOrg: string, pool: McpServerPool) {
-  return {
-    migrated: false,
-    code: 'MCP_POOL_NOT_MIGRATED',
-    fallback_found: pool.fallbackFound,
-    legacy_keys: pool.legacyKeys,
-    warning: `The '${MCP_GLOBAL_KEY}' key does not exist yet; this list is served from the legacy '${defaultOrg}' key (or is empty) and writes are refused. ${poolMigrationHint(pool)}`,
-  };
-}
-
-/** `{ migrated: true }` or the fallback warning fields, for spreading into a GET body. */
 function poolStateFields(defaultOrg: string, pool: McpServerPool) {
-  return pool.migrated ? { migrated: true } : poolNotMigratedFields(defaultOrg, pool);
+  if (!pool.migrated) {
+    return {
+      migrated: false,
+      code: 'MCP_POOL_NOT_MIGRATED',
+      fallback_found: pool.fallbackFound,
+      legacy_keys: pool.legacyKeys,
+      legacy_listing: pool.legacyListing,
+      warning: `The '${MCP_GLOBAL_KEY}' key does not exist yet; this list is served from the legacy '${defaultOrg}' key (or is empty) and writes are refused. ${describeMigrationHint(pool)}`,
+    };
+  }
+  const leftover = describeLeftoverLegacyKeys(pool);
+  return leftover === null
+    ? { migrated: true }
+    : { migrated: true, legacy_keys: pool.legacyKeys, warning: leftover };
 }
 
 /**
@@ -444,13 +442,13 @@ function poolNotMigratedResponse(
     fallback_key: c.env.DEFAULT_ORG,
     fallback_found: pool.fallbackFound,
     legacy_keys: pool.legacyKeys,
+    legacy_listing: pool.legacyListing,
   });
+  // Same field set as an unmigrated GET so one client parser serves both.
   return c.json(
     {
-      error: `MCP server pool key '${MCP_GLOBAL_KEY}' does not exist in this namespace, so writes are refused. ${poolMigrationHint(pool)}`,
-      code: 'MCP_POOL_NOT_MIGRATED',
-      fallback_found: pool.fallbackFound,
-      legacy_keys: pool.legacyKeys,
+      error: `MCP server pool key '${MCP_GLOBAL_KEY}' does not exist in this namespace, so writes are refused. ${describeMigrationHint(pool)}`,
+      ...poolStateFields(c.env.DEFAULT_ORG, pool),
     },
     409
   );
@@ -458,11 +456,10 @@ function poolNotMigratedResponse(
 
 /**
  * Common guard for the three pool write routes: the reserved-org 400 and the
- * super-admin 403. Writes to the global pool are super-admin only. Today the
- * global `/api/*` middleware already accepts nothing but ENGINE_API_KEY, so
- * the 403 is a second fence rather than a live gate — it keeps the invariant
- * next to the shared store in case org-scoped admin keys are ever honoured
- * upstream (an org key must never be able to replace every org's pool).
+ * super-admin 403 (poolWriteAuthError). Today the global `/api/*` middleware
+ * already accepts nothing but ENGINE_API_KEY, so the 403 is a second fence
+ * rather than a live gate — it keeps the invariant next to the shared store in
+ * case org-scoped admin keys are ever honoured upstream.
  */
 function rejectMcpWrite(
   c: Context<{ Bindings: Env }>,
@@ -474,12 +471,12 @@ function rejectMcpWrite(
   if (orgError) {
     return c.json({ error: orgError }, 400);
   }
-  const token = c.req.header('Authorization')?.slice(7) ?? '';
-  if (constantTimeCompare(token, c.env.ENGINE_API_KEY)) {
+  const authError = poolWriteAuthError(c.req.header('Authorization'), c.env.ENGINE_API_KEY);
+  if (authError === null) {
     return null;
   }
   logger.warn('admin_action', { action, org, rejected: 'mcp_pool_write_requires_super_admin' });
-  return c.json({ error: 'Writing the global MCP server pool requires the super admin key' }, 403);
+  return c.json({ error: authError }, 403);
 }
 
 app.put('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
