@@ -155,6 +155,24 @@ async function listLegacyKeys(kv: KVNamespace, logger: RequestLogger): Promise<L
   }
 }
 
+/**
+ * Diagnostic probe for the legacy DEFAULT_ORG key on a migrated read. Like the
+ * key listing it must never fail the primary read: a KV error is logged and
+ * reported as `'failed'` so callers fail closed (assume present, warn).
+ */
+async function probeLegacyKey(
+  kv: KVNamespace,
+  key: string,
+  logger: RequestLogger
+): Promise<'present' | 'absent' | 'failed'> {
+  try {
+    return (await kv.get(key, 'text')) === null ? 'absent' : 'present';
+  } catch (error) {
+    logger.error('mcp_legacy_key_probe_failed', error, { key });
+    return 'failed';
+  }
+}
+
 /** Prepend a key that a direct `get` just found, if the listing did not report it. */
 function withKnownKey(names: string[], key: string, known: boolean): string[] {
   return known && !names.includes(key) ? [key, ...names] : names;
@@ -210,11 +228,15 @@ async function migratedPool(
   // over live legacy data) is visible on the API, not only in logs. The
   // listing is eventually consistent and may fail, so the legacy DEFAULT_ORG
   // key is also read directly and reported even when the listing misses it.
-  const [listing, legacyStillPresent] = await Promise.all([
+  const [listed, legacyProbe] = await Promise.all([
     listLegacyKeys(kv, logger),
-    kv.get(defaultOrg, 'text').then((raw) => raw !== null),
+    probeLegacyKey(kv, defaultOrg, logger),
   ]);
-  const names = withKnownKey(listing.names, defaultOrg, legacyStillPresent);
+  // A failed probe is treated as "present" and downgrades the listing so the
+  // leftover warning fires (fail closed) without failing the primary read.
+  const listing: LegacyKeyListing =
+    legacyProbe === 'failed' ? { ...listed, status: 'failed' } : listed;
+  const names = withKnownKey(listing.names, defaultOrg, legacyProbe !== 'absent');
   if (names.length > 0 || listing.status !== 'complete') {
     logger.warn('mcp_legacy_keys_leftover', {
       global_key: MCP_GLOBAL_KEY,
@@ -303,7 +325,7 @@ async function fallbackPool(
  */
 export function describeMigrationHint(pool: McpServerPool): string {
   if (pool.staleGlobalSuspected) {
-    return `The key listing shows '${MCP_GLOBAL_KEY}' although this read did not find it: this is a stale read (KV eventual consistency), not an unmigrated namespace. Retry shortly. Do NOT seed [] and do NOT write anything.`;
+    return `The server-side key listing shows '${MCP_GLOBAL_KEY}' although this read did not find it: this is a stale read (KV eventual consistency), not an unmigrated namespace. Retry shortly. Do NOT seed [] and do NOT write anything.`;
   }
   const known =
     pool.legacyKeys.length > 0
@@ -313,7 +335,13 @@ export function describeMigrationHint(pool: McpServerPool): string {
     pool.legacyListing === 'complete'
       ? ''
       : ` (Server-side key listing was ${pool.legacyListing === 'skipped' ? 'not run' : pool.legacyListing}.)`;
-  return `${known}${listingNote} Run wrangler kv key list --binding=MCP_SERVERS yourself: if it shows ANY key, create '${MCP_GLOBAL_KEY}' from the RAW KV value(s) of the legacy key(s) with the admin-portal#278 runbook (wrangler kv key get … then wrangler kv key put … ${MCP_GLOBAL_KEY} --path …); only if it shows no keys at all, seed '${MCP_GLOBAL_KEY}' with []. Never write an admin GET body back: GET bodies are redacted and carry no authToken.`;
+  return (
+    `${known}${listingNote} Run wrangler kv key list --binding=MCP_SERVERS yourself and act on THAT listing: ` +
+    `(1) if it shows '${MCP_GLOBAL_KEY}', this API read was stale — retry shortly, do NOT seed [] and do NOT write anything; ` +
+    `(2) if it shows other keys but not '${MCP_GLOBAL_KEY}', create '${MCP_GLOBAL_KEY}' from the RAW KV value(s) of those legacy key(s) with the admin-portal#278 runbook (wrangler kv key get … then wrangler kv key put … ${MCP_GLOBAL_KEY} --path …); ` +
+    `(3) only if it shows no keys at all, seed '${MCP_GLOBAL_KEY}' with []. ` +
+    `Never write an admin GET body back: GET bodies are redacted and carry no authToken.`
+  );
 }
 
 /**

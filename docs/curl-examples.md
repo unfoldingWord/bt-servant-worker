@@ -203,9 +203,11 @@ that from your own listing:
 npx wrangler kv key list --binding=MCP_SERVERS            # add --env staging / --local as needed
 ```
 
-- **If that listing shows any key** (including `__global__` — then the API
-  read was stale; retry), create `__global__` from the **raw KV value(s)** with
-  the runbook on admin-portal#278
+- **If that listing shows `__global__`**, the API read was stale (KV eventual
+  consistency) — retry shortly. Do **not** seed `[]`, do **not** recreate the
+  key from leftovers; the pool is already migrated.
+- **If it shows other keys but not `__global__`**, create `__global__` from the
+  **raw KV value(s)** of those legacy keys with the runbook on admin-portal#278
   (`wrangler kv key get … <legacy key>` → `wrangler kv key put … __global__ --path …`).
   Never write an admin `GET` body back as the migration payload: GET bodies
   are redacted (no `authToken`), so a `[]` seed followed by a `PUT` of a saved
@@ -263,12 +265,14 @@ curl "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers" \
 ```
 
 **Response** (`org` echoes the URL; the list is the same for every org;
-`migrated: true` means `__global__` exists — see "Migration state" above):
+`migrated: true` means `__global__` exists — see "Migration state" above;
+`legacy_listing` is always present on a migrated GET):
 
 ```json
 {
   "org": "unfoldingWord",
   "migrated": true,
+  "legacy_listing": "complete",
   "servers": [
     {
       "id": "translation-helps",
@@ -297,6 +301,7 @@ curl "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers?discove
 {
   "org": "unfoldingWord",
   "migrated": true,
+  "legacy_listing": "complete",
   "servers": [
     {
       "id": "translation-helps",

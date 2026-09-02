@@ -450,6 +450,7 @@ function poolNotMigratedResponse(
     fallback_found: pool.fallbackFound,
     legacy_keys: pool.legacyKeys,
     legacy_listing: pool.legacyListing,
+    stale_global_suspected: pool.staleGlobalSuspected,
   });
   // Same field set as an unmigrated GET so one client parser serves both.
   return c.json(

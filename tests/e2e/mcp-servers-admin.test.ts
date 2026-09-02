@@ -344,6 +344,10 @@ describe('writes require __global__ to exist (409 MCP_POOL_NOT_MIGRATED)', () =>
     expect(json.stale_global_suspected).toBe(false);
     expect(json.error).toContain(LEGACY_KEY);
     expect(json.error).not.toMatch(/No legacy keys exist/);
+    // Three wrangler cases, in order: stale → retry; other keys → raw migrate; none → seed.
+    expect(json.error).toContain(`(1) if it shows '${MCP_GLOBAL_KEY}', this API read was stale`);
+    expect(json.error).toContain('(2) if it shows other keys');
+    expect(json.error).toContain('(3) only if it shows no keys at all');
   });
 
   it('when neither key exists (fresh namespace)', async () => {

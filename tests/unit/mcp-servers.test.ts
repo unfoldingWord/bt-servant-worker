@@ -298,6 +298,30 @@ describe('readMcpServerPool migrated leftovers', () => {
     );
   });
 
+  it('a failing legacy-key probe never fails a migrated read; it fails closed', async () => {
+    const kv = fakeKv({ [MCP_GLOBAL_KEY]: [stored('g')] });
+    (kv.get as ReturnType<typeof vi.fn>).mockImplementation(async (key: string) => {
+      if (key === MCP_GLOBAL_KEY) return JSON.stringify([stored('g')]);
+      throw new Error('get down');
+    });
+    const logger = fakeLogger();
+    const pool = await readMcpServerPool(kv, 'unfoldingWord', logger, 'admin');
+    expect(pool.migrated).toBe(true);
+    expect(pool.servers.map((s) => s.id)).toEqual(['g']);
+    // Probe failure → assume present, downgrade listing, warn.
+    expect(pool.legacyKeys).toEqual(['unfoldingWord']);
+    expect(pool.legacyListing).toBe('failed');
+    expect(logger.error).toHaveBeenCalledWith(
+      'mcp_legacy_key_probe_failed',
+      expect.any(Error),
+      expect.objectContaining({ key: 'unfoldingWord' })
+    );
+    expect(logger.warn).toHaveBeenCalledWith(
+      'mcp_legacy_keys_leftover',
+      expect.objectContaining({ legacy_keys: ['unfoldingWord'], legacy_listing: 'failed' })
+    );
+  });
+
   it('migrated read warns on an incomplete listing even with no names', async () => {
     const kv = fakeKv({ [MCP_GLOBAL_KEY]: [stored('g')] });
     (kv.list as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('list down'));
@@ -597,6 +621,26 @@ describe('describeMigrationHint', () => {
     expect(hint).toContain('only if it shows no keys at all');
     expect(hint).toContain('redacted');
   });
+});
+
+describe('describeMigrationHint wrangler cases', () => {
+  it.each<[string, Partial<McpServerPool>]>([
+    ['nothing seen', {}],
+    ['fallback key seen', { fallbackFound: true, legacyKeys: ['unfoldingWord'] }],
+    ['listing failed', { legacyListing: 'failed' }],
+  ])(
+    'tells the operator that a wrangler-visible __global__ means retry, never recreate (%s)',
+    (_label, over) => {
+      const hint = describeMigrationHint(poolOf(over));
+      const retryIdx = hint.indexOf(`(1) if it shows '${MCP_GLOBAL_KEY}', this API read was stale`);
+      const createIdx = hint.indexOf(`(2) if it shows other keys but not '${MCP_GLOBAL_KEY}'`);
+      const seedIdx = hint.indexOf('(3) only if it shows no keys at all');
+      expect(retryIdx).toBeGreaterThan(-1);
+      expect(createIdx).toBeGreaterThan(retryIdx);
+      expect(seedIdx).toBeGreaterThan(createIdx);
+      expect(hint).toContain('retry shortly, do NOT seed [] and do NOT write anything');
+    }
+  );
 
   it('names the keys it knows and flags an incomplete listing', () => {
     const hint = describeMigrationHint(
