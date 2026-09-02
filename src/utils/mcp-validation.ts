@@ -5,6 +5,7 @@
  */
 
 import { MCPServerConfig } from '../services/mcp/types.js';
+import { MCPServerWrite } from '../types/mcp.js';
 
 /** Max length for server ID to prevent DoS */
 export const MAX_SERVER_ID_LENGTH = 64;
@@ -124,15 +125,27 @@ export function validateTransport(transport: unknown): string | null {
 }
 
 /**
+ * Validate the optional authToken write field: omitted, null, or a string
+ * (empty string clears — see MCPServerWrite). Anything else is a client error.
+ * @returns Error message if invalid, null if valid
+ */
+export function validateAuthToken(authToken: unknown): string | null {
+  if (authToken === undefined || authToken === null) return null;
+  if (typeof authToken !== 'string') return 'authToken must be a string or null';
+  return null;
+}
+
+/**
  * Validate optional MCP server fields
  * @returns Error message if invalid, null if valid
  */
-export function validateOptionalFields(server: MCPServerConfig): string | null {
+export function validateOptionalFields(server: MCPServerConfig | MCPServerWrite): string | null {
   return (
     validateServerName(server.name) ||
     validateServerPriority(server.priority) ||
     validateAllowedTools(server.allowedTools) ||
-    validateTransport(server.transport)
+    validateTransport(server.transport) ||
+    validateAuthToken(server.authToken)
   );
 }
 
@@ -140,7 +153,7 @@ export function validateOptionalFields(server: MCPServerConfig): string | null {
  * Validate complete MCP server config
  * @returns Error message if invalid, null if valid
  */
-export function validateServerConfig(server: MCPServerConfig): string | null {
+export function validateServerConfig(server: MCPServerConfig | MCPServerWrite): string | null {
   return (
     validateServerId(server.id) || validateServerUrl(server.url) || validateOptionalFields(server)
   );
