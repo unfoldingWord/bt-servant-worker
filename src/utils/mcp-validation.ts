@@ -12,8 +12,31 @@ export const MAX_SERVER_ID_LENGTH = 64;
 /** Max length for server name to prevent DoS */
 export const MAX_SERVER_NAME_LENGTH = 128;
 
-/** Maximum servers per organization */
-export const MAX_SERVERS_PER_ORG = 50;
+/**
+ * Reserved KV key under which the single global MCP server pool is stored.
+ *
+ * MCP servers are global by decision (admin-portal#278): the pool is one
+ * library shared by every organization, unlike modes/languages which stay
+ * per org. The `:org` path parameter on the admin routes is ignored for
+ * storage; an org literally named this value is rejected at the route.
+ */
+export const MCP_GLOBAL_KEY = '__global__';
+
+/** Maximum servers in the global pool */
+export const MAX_SERVERS = 50;
+
+/**
+ * Reject a request whose `:org` path parameter collides with the reserved
+ * global pool key. Org names are unconstrained strings, so the collision has
+ * to be checked explicitly.
+ * @returns Error message if the org is reserved, null otherwise
+ */
+export function validateOrgNotReserved(org: string): string | null {
+  if (org === MCP_GLOBAL_KEY) {
+    return `Org '${MCP_GLOBAL_KEY}' is reserved for the global MCP server pool`;
+  }
+  return null;
+}
 
 /** Pattern for valid server IDs: alphanumeric, hyphens, underscores */
 export const SERVER_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
