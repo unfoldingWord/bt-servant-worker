@@ -3,16 +3,21 @@
  * projection that redacts authToken, and the write-rule merge that keeps a
  * stored token across a redacted read → edit → write round-trip.
  */
-import { describe, expect, it } from 'vitest';
-import type { MCPServerConfig } from '../../src/types/mcp';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { MCPServerConfig, MCPServerWrite } from '../../src/types/mcp';
 import {
   mergeServerPool,
   mergeServerWrite,
+  readMcpServerPool,
+  readMcpServerPoolOrEmpty,
+  resetChatFallbackWarning,
   resolveAuthToken,
   toPublicServerConfig,
   toPublicServerConfigs,
   upsertServer,
 } from '../../src/utils/mcp-servers';
+import { MCP_GLOBAL_KEY, findDuplicateServerIds } from '../../src/utils/mcp-validation';
+import type { RequestLogger } from '../../src/utils/logger';
 
 const stored = (id: string, extra: Partial<MCPServerConfig> = {}): MCPServerConfig => ({
   id,
@@ -89,6 +94,10 @@ describe('resolveAuthToken (write rule)', () => {
   it('treats an explicit undefined like omitted', () => {
     expect(resolveAuthToken({ ...stored('a'), authToken: undefined }, existing)).toBe('keep-me');
   });
+
+  it('does not re-persist a stored empty string when the write omits the token', () => {
+    expect(resolveAuthToken(stored('a'), stored('a', { authToken: '' }))).toBeUndefined();
+  });
 });
 
 describe('mergeServerWrite', () => {
@@ -99,6 +108,21 @@ describe('mergeServerWrite', () => {
     expect('authToken' in mergeServerWrite({ ...stored('a'), authToken: '' }, stored('a'))).toBe(
       false
     );
+  });
+
+  it('persists only known MCPServerConfig fields (allowlist)', () => {
+    const write = {
+      ...stored('a'),
+      hasAuthToken: true, // public-shape field from a GET → PUT round-trip
+      password: 'hunter2', // unknown secret-looking key
+      allowedTools: ['t'],
+      transport: 'json-rpc',
+    } as unknown as MCPServerWrite;
+    const merged = mergeServerWrite(write, undefined);
+    expect(Object.keys(merged).sort()).toEqual(
+      ['allowedTools', 'enabled', 'id', 'name', 'priority', 'transport', 'url'].sort()
+    );
+    expect(JSON.stringify(merged)).not.toContain('hunter2');
   });
 
   it('takes every non-token field from the write, not from existing', () => {
@@ -164,5 +188,144 @@ describe('upsertServer (POST)', () => {
     const before = JSON.stringify(pool);
     upsertServer({ ...stored('a'), authToken: null }, pool);
     expect(JSON.stringify(pool)).toBe(before);
+  });
+});
+
+describe('findDuplicateServerIds', () => {
+  it('returns each duplicated id once', () => {
+    expect(findDuplicateServerIds([{ id: 'a' }, { id: 'b' }, { id: 'a' }, { id: 'a' }])).toEqual([
+      'a',
+    ]);
+    expect(findDuplicateServerIds([{ id: 'a' }, { id: 'b' }])).toEqual([]);
+  });
+});
+
+// ─── readMcpServerPool against a fake KV ──────────────────────────────────────
+
+function fakeKv(entries: Record<string, unknown>): KVNamespace {
+  const store = new Map(Object.entries(entries));
+  return {
+    get: vi.fn(async (key: string) => store.get(key) ?? null),
+    list: vi.fn(async () => ({
+      keys: [...store.keys()].map((name) => ({ name })),
+      list_complete: true,
+      cacheStatus: null,
+    })),
+    put: vi.fn(),
+    delete: vi.fn(),
+  } as unknown as KVNamespace;
+}
+
+function fakeLogger() {
+  return {
+    log: vi.fn(),
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+  } as unknown as RequestLogger & {
+    warn: ReturnType<typeof vi.fn>;
+    info: ReturnType<typeof vi.fn>;
+    error: ReturnType<typeof vi.fn>;
+  };
+}
+
+describe('readMcpServerPool', () => {
+  beforeEach(() => resetChatFallbackWarning());
+
+  it('serves __global__ when present, even when empty, and never falls back', async () => {
+    const kv = fakeKv({ [MCP_GLOBAL_KEY]: [], unfoldingWord: [stored('legacy')] });
+    const logger = fakeLogger();
+    const pool = await readMcpServerPool(kv, 'unfoldingWord', logger, 'admin');
+    expect(pool).toEqual({ servers: [], migrated: true, writeBlocked: false });
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the legacy key and blocks writes while it holds data', async () => {
+    const kv = fakeKv({ unfoldingWord: [stored('legacy', { authToken: 't' })] });
+    const logger = fakeLogger();
+    const pool = await readMcpServerPool(kv, 'unfoldingWord', logger, 'admin');
+    expect(pool.migrated).toBe(false);
+    expect(pool.writeBlocked).toBe(true);
+    expect(pool.servers.map((s) => s.id)).toEqual(['legacy']);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'mcp_global_key_missing',
+      expect.objectContaining({
+        fallback_found: true,
+        server_count: 1,
+        legacy_keys: ['unfoldingWord'],
+      })
+    );
+    // The token never reaches a log line.
+    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain("'t'");
+  });
+
+  it('does not block writes when neither key exists (fresh namespace)', async () => {
+    const pool = await readMcpServerPool(fakeKv({}), 'unfoldingWord', fakeLogger(), 'admin');
+    expect(pool).toEqual({ servers: [], migrated: false, writeBlocked: false });
+  });
+
+  it('does not block writes when the legacy key is an empty list', async () => {
+    const pool = await readMcpServerPool(
+      fakeKv({ unfoldingWord: [] }),
+      'unfoldingWord',
+      fakeLogger(),
+      'admin'
+    );
+    expect(pool.writeBlocked).toBe(false);
+  });
+});
+
+describe('readMcpServerPool logging and shape guards', () => {
+  beforeEach(() => resetChatFallbackWarning());
+
+  it('chat source warns once per isolate, then logs info', async () => {
+    const kv = fakeKv({ unfoldingWord: [stored('legacy')] });
+    const logger = fakeLogger();
+    await readMcpServerPool(kv, 'unfoldingWord', logger, 'chat');
+    await readMcpServerPool(kv, 'unfoldingWord', logger, 'chat');
+    await readMcpServerPool(kv, 'unfoldingWord', logger, 'chat');
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.info).toHaveBeenCalledTimes(2);
+    expect(kv.list).not.toHaveBeenCalled();
+  });
+
+  it('throws when a stored value is not an array', async () => {
+    await expect(
+      readMcpServerPool(fakeKv({ [MCP_GLOBAL_KEY]: { oops: 1 } }), 'u', fakeLogger(), 'admin')
+    ).rejects.toThrow(/not a JSON array/);
+    await expect(
+      readMcpServerPool(fakeKv({ unfoldingWord: 'nope' }), 'unfoldingWord', fakeLogger(), 'admin')
+    ).rejects.toThrow(/not a JSON array/);
+  });
+});
+
+describe('readMcpServerPoolOrEmpty (chat path)', () => {
+  beforeEach(() => resetChatFallbackWarning());
+
+  it('returns the pool servers on success', async () => {
+    const kv = fakeKv({ [MCP_GLOBAL_KEY]: [stored('g', { authToken: 'raw' })] });
+    const servers = await readMcpServerPoolOrEmpty(kv, 'unfoldingWord', fakeLogger());
+    // The chat path needs the raw config, token included.
+    expect(servers).toEqual([stored('g', { authToken: 'raw' })]);
+  });
+
+  it('logs mcp_kv_read_error and returns [] on KV failure or corrupt data', async () => {
+    const failing = {
+      get: vi.fn(async () => {
+        throw new Error('kv down');
+      }),
+    } as unknown as KVNamespace;
+    const logger = fakeLogger();
+    expect(await readMcpServerPoolOrEmpty(failing, 'unfoldingWord', logger)).toEqual([]);
+    expect(logger.error).toHaveBeenCalledWith(
+      'mcp_kv_read_error',
+      expect.any(Error),
+      expect.objectContaining({ global_key: MCP_GLOBAL_KEY })
+    );
+
+    const corrupt = fakeKv({ [MCP_GLOBAL_KEY]: 'nope' });
+    const logger2 = fakeLogger();
+    expect(await readMcpServerPoolOrEmpty(corrupt, 'unfoldingWord', logger2)).toEqual([]);
+    expect(logger2.error).toHaveBeenCalledTimes(1);
   });
 });

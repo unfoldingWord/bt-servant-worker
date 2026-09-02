@@ -8,7 +8,9 @@
  *   reserved key itself.
  * - Transitional fallback: while `__global__` is absent, reads fall back to the
  *   legacy `DEFAULT_ORG` (`unfoldingWord`) key so a staging redeploy on a PR
- *   push never blanks the pool.
+ *   push never blanks the pool. Writes never merge from the legacy key: while
+ *   it holds data and `__global__` is absent they return 409, so a stale colo
+ *   can never rebuild the pool from legacy data over a completed migration.
  * - `authToken` is never serialised in a response (`hasAuthToken` instead) and
  *   is merged by server id on write: omitted → preserve, null/"" → clear,
  *   string → set.
@@ -112,19 +114,69 @@ describe('transitional fallback to the legacy DEFAULT_ORG key', () => {
     const res = await SELF.fetch(base(ORG_A), { headers: AUTH });
     expect(await res.json()).toEqual({ org: ORG_A, servers: [] });
   });
+});
 
-  it('first write carries the legacy list into __global__ and leaves the legacy key alone', async () => {
-    await env.MCP_SERVERS.put(LEGACY_KEY, JSON.stringify([server('legacy')]));
+describe('writes are refused while the legacy key is what serves the pool', () => {
+  it.each([
+    ['POST', (org: string) => base(org), JSON.stringify(server('new'))],
+    ['PUT', (org: string) => base(org), JSON.stringify([server('new')])],
+    ['PUT', (org: string) => base(org), JSON.stringify([])],
+    ['DELETE', (org: string) => `${base(org)}/legacy`, undefined],
+  ])(
+    '%s while __global__ is absent and the legacy key holds data → 409, nothing written',
+    async (method, url, body) => {
+      await env.MCP_SERVERS.put(
+        LEGACY_KEY,
+        JSON.stringify([server('legacy', { authToken: 'tok' })])
+      );
 
+      const res = await SELF.fetch(url(ORG_A), {
+        method,
+        headers: body === undefined ? AUTH : JSON_HEADERS,
+        body,
+      });
+      expect(res.status).toBe(409);
+      const json = (await res.json()) as { error: string; code: string };
+      expect(json.code).toBe('MCP_POOL_NOT_MIGRATED');
+      expect(JSON.stringify(json)).not.toContain('tok');
+
+      expect(await readKey(MCP_GLOBAL_KEY)).toBeNull();
+      expect((await readKey(LEGACY_KEY))?.[0].authToken).toBe('tok');
+    }
+  );
+
+  it('writes are allowed when the legacy key is an empty list', async () => {
+    await env.MCP_SERVERS.put(LEGACY_KEY, JSON.stringify([]));
     const post = await SELF.fetch(base(ORG_A), {
       method: 'POST',
       headers: JSON_HEADERS,
       body: JSON.stringify(server('new')),
     });
     expect(post.status).toBe(200);
+    expect((await readKey(MCP_GLOBAL_KEY))?.map((s) => s.id)).toEqual(['new']);
+  });
+});
 
-    expect((await readKey(MCP_GLOBAL_KEY))?.map((s) => s.id)).toEqual(['legacy', 'new']);
+describe('once __global__ exists', () => {
+  it('once __global__ exists, PUT [] empties the pool (replace-all) and legacy is ignored', async () => {
+    await env.MCP_SERVERS.put(LEGACY_KEY, JSON.stringify([server('legacy')]));
+    await env.MCP_SERVERS.put(MCP_GLOBAL_KEY, JSON.stringify([server('g1'), server('g2')]));
+
+    const put = await SELF.fetch(base(ORG_A), {
+      method: 'PUT',
+      headers: JSON_HEADERS,
+      body: JSON.stringify([]),
+    });
+    expect(put.status).toBe(200);
+    expect(await readKey(MCP_GLOBAL_KEY)).toEqual([]);
     expect((await readKey(LEGACY_KEY))?.map((s) => s.id)).toEqual(['legacy']);
+  });
+
+  it('GET returns 500, not a token or a crash, when __global__ is not an array', async () => {
+    await env.MCP_SERVERS.put(MCP_GLOBAL_KEY, JSON.stringify({ authToken: 'sekrit' }));
+    const res = await SELF.fetch(base(ORG_A), { headers: AUTH });
+    expect(res.status).toBe(500);
+    expect(await res.text()).not.toContain('sekrit');
   });
 });
 
@@ -286,20 +338,27 @@ describe('authToken write rule on POST: omitted → preserve, null/"" → clear,
     expect(await tokenOf('s')).toBeUndefined();
   });
 
-  it('preserves a token stored under the legacy key across the first global write', async () => {
+  it('GET → PUT of the public shape does not persist hasAuthToken or lose the token', async () => {
     await env.MCP_SERVERS.put(
-      LEGACY_KEY,
-      JSON.stringify([server('fia', { authToken: 'fia-tok' })])
+      MCP_GLOBAL_KEY,
+      JSON.stringify([server('rt', { authToken: 'rt-tok', transport: 'json-rpc' })])
     );
+    const got = (await (await SELF.fetch(base(ORG_A), { headers: AUTH })).json()) as {
+      servers: Record<string, unknown>[];
+    };
+    expect(got.servers[0]).toHaveProperty('hasAuthToken', true);
 
-    const post = await SELF.fetch(base(ORG_A), {
-      method: 'POST',
+    const put = await SELF.fetch(base(ORG_A), {
+      method: 'PUT',
       headers: JSON_HEADERS,
-      body: JSON.stringify(server('fia', { name: 'FIA renamed' })),
+      body: JSON.stringify(got.servers.map((s) => ({ ...s, password: 'hunter2' }))),
     });
-    expect(post.status).toBe(200);
-    expect(await tokenOf('fia')).toBe('fia-tok');
-    expect((await readKey(MCP_GLOBAL_KEY))?.[0].name).toBe('FIA renamed');
+    expect(put.status).toBe(200);
+    expect(await put.text()).not.toContain('hunter2');
+
+    const pool = await readKey(MCP_GLOBAL_KEY);
+    expect(pool).toEqual([server('rt', { authToken: 'rt-tok', transport: 'json-rpc' })]);
+    expect(Object.keys(pool?.[0] ?? {})).not.toContain('hasAuthToken');
   });
 });
 
@@ -331,6 +390,19 @@ describe('authToken write rule on PUT, and rejected token types', () => {
       ['clear', null, 1],
       ['new', 'tok-new', 1],
     ]);
+  });
+});
+
+describe('rejected authToken values', () => {
+  it('rejects an over-long authToken with 400', async () => {
+    const post = await SELF.fetch(base(ORG_A), {
+      method: 'POST',
+      headers: JSON_HEADERS,
+      body: JSON.stringify(server('long', { authToken: 'x'.repeat(8193) })),
+    });
+    expect(post.status).toBe(400);
+    expect(((await post.json()) as { error: string }).error).toContain('authToken');
+    expect(await readKey(MCP_GLOBAL_KEY)).toBeNull();
   });
 
   it('rejects a non-string authToken with 400 and writes nothing', async () => {
@@ -372,6 +444,32 @@ describe('body validation', () => {
     expect(res.status).toBe(400);
     expect(await readKey(MCP_GLOBAL_KEY)).toBeNull();
   });
+});
+
+describe('PUT element validation', () => {
+  it('PUT with a null element → 400, not 500', async () => {
+    const res = await SELF.fetch(base(ORG_A), {
+      method: 'PUT',
+      headers: JSON_HEADERS,
+      body: JSON.stringify([server('ok'), null]),
+    });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toContain('object');
+    expect(await readKey(MCP_GLOBAL_KEY)).toBeNull();
+  });
+
+  it('PUT with duplicate ids → 400', async () => {
+    const res = await SELF.fetch(base(ORG_A), {
+      method: 'PUT',
+      headers: JSON_HEADERS,
+      body: JSON.stringify([server('dup'), server('other'), server('dup', { priority: 2 })]),
+    });
+    expect(res.status).toBe(400);
+    const json = (await res.json()) as { error: string; server_ids: string[] };
+    expect(json.error).toContain('Duplicate');
+    expect(json.server_ids).toEqual(['dup']);
+    expect(await readKey(MCP_GLOBAL_KEY)).toBeNull();
+  });
 
   it('PUT with a non-array body → 400', async () => {
     const res = await SELF.fetch(base(ORG_A), {
@@ -382,7 +480,9 @@ describe('body validation', () => {
     expect(res.status).toBe(400);
     expect(await readKey(MCP_GLOBAL_KEY)).toBeNull();
   });
+});
 
+describe('pool cap', () => {
   it('POST updating an existing id is allowed at the cap; adding a new one is not', async () => {
     const full = Array.from({ length: 50 }, (_, i) => server(`s${String(i)}`));
     await env.MCP_SERVERS.put(MCP_GLOBAL_KEY, JSON.stringify(full));

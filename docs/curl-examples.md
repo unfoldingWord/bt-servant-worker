@@ -180,7 +180,24 @@ and edits the same list, stored under the reserved `MCP_SERVERS` key
 Responses never include a server's `authToken`; they report
 `hasAuthToken: boolean` instead. On write (`POST` / `PUT`) the token is merged
 by server `id`: omit `authToken` to keep whatever is stored, send `null` or
-`""` to clear it, or a non-empty string to set it.
+`""` to clear it, or a non-empty string to set it. Only the known config fields
+(`id`, `name`, `url`, `enabled`, `priority`, `allowedTools`, `transport`,
+`authToken`) are persisted; anything else in the body is dropped.
+
+**Migration state.** While a namespace has no `__global__` key (JSON `null` —
+note that `[]` _is_ a key, meaning a real empty pool), reads fall back to the
+legacy `unfoldingWord` key and log `mcp_global_key_missing`. In that state:
+
+- if the legacy key holds servers, `POST`/`PUT`/`DELETE` return
+  `409 { code: "MCP_POOL_NOT_MIGRATED" }` — create `__global__` with the
+  runbook on admin-portal#278 (`wrangler kv key put … __global__ --path …`);
+  the API never copies legacy data itself;
+- if neither key exists (fresh namespace, local dev), writes create
+  `__global__` normally.
+
+The org-specific admin keys described next cannot currently reach these
+routes: the global `/api/*` middleware accepts only `ENGINE_API_KEY`. If that
+changes, writes to the global pool must stay super-admin only.
 
 Admin endpoints require either:
 
@@ -328,8 +345,9 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers
 ### Replace All MCP Servers
 
 `PUT` replaces the whole pool with the array you send (servers you leave out
-are removed). Each entry's `authToken` is merged by `id` under the same rule as
-`POST`, so a redacted `GET` → edit → `PUT` round-trip keeps stored tokens.
+are removed; `[]` empties the pool; duplicate `id`s are rejected). Each entry's
+`authToken` is merged by `id` under the same rule as `POST`, so a redacted
+`GET` → edit → `PUT` round-trip keeps stored tokens.
 
 ```bash
 curl -X PUT "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers" \

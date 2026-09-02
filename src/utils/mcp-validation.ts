@@ -13,6 +13,9 @@ export const MAX_SERVER_ID_LENGTH = 64;
 /** Max length for server name to prevent DoS */
 export const MAX_SERVER_NAME_LENGTH = 128;
 
+/** Max length for an upstream authToken (bearer tokens/JWTs are well under this) */
+export const MAX_AUTH_TOKEN_LENGTH = 8192;
+
 /**
  * Reserved KV key under which the single global MCP server pool is stored.
  *
@@ -132,6 +135,9 @@ export function validateTransport(transport: unknown): string | null {
 export function validateAuthToken(authToken: unknown): string | null {
   if (authToken === undefined || authToken === null) return null;
   if (typeof authToken !== 'string') return 'authToken must be a string or null';
+  if (authToken.length > MAX_AUTH_TOKEN_LENGTH) {
+    return `authToken must be <= ${MAX_AUTH_TOKEN_LENGTH} characters`;
+  }
   return null;
 }
 
@@ -150,11 +156,32 @@ export function validateOptionalFields(server: MCPServerConfig | MCPServerWrite)
 }
 
 /**
- * Validate complete MCP server config
+ * Validate complete MCP server config. Accepts `unknown` so a null or
+ * non-object element in a PUT array is a 400, not a TypeError-turned-500.
  * @returns Error message if invalid, null if valid
  */
-export function validateServerConfig(server: MCPServerConfig | MCPServerWrite): string | null {
+export function validateServerConfig(server: unknown): string | null {
+  if (server === null || typeof server !== 'object' || Array.isArray(server)) {
+    return 'Server config must be an object';
+  }
+  const candidate = server as MCPServerConfig | MCPServerWrite;
   return (
-    validateServerId(server.id) || validateServerUrl(server.url) || validateOptionalFields(server)
+    validateServerId(candidate.id) ||
+    validateServerUrl(candidate.url) ||
+    validateOptionalFields(candidate)
   );
+}
+
+/**
+ * Find server ids that appear more than once in a replace-all write.
+ * @returns The duplicated ids (empty when none)
+ */
+export function findDuplicateServerIds(servers: ReadonlyArray<{ id: string }>): string[] {
+  const seen = new Set<string>();
+  const dupes = new Set<string>();
+  for (const { id } of servers) {
+    if (seen.has(id)) dupes.add(id);
+    seen.add(id);
+  }
+  return [...dupes];
 }
