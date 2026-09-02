@@ -261,6 +261,7 @@ describe('readMcpServerPool', () => {
       fallbackFound: false,
       legacyKeys: ['unfoldingWord'],
       legacyListing: 'complete',
+      staleGlobalSuspected: false,
     });
     // Leftover legacy keys are surfaced (warn), but the pool is still served from __global__.
     expect(logger.warn).toHaveBeenCalledWith(
@@ -277,6 +278,37 @@ describe('readMcpServerPool', () => {
     expect(pool.legacyKeys).toEqual([]);
     expect(pool.legacyListing).toBe('complete');
     expect(logger.warn).not.toHaveBeenCalled();
+  });
+});
+
+describe('readMcpServerPool migrated leftovers', () => {
+  beforeEach(() => resetChatFallbackWarning());
+
+  it('migrated read reports the legacy key even when the listing fails (fail closed)', async () => {
+    const kv = fakeKv({ [MCP_GLOBAL_KEY]: [stored('g')], unfoldingWord: [stored('legacy')] });
+    (kv.list as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('list down'));
+    const logger = fakeLogger();
+    const pool = await readMcpServerPool(kv, 'unfoldingWord', logger, 'admin');
+    expect(pool.migrated).toBe(true);
+    expect(pool.legacyListing).toBe('failed');
+    expect(pool.legacyKeys).toEqual(['unfoldingWord']);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'mcp_legacy_keys_leftover',
+      expect.objectContaining({ legacy_keys: ['unfoldingWord'], legacy_listing: 'failed' })
+    );
+  });
+
+  it('migrated read warns on an incomplete listing even with no names', async () => {
+    const kv = fakeKv({ [MCP_GLOBAL_KEY]: [stored('g')] });
+    (kv.list as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('list down'));
+    const logger = fakeLogger();
+    const pool = await readMcpServerPool(kv, 'unfoldingWord', logger, 'admin');
+    expect(pool.legacyKeys).toEqual([]);
+    expect(pool.legacyListing).toBe('failed');
+    expect(logger.warn).toHaveBeenCalledWith(
+      'mcp_legacy_keys_leftover',
+      expect.objectContaining({ legacy_listing: 'failed' })
+    );
   });
 });
 
@@ -305,7 +337,9 @@ describe('readMcpServerPool fallback', () => {
     );
     expect(JSON.stringify(logger.warn.mock.calls)).not.toContain('tok-legacy-secret');
   });
+});
 
+describe('readMcpServerPool fresh namespace', () => {
   it('reports migrated=false when neither key exists (fresh namespace)', async () => {
     const pool = await readMcpServerPool(fakeKv({}), 'unfoldingWord', fakeLogger(), 'admin');
     expect(pool).toEqual({
@@ -314,6 +348,7 @@ describe('readMcpServerPool fallback', () => {
       fallbackFound: false,
       legacyKeys: [],
       legacyListing: 'complete',
+      staleGlobalSuspected: false,
     });
   });
 });
@@ -331,10 +366,32 @@ describe('readMcpServerPool on unmigrated namespaces', () => {
       fallbackFound: false,
       legacyKeys: ['other-org'],
       legacyListing: 'complete',
+      staleGlobalSuspected: false,
     });
     expect(logger.warn).toHaveBeenCalledWith(
       'mcp_global_key_missing',
       expect.objectContaining({ fallback_found: false, legacy_keys: ['other-org'] })
+    );
+  });
+});
+
+describe('readMcpServerPool stale-miss detection', () => {
+  beforeEach(() => resetChatFallbackWarning());
+
+  it('flags a stale miss when the listing shows __global__ but get did not', async () => {
+    const kv = fakeKv({});
+    (kv.list as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      keys: [{ name: MCP_GLOBAL_KEY }],
+      list_complete: true,
+    });
+    const logger = fakeLogger();
+    const pool = await readMcpServerPool(kv, 'unfoldingWord', logger, 'admin');
+    expect(pool.migrated).toBe(false);
+    expect(pool.staleGlobalSuspected).toBe(true);
+    expect(pool.legacyKeys).toEqual([]);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'mcp_global_key_missing',
+      expect.objectContaining({ stale_global_suspected: true })
     );
   });
 });
@@ -513,24 +570,31 @@ const poolOf = (over: Partial<McpServerPool>): McpServerPool => ({
   fallbackFound: false,
   legacyKeys: [],
   legacyListing: 'complete',
+  staleGlobalSuspected: false,
   ...over,
 });
 
 describe('describeMigrationHint', () => {
-  it('offers seeding [] only when nothing to migrate is proven', () => {
-    expect(describeMigrationHint(poolOf({}))).toContain("'[]'");
-  });
-
   it.each<[string, Partial<McpServerPool>]>([
+    ['nothing seen and listing complete', {}],
     ['fallback key found but listing empty (list lagging get)', { fallbackFound: true }],
     ['listing failed', { legacyListing: 'failed' }],
     ['listing truncated', { legacyListing: 'truncated' }],
     ['listing skipped', { legacyListing: 'skipped' }],
     ['another key present', { legacyKeys: ['other-org'] }],
-  ])('never offers [] when %s', (_label, over) => {
+    ['stale global suspected', { staleGlobalSuspected: true }],
+  ])('never tells the operator to seed [] outright when %s', (_label, over) => {
     const hint = describeMigrationHint(poolOf(over));
-    expect(hint).not.toContain("'[]'");
-    expect(hint).toContain('Do NOT seed []');
+    expect(hint).not.toMatch(/^No legacy keys exist/);
+    expect(hint).not.toContain("put … __global__ '[]'");
+    expect(hint).toMatch(/Do NOT seed \[\]|only if it shows no keys at all/);
+  });
+
+  it('defers the emptiness decision to the operator-run wrangler listing', () => {
+    const hint = describeMigrationHint(poolOf({}));
+    expect(hint).toContain('not proof that none exist');
+    expect(hint).toContain('wrangler kv key list --binding=MCP_SERVERS');
+    expect(hint).toContain('only if it shows no keys at all');
     expect(hint).toContain('redacted');
   });
 
@@ -541,10 +605,17 @@ describe('describeMigrationHint', () => {
     expect(hint).toContain('[unfoldingWord]');
     expect(hint).toContain('listing was failed');
   });
+
+  it('calls out a stale read when the listing shows __global__', () => {
+    const hint = describeMigrationHint(poolOf({ staleGlobalSuspected: true }));
+    expect(hint).toContain('stale read');
+    expect(hint).toContain('Retry');
+    expect(hint).toContain('Do NOT seed []');
+  });
 });
 
 describe('describeLeftoverLegacyKeys', () => {
-  it('is silent unless migrated with leftovers', () => {
+  it('is silent only for a migrated pool with a complete, empty listing', () => {
     expect(describeLeftoverLegacyKeys(poolOf({}))).toBeNull();
     expect(describeLeftoverLegacyKeys(poolOf({ legacyKeys: ['x'] }))).toBeNull();
     expect(describeLeftoverLegacyKeys(poolOf({ migrated: true }))).toBeNull();
@@ -557,6 +628,14 @@ describe('describeLeftoverLegacyKeys', () => {
     expect(msg).toContain('[unfoldingWord]');
     expect(msg).toContain('Do not delete');
   });
+
+  it.each(['failed', 'truncated', 'skipped'] as const)(
+    'warns that leftovers may exist unseen when the listing is %s',
+    (status) => {
+      const msg = describeLeftoverLegacyKeys(poolOf({ migrated: true, legacyListing: status }));
+      expect(msg).toContain('may exist unseen');
+    }
+  );
 });
 
 describe('poolWriteAuthError', () => {

@@ -51,6 +51,8 @@ type ListBody = {
   warning?: string;
   fallback_found?: boolean;
   legacy_keys?: string[];
+  legacy_listing?: string;
+  stale_global_suspected?: boolean;
   servers: PublicServer[];
 };
 
@@ -147,11 +149,16 @@ describe('transitional read fallback to the legacy DEFAULT_ORG key', () => {
       code: 'MCP_POOL_NOT_MIGRATED',
       fallback_found: false,
       legacy_keys: [],
+      legacy_listing: 'complete',
+      stale_global_suspected: false,
     });
     expect(typeof res.body.warning).toBe('string');
     expect(res.body.warning).toContain(MCP_GLOBAL_KEY);
-    // Nothing to migrate → seeding [] is the right unlock, and is offered.
-    expect(res.body.warning).toContain("'[]'");
+    // The API never asserts emptiness: the operator runs the listing and
+    // seeds [] only if that shows no keys.
+    expect(res.body.warning).toContain('not proof that none exist');
+    expect(res.body.warning).toContain('only if it shows no keys at all');
+    expect(res.body.warning).not.toMatch(/^.*No legacy keys exist/);
   });
 });
 
@@ -169,9 +176,10 @@ describe('unmigrated GET guidance', () => {
       migrated: false,
       fallback_found: false,
       legacy_keys: [OTHER_ORG_KEY],
+      legacy_listing: 'complete',
     });
     expect(res.body.warning).toContain(OTHER_ORG_KEY);
-    expect(res.body.warning).not.toContain("'[]'");
+    expect(res.body.warning).not.toMatch(/No legacy keys exist/);
     expect(res.body.warning).toContain('redacted');
   });
 });
@@ -199,18 +207,53 @@ describe('resources route migration state', () => {
       legacy_keys: [LEGACY_KEY],
       servers: [],
     });
+    expect(body).toMatchObject({ legacy_listing: 'complete', stale_global_suspected: false });
     expect(body.warning).toContain(LEGACY_KEY);
-    expect(body.warning).not.toContain("'[]'");
-    await env.MCP_SERVERS.delete(LEGACY_KEY);
+    expect(body.warning).not.toMatch(/No legacy keys exist/);
+  });
+});
 
+describe('resources route after migration', () => {
+  it('GET …/resources surfaces leftover legacy keys after migration, without the token', async () => {
+    await env.MCP_SERVERS.put(
+      LEGACY_KEY,
+      JSON.stringify([server('legacy', { authToken: 'tok-res', enabled: false })])
+    );
+    await seedGlobal();
+    const leftover = await SELF.fetch(
+      `https://worker/api/v1/admin/orgs/${ORG_A}/resources?language=en`,
+      { headers: AUTH }
+    );
+    const leftoverText = await leftover.text();
+    expect(leftoverText).not.toContain('tok-res');
+    const leftoverBody = JSON.parse(leftoverText) as ListBody;
+    expect(leftoverBody).toMatchObject({
+      migrated: true,
+      legacy_keys: [LEGACY_KEY],
+      legacy_listing: 'complete',
+    });
+    expect(leftoverBody.warning).toContain('no longer read');
+    await env.MCP_SERVERS.delete(LEGACY_KEY);
+  });
+
+  it('GET …/resources on a clean migrated pool carries legacy_listing and no warning', async () => {
     await seedGlobal();
     const migrated = await SELF.fetch(
       `https://worker/api/v1/admin/orgs/${ORG_A}/resources?language=en`,
       { headers: AUTH }
     );
-    expect(await migrated.json()).toMatchObject({ org: ORG_A, migrated: true, servers: [] });
+    const migratedBody = (await migrated.json()) as ListBody;
+    expect(migratedBody).toMatchObject({
+      org: ORG_A,
+      migrated: true,
+      legacy_listing: 'complete',
+      servers: [],
+    });
+    expect(migratedBody).not.toHaveProperty('warning');
   });
+});
 
+describe('transitional read fallback: legacy served', () => {
   it('reads the legacy key while __global__ is absent, redacted and flagged', async () => {
     await env.MCP_SERVERS.put(
       LEGACY_KEY,
@@ -253,6 +296,7 @@ describe('__global__ precedence and corruption', () => {
     await seedGlobal([server('g')]);
     const res = await get(ORG_A);
     expect(res.body.migrated).toBe(true);
+    expect(res.body.legacy_listing).toBe('complete');
     expect(res.body).not.toHaveProperty('warning');
     expect(res.body).not.toHaveProperty('legacy_keys');
   });
@@ -297,8 +341,9 @@ describe('writes require __global__ to exist (409 MCP_POOL_NOT_MIGRATED)', () =>
     };
     expect(json.fallback_found).toBe(true);
     expect(json.legacy_keys).toEqual([LEGACY_KEY]);
+    expect(json.stale_global_suspected).toBe(false);
     expect(json.error).toContain(LEGACY_KEY);
-    expect(json.error).not.toContain("'[]'");
+    expect(json.error).not.toMatch(/No legacy keys exist/);
   });
 
   it('when neither key exists (fresh namespace)', async () => {
@@ -321,6 +366,12 @@ describe('super-admin fence on writes', () => {
     await env.ORG_ADMIN_KEYS.delete(ORG_A);
   });
 
+  // NOTE: the global `/api/*` middleware rejects any non-ENGINE_API_KEY bearer
+  // before these routes run, so end-to-end this 403 is produced upstream of
+  // rejectMcpWrite and cannot be told apart by status alone. The route fence
+  // itself is contracted by the poolWriteAuthError unit tests; this test pins
+  // the observable invariant (an org key cannot change the pool) regardless
+  // of which layer enforces it.
   it('an org-scoped admin key can never write the global pool', async () => {
     await env.ORG_ADMIN_KEYS.put(ORG_A, ORG_KEY);
     await seedGlobal([server('keep')]);

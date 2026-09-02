@@ -390,9 +390,10 @@ app.get('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
 /**
  * Migration-state fields spread into admin GET bodies and the 409 body.
  * Unmigrated: `migrated:false`, `code`, `fallback_found`, `legacy_keys`,
- * `legacy_listing`, `warning` (guidance from describeMigrationHint). Migrated:
- * `migrated:true`, plus `legacy_keys` and a `warning` when the namespace still
- * holds legacy keys that are no longer served (describeLeftoverLegacyKeys).
+ * `legacy_listing`, `stale_global_suspected`, `warning` (guidance from
+ * describeMigrationHint). Migrated: `migrated:true`, `legacy_listing`, plus
+ * `legacy_keys` and a `warning` when leftovers were seen or the listing was
+ * incomplete (describeLeftoverLegacyKeys).
  */
 function poolStateFields(defaultOrg: string, pool: McpServerPool) {
   if (!pool.migrated) {
@@ -402,13 +403,19 @@ function poolStateFields(defaultOrg: string, pool: McpServerPool) {
       fallback_found: pool.fallbackFound,
       legacy_keys: pool.legacyKeys,
       legacy_listing: pool.legacyListing,
-      warning: `The '${MCP_GLOBAL_KEY}' key does not exist yet; this list is served from the legacy '${defaultOrg}' key (or is empty) and writes are refused. ${describeMigrationHint(pool)}`,
+      stale_global_suspected: pool.staleGlobalSuspected,
+      warning: `The '${MCP_GLOBAL_KEY}' key was not found by this read; this list is served from the legacy '${defaultOrg}' key (or is empty) and writes are refused. ${describeMigrationHint(pool)}`,
     };
   }
   const leftover = describeLeftoverLegacyKeys(pool);
   return leftover === null
-    ? { migrated: true }
-    : { migrated: true, legacy_keys: pool.legacyKeys, warning: leftover };
+    ? { migrated: true, legacy_listing: pool.legacyListing }
+    : {
+        migrated: true,
+        legacy_keys: pool.legacyKeys,
+        legacy_listing: pool.legacyListing,
+        warning: leftover,
+      };
 }
 
 /**
