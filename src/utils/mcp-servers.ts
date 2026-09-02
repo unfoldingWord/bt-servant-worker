@@ -19,7 +19,7 @@ import { MCP_GLOBAL_KEY } from './mcp-validation.js';
 
 // ─── Read path ────────────────────────────────────────────────────────────────
 
-/** Where a pool read originates; controls how loudly the fallback is logged. */
+/** Where a pool read originates; controls how the fallback is logged. */
 export type PoolReadSource = 'admin' | 'chat';
 
 export interface McpServerPool {
@@ -27,19 +27,17 @@ export interface McpServerPool {
   /**
    * True when `__global__` exists in the namespace (even as `[]`). False means
    * the pool was served from the legacy DEFAULT_ORG key, or is empty because
-   * neither key exists.
+   * neither key exists. Write routes refuse with 409 unless this is true: the
+   * migration runbook on admin-portal#278 (or, for a fresh/local namespace,
+   * seeding `__global__` with `[]`) is the only path that creates the key.
+   * Letting a write create it would race KV's eventual consistency — a colo
+   * with a stale miss on `__global__` could rebuild the pool from whatever
+   * legacy view it had — and could seal off legacy keys of other orgs.
    */
   migrated: boolean;
-  /**
-   * True when `__global__` is absent but the legacy key holds data — the state
-   * in which a write would silently orphan or overwrite that data. Write routes
-   * refuse with 409 in this state; the migration runbook on admin-portal#278
-   * is the only path that creates `__global__` from legacy data.
-   */
-  writeBlocked: boolean;
 }
 
-/** Once-per-isolate latch so the chat hot path does not warn on every turn. */
+/** Once-per-isolate latch so the chat hot path does not log on every turn. */
 let chatFallbackWarned = false;
 
 /** Test seam: reset the once-per-isolate chat warning latch. */
@@ -47,11 +45,56 @@ export function resetChatFallbackWarning(): void {
   chatFallbackWarned = false;
 }
 
+/** Upper bound on `kv.list` pages when enumerating legacy keys for the warn. */
+const MAX_LEGACY_KEY_PAGES = 10;
+
+function isStoredServer(value: unknown): value is MCPServerConfig {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    typeof (value as { id?: unknown }).id === 'string'
+  );
+}
+
 function assertPoolShape(value: unknown, key: string): MCPServerConfig[] {
   if (!Array.isArray(value)) {
     throw new Error(`MCP_SERVERS key '${key}' is not a JSON array (got ${typeof value})`);
   }
+  const bad = value.findIndex((v) => !isStoredServer(v));
+  if (bad >= 0) {
+    throw new Error(
+      `MCP_SERVERS key '${key}' element ${String(bad)} is not a server config object`
+    );
+  }
   return value as MCPServerConfig[];
+}
+
+/**
+ * Enumerate the namespace's keys (other than `__global__`) so the migration
+ * runbook can see legacy org keys it must merge (admin-portal#278 Q#6). Purely
+ * diagnostic: a listing failure is logged and must never fail the read.
+ */
+async function listLegacyKeys(kv: KVNamespace, logger: RequestLogger): Promise<string[]> {
+  const names: string[] = [];
+  try {
+    let cursor: string | undefined;
+    for (let page = 0; page < MAX_LEGACY_KEY_PAGES; page++) {
+      const result = await kv.list(
+        cursor === undefined ? { limit: 1000 } : { limit: 1000, cursor }
+      );
+      names.push(...result.keys.map((k) => k.name).filter((n) => n !== MCP_GLOBAL_KEY));
+      if (result.list_complete) return names;
+      cursor = result.cursor;
+    }
+    logger.warn('mcp_legacy_key_list_truncated', {
+      pages: MAX_LEGACY_KEY_PAGES,
+      listed: names.length,
+    });
+  } catch (error) {
+    logger.error('mcp_legacy_key_list_failed', error, { listed: names.length });
+  }
+  return names;
 }
 
 /**
@@ -62,8 +105,9 @@ function assertPoolShape(value: unknown, key: string): MCPServerConfig[] {
  * staging redeploy on a PR push never blanks the pool. `[]` under `__global__`
  * is a real, empty pool and disables the fallback. Reads never write.
  *
- * Throws when KV fails or a stored value is not an array; admin routes turn
- * that into a 500 and the chat path degrades to an empty pool.
+ * Throws when KV fails or a stored value is not an array of server configs;
+ * admin routes turn that into a 500 and the chat path degrades to an empty
+ * pool.
  */
 export async function readMcpServerPool(
   kv: KVNamespace,
@@ -73,11 +117,7 @@ export async function readMcpServerPool(
 ): Promise<McpServerPool> {
   const global = await kv.get<unknown>(MCP_GLOBAL_KEY, 'json');
   if (global !== null) {
-    return {
-      servers: assertPoolShape(global, MCP_GLOBAL_KEY),
-      migrated: true,
-      writeBlocked: false,
-    };
+    return { servers: assertPoolShape(global, MCP_GLOBAL_KEY), migrated: true };
   }
 
   const legacyRaw = await kv.get<unknown>(defaultOrg, 'json');
@@ -90,25 +130,19 @@ export async function readMcpServerPool(
   };
 
   if (source === 'admin') {
-    // Admin reads are rare: always warn, and list the namespace so any other
-    // legacy org key that the runbook must merge is visible (#278 Q#6).
-    const listed = await kv.list({ limit: 100 });
+    // Admin reads are rare: always warn, with the namespace's other keys so
+    // any legacy org list the runbook must merge is visible.
     logger.warn('mcp_global_key_missing', {
       ...data,
-      legacy_keys: listed.keys.map((k) => k.name),
+      legacy_keys: await listLegacyKeys(kv, logger),
     });
   } else if (!chatFallbackWarned) {
+    // Chat is the hot path: one warn per isolate is the operator signal.
     chatFallbackWarned = true;
     logger.warn('mcp_global_key_missing', { ...data, once_per_isolate: true });
-  } else {
-    logger.info('mcp_global_key_missing', data);
   }
 
-  return {
-    servers: legacy ?? [],
-    migrated: false,
-    writeBlocked: legacy !== null && legacy.length > 0,
-  };
+  return { servers: legacy ?? [], migrated: false };
 }
 
 /**
@@ -130,10 +164,23 @@ export async function readMcpServerPoolOrEmpty(
 
 // ─── Public projection ────────────────────────────────────────────────────────
 
-/** Project a stored config to its public shape: drop authToken, add hasAuthToken. */
+/**
+ * Project a stored config to its public shape. Built from an allowlist, not by
+ * deleting `authToken`: the pre-#278 POST persisted `{...body}` verbatim, so a
+ * stored object may carry unknown keys that must not reach every org's admins.
+ */
 export function toPublicServerConfig(server: MCPServerConfig): MCPServerConfigPublic {
-  const { authToken, ...rest } = server;
-  return { ...rest, hasAuthToken: typeof authToken === 'string' && authToken.length > 0 };
+  const pub: MCPServerConfigPublic = {
+    id: server.id,
+    name: server.name,
+    url: server.url,
+    enabled: server.enabled,
+    priority: server.priority,
+    hasAuthToken: typeof server.authToken === 'string' && server.authToken.length > 0,
+  };
+  if (server.allowedTools !== undefined) pub.allowedTools = server.allowedTools;
+  if (server.transport !== undefined) pub.transport = server.transport;
+  return pub;
 }
 
 /** Project a whole pool to its public shape, preserving order. */

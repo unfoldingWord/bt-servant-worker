@@ -48,6 +48,20 @@ describe('toPublicServerConfig', () => {
     expect(toPublicServerConfig(stored('a', { authToken: '' })).hasAuthToken).toBe(false);
   });
 
+  it('is an allowlist: unknown stored keys never reach the public shape', () => {
+    const legacyStored = {
+      ...stored('a', { authToken: 'sekrit' }),
+      password: 'hunter2',
+      hasAuthToken: false, // stale public-shape field persisted pre-#278
+    } as unknown as MCPServerConfig;
+    const pub = toPublicServerConfig(legacyStored);
+    expect(Object.keys(pub).sort()).toEqual(
+      ['enabled', 'hasAuthToken', 'id', 'name', 'priority', 'url'].sort()
+    );
+    expect(pub.hasAuthToken).toBe(true);
+    expect(JSON.stringify(pub)).not.toMatch(/hunter2|sekrit/);
+  });
+
   it('keeps every other field, including optional ones', () => {
     const pub = toPublicServerConfig(
       stored('a', { allowedTools: ['x'], transport: 'streamable-http', enabled: false })
@@ -236,66 +250,113 @@ describe('readMcpServerPool', () => {
     const kv = fakeKv({ [MCP_GLOBAL_KEY]: [], unfoldingWord: [stored('legacy')] });
     const logger = fakeLogger();
     const pool = await readMcpServerPool(kv, 'unfoldingWord', logger, 'admin');
-    expect(pool).toEqual({ servers: [], migrated: true, writeBlocked: false });
+    expect(pool).toEqual({ servers: [], migrated: true });
     expect(logger.warn).not.toHaveBeenCalled();
+    expect(kv.list).not.toHaveBeenCalled();
   });
 
-  it('falls back to the legacy key and blocks writes while it holds data', async () => {
-    const kv = fakeKv({ unfoldingWord: [stored('legacy', { authToken: 't' })] });
+  it('falls back to the legacy key and reports migrated=false with the namespace keys', async () => {
+    const kv = fakeKv({
+      unfoldingWord: [stored('legacy', { authToken: 'tok-legacy-secret' })],
+      'other-org': [stored('theirs')],
+    });
     const logger = fakeLogger();
     const pool = await readMcpServerPool(kv, 'unfoldingWord', logger, 'admin');
     expect(pool.migrated).toBe(false);
-    expect(pool.writeBlocked).toBe(true);
     expect(pool.servers.map((s) => s.id)).toEqual(['legacy']);
     expect(logger.warn).toHaveBeenCalledWith(
       'mcp_global_key_missing',
       expect.objectContaining({
         fallback_found: true,
         server_count: 1,
-        legacy_keys: ['unfoldingWord'],
+        legacy_keys: ['unfoldingWord', 'other-org'],
       })
     );
-    // The token never reaches a log line.
-    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain("'t'");
+    expect(JSON.stringify(logger.warn.mock.calls)).not.toContain('tok-legacy-secret');
   });
 
-  it('does not block writes when neither key exists (fresh namespace)', async () => {
+  it('reports migrated=false when neither key exists (fresh namespace)', async () => {
     const pool = await readMcpServerPool(fakeKv({}), 'unfoldingWord', fakeLogger(), 'admin');
-    expect(pool).toEqual({ servers: [], migrated: false, writeBlocked: false });
+    expect(pool).toEqual({ servers: [], migrated: false });
   });
 
-  it('does not block writes when the legacy key is an empty list', async () => {
-    const pool = await readMcpServerPool(
-      fakeKv({ unfoldingWord: [] }),
-      'unfoldingWord',
-      fakeLogger(),
-      'admin'
+  it('reports migrated=false when only another org key holds servers', async () => {
+    const kv = fakeKv({ 'other-org': [stored('theirs')] });
+    const logger = fakeLogger();
+    const pool = await readMcpServerPool(kv, 'unfoldingWord', logger, 'admin');
+    expect(pool).toEqual({ servers: [], migrated: false });
+    expect(logger.warn).toHaveBeenCalledWith(
+      'mcp_global_key_missing',
+      expect.objectContaining({ fallback_found: false, legacy_keys: ['other-org'] })
     );
-    expect(pool.writeBlocked).toBe(false);
   });
 });
 
 describe('readMcpServerPool logging and shape guards', () => {
   beforeEach(() => resetChatFallbackWarning());
 
-  it('chat source warns once per isolate, then logs info', async () => {
+  it('chat source warns once per isolate and is otherwise silent', async () => {
     const kv = fakeKv({ unfoldingWord: [stored('legacy')] });
     const logger = fakeLogger();
     await readMcpServerPool(kv, 'unfoldingWord', logger, 'chat');
     await readMcpServerPool(kv, 'unfoldingWord', logger, 'chat');
     await readMcpServerPool(kv, 'unfoldingWord', logger, 'chat');
     expect(logger.warn).toHaveBeenCalledTimes(1);
-    expect(logger.info).toHaveBeenCalledTimes(2);
+    expect(logger.info).not.toHaveBeenCalled();
     expect(kv.list).not.toHaveBeenCalled();
   });
 
-  it('throws when a stored value is not an array', async () => {
+  it('a failing key listing is logged and does not fail the read', async () => {
+    const kv = fakeKv({ unfoldingWord: [stored('legacy')] });
+    (kv.list as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('list down'));
+    const logger = fakeLogger();
+    const pool = await readMcpServerPool(kv, 'unfoldingWord', logger, 'admin');
+    expect(pool.servers.map((s) => s.id)).toEqual(['legacy']);
+    expect(logger.error).toHaveBeenCalledWith(
+      'mcp_legacy_key_list_failed',
+      expect.any(Error),
+      expect.anything()
+    );
+    expect(logger.warn).toHaveBeenCalledWith(
+      'mcp_global_key_missing',
+      expect.objectContaining({ legacy_keys: [] })
+    );
+  });
+});
+
+describe('readMcpServerPool key listing and shape guards', () => {
+  beforeEach(() => resetChatFallbackWarning());
+
+  it('follows list pagination until list_complete', async () => {
+    const kv = fakeKv({ unfoldingWord: [] });
+    (kv.list as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ keys: [{ name: 'a' }], list_complete: false, cursor: 'c1' })
+      .mockResolvedValueOnce({ keys: [{ name: 'b' }], list_complete: true });
+    const logger = fakeLogger();
+    await readMcpServerPool(kv, 'unfoldingWord', logger, 'admin');
+    expect(kv.list).toHaveBeenCalledTimes(2);
+    expect(kv.list).toHaveBeenLastCalledWith({ limit: 1000, cursor: 'c1' });
+    expect(logger.warn).toHaveBeenCalledWith(
+      'mcp_global_key_missing',
+      expect.objectContaining({ legacy_keys: ['a', 'b'] })
+    );
+  });
+
+  it('throws when a stored value is not an array of server configs', async () => {
     await expect(
       readMcpServerPool(fakeKv({ [MCP_GLOBAL_KEY]: { oops: 1 } }), 'u', fakeLogger(), 'admin')
     ).rejects.toThrow(/not a JSON array/);
     await expect(
       readMcpServerPool(fakeKv({ unfoldingWord: 'nope' }), 'unfoldingWord', fakeLogger(), 'admin')
     ).rejects.toThrow(/not a JSON array/);
+    await expect(
+      readMcpServerPool(
+        fakeKv({ [MCP_GLOBAL_KEY]: [stored('ok'), null] }),
+        'u',
+        fakeLogger(),
+        'admin'
+      )
+    ).rejects.toThrow(/element 1/);
   });
 });
 

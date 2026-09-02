@@ -186,14 +186,17 @@ by server `id`: omit `authToken` to keep whatever is stored, send `null` or
 
 **Migration state.** While a namespace has no `__global__` key (JSON `null` —
 note that `[]` _is_ a key, meaning a real empty pool), reads fall back to the
-legacy `unfoldingWord` key and log `mcp_global_key_missing`. In that state:
+legacy `unfoldingWord` key, log `mcp_global_key_missing`, and the GET body
+carries `migrated: false`, `code: "MCP_POOL_NOT_MIGRATED"` and a `warning`.
+In that state every `POST`/`PUT`/`DELETE` returns
+`409 { code: "MCP_POOL_NOT_MIGRATED" }`. The API never creates `__global__`
+itself — create it with the runbook on admin-portal#278
+(`wrangler kv key put … __global__ --path …` from the legacy data), or, on a
+fresh/local namespace with nothing to migrate:
 
-- if the legacy key holds servers, `POST`/`PUT`/`DELETE` return
-  `409 { code: "MCP_POOL_NOT_MIGRATED" }` — create `__global__` with the
-  runbook on admin-portal#278 (`wrangler kv key put … __global__ --path …`);
-  the API never copies legacy data itself;
-- if neither key exists (fresh namespace, local dev), writes create
-  `__global__` normally.
+```bash
+npx wrangler kv key put --binding=MCP_SERVERS --local __global__ '[]'
+```
 
 The org-specific admin keys described next cannot currently reach these
 routes: the global `/api/*` middleware accepts only `ENGINE_API_KEY`. If that
@@ -221,12 +224,9 @@ npx wrangler kv:key put --binding=ORG_ADMIN_KEYS "unfoldingWord" "your-org-speci
 npx wrangler kv:key list --binding=ORG_ADMIN_KEYS
 ```
 
-Clients can then use the org-specific key instead of the super admin key:
-
-```bash
-curl "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers" \
-  -H "Authorization: Bearer your-org-specific-api-key"
-```
+Clients would then use the org-specific key instead of the super admin key —
+but see the note above: today every `/api/*` request must carry `ENGINE_API_KEY`,
+so all examples below use `$API_KEY`.
 
 ### List MCP Servers
 
@@ -235,11 +235,13 @@ curl "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers" \
   -H "Authorization: Bearer $API_KEY"
 ```
 
-**Response** (`org` echoes the URL; the list is the same for every org):
+**Response** (`org` echoes the URL; the list is the same for every org;
+`migrated: true` means `__global__` exists — see "Migration state" above):
 
 ```json
 {
   "org": "unfoldingWord",
+  "migrated": true,
   "servers": [
     {
       "id": "translation-helps",
@@ -267,6 +269,7 @@ curl "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-servers?discove
 ```json
 {
   "org": "unfoldingWord",
+  "migrated": true,
   "servers": [
     {
       "id": "translation-helps",

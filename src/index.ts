@@ -346,18 +346,16 @@ app.get('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
   }
 
   try {
-    const { servers } = await readMcpServerPool(
-      c.env.MCP_SERVERS,
-      c.env.DEFAULT_ORG,
-      logger,
-      'admin'
-    );
+    const pool = await readMcpServerPool(c.env.MCP_SERVERS, c.env.DEFAULT_ORG, logger, 'admin');
+    const { servers } = pool;
+    const state = pool.migrated ? { migrated: true } : poolNotMigratedFields(c.env.DEFAULT_ORG);
 
     logger.log('admin_action', {
       action: 'list_mcp_servers',
       org,
       server_count: servers.length,
       discover,
+      migrated: pool.migrated,
     });
 
     // If discover=true, run discovery and include status/errors in response
@@ -375,24 +373,33 @@ app.get('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
         };
       });
 
-      return c.json({ org, servers: serverStatuses });
+      return c.json({ org, ...state, servers: serverStatuses });
     }
 
-    return c.json({ org, servers: toPublicServerConfigs(servers) });
+    return c.json({ org, ...state, servers: toPublicServerConfigs(servers) });
   } catch (error) {
     logger.error('admin_action', error, { action: 'list_mcp_servers', org });
     return c.json({ error: 'Failed to read MCP servers from storage' }, 500);
   }
 });
 
+/** Warning fields added to a GET response while the pool is served by fallback. */
+function poolNotMigratedFields(defaultOrg: string) {
+  return {
+    migrated: false,
+    code: 'MCP_POOL_NOT_MIGRATED',
+    warning: `The '${MCP_GLOBAL_KEY}' key does not exist yet; this list is served from the legacy '${defaultOrg}' key (or is empty) and writes are refused until the admin-portal#278 migration runbook has created '${MCP_GLOBAL_KEY}'.`,
+  };
+}
+
 /**
- * 409 for a write attempted while `__global__` is absent but the legacy key
- * holds data. Writes never merge from the legacy key: with KV's eventual
- * consistency a colo that still sees `__global__` as missing could otherwise
- * rebuild the pool from stale legacy data on top of a completed migration, and
- * a replace-all PUT during fallback would orphan the legacy list for good.
- * The runbook on admin-portal#278 is the single path that creates `__global__`
- * from legacy data.
+ * 409 for a write attempted while `__global__` does not exist. Writes never
+ * create or merge from legacy data: with KV's eventual consistency a colo that
+ * still sees `__global__` as missing could otherwise rebuild the pool from a
+ * stale legacy view on top of a completed migration, and a first write could
+ * seal off legacy keys of other orgs. The runbook on admin-portal#278 (or, for
+ * a fresh/local namespace, seeding `__global__` with `[]`) is the single path
+ * that creates the key.
  */
 function poolNotMigratedResponse(
   c: Context<{ Bindings: Env }>,
@@ -409,7 +416,7 @@ function poolNotMigratedResponse(
   });
   return c.json(
     {
-      error: `MCP server pool has not been migrated to the '${MCP_GLOBAL_KEY}' key; run the admin-portal#278 migration runbook before writing`,
+      error: `MCP server pool key '${MCP_GLOBAL_KEY}' does not exist in this namespace; run the admin-portal#278 migration runbook (or seed it with [] on a fresh/local namespace) before writing`,
       code: 'MCP_POOL_NOT_MIGRATED',
     },
     409
@@ -439,7 +446,7 @@ app.put('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
     // Replace-all for the list; authToken merged by id against the stored
     // pool (omitted → preserve, null/"" → clear, string → set).
     const pool = await readMcpServerPool(c.env.MCP_SERVERS, c.env.DEFAULT_ORG, logger, 'admin');
-    if (pool.writeBlocked) {
+    if (!pool.migrated) {
       return poolNotMigratedResponse(c, logger, 'replace_mcp_servers', org);
     }
     const servers = mergeServerPool(writes, pool.servers);
@@ -524,7 +531,7 @@ app.post('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
 
   try {
     const pool = await readMcpServerPool(c.env.MCP_SERVERS, c.env.DEFAULT_ORG, logger, 'admin');
-    if (pool.writeBlocked) {
+    if (!pool.migrated) {
       return poolNotMigratedResponse(c, logger, 'add_mcp_server', org);
     }
     const existing = pool.servers;
@@ -576,7 +583,7 @@ app.delete('/api/v1/admin/orgs/:org/mcp-servers/:serverId', async (c) => {
 
   try {
     const pool = await readMcpServerPool(c.env.MCP_SERVERS, c.env.DEFAULT_ORG, logger, 'admin');
-    if (pool.writeBlocked) {
+    if (!pool.migrated) {
       return poolNotMigratedResponse(c, logger, 'remove_mcp_server', org);
     }
     const filtered = pool.servers.filter((s) => s.id !== serverId);

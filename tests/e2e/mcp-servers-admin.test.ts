@@ -8,15 +8,16 @@
  *   reserved key itself.
  * - Transitional fallback: while `__global__` is absent, reads fall back to the
  *   legacy `DEFAULT_ORG` (`unfoldingWord`) key so a staging redeploy on a PR
- *   push never blanks the pool. Writes never merge from the legacy key: while
- *   it holds data and `__global__` is absent they return 409, so a stale colo
- *   can never rebuild the pool from legacy data over a completed migration.
+ *   push never blanks the pool, and the GET body says so (`migrated: false`).
+ *   Writes require `__global__` to exist (409 otherwise): the migration runbook
+ *   is the only path that creates it, so no colo can ever rebuild the pool from
+ *   a stale legacy view or seal off another org's legacy key.
  * - `authToken` is never serialised in a response (`hasAuthToken` instead) and
  *   is merged by server id on write: omitted → preserve, null/"" → clear,
- *   string → set.
+ *   non-empty string → set.
  *
  * KV is shared between suites (`isolatedStorage: false` in vitest.config.ts),
- * so every test asserts a clean pool at start and deletes both keys after.
+ * so every test asserts a clean namespace at start and deletes its keys after.
  *
  * Skipped on Windows (SQLite/workerd incompatibility). Runs in CI on Linux.
  */
@@ -30,6 +31,7 @@ const JSON_HEADERS = { ...AUTH, 'Content-Type': 'application/json' };
 const ORG_A = 'test-org-278-a';
 const ORG_B = 'test-org-278-b';
 const LEGACY_KEY = 'unfoldingWord'; // DEFAULT_ORG in vitest.config.ts
+const OTHER_ORG_KEY = 'test-org-278-other-legacy';
 const base = (org: string) => `https://worker/api/v1/admin/orgs/${org}/mcp-servers`;
 
 const server = (id: string, extra: Partial<MCPServerConfig> = {}): MCPServerConfig => ({
@@ -41,142 +43,173 @@ const server = (id: string, extra: Partial<MCPServerConfig> = {}): MCPServerConf
   ...extra,
 });
 
+type PublicServer = { id: string; hasAuthToken: boolean; authToken?: unknown };
+type ListBody = { org: string; migrated: boolean; code?: string; servers: PublicServer[] };
+
 async function readKey(key: string): Promise<MCPServerConfig[] | null> {
   return env.MCP_SERVERS.get<MCPServerConfig[]>(key, 'json');
 }
+
+/** Migrated namespace: `__global__` exists (as the runbook would have created it). */
+async function seedGlobal(servers: MCPServerConfig[] = []): Promise<void> {
+  await env.MCP_SERVERS.put(MCP_GLOBAL_KEY, JSON.stringify(servers));
+}
+
+const tokenOf = async (id: string) =>
+  (await readKey(MCP_GLOBAL_KEY))?.find((s) => s.id === id)?.authToken;
+
+/** Fail loudly if any server in a response body carries the secret. */
+function expectRedacted(servers: PublicServer[]): void {
+  for (const s of servers) {
+    expect(Object.keys(s)).not.toContain('authToken');
+    expect(typeof s.hasAuthToken).toBe('boolean');
+  }
+}
+
+const post = (org: string, payload: unknown) =>
+  SELF.fetch(base(org), { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(payload) });
+const put = (org: string, payload: unknown) =>
+  SELF.fetch(base(org), { method: 'PUT', headers: JSON_HEADERS, body: JSON.stringify(payload) });
+const del = (org: string, id: string) =>
+  SELF.fetch(`${base(org)}/${id}`, { method: 'DELETE', headers: AUTH });
+const get = async (
+  org: string,
+  query = ''
+): Promise<{ status: number; text: string; body: ListBody }> => {
+  const res = await SELF.fetch(`${base(org)}${query}`, { headers: AUTH });
+  const text = await res.text();
+  return { status: res.status, text, body: JSON.parse(text) as ListBody };
+};
 
 beforeEach(async () => {
   // Shared KV: another suite leaking a pool would make these assertions lie.
   expect(await readKey(MCP_GLOBAL_KEY)).toBeNull();
   expect(await readKey(LEGACY_KEY)).toBeNull();
+  expect(await readKey(OTHER_ORG_KEY)).toBeNull();
 });
 
 afterEach(async () => {
   await env.MCP_SERVERS.delete(MCP_GLOBAL_KEY);
   await env.MCP_SERVERS.delete(LEGACY_KEY);
+  await env.MCP_SERVERS.delete(OTHER_ORG_KEY);
 });
 
 describe('global pool: :org is ignored for storage', () => {
-  it('returns an empty pool when neither key exists', async () => {
-    const res = await SELF.fetch(base(ORG_A), { headers: AUTH });
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ org: ORG_A, servers: [] });
-  });
-
   it('writes under __global__ and serves the same list to every org', async () => {
-    const post = await SELF.fetch(base(ORG_A), {
-      method: 'POST',
-      headers: JSON_HEADERS,
-      body: JSON.stringify(server('alpha')),
-    });
-    expect(post.status).toBe(200);
+    await seedGlobal();
+    expect((await post(ORG_A, server('alpha'))).status).toBe(200);
 
     expect((await readKey(MCP_GLOBAL_KEY))?.map((s) => s.id)).toEqual(['alpha']);
     expect(await readKey(ORG_A)).toBeNull();
 
-    const fromB = await SELF.fetch(base(ORG_B), { headers: AUTH });
-    const body = (await fromB.json()) as { org: string; servers: { id: string }[] };
-    expect(body.org).toBe(ORG_B);
-    expect(body.servers.map((s) => s.id)).toEqual(['alpha']);
+    const fromB = await get(ORG_B);
+    expect(fromB.body.org).toBe(ORG_B);
+    expect(fromB.body.migrated).toBe(true);
+    expect(fromB.body.servers.map((s) => s.id)).toEqual(['alpha']);
   });
 
   it('PUT replaces the global pool and DELETE removes from it', async () => {
-    const put = await SELF.fetch(base(ORG_A), {
-      method: 'PUT',
-      headers: JSON_HEADERS,
-      body: JSON.stringify([server('one'), server('two', { priority: 2 })]),
-    });
-    expect(put.status).toBe(200);
+    await seedGlobal();
+    expect((await put(ORG_A, [server('one'), server('two', { priority: 2 })])).status).toBe(200);
     expect((await readKey(MCP_GLOBAL_KEY))?.map((s) => s.id)).toEqual(['one', 'two']);
 
-    const del = await SELF.fetch(`${base(ORG_B)}/one`, { method: 'DELETE', headers: AUTH });
-    expect(del.status).toBe(200);
+    expect((await del(ORG_B, 'one')).status).toBe(200);
     expect((await readKey(MCP_GLOBAL_KEY))?.map((s) => s.id)).toEqual(['two']);
+  });
+
+  it('PUT [] empties a migrated pool (replace-all) and the legacy key is ignored', async () => {
+    await env.MCP_SERVERS.put(LEGACY_KEY, JSON.stringify([server('legacy')]));
+    await seedGlobal([server('g1'), server('g2')]);
+
+    expect((await put(ORG_A, [])).status).toBe(200);
+    expect(await readKey(MCP_GLOBAL_KEY)).toEqual([]);
+    expect((await readKey(LEGACY_KEY))?.map((s) => s.id)).toEqual(['legacy']);
+    expect((await get(ORG_A)).body).toMatchObject({ migrated: true, servers: [] });
   });
 });
 
-describe('transitional fallback to the legacy DEFAULT_ORG key', () => {
-  it('reads the legacy key while __global__ is absent', async () => {
-    await env.MCP_SERVERS.put(LEGACY_KEY, JSON.stringify([server('legacy')]));
-
-    const res = await SELF.fetch(base(ORG_A), { headers: AUTH });
+describe('transitional read fallback to the legacy DEFAULT_ORG key', () => {
+  it('GET on a fresh namespace returns an empty, unmigrated pool with a warning', async () => {
+    const res = await get(ORG_A);
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { servers: { id: string }[] };
-    expect(body.servers.map((s) => s.id)).toEqual(['legacy']);
+    expect(res.body).toMatchObject({
+      org: ORG_A,
+      servers: [],
+      migrated: false,
+      code: 'MCP_POOL_NOT_MIGRATED',
+    });
+    expect(res.text).toContain('warning');
+  });
+
+  it('reads the legacy key while __global__ is absent, redacted and flagged', async () => {
+    await env.MCP_SERVERS.put(
+      LEGACY_KEY,
+      JSON.stringify([server('legacy', { authToken: 'sekrit-l' })])
+    );
+
+    const res = await get(ORG_A);
+    expect(res.status).toBe(200);
+    expect(res.text).not.toContain('sekrit-l');
+    expectRedacted(res.body.servers);
+    expect(res.body.migrated).toBe(false);
+    expect(res.body.code).toBe('MCP_POOL_NOT_MIGRATED');
+    expect(res.body.servers.map((s) => [s.id, s.hasAuthToken])).toEqual([['legacy', true]]);
     // Reads never write: the global key is still absent.
     expect(await readKey(MCP_GLOBAL_KEY)).toBeNull();
   });
 
   it('prefers __global__ over the legacy key once it exists, even when empty', async () => {
     await env.MCP_SERVERS.put(LEGACY_KEY, JSON.stringify([server('legacy')]));
-    await env.MCP_SERVERS.put(MCP_GLOBAL_KEY, JSON.stringify([]));
+    await seedGlobal();
 
-    const res = await SELF.fetch(base(ORG_A), { headers: AUTH });
-    expect(await res.json()).toEqual({ org: ORG_A, servers: [] });
+    const res = await get(ORG_A);
+    expect(res.body).toEqual({ org: ORG_A, migrated: true, servers: [] });
+  });
+
+  it('GET returns 500, not a token or a crash, when __global__ is corrupt', async () => {
+    await env.MCP_SERVERS.put(MCP_GLOBAL_KEY, JSON.stringify({ authToken: 'sekrit' }));
+    const res = await get(ORG_A);
+    expect(res.status).toBe(500);
+    expect(res.text).not.toContain('sekrit');
   });
 });
 
-describe('writes are refused while the legacy key is what serves the pool', () => {
-  it.each([
-    ['POST', (org: string) => base(org), JSON.stringify(server('new'))],
-    ['PUT', (org: string) => base(org), JSON.stringify([server('new')])],
-    ['PUT', (org: string) => base(org), JSON.stringify([])],
-    ['DELETE', (org: string) => `${base(org)}/legacy`, undefined],
-  ])(
-    '%s while __global__ is absent and the legacy key holds data → 409, nothing written',
-    async (method, url, body) => {
-      await env.MCP_SERVERS.put(
-        LEGACY_KEY,
-        JSON.stringify([server('legacy', { authToken: 'tok' })])
-      );
+describe('writes require __global__ to exist (409 MCP_POOL_NOT_MIGRATED)', () => {
+  const attempts: [string, () => Promise<Response>][] = [
+    ['POST', () => post(ORG_A, server('new'))],
+    ['PUT', () => put(ORG_A, [server('new')])],
+    ['PUT []', () => put(ORG_A, [])],
+    ['DELETE', () => del(ORG_A, 'legacy')],
+  ];
 
-      const res = await SELF.fetch(url(ORG_A), {
-        method,
-        headers: body === undefined ? AUTH : JSON_HEADERS,
-        body,
-      });
+  async function expectRefused(): Promise<void> {
+    for (const [, attempt] of attempts) {
+      const res = await attempt();
       expect(res.status).toBe(409);
       const json = (await res.json()) as { error: string; code: string };
       expect(json.code).toBe('MCP_POOL_NOT_MIGRATED');
       expect(JSON.stringify(json)).not.toContain('tok');
-
-      expect(await readKey(MCP_GLOBAL_KEY)).toBeNull();
-      expect((await readKey(LEGACY_KEY))?.[0].authToken).toBe('tok');
     }
-  );
+    expect(await readKey(MCP_GLOBAL_KEY)).toBeNull();
+  }
 
-  it('writes are allowed when the legacy key is an empty list', async () => {
-    await env.MCP_SERVERS.put(LEGACY_KEY, JSON.stringify([]));
-    const post = await SELF.fetch(base(ORG_A), {
-      method: 'POST',
-      headers: JSON_HEADERS,
-      body: JSON.stringify(server('new')),
-    });
-    expect(post.status).toBe(200);
-    expect((await readKey(MCP_GLOBAL_KEY))?.map((s) => s.id)).toEqual(['new']);
-  });
-});
-
-describe('once __global__ exists', () => {
-  it('once __global__ exists, PUT [] empties the pool (replace-all) and legacy is ignored', async () => {
-    await env.MCP_SERVERS.put(LEGACY_KEY, JSON.stringify([server('legacy')]));
-    await env.MCP_SERVERS.put(MCP_GLOBAL_KEY, JSON.stringify([server('g1'), server('g2')]));
-
-    const put = await SELF.fetch(base(ORG_A), {
-      method: 'PUT',
-      headers: JSON_HEADERS,
-      body: JSON.stringify([]),
-    });
-    expect(put.status).toBe(200);
-    expect(await readKey(MCP_GLOBAL_KEY)).toEqual([]);
-    expect((await readKey(LEGACY_KEY))?.map((s) => s.id)).toEqual(['legacy']);
+  it('when the legacy key holds servers', async () => {
+    await env.MCP_SERVERS.put(LEGACY_KEY, JSON.stringify([server('legacy', { authToken: 'tok' })]));
+    await expectRefused();
+    expect((await readKey(LEGACY_KEY))?.[0].authToken).toBe('tok');
   });
 
-  it('GET returns 500, not a token or a crash, when __global__ is not an array', async () => {
-    await env.MCP_SERVERS.put(MCP_GLOBAL_KEY, JSON.stringify({ authToken: 'sekrit' }));
-    const res = await SELF.fetch(base(ORG_A), { headers: AUTH });
-    expect(res.status).toBe(500);
-    expect(await res.text()).not.toContain('sekrit');
+  it('when neither key exists (fresh namespace)', async () => {
+    await expectRefused();
+  });
+
+  it('when only another org key holds servers (never sealed off by a write)', async () => {
+    await env.MCP_SERVERS.put(
+      OTHER_ORG_KEY,
+      JSON.stringify([server('theirs', { authToken: 'tok' })])
+    );
+    await expectRefused();
+    expect((await readKey(OTHER_ORG_KEY))?.map((s) => s.id)).toEqual(['theirs']);
   });
 });
 
@@ -190,6 +223,7 @@ describe('reserved key guard', () => {
     ['DELETE', `${reserved}/x`, undefined],
     ['GET', `https://worker/api/v1/admin/orgs/${MCP_GLOBAL_KEY}/resources?language=en`, undefined],
   ])('%s %s → 400', async (method, url, body) => {
+    await seedGlobal();
     const res = await SELF.fetch(url, {
       method,
       headers: body === undefined ? AUTH : JSON_HEADERS,
@@ -198,51 +232,37 @@ describe('reserved key guard', () => {
     expect(res.status).toBe(400);
     const json = (await res.json()) as { error: string };
     expect(json.error).toContain('reserved');
-    expect(await readKey(MCP_GLOBAL_KEY)).toBeNull();
+    expect(await readKey(MCP_GLOBAL_KEY)).toEqual([]);
   });
 });
 
-type PublicServer = { id: string; hasAuthToken: boolean; authToken?: unknown };
-
-/** Fail loudly if any server in a response body carries the secret. */
-function expectRedacted(servers: PublicServer[]): void {
-  for (const s of servers) {
-    expect(Object.keys(s)).not.toContain('authToken');
-    expect(typeof s.hasAuthToken).toBe('boolean');
-  }
-}
-
 describe('authToken redaction on GET response sites', () => {
-  it('GET (plain and ?discover=true) never returns the token', async () => {
+  it('GET (plain and ?discover=true) never returns the token or unknown stored keys', async () => {
     // Both disabled: discovery reports them as skipped without touching the
     // network, while the discover response still spreads every stored config.
+    // `password` simulates a pre-#278 record that persisted `{...body}` verbatim.
     await env.MCP_SERVERS.put(
       MCP_GLOBAL_KEY,
       JSON.stringify([
-        server('with-token', { authToken: 'sekrit-1', enabled: false }),
+        { ...server('with-token', { authToken: 'sekrit-1', enabled: false }), password: 'hunter2' },
         server('no-token', { enabled: false }),
       ])
     );
 
-    const plain = await SELF.fetch(base(ORG_A), { headers: AUTH });
-    const plainText = await plain.text();
-    expect(plainText).not.toContain('sekrit-1');
-    const plainBody = JSON.parse(plainText) as { servers: PublicServer[] };
-    expectRedacted(plainBody.servers);
-    expect(plainBody.servers.map((s) => [s.id, s.hasAuthToken])).toEqual([
+    const plain = await get(ORG_A);
+    expect(plain.text).not.toMatch(/sekrit-1|hunter2/);
+    expectRedacted(plain.body.servers);
+    expect(plain.body.servers.map((s) => [s.id, s.hasAuthToken])).toEqual([
       ['with-token', true],
       ['no-token', false],
     ]);
 
-    const discover = await SELF.fetch(`${base(ORG_A)}?discover=true`, { headers: AUTH });
-    const discoverText = await discover.text();
+    const discover = await get(ORG_A, '?discover=true');
     expect(discover.status).toBe(200);
-    expect(discoverText).not.toContain('sekrit-1');
-    const discoverBody = JSON.parse(discoverText) as {
-      servers: (PublicServer & { discovery_status: string; tools_count: number })[];
-    };
-    expectRedacted(discoverBody.servers);
-    expect(discoverBody.servers.map((s) => [s.id, s.hasAuthToken, s.discovery_status])).toEqual([
+    expect(discover.text).not.toMatch(/sekrit-1|hunter2/);
+    const statuses = discover.body.servers as (PublicServer & { discovery_status: string })[];
+    expectRedacted(statuses);
+    expect(statuses.map((s) => [s.id, s.hasAuthToken, s.discovery_status])).toEqual([
       ['with-token', true, 'skipped'],
       ['no-token', false, 'skipped'],
     ]);
@@ -251,138 +271,103 @@ describe('authToken redaction on GET response sites', () => {
 
 describe('authToken redaction on POST/PUT/DELETE response sites', () => {
   it('POST response never returns the token', async () => {
-    const post = await SELF.fetch(base(ORG_A), {
-      method: 'POST',
-      headers: JSON_HEADERS,
-      body: JSON.stringify(server('p', { authToken: 'sekrit-post' })),
-    });
-    const postText = await post.text();
-    expect(post.status).toBe(200);
-    expect(postText).not.toContain('sekrit-post');
-    const postBody = JSON.parse(postText) as { servers: PublicServer[] };
-    expectRedacted(postBody.servers);
-    expect(postBody.servers).toEqual([expect.objectContaining({ id: 'p', hasAuthToken: true })]);
+    await seedGlobal();
+    const res = await post(ORG_A, server('p', { authToken: 'sekrit-post' }));
+    const text = await res.text();
+    expect(res.status).toBe(200);
+    expect(text).not.toContain('sekrit-post');
+    const body = JSON.parse(text) as { servers: PublicServer[] };
+    expectRedacted(body.servers);
+    expect(body.servers).toEqual([expect.objectContaining({ id: 'p', hasAuthToken: true })]);
   });
 
   it('PUT response never returns the token', async () => {
-    await env.MCP_SERVERS.put(
-      MCP_GLOBAL_KEY,
-      JSON.stringify([server('p', { authToken: 'sekrit-p' })])
-    );
-
-    const put = await SELF.fetch(base(ORG_A), {
-      method: 'PUT',
-      headers: JSON_HEADERS,
-      body: JSON.stringify([server('p'), server('q', { authToken: 'sekrit-put' })]),
-    });
-    const putText = await put.text();
-    expect(put.status).toBe(200);
-    expect(putText).not.toContain('sekrit');
-    const putBody = JSON.parse(putText) as { servers: PublicServer[] };
-    expectRedacted(putBody.servers);
-    expect(putBody.servers.map((s) => [s.id, s.hasAuthToken])).toEqual([
+    await seedGlobal([server('p', { authToken: 'sekrit-p' })]);
+    const res = await put(ORG_A, [server('p'), server('q', { authToken: 'sekrit-put' })]);
+    const text = await res.text();
+    expect(res.status).toBe(200);
+    expect(text).not.toContain('sekrit');
+    const body = JSON.parse(text) as { servers: PublicServer[] };
+    expectRedacted(body.servers);
+    expect(body.servers.map((s) => [s.id, s.hasAuthToken])).toEqual([
       ['p', true],
       ['q', true],
     ]);
   });
-});
 
-describe('authToken redaction on the DELETE response site', () => {
   it('DELETE response never returns the token', async () => {
-    await env.MCP_SERVERS.put(
-      MCP_GLOBAL_KEY,
-      JSON.stringify([
-        server('p', { authToken: 'sekrit-p' }),
-        server('q', { authToken: 'sekrit-q' }),
-      ])
-    );
-
-    const del = await SELF.fetch(`${base(ORG_A)}/p`, { method: 'DELETE', headers: AUTH });
-    const delText = await del.text();
-    expect(del.status).toBe(200);
-    expect(delText).not.toContain('sekrit');
-    const delBody = JSON.parse(delText) as { servers: PublicServer[] };
-    expectRedacted(delBody.servers);
-    expect(delBody.servers.map((s) => [s.id, s.hasAuthToken])).toEqual([['q', true]]);
+    await seedGlobal([
+      server('p', { authToken: 'sekrit-p' }),
+      server('q', { authToken: 'sekrit-q' }),
+    ]);
+    const res = await del(ORG_A, 'p');
+    const text = await res.text();
+    expect(res.status).toBe(200);
+    expect(text).not.toContain('sekrit');
+    const body = JSON.parse(text) as { servers: PublicServer[] };
+    expectRedacted(body.servers);
+    expect(body.servers.map((s) => [s.id, s.hasAuthToken])).toEqual([['q', true]]);
   });
 });
 
-const tokenOf = async (id: string) =>
-  (await readKey(MCP_GLOBAL_KEY))?.find((s) => s.id === id)?.authToken;
-
 describe('authToken write rule on POST: omitted → preserve, null/"" → clear, string → set', () => {
-  it('POST: set, then preserve on omit, then clear on "" and on null', async () => {
-    const post = (payload: unknown) =>
-      SELF.fetch(base(ORG_A), {
-        method: 'POST',
-        headers: JSON_HEADERS,
-        body: JSON.stringify(payload),
-      });
+  it('sets, then preserves on omit', async () => {
+    await seedGlobal();
 
-    expect((await post(server('s', { authToken: 'first' }))).status).toBe(200);
+    expect((await post(ORG_A, server('s', { authToken: 'first' }))).status).toBe(200);
     expect(await tokenOf('s')).toBe('first');
 
     // Redacted read → edit → write round-trip: no authToken key in the body.
-    expect((await post(server('s', { priority: 5 }))).status).toBe(200);
+    expect((await post(ORG_A, server('s', { priority: 5 }))).status).toBe(200);
     expect(await tokenOf('s')).toBe('first');
     expect((await readKey(MCP_GLOBAL_KEY))?.[0].priority).toBe(5);
+  });
 
-    expect((await post({ ...server('s'), authToken: '' })).status).toBe(200);
+  it('clears on "" and on null, and sets again on a non-empty string', async () => {
+    await seedGlobal([server('s', { authToken: 'first' })]);
+
+    expect((await post(ORG_A, { ...server('s'), authToken: '' })).status).toBe(200);
     expect(await tokenOf('s')).toBeUndefined();
     expect(Object.keys((await readKey(MCP_GLOBAL_KEY))?.[0] ?? {})).not.toContain('authToken');
 
-    expect((await post(server('s', { authToken: 'second' }))).status).toBe(200);
+    expect((await post(ORG_A, server('s', { authToken: 'second' }))).status).toBe(200);
     expect(await tokenOf('s')).toBe('second');
 
-    expect((await post({ ...server('s'), authToken: null })).status).toBe(200);
+    expect((await post(ORG_A, { ...server('s'), authToken: null })).status).toBe(200);
     expect(await tokenOf('s')).toBeUndefined();
   });
 
   it('GET → PUT of the public shape does not persist hasAuthToken or lose the token', async () => {
-    await env.MCP_SERVERS.put(
-      MCP_GLOBAL_KEY,
-      JSON.stringify([server('rt', { authToken: 'rt-tok', transport: 'json-rpc' })])
-    );
-    const got = (await (await SELF.fetch(base(ORG_A), { headers: AUTH })).json()) as {
-      servers: Record<string, unknown>[];
-    };
-    expect(got.servers[0]).toHaveProperty('hasAuthToken', true);
+    await seedGlobal([server('rt', { authToken: 'rt-tok', transport: 'json-rpc' })]);
+    const got = await get(ORG_A);
+    expect(got.body.servers[0]).toHaveProperty('hasAuthToken', true);
 
-    const put = await SELF.fetch(base(ORG_A), {
-      method: 'PUT',
-      headers: JSON_HEADERS,
-      body: JSON.stringify(got.servers.map((s) => ({ ...s, password: 'hunter2' }))),
-    });
-    expect(put.status).toBe(200);
-    expect(await put.text()).not.toContain('hunter2');
+    const res = await put(
+      ORG_A,
+      got.body.servers.map((s) => ({ ...s, password: 'hunter2' }))
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).not.toContain('hunter2');
 
     const pool = await readKey(MCP_GLOBAL_KEY);
     expect(pool).toEqual([server('rt', { authToken: 'rt-tok', transport: 'json-rpc' })]);
-    expect(Object.keys(pool?.[0] ?? {})).not.toContain('hasAuthToken');
   });
 });
 
-describe('authToken write rule on PUT, and rejected token types', () => {
-  it('PUT: merges tokens by id, drops servers absent from the array', async () => {
-    await env.MCP_SERVERS.put(
-      MCP_GLOBAL_KEY,
-      JSON.stringify([
-        server('keep', { authToken: 'tok-keep' }),
-        server('clear', { authToken: 'tok-clear' }),
-        server('drop', { authToken: 'tok-drop' }),
-      ])
-    );
+describe('authToken write rule on PUT', () => {
+  it('merges tokens by id, drops servers absent from the array', async () => {
+    await seedGlobal([
+      server('keep', { authToken: 'tok-keep' }),
+      server('clear', { authToken: 'tok-clear' }),
+      server('drop', { authToken: 'tok-drop' }),
+    ]);
 
-    const put = await SELF.fetch(base(ORG_B), {
-      method: 'PUT',
-      headers: JSON_HEADERS,
-      body: JSON.stringify([
-        server('keep', { priority: 3 }),
-        { ...server('clear'), authToken: null },
-        server('new', { authToken: 'tok-new' }),
-      ]),
-    });
-    expect(put.status).toBe(200);
+    const res = await put(ORG_B, [
+      server('keep', { priority: 3 }),
+      { ...server('clear'), authToken: null },
+      server('new', { authToken: 'tok-new' }),
+    ]);
+    expect(res.status).toBe(200);
 
     const pool = await readKey(MCP_GLOBAL_KEY);
     expect(pool?.map((s) => [s.id, s.authToken ?? null, s.priority])).toEqual([
@@ -395,33 +380,22 @@ describe('authToken write rule on PUT, and rejected token types', () => {
 
 describe('rejected authToken values', () => {
   it('rejects an over-long authToken with 400', async () => {
-    const post = await SELF.fetch(base(ORG_A), {
-      method: 'POST',
-      headers: JSON_HEADERS,
-      body: JSON.stringify(server('long', { authToken: 'x'.repeat(8193) })),
-    });
-    expect(post.status).toBe(400);
-    expect(((await post.json()) as { error: string }).error).toContain('authToken');
-    expect(await readKey(MCP_GLOBAL_KEY)).toBeNull();
+    await seedGlobal();
+    const res = await post(ORG_A, server('long', { authToken: 'x'.repeat(8193) }));
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toContain('authToken');
+    expect(await readKey(MCP_GLOBAL_KEY)).toEqual([]);
   });
 
   it('rejects a non-string authToken with 400 and writes nothing', async () => {
-    const post = await SELF.fetch(base(ORG_A), {
-      method: 'POST',
-      headers: JSON_HEADERS,
-      body: JSON.stringify({ ...server('bad'), authToken: 42 }),
-    });
-    expect(post.status).toBe(400);
-    expect(((await post.json()) as { error: string }).error).toContain('authToken');
-    expect(await readKey(MCP_GLOBAL_KEY)).toBeNull();
+    await seedGlobal();
+    const p = await post(ORG_A, { ...server('bad'), authToken: 42 });
+    expect(p.status).toBe(400);
+    expect(((await p.json()) as { error: string }).error).toContain('authToken');
 
-    const put = await SELF.fetch(base(ORG_A), {
-      method: 'PUT',
-      headers: JSON_HEADERS,
-      body: JSON.stringify([{ ...server('bad'), authToken: { nested: true } }]),
-    });
-    expect(put.status).toBe(400);
-    expect(await readKey(MCP_GLOBAL_KEY)).toBeNull();
+    const u = await put(ORG_A, [{ ...server('bad'), authToken: { nested: true } }]);
+    expect(u.status).toBe(400);
+    expect(await readKey(MCP_GLOBAL_KEY)).toEqual([]);
   });
 });
 
@@ -430,75 +404,54 @@ describe('body validation', () => {
     ['PUT', '[{"id": "x"'],
     ['POST', '{"id": "x"'],
   ])('%s with malformed JSON → 400, not 500', async (method, body) => {
+    await seedGlobal();
     const res = await SELF.fetch(base(ORG_A), { method, headers: JSON_HEADERS, body });
     expect(res.status).toBe(400);
     expect(((await res.json()) as { error: string }).error).toContain('valid JSON');
   });
 
   it('POST with a non-object body → 400', async () => {
-    const res = await SELF.fetch(base(ORG_A), {
-      method: 'POST',
-      headers: JSON_HEADERS,
-      body: JSON.stringify([server('x')]),
-    });
+    await seedGlobal();
+    const res = await post(ORG_A, [server('x')]);
     expect(res.status).toBe(400);
-    expect(await readKey(MCP_GLOBAL_KEY)).toBeNull();
+    expect(await readKey(MCP_GLOBAL_KEY)).toEqual([]);
+  });
+
+  it('PUT with a non-array body → 400', async () => {
+    await seedGlobal();
+    const res = await put(ORG_A, server('x'));
+    expect(res.status).toBe(400);
+    expect(await readKey(MCP_GLOBAL_KEY)).toEqual([]);
   });
 });
 
 describe('PUT element validation', () => {
-  it('PUT with a null element → 400, not 500', async () => {
-    const res = await SELF.fetch(base(ORG_A), {
-      method: 'PUT',
-      headers: JSON_HEADERS,
-      body: JSON.stringify([server('ok'), null]),
-    });
+  it('null element → 400, not 500', async () => {
+    await seedGlobal();
+    const res = await put(ORG_A, [server('ok'), null]);
     expect(res.status).toBe(400);
     expect(((await res.json()) as { error: string }).error).toContain('object');
-    expect(await readKey(MCP_GLOBAL_KEY)).toBeNull();
+    expect(await readKey(MCP_GLOBAL_KEY)).toEqual([]);
   });
 
-  it('PUT with duplicate ids → 400', async () => {
-    const res = await SELF.fetch(base(ORG_A), {
-      method: 'PUT',
-      headers: JSON_HEADERS,
-      body: JSON.stringify([server('dup'), server('other'), server('dup', { priority: 2 })]),
-    });
+  it('duplicate ids → 400', async () => {
+    await seedGlobal();
+    const res = await put(ORG_A, [server('dup'), server('other'), server('dup', { priority: 2 })]);
     expect(res.status).toBe(400);
     const json = (await res.json()) as { error: string; server_ids: string[] };
     expect(json.error).toContain('Duplicate');
     expect(json.server_ids).toEqual(['dup']);
-    expect(await readKey(MCP_GLOBAL_KEY)).toBeNull();
-  });
-
-  it('PUT with a non-array body → 400', async () => {
-    const res = await SELF.fetch(base(ORG_A), {
-      method: 'PUT',
-      headers: JSON_HEADERS,
-      body: JSON.stringify(server('x')),
-    });
-    expect(res.status).toBe(400);
-    expect(await readKey(MCP_GLOBAL_KEY)).toBeNull();
+    expect(await readKey(MCP_GLOBAL_KEY)).toEqual([]);
   });
 });
 
 describe('pool cap', () => {
   it('POST updating an existing id is allowed at the cap; adding a new one is not', async () => {
-    const full = Array.from({ length: 50 }, (_, i) => server(`s${String(i)}`));
-    await env.MCP_SERVERS.put(MCP_GLOBAL_KEY, JSON.stringify(full));
+    await seedGlobal(Array.from({ length: 50 }, (_, i) => server(`s${String(i)}`)));
 
-    const update = await SELF.fetch(base(ORG_A), {
-      method: 'POST',
-      headers: JSON_HEADERS,
-      body: JSON.stringify(server('s0', { priority: 9 })),
-    });
-    expect(update.status).toBe(200);
+    expect((await post(ORG_A, server('s0', { priority: 9 }))).status).toBe(200);
 
-    const add = await SELF.fetch(base(ORG_A), {
-      method: 'POST',
-      headers: JSON_HEADERS,
-      body: JSON.stringify(server('overflow')),
-    });
+    const add = await post(ORG_A, server('overflow'));
     expect(add.status).toBe(400);
     expect(((await add.json()) as { error: string }).error).toContain('global pool');
     expect((await readKey(MCP_GLOBAL_KEY))?.length).toBe(50);
