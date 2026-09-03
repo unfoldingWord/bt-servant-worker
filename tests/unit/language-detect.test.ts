@@ -9,12 +9,18 @@
  *      reads as `pt`, the pt/es confusion being the failure mode that would
  *      make the recorded input_language lie most often.
  *   2. Inputs with too little linguistic signal — short acks, bare scripture
- *      references, trigger-only turns, emoji, URLs — resolve to `null`, not a
- *      guess.
- *   3. The text handed to tinyld is capped at MAX_DETECT_CHARS.
- *   4. tinyld/light emits an ISO 639-1 code for every language in its set,
+ *      references, trigger-only turns, emoji, URLs, one repeated token —
+ *      resolve to `null`, not a guess.
+ *   3. Languages OUTSIDE tinyld/light's 24-language set (Indonesian, Swahili)
+ *      and mixed-language sentences resolve to `null` rather than to a
+ *      phantom in-set language; the one English fixture that costs is
+ *      recorded as a deliberate recall loss.
+ *   4. Prose that merely contains numbers (`Reunião 15:30`, `2 pessoas e 5
+ *      minutos`) is detected, not stripped.
+ *   5. The text handed to tinyld is capped at MAX_DETECT_CHARS.
+ *   6. tinyld/light emits an ISO 639-1 code for every language in its set,
  *      which is why detect.ts carries no shape check of its own.
- *   5. A detector failure is observable (one `language_detect_failed` warn on
+ *   7. A detector failure is observable (one `language_detect_failed` warn on
  *      the request logger) and degrades to `null`; it never throws.
  */
 import { describe, it, expect, vi } from 'vitest';
@@ -24,10 +30,12 @@ import {
   prepareForDetection,
   stripNonLinguistic,
   MAX_DETECT_CHARS,
+  MIN_ACCURACY,
   MIN_CONFIDENCE,
+  MIN_DISTINCT_WORDS,
   MIN_LETTERS,
 } from '../../src/services/language/detect.js';
-import { createMockLogger } from '../helpers/anthropic-capture.js';
+import { createMockLogger } from '../helpers/mock-logger.js';
 
 vi.mock('tinyld/light', async (importOriginal) => {
   const actual = await importOriginal<typeof import('tinyld/light')>();
@@ -51,7 +59,6 @@ const EN = [
   'Can you explain what John 3:16 means in simple words?',
   'I am translating the gospel of Mark into my mother tongue.',
   'What is the difference between grace and mercy in the Bible?',
-  'We need help understanding this difficult passage.',
   'Thank you for the explanation, it makes much more sense now.',
   'How should I translate the word covenant in the Old Testament?',
   'Our translation team meets every week at the church.',
@@ -83,6 +90,22 @@ describe('detectWrittenLanguage — fixture set', () => {
       expect(result?.confidence).toBeGreaterThanOrEqual(MIN_CONFIDENCE);
       expect(result?.confidence).toBeLessThanOrEqual(1);
     });
+  });
+
+  it('records a deliberate recall loss: an English sentence below MIN_ACCURACY is null', () => {
+    // tinyld scores this sentence en 0.041 — inside the band where the light
+    // set lands on languages it does not know (Indonesian → tr 0.057). No
+    // accuracy or margin cut separates the two, so the band is set to null
+    // both: "und" for one English sentence is a truthful record, "tr" for an
+    // Indonesian speaker is not. Lowering MIN_ACCURACY below 0.057 to recover
+    // this sentence would re-admit the Indonesian misread.
+    expect(MIN_ACCURACY).toBe(0.06);
+    expect(
+      detectWrittenLanguage(
+        'We need help understanding this difficult passage.',
+        createMockLogger()
+      )
+    ).toBeNull();
   });
 
   it('returns null rather than a guess on a pt/it/es near-tie', () => {
@@ -124,6 +147,17 @@ describe('detectWrittenLanguage — inputs without enough linguistic signal', ()
     expect(detectWrittenLanguage(text, createMockLogger())).toBeNull();
   });
 
+  it(`requires at least ${MIN_DISTINCT_WORDS} distinct words, so one repeated token is not a language`, () => {
+    // Without the rule tinyld reads these as pl @ 0.99 and hu @ 0.53: every
+    // repetition is another vote for whatever the token's n-grams resemble.
+    for (const text of [
+      'xyzzy xyzzy xyzzy xyzzy xyzzy',
+      'asdf asdf asdf asdf asdf asdf asdf asdf',
+    ]) {
+      expect(detectWrittenLanguage(text, createMockLogger())).toBeNull();
+    }
+  });
+
   it(`requires at least ${MIN_LETTERS} letters after stripping`, () => {
     const belowMin = 'obrigado amigo';
     expect(belowMin.replace(/\P{L}/gu, '').length).toBeLessThan(MIN_LETTERS);
@@ -131,7 +165,35 @@ describe('detectWrittenLanguage — inputs without enough linguistic signal', ()
   });
 });
 
+describe('detectWrittenLanguage — languages outside the tinyld/light set', () => {
+  it.each([
+    ['Indonesian', 'Saya sedang menerjemahkan Injil Markus ke dalam bahasa ibu saya.'],
+    ['Indonesian', 'Bisakah Anda menjelaskan arti Yohanes 3:16 dengan kata-kata sederhana?'],
+    ['Indonesian', 'Kami membutuhkan bantuan untuk memahami bagian yang sulit ini.'],
+    ['Swahili', 'Ninatafsiri Injili ya Marko katika lugha yangu ya asili.'],
+    ['Swahili', 'Unaweza kunieleza maana ya Yohana 3:16 kwa maneno rahisi?'],
+    ['Swahili', 'Tunahitaji msaada wa kuelewa kifungu hiki kigumu.'],
+    [
+      'mixed English / Portuguese',
+      'Can you explain este versículo for me, por favor, in simple words?',
+    ],
+  ])('returns null rather than a phantom in-set language for %s: %s', (_label, text) => {
+    expect(detectWrittenLanguage(text, createMockLogger())).toBeNull();
+  });
+});
+
 describe('detectWrittenLanguage — pre-strip', () => {
+  it.each([
+    ['a clock time', 'Reunião 15:30 na igreja, quem vem?'],
+    ['counts', 'temos 2 pessoas e 5 minutos para isso agora mesmo, amigos'],
+  ])('keeps prose that merely contains numbers (%s) and detects pt', (_label, text) => {
+    expect(detectWrittenLanguage(text, createMockLogger())?.code).toBe('pt');
+  });
+
+  it('leaves scripture references in place: digits never count as letters and book names are words', () => {
+    expect(stripNonLinguistic('João 3:16 e Gen 1:1-5')).toBe('João 3:16 e Gen 1:1-5');
+  });
+
   it('detects pt when a reference is stripped and a Portuguese sentence remains', () => {
     const result = detectWrittenLanguage(
       '#fia João 3:16 e Gen 1:1-5 — você pode me explicar o significado destas passagens?',
@@ -148,15 +210,10 @@ describe('detectWrittenLanguage — pre-strip', () => {
     expect(result?.code).toBe('pt');
   });
 
-  it('stripNonLinguistic removes URLs, references, residual hashtags / handles and emoji', () => {
-    const stripped = stripNonLinguistic(
-      '#fia @hindi Gen 1:1-5 João 3:16 1 Cor 13 https://x.example/a?b=1 🙏 palavras restantes'
+  it('stripNonLinguistic removes URLs, residual hashtags / handles and emoji', () => {
+    expect(stripNonLinguistic('#fia @hindi https://x.example/a?b=1 🙏 palavras restantes')).toBe(
+      'palavras restantes'
     );
-    expect(stripped).not.toMatch(/https?:/);
-    expect(stripped).not.toMatch(/#fia|@hindi/);
-    expect(stripped).not.toMatch(/Gen|João|Cor|\d/);
-    expect(stripped).not.toMatch(/🙏/);
-    expect(stripped).toBe('palavras restantes');
   });
 });
 
@@ -164,20 +221,29 @@ describe('detectWrittenLanguage — input cap', () => {
   it(`hands the detector at most ${MAX_DETECT_CHARS} characters and still returns a read`, () => {
     const long = Array.from({ length: 400 }, () => PT[1] as string).join(' ');
     expect(long.length).toBeGreaterThan(MAX_DETECT_CHARS * 10);
-    expect(prepareForDetection(long)).toHaveLength(MAX_DETECT_CHARS);
+    // The cap is applied to the raw text first; the strip may then trim a
+    // trailing space, so the prepared length is at most the cap.
+    expect(prepareForDetection(long).length).toBeLessThanOrEqual(MAX_DETECT_CHARS);
+    expect(prepareForDetection(long).length).toBeGreaterThan(MAX_DETECT_CHARS - 10);
 
     vi.mocked(tinyld.detectAll).mockClear();
     const result = detectWrittenLanguage(long, createMockLogger());
 
     expect(result?.code).toBe('pt');
     expect(vi.mocked(tinyld.detectAll)).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(tinyld.detectAll).mock.calls[0]?.[0]).toHaveLength(MAX_DETECT_CHARS);
+    const handed = vi.mocked(tinyld.detectAll).mock.calls[0]?.[0] ?? '';
+    expect(handed.length).toBeLessThanOrEqual(MAX_DETECT_CHARS);
+    expect(handed.length).toBeGreaterThan(MAX_DETECT_CHARS - 10);
   });
 
-  it('caps a single 20,000-letter token the same way and does not throw', () => {
+  it('caps a single 20,000-letter token before any regex runs and never reaches the detector', () => {
+    const token = 'a'.repeat(20_000);
+    expect(prepareForDetection(token)).toHaveLength(MAX_DETECT_CHARS);
+
     vi.mocked(tinyld.detectAll).mockClear();
-    expect(() => detectWrittenLanguage('a'.repeat(20_000), createMockLogger())).not.toThrow();
-    expect(vi.mocked(tinyld.detectAll).mock.calls[0]?.[0]).toHaveLength(MAX_DETECT_CHARS);
+    expect(detectWrittenLanguage(token, createMockLogger())).toBeNull();
+    // One distinct word: rejected by MIN_DISTINCT_WORDS, so tinyld is not called at all.
+    expect(vi.mocked(tinyld.detectAll)).not.toHaveBeenCalled();
   });
 });
 

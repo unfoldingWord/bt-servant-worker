@@ -35,7 +35,7 @@ vi.mock('@anthropic-ai/sdk', () => ({ default: vi.fn() }));
 const PT_MESSAGE = 'Estou traduzindo o evangelho de Marcos para a minha língua materna.';
 const PT_MESSAGE_2 = 'Precisamos de ajuda para entender esta passagem difícil.';
 const EN_MESSAGE = 'I am translating the gospel of Mark into my mother tongue.';
-const EN_MESSAGE_2 = 'We need help understanding this difficult passage.';
+const EN_MESSAGE_2 = 'Please summarize the chapter in three short sentences.';
 const UNDETECTABLE_MESSAGE = 'João 3:16';
 
 /** One published org language, so `@testlang` is a MATCHED trigger the classifier strips. */

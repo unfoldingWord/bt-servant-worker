@@ -20,7 +20,6 @@
 import { expect, vi } from 'vitest';
 import Anthropic from '@anthropic-ai/sdk';
 import type { ChatRequest, ChatResponse } from '../../src/types/engine.js';
-import type { RequestLogger } from '../../src/utils/logger.js';
 
 export const ANTHROPIC_HOST = 'api.anthropic.com';
 
@@ -42,11 +41,6 @@ export interface AnthropicCapture {
   logs: LogRecord[];
   /** `console.warn` lines — where `logger.warn` records land. */
   warnLogs: LogRecord[];
-}
-
-/** Minimal request-logger stub for unit tests that only assert on log calls. */
-export function createMockLogger(): RequestLogger {
-  return { log: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as RequestLogger;
 }
 
 /** A text chat body; `defaults` are the per-suite identity, `overrides` win. */
