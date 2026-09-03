@@ -12,6 +12,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { Env } from '../../config/types.js';
 import { AudioContext, VOICE_SUBMISSION_PREFIX, voiceSubmissionKeyToUrl } from '../audio/index.js';
 import { ChatHistoryEntry, StreamCallbacks } from '../../types/engine.js';
+import { statusUpdate, uiString } from '../../i18n/ui-strings.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig } from '../../types/org-config.js';
 import {
   DEFAULT_PROMPT_VALUES,
@@ -315,6 +316,12 @@ interface OrchestrationContext {
   catalog: ToolCatalog;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
+  /**
+   * Locale for the status lines and notices the orchestrator emits itself
+   * (not LLM output). Taken from `preferences.response_language`; see
+   * `src/i18n/ui-strings.ts` (#405).
+   */
+  locale: string;
   healthTracker: HealthTracker;
   memoryStore: UserMemoryStore | undefined;
   modeContext: ModeContext | undefined;
@@ -1334,7 +1341,9 @@ function processIteration(ctx: OrchestrationContext, iteration: number): Promise
 
     if (iteration > 0 && ctx.callbacks) {
       notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress('\n'));
-      notifyCallback(ctx.logger, () => ctx.callbacks?.onStatus('Preparing your response...'));
+      notifyCallback(ctx.logger, () =>
+        ctx.callbacks?.onStatus(statusUpdate(ctx.locale, 'status_preparing'))
+      );
     }
 
     const response = await callClaudeForIteration(ctx, iteration, iterStart);
@@ -1354,7 +1363,9 @@ function processIteration(ctx: OrchestrationContext, iteration: number): Promise
     }
 
     notifyCallback(ctx.logger, () =>
-      ctx.callbacks?.onStatus(`Executing ${toolCalls.length} tool(s)...`)
+      ctx.callbacks?.onStatus(
+        statusUpdate(ctx.locale, 'status_executing_tools', { n: toolCalls.length })
+      )
     );
     const toolResults = await executeIterationTools(toolCalls, ctx, iteration, iterStart);
     ctx.messages.push({ role: 'assistant', content: response.content as Anthropic.ContentBlock[] });
@@ -1578,6 +1589,7 @@ function createOrchestrationContext(
     catalog,
     logger,
     callbacks,
+    locale: preferences.response_language,
     healthTracker: createHealthTracker(),
     memoryStore: options.memoryStore,
     modeContext: options.modeContext,
@@ -1603,13 +1615,13 @@ function createOrchestrationContext(
  * appended to `ctx.responses` (so it persists in the saved history and the
  * next conversation turn has the right context — otherwise next turn would
  * see only the partial mid-thought as the assistant's "previous reply").
+ *
+ * The text itself lives in `src/i18n/ui-strings.ts` (`notice_max_iterations`)
+ * and is localized to `ctx.locale` (#405).
  */
-const MAX_ITERATIONS_USER_MESSAGE =
-  "\n\n⚠️ I've reached my limit on how many steps I can take in a single turn while " +
-  'working on this. The work above is what I got done; some of it may be incomplete. ' +
-  "If you'd like me to keep going, send me a follow-up telling me what to focus on " +
-  '(e.g. "just submit the standard PDF" or "try once more with X"), and I\'ll pick ' +
-  'up from here without re-doing the parts that already worked.';
+function maxIterationsUserMessage(ctx: OrchestrationContext): string {
+  return uiString(ctx.locale, 'notice_max_iterations');
+}
 
 async function runOrchestrationLoop(
   ctx: OrchestrationContext,
@@ -1635,8 +1647,9 @@ async function runOrchestrationLoop(
       max_iterations: maxIterations,
       last_iteration: lastIteration,
     });
-    notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress(MAX_ITERATIONS_USER_MESSAGE));
-    ctx.responses.push(MAX_ITERATIONS_USER_MESSAGE);
+    const notice = maxIterationsUserMessage(ctx);
+    notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress(notice));
+    ctx.responses.push(notice);
   }
   ctx.logger.log('orchestration_loop_end', {
     exit_reason: exitReason,
@@ -1733,7 +1746,9 @@ export async function orchestrate(
 
   const ctx = createOrchestrationContext(effectiveMessage, options, config);
 
-  notifyCallback(ctx.logger, () => ctx.callbacks?.onStatus('Processing your request...'));
+  notifyCallback(ctx.logger, () =>
+    ctx.callbacks?.onStatus(statusUpdate(ctx.locale, 'status_processing'))
+  );
 
   try {
     await runOrchestrationLoop(ctx, config.maxIterations);

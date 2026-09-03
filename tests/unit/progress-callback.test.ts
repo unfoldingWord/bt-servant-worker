@@ -29,7 +29,7 @@ describe('ProgressCallbackSender.sendStatus', () => {
 
   it('sends status payload with correct headers', async () => {
     const sender = new ProgressCallbackSender(mockConfig);
-    await sender.sendStatus('Processing your request...');
+    await sender.sendStatus({ key: 'status_processing', message: 'Processing your request...' });
 
     expect(fetch).toHaveBeenCalledWith(
       mockConfig.url,
@@ -41,6 +41,7 @@ describe('ProgressCallbackSender.sendStatus', () => {
         },
         body: JSON.stringify({
           type: 'status',
+          key: 'status_processing',
           message: 'Processing your request...',
           user_id: mockConfig.user_id,
           message_key: mockConfig.message_key,
@@ -337,7 +338,9 @@ describe('ProgressCallbackSender error handling', () => {
   it('fails silently when fetch throws', async () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('Network error')));
     const sender = new ProgressCallbackSender(mockConfig);
-    await expect(sender.sendStatus('test')).resolves.toBeUndefined();
+    await expect(
+      sender.sendStatus({ key: 'status_processing', message: 'test' })
+    ).resolves.toBeUndefined();
   });
 });
 
@@ -372,7 +375,7 @@ describe('createWebhookCallbacks async operations', () => {
   it('onStatus sends status message', async () => {
     const sender = new ProgressCallbackSender(mockConfig);
     const callbacks = createWebhookCallbacks(sender, testLogger);
-    callbacks.onStatus('Processing...');
+    callbacks.onStatus({ key: 'status_processing', message: 'Processing...' });
     await vi.runAllTimersAsync();
     expect(fetch).toHaveBeenCalled();
   });
@@ -801,7 +804,7 @@ describe('createWebhookCallbacks status event gating by mode', () => {
     const callbacks = createWebhookCallbacks(sender, testLogger, { mode: 'complete' });
 
     // Simulate the orchestrator firing a status event at the start of processing.
-    callbacks.onStatus('Processing your request...');
+    callbacks.onStatus({ key: 'status_processing', message: 'Processing your request...' });
     await vi.runAllTimersAsync();
 
     // Status must NOT have hit the webhook — it's noise when the caller asked
@@ -829,7 +832,7 @@ describe('createWebhookCallbacks status event gating by mode', () => {
     const sender = new ProgressCallbackSender(mockConfig);
     const callbacks = createWebhookCallbacks(sender, testLogger, { mode: 'iteration' });
 
-    callbacks.onStatus('Processing your request...');
+    callbacks.onStatus({ key: 'status_processing', message: 'Processing your request...' });
     await vi.runAllTimersAsync();
 
     // Non-complete modes keep the status signal for clients that want it.

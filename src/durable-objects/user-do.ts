@@ -92,6 +92,7 @@ import type { UnmatchedTrigger } from '../services/classifier/index.js';
 import { isAdminClient, validateChatBody } from '../utils/chat-validation.js';
 import { OrgLanguages, resolveEffectiveLanguage } from '../types/languages.js';
 import { InternalQueueEntry } from '../types/queue.js';
+import { statusUpdate, uiString, StatusKey, UiStringParams } from '../i18n/ui-strings.js';
 
 // ── Storage keys ───────────────────────────────────────────────────────────────
 const HISTORY_KEY = 'history';
@@ -483,6 +484,35 @@ function buildStoredIdentity(body: ChatRequest, defaultOrg: string): StoredIdent
   };
 }
 
+/**
+ * Emits one worker-authored status line by key through the turn's transport
+ * callbacks, localized to the user's response_language (#405). The DO calls
+ * these from sites that only need `onStatus` (voice pipeline), so the locale
+ * is bound once instead of being threaded through every signature.
+ */
+export type StatusEmitter = (key: StatusKey, params?: UiStringParams) => void | Promise<void>;
+
+/** Bind `callbacks.onStatus` to a locale. `undefined` callbacks → `undefined` (nothing to emit to). */
+export function createStatusEmitter(
+  callbacks: StreamCallbacks | undefined,
+  locale: string
+): StatusEmitter | undefined {
+  if (!callbacks) return undefined;
+  return (key, params) => callbacks.onStatus(statusUpdate(locale, key, params));
+}
+
+/**
+ * Locale for worker-emitted status/notice strings on this turn: the gateway's
+ * per-request `response_language_hint` when present, else the stored
+ * preference. Mirrors how `processChat` derives `effectivePreferences`.
+ */
+export function resolveStatusLocale(
+  body: ChatRequest,
+  preferences: UserPreferencesInternal
+): string {
+  return body.response_language_hint ?? preferences.response_language;
+}
+
 export class UserDO {
   private state: DurableObjectState;
   private env: Env;
@@ -829,7 +859,7 @@ export class UserDO {
       return Response.json({ message_id: messageId }, { status: 202 });
     }
 
-    return this.createQueuedSSEStream(messageId, logger);
+    return this.createQueuedSSEStream(body, messageId, logger);
   }
 
   /**
@@ -888,9 +918,9 @@ export class UserDO {
         }
         response = createErrorResponse(error.name, error.code, error.message, error.statusCode);
       } else {
-        const message = error instanceof Error ? error.message : 'Processing failed';
         logger.error('immediate_final_error', error, { message_id: messageId });
-        response = createErrorResponse('Processing failed', 'INTERNAL_ERROR', message, 500);
+        const failure = await this.describeProcessingFailure(error, body, logger);
+        response = createErrorResponse(failure.title, 'INTERNAL_ERROR', failure.detail, 500);
       }
     }
 
@@ -932,7 +962,8 @@ export class UserDO {
         logger.log('immediate_callback_complete', { message_id: messageId });
       } catch (error) {
         logger.error('immediate_callback_error', error, { message_id: messageId });
-        await callbacks?.onError?.(error instanceof Error ? error.message : 'Processing failed');
+        const failure = await this.describeProcessingFailure(error, body, logger);
+        await callbacks?.onError?.(failure.detail);
       } finally {
         await this.releaseLock();
         await this.drainQueue(logger);
@@ -958,7 +989,7 @@ export class UserDO {
     const { sendEvent, keepaliveInterval } = this.buildSSESender(writer, logger, Date.now());
 
     const callbacks: StreamCallbacks = {
-      onStatus: async (message) => sendEvent({ type: 'status', message }),
+      onStatus: async (status) => sendEvent({ type: 'status', ...status }),
       onProgress: async (text) => sendEvent({ type: 'progress', text }),
       onComplete: async (response) => sendEvent({ type: 'complete', response }),
       onError: async (error) => sendEvent({ type: 'error', error }),
@@ -973,9 +1004,9 @@ export class UserDO {
         const response = await this.processChat(body, workerOrigin, logger, timing, callbacks);
         await sendEvent({ type: 'complete', response });
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : 'Processing failed';
         logger.error('immediate_sse_error', error, { message_id: messageId });
-        await sendEvent({ type: 'error', error: errorMessage });
+        const failure = await this.describeProcessingFailure(error, body, logger);
+        await sendEvent({ type: 'error', error: failure.detail });
       } finally {
         clearInterval(keepaliveInterval);
         try {
@@ -999,8 +1030,17 @@ export class UserDO {
     });
   }
 
-  /** Create an SSE stream for a queued message. Events flow when the alarm processes it. */
-  private createQueuedSSEStream(messageId: string, logger: RequestLogger): Response {
+  /**
+   * Create an SSE stream for a queued message. Events flow when the alarm
+   * processes it. The queued notice fires before the turn loads its context,
+   * so the locale comes from one cheap preferences read here (#405).
+   */
+  private async createQueuedSSEStream(
+    body: ChatRequest,
+    messageId: string,
+    logger: RequestLogger
+  ): Promise<Response> {
+    const locale = await this.readStatusLocale(body, logger);
     const { readable, writable } = new TransformStream<Uint8Array>();
     const writer = writable.getWriter();
     const encoder = new TextEncoder();
@@ -1009,10 +1049,7 @@ export class UserDO {
     this.queuedWriters.set(messageId, writer);
 
     // Send initial queued event
-    const queuedEvent: SSEEvent = {
-      type: 'status',
-      message: 'Queued — processing will begin shortly',
-    };
+    const queuedEvent: SSEEvent = { type: 'status', ...statusUpdate(locale, 'status_queued') };
     writer.write(encoder.encode(`data: ${JSON.stringify(queuedEvent)}\n\n`)).catch((error) => {
       logger.warn('sse_client_disconnected', {
         phase: 'initial_queued_event',
@@ -1202,7 +1239,7 @@ export class UserDO {
 
     try {
       const callbacks: StreamCallbacks = {
-        onStatus: async (message) => sendEvent({ type: 'status', message }),
+        onStatus: async (status) => sendEvent({ type: 'status', ...status }),
         onProgress: async (text) => sendEvent({ type: 'progress', text }),
         // onComplete is sent explicitly after processChat returns (not by the orchestrator)
         onComplete: async (response) => sendEvent({ type: 'complete', response }),
@@ -1223,9 +1260,9 @@ export class UserDO {
     } catch (error) {
       // Send error to SSE client BEFORE closing the writer — if we let this propagate
       // to processQueueEntry's handleProcessingError, the writer is already closed.
-      const errorMessage = error instanceof Error ? error.message : 'Processing failed';
       logger.error('sse_entry_processing_error', error, { message_id: entry.message_id });
-      await sendEvent({ type: 'error', error: errorMessage });
+      const failure = await this.describeProcessingFailure(error, body, logger);
+      await sendEvent({ type: 'error', error: failure.detail });
       throw error; // Re-throw for retry logic in processQueueEntry
     } finally {
       clearInterval(keepaliveInterval);
@@ -1562,8 +1599,9 @@ export class UserDO {
     );
     const ttsResponses = this.extractTtsResponses(orchResult, logger);
 
+    const emitStatus = createStatusEmitter(callbacks, effectivePreferences.response_language);
     const voiceAudio = await this.tracedPhase(ctx, 'audio_generation', () =>
-      this.maybeGenerateAudio(body, audioContext, ttsResponses, logger, callbacks)
+      this.maybeGenerateAudio(body, audioContext, ttsResponses, logger, emitStatus)
     );
     const audioKey = voiceAudio?.audioKey ?? null;
 
@@ -1860,11 +1898,14 @@ export class UserDO {
     callbacks?: StreamCallbacks
   ) {
     const { logger } = ctx;
-    const resolved_message = await this.tracedPhase(ctx, 'resolve_message', () =>
-      this.resolveMessageText(body, logger, callbacks)
-    );
+    // Preferences load first so the transcription status line (emitted inside
+    // resolve_message) can be localized to the user's response_language (#405).
     const { preferences, history } = await this.tracedPhase(ctx, 'load_user_context', () =>
       this.loadUserContext(logger)
+    );
+    const emitStatus = createStatusEmitter(callbacks, resolveStatusLocale(body, preferences));
+    const resolved_message = await this.tracedPhase(ctx, 'resolve_message', () =>
+      this.resolveMessageText(body, logger, emitStatus)
     );
     const catalog = await this.tracedPhase(ctx, 'mcp_discovery', () =>
       this.discoverMCPTools(body._mcp_servers ?? [], logger)
@@ -1899,10 +1940,10 @@ export class UserDO {
   private async resolveMessageText(
     body: ChatRequest,
     logger: RequestLogger,
-    callbacks?: StreamCallbacks
+    emit?: StatusEmitter
   ): Promise<{ text: string; inboundVoiceKey?: string }> {
     if (body.message_type === 'audio') {
-      return this.transcribeAudioMessage(body, logger, callbacks);
+      return this.transcribeAudioMessage(body, logger, emit);
     }
     if (!body.message?.trim()) {
       throw new ValidationError('Message is required');
@@ -1913,11 +1954,11 @@ export class UserDO {
   private async transcribeAudioMessage(
     body: ChatRequest,
     logger: RequestLogger,
-    callbacks?: StreamCallbacks
+    emit?: StatusEmitter
   ): Promise<{ text: string; inboundVoiceKey?: string }> {
     const sttFlowStart = Date.now();
     const { audio_base64, audio_format } = this.requireAudioFields(body, logger);
-    await callbacks?.onStatus?.('Transcribing audio...');
+    await emit?.('status_transcribing');
 
     // Run transcription and R2 archival in parallel. Whisper consumes the
     // base64 string directly; archival needs the decoded bytes. Both kick
@@ -2187,7 +2228,7 @@ export class UserDO {
     audioContext: AudioContext,
     responses: string[],
     logger: RequestLogger,
-    callbacks?: StreamCallbacks
+    emit?: StatusEmitter
   ): Promise<{ audioKey: string } | null> {
     const ttsFlowStart = Date.now();
     const shouldGenerate = body.message_type === 'audio' || audioContext.audioRequested;
@@ -2209,7 +2250,7 @@ export class UserDO {
       });
       return null;
     }
-    const audio = await this.generateVoiceResponse(org, userId, responses, logger, callbacks);
+    const audio = await this.generateVoiceResponse(org, userId, responses, logger, emit);
     logger.log('audio_flow_tts_result', {
       has_audio: audio !== null,
       audio_key: audio?.audioKey ?? null,
@@ -2219,7 +2260,7 @@ export class UserDO {
   }
 
   private startTtsKeepalive(
-    callbacks: StreamCallbacks,
+    emit: StatusEmitter,
     genStart: number,
     logger: RequestLogger
   ): { interval: ReturnType<typeof setInterval>; getCount: () => number } {
@@ -2230,7 +2271,7 @@ export class UserDO {
         keepalive_number: count,
         elapsed_seconds: Math.round((Date.now() - genStart) / 1000),
       });
-      Promise.resolve(callbacks.onStatus?.('Still generating audio...')).catch((error: unknown) => {
+      Promise.resolve(emit('status_tts_still_generating')).catch((error: unknown) => {
         logger.warn('tts_keepalive_failed', {
           error: error instanceof Error ? error.message : String(error),
           keepalive_number: count,
@@ -2246,19 +2287,19 @@ export class UserDO {
     userId: string,
     responses: string[],
     logger: RequestLogger,
-    callbacks?: StreamCallbacks
+    emit?: StatusEmitter
   ): Promise<{ audioKey: string } | null> {
     const genStart = Date.now();
     const combinedText = responses.join('\n\n');
     logger.log('audio_flow_generate_voice_start', {
       response_count: responses.length,
       combined_text_chars: combinedText.length,
-      has_callbacks: !!callbacks,
+      has_callbacks: !!emit,
     });
 
-    const keepalive = callbacks ? this.startTtsKeepalive(callbacks, genStart, logger) : null;
+    const keepalive = emit ? this.startTtsKeepalive(emit, genStart, logger) : null;
     try {
-      await callbacks?.onStatus?.('Generating audio response...');
+      await emit?.('status_tts_generating');
       const synthesis = await synthesizeSpeech(this.env.OPENAI_API_KEY, combinedText, logger);
       const synthesisDoneAt = Date.now();
 
@@ -2710,6 +2751,41 @@ export class UserDO {
 
   private async updatePreferences(preferences: UserPreferencesInternal): Promise<void> {
     await this.state.storage.put(PREFERENCES_KEY, preferences);
+  }
+
+  /**
+   * Locale for a worker-emitted string on a path that has not loaded the turn
+   * context yet (queued notice, error fallbacks). One preferences read; the
+   * DO runtime caches it. A failed read degrades to English — the string is a
+   * courtesy, not the turn — but is logged so it never fails invisibly.
+   */
+  private async readStatusLocale(body: ChatRequest, logger: RequestLogger): Promise<string> {
+    if (body.response_language_hint) return body.response_language_hint;
+    try {
+      return (await this.getPreferences()).response_language;
+    } catch (error) {
+      logger.warn('status_locale_read_failed', {
+        error: error instanceof Error ? error.message : String(error),
+        user_id: body.user_id,
+      });
+      // Explicitly continue — the notice is still sent, in English.
+      return DEFAULT_PREFERENCES.response_language;
+    }
+  }
+
+  /**
+   * User-facing text for a failed turn. An upstream `Error.message` passes
+   * through unchanged (it is diagnostic — `ClaudeAPIError`, `MCPError` — and
+   * translating exceptions is out of scope); only the generic fallback for a
+   * non-Error throw is localized (#405).
+   */
+  private async describeProcessingFailure(
+    error: unknown,
+    body: ChatRequest,
+    logger: RequestLogger
+  ): Promise<{ title: string; detail: string }> {
+    const title = uiString(await this.readStatusLocale(body, logger), 'error_processing_failed');
+    return { title, detail: error instanceof Error ? error.message : title };
   }
 
   // ── Config helpers ────────────────────────────────────────────────────────────

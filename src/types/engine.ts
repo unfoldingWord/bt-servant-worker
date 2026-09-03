@@ -6,6 +6,7 @@ import { OrgLanguages } from './languages.js';
 import { MCPServerConfig } from './mcp.js';
 import { OrgConfig } from './org-config.js';
 import { OrgModes, PromptOverrides } from './prompt-overrides.js';
+import type { StatusKey, StatusUpdate } from '../i18n/ui-strings.js';
 
 /**
  * Progress mode for webhook callbacks.
@@ -287,9 +288,14 @@ export interface UpdatePreferencesRequest {
 export type SSEEventType =
   'status' | 'progress' | 'complete' | 'error' | 'tool_use' | 'tool_result';
 
-export interface SSEStatusEvent {
+/**
+ * Worker-emitted status line. `key` is the stable identifier clients should
+ * branch on; `message` is the same status localized to the user's
+ * `response_language` (see `src/i18n/ui-strings.ts`). `key` was added in
+ * #405 (additive); `message` is retained for clients that only display it.
+ */
+export interface SSEStatusEvent extends StatusUpdate {
   type: 'status';
-  message: string;
 }
 
 export interface SSEProgressEvent {
@@ -331,7 +337,8 @@ export type SSEEvent =
  * Stream callbacks interface for orchestrator
  */
 export interface StreamCallbacks {
-  onStatus: (message: string) => void;
+  /** Localized status line plus its closed `key` — see `SSEStatusEvent`. */
+  onStatus: (status: StatusUpdate) => void;
   onProgress: (text: string) => void;
   onComplete: (response: ChatResponse) => void;
   onError: (error: string) => void;
@@ -356,7 +363,9 @@ export interface ProgressCallback {
   message_key: string;
   /** ISO-8601 timestamp string (e.g. "2026-04-30T14:00:00.000Z"). */
   timestamp: string;
-  /** Status updates (e.g. "Working on it…") — present on `type: "status"`. */
+  /** Stable status identifier — present on `type: "status"` (added in #405, additive). */
+  key?: StatusKey;
+  /** Localized status text (e.g. "Working on it…") — present on `type: "status"`. */
   message?: string;
   /** Accumulated/delta text — present on `progress` and `complete` events. */
   text?: string;
