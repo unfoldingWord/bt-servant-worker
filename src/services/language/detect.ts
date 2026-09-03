@@ -51,8 +51,20 @@ export const MIN_LETTERS = 20;
  * Minimum distinct words in the prepared text. tinyld scores word by word,
  * so one token repeated is one vote counted many times, not evidence of a
  * language (`xyzzy xyzzy xyzzy xyzzy xyzzy` otherwise reads as pl @ 0.99).
+ * Not applied to scripts written without word spacing (see
+ * {@link NO_WORD_SPACING_SCRIPT_PATTERN}).
  */
 export const MIN_DISTINCT_WORDS = 4;
+
+/**
+ * Latin-script text must carry lexical evidence before any read is accepted:
+ * at least one word of at most this many letters (de, a, o, que, the, is, to)
+ * or one letter with a diacritic. Keyboard-row and low-entropy token lists
+ * have neither, yet unique-gram to ro / it / de @ 1.0 or scrape past the
+ * floors (`aaaa bbbb cccc dddd eeee ffff` → nl 0.069 / 0.40); real Romance
+ * and Germanic sentences almost always have one.
+ */
+export const LATIN_LEXICAL_EVIDENCE_SHORT_WORD_MAX_LETTERS = 3;
 
 /**
  * Minimum tinyld `accuracy` for the top candidate. Below a unique-n-gram hit
@@ -94,6 +106,21 @@ const EMOJI_PATTERN = /[\p{Extended_Pictographic}\p{Emoji_Presentation}\uFE0F\u2
 
 const LETTER_PATTERN = /\p{L}/gu;
 const WORD_PATTERN = /\p{L}+/gu;
+const LATIN_LETTER_PATTERN = /\p{Script=Latin}/u;
+/** Any combining mark after NFD: a letter carrying a diacritic. */
+const COMBINING_MARK_PATTERN = /\p{M}/u;
+/** A whole word of 1–{@link LATIN_LEXICAL_EVIDENCE_SHORT_WORD_MAX_LETTERS} letters. */
+const SHORT_WORD_PATTERN = new RegExp(
+  `(?<!\\p{L})\\p{L}{1,${LATIN_LEXICAL_EVIDENCE_SHORT_WORD_MAX_LETTERS}}(?!\\p{L})`,
+  'u'
+);
+/**
+ * Scripts in tinyld's set that are written without spaces between words
+ * (Chinese, Japanese, Thai). Word counting is meaningless there, and their
+ * unique n-grams are strong, so such text goes straight to the detector.
+ */
+const NO_WORD_SPACING_SCRIPT_PATTERN =
+  /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}]/u;
 
 /**
  * Remove URLs, residual hashtags / handles and emoji, collapsing the
@@ -129,11 +156,30 @@ function countDistinctWords(text: string): number {
   return new Set(text.normalize('NFC').toLowerCase().match(WORD_PATTERN) ?? []).size;
 }
 
-/** Enough letters and enough distinct words for the detector's vote to mean anything. */
-function hasEnoughSignal(prepared: string): boolean {
+/**
+ * Latin-script text needs a short word or a diacritic (see
+ * {@link LATIN_LEXICAL_EVIDENCE_SHORT_WORD_MAX_LETTERS}); other scripts pass.
+ */
+function hasLexicalEvidence(prepared: string): boolean {
+  if (!LATIN_LETTER_PATTERN.test(prepared)) return true;
   return (
-    countLetters(prepared) >= MIN_LETTERS && countDistinctWords(prepared) >= MIN_DISTINCT_WORDS
+    SHORT_WORD_PATTERN.test(prepared) || COMBINING_MARK_PATTERN.test(prepared.normalize('NFD'))
   );
+}
+
+/**
+ * Enough letters, enough distinct words (where words are space-delimited) and,
+ * for Latin script, lexical evidence — before the detector's vote means anything.
+ */
+function hasEnoughSignal(prepared: string): boolean {
+  if (countLetters(prepared) < MIN_LETTERS) return false;
+  if (
+    !NO_WORD_SPACING_SCRIPT_PATTERN.test(prepared) &&
+    countDistinctWords(prepared) < MIN_DISTINCT_WORDS
+  ) {
+    return false;
+  }
+  return hasLexicalEvidence(prepared);
 }
 
 function roundConfidence(value: number): number {

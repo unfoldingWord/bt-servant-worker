@@ -30,6 +30,7 @@ import {
   prepareForDetection,
   stripNonLinguistic,
   MAX_DETECT_CHARS,
+  LATIN_LEXICAL_EVIDENCE_SHORT_WORD_MAX_LETTERS,
   MIN_ACCURACY,
   MIN_CONFIDENCE,
   MIN_DISTINCT_WORDS,
@@ -75,11 +76,35 @@ const ES = [
   'Gracias por la explicación, ahora tiene mucho más sentido para mí.',
 ];
 
-/** `[expected code, fixtures]`: plain prose sentences of 20–200 characters. */
+/** Scripts written without word spacing: the distinct-word rule must not gate them. */
+const ZH = [
+  '我正在把马可福音翻译成我的母语，请帮我理解这段经文。',
+  '请你用简单的话解释约翰福音三章十六节的意思。',
+];
+const JA = [
+  '私はマルコの福音書を母語に翻訳しています。この箇所を理解するのを手伝ってください。',
+  'ヨハネによる福音書三章十六節の意味を簡単な言葉で説明してください。',
+];
+const TH = [
+  // With a clause space: two \p{L}+ tokens, which a naive distinct-word rule would reject.
+  'ฉันกำลังแปลพระกิตติคุณมาระโกเป็นภาษาแม่ของฉัน ช่วยอธิบายข้อนี้หน่อย',
+  'คุณช่วยอธิบายความหมายของยอห์น 3:16 ด้วยคำง่ายๆ ได้ไหม',
+  'ฉันกำลังแปลพระกิตติคุณมาระโกเป็นภาษาแม่ของฉัน',
+];
+
+/**
+ * `[expected code, fixtures]`: plain prose sentences of 20–200 characters.
+ * Every Latin-script fixture carries a short word or a diacritic, which the
+ * lexical-evidence rule requires; a fixture failing here for lack of one is a
+ * finding to report, not a reason to weaken the rule.
+ */
 const FIXTURES: ReadonlyArray<[string, readonly string[]]> = [
   ['pt', PT],
   ['en', EN],
   ['es', ES],
+  ['zh', ZH],
+  ['ja', JA],
+  ['th', TH],
 ];
 
 describe('detectWrittenLanguage — fixture set', () => {
@@ -99,6 +124,12 @@ describe('detectWrittenLanguage — fixture set', () => {
     // both: "und" for one English sentence is a truthful record, "tr" for an
     // Indonesian speaker is not. Lowering MIN_ACCURACY below 0.057 to recover
     // this sentence would re-admit the Indonesian misread.
+    //
+    // Residual out-of-set collision, accepted for telemetry: Yoruba (Latin
+    // script with diacritics and short words, so it carries lexical evidence)
+    // unique-grams to phantom in-set codes. Measured on four sentences: three
+    // read pl / it / it @ 1.0, one gates out at it 0.54 / margin 0.14. Nothing
+    // in tinyld's output distinguishes those hits from real Polish or Italian.
     expect(MIN_ACCURACY).toBe(0.06);
     expect(
       detectWrittenLanguage(
@@ -167,6 +198,18 @@ describe('detectWrittenLanguage — inputs without enough linguistic signal', ()
     expect(detectWrittenLanguage(text, createMockLogger())).toBeNull();
   });
 
+  it.each([
+    ['a keyboard-row list that unique-grams to ro @ 1.0', 'qwerty asdfgh zxcvbn poiuyt lkjhgf'],
+    ['a low-entropy list that clears both floors as nl 0.069', 'aaaa bbbb cccc dddd eeee ffff'],
+    ['a keyboard-row list that unique-grams to de @ 1.0', 'zxcvbnm asdfghjkl qwertyuiop mnbvcxz'],
+    ['a keyboard-column list that unique-grams to de @ 1.0', 'plokij mnjuhy bgtvfr cdexsw'],
+  ])(
+    `requires lexical evidence in Latin script (a word of ≤ ${LATIN_LEXICAL_EVIDENCE_SHORT_WORD_MAX_LETTERS} letters or a diacritic): %s`,
+    (_label, text) => {
+      expect(detectWrittenLanguage(text, createMockLogger())).toBeNull();
+    }
+  );
+
   it(`requires at least ${MIN_LETTERS} letters after stripping`, () => {
     const belowMin = 'obrigado amigo';
     expect(belowMin.replace(/\P{L}/gu, '').length).toBeLessThan(MIN_LETTERS);
@@ -194,6 +237,8 @@ describe('detectWrittenLanguage — languages outside the tinyld/light set', () 
 describe('detectWrittenLanguage — pre-strip', () => {
   it.each([
     ['a clock time', 'Reunião 15:30 na igreja, quem vem?'],
+    // Padded past the 20-letter floor: the reviewer's original
+    // 'temos 2 pessoas e 5 minutos' has 19 letters and is null for that reason alone.
     ['counts', 'temos 2 pessoas e 5 minutos para isso agora mesmo, amigos'],
   ])('keeps prose that merely contains numbers (%s) and detects pt', (_label, text) => {
     expect(detectWrittenLanguage(text, createMockLogger())?.code).toBe('pt');
