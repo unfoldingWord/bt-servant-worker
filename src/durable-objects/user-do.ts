@@ -893,9 +893,12 @@ export class UserDO {
     logger: RequestLogger
   ): Promise<Response> {
     const timing = createTimingContext();
-    const locale = await this.readStatusLocale(body, logger);
+    // Resolved inside the try: if the read ever throws, the lock release and
+    // drain below must still run, and the error still reach the caller.
+    let locale = DEFAULT_PREFERENCES.response_language;
     let response: Response;
     try {
+      locale = await this.readStatusLocale(body, logger);
       const chatResponse = await this.processChat(body, workerOrigin, logger, timing);
       logger.log('immediate_final_complete', { message_id: messageId });
       response = Response.json({ message_id: messageId, ...chatResponse });
@@ -974,8 +977,10 @@ export class UserDO {
     (async () => {
       const timing = createTimingContext();
       const callbacks = this.buildWebhookCallbacks(body, logger);
-      const locale = await this.readStatusLocale(body, logger);
+      // Resolved inside the try so the finally (lock release, drain) always runs.
+      let locale = DEFAULT_PREFERENCES.response_language;
       try {
+        locale = await this.readStatusLocale(body, logger);
         const response = await this.processChat(body, workerOrigin, logger, timing, callbacks);
         await callbacks?.onComplete?.(response);
         logger.log('immediate_callback_complete', { message_id: messageId });
@@ -1017,8 +1022,11 @@ export class UserDO {
 
     // Process in background — the Response is returned immediately with the SSE stream
     (async () => {
-      const locale = await this.readStatusLocale(body, logger);
+      // Resolved inside the try so the finally (writer close, lock release,
+      // drain) always runs, even if the read itself throws.
+      let locale = DEFAULT_PREFERENCES.response_language;
       try {
+        locale = await this.readStatusLocale(body, logger);
         const timing = createTimingContext();
         const response = await this.processChat(body, workerOrigin, logger, timing, callbacks);
         await sendEvent({ type: 'complete', response });
@@ -1027,11 +1035,7 @@ export class UserDO {
         await sendEvent({ type: 'error', error: processingFailureDetail(error, locale) });
       } finally {
         clearInterval(keepaliveInterval);
-        try {
-          await writer.close();
-        } catch {
-          /* client disconnected */
-        }
+        await this.closeSSEWriter(writer, 'processImmediateSSE', messageId, logger);
         await this.releaseLock();
         await this.drainQueue(logger);
         // Flush measurements from this background path — emitted after fetch() returned.
@@ -1285,16 +1289,26 @@ export class UserDO {
       throw error; // Re-throw for retry logic in processQueueEntry
     } finally {
       clearInterval(keepaliveInterval);
-      if (writer) {
-        try {
-          await writer.close();
-        } catch (error) {
-          logger.warn('stream_writer_close_failed', {
-            phase: 'processSSEEntry',
-            error: error instanceof Error ? error.message : String(error),
-          });
-        }
-      }
+      if (writer) await this.closeSSEWriter(writer, 'processSSEEntry', entry.message_id, logger);
+    }
+  }
+
+  /** Close an SSE writer; a client that already disconnected is expected but never invisible. */
+  private async closeSSEWriter(
+    writer: WritableStreamDefaultWriter<Uint8Array>,
+    phase: string,
+    messageId: string,
+    logger: RequestLogger
+  ): Promise<void> {
+    try {
+      await writer.close();
+    } catch (error) {
+      logger.warn('stream_writer_close_failed', {
+        phase,
+        message_id: messageId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // Client disconnected — expected, but must be visible in logs.
     }
   }
 
@@ -2294,8 +2308,15 @@ export class UserDO {
         keepalive_number: count,
         elapsed_seconds: Math.round((Date.now() - genStart) / 1000),
       });
-      // Never rejects: a failing callback is logged inside the emitter.
-      emit('status_tts_still_generating');
+      // The emitter logs and swallows callback failures itself; this guard is
+      // for anything else, so a broken keepalive stops instead of repeating.
+      emit('status_tts_still_generating').catch((error: unknown) => {
+        logger.warn('tts_keepalive_failed', {
+          error: error instanceof Error ? error.message : String(error),
+          keepalive_number: count,
+        });
+        clearInterval(interval);
+      });
     }, 15_000);
     return { interval, getCount: () => count };
   }

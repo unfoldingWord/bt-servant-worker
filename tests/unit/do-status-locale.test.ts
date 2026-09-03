@@ -79,6 +79,24 @@ interface UserDOInternals {
     callbacks?: StreamCallbacks
   ): Promise<ChatResponse>;
   readStatusLocale(body: ChatRequest, logger: RequestLogger): Promise<string>;
+  processImmediateFinal(
+    body: ChatRequest,
+    workerOrigin: string,
+    messageId: string,
+    logger: RequestLogger
+  ): Promise<Response>;
+  processImmediateCallback(
+    body: ChatRequest,
+    workerOrigin: string,
+    messageId: string,
+    logger: RequestLogger
+  ): Response;
+  processImmediateSSE(
+    body: ChatRequest,
+    workerOrigin: string,
+    messageId: string,
+    logger: RequestLogger
+  ): Response;
   loadChatContext(
     body: ChatRequest,
     ctx: PhaseCtx,
@@ -152,14 +170,25 @@ function createFakeState(opts: FakeStorageOptions = {}): DurableObjectState {
   } as unknown as DurableObjectState;
 }
 
-function createDO(opts: FakeStorageOptions = {}): UserDOInternals {
+function createDOFromState(state: DurableObjectState): UserDOInternals {
   const env = {
     DEFAULT_ORG: 'unfoldingWord',
     AI: {},
     OPENAI_API_KEY: 'test-openai-key',
     AUDIO_BUCKET: {},
   } as unknown as Env;
-  return new UserDO(createFakeState(opts), env) as unknown as UserDOInternals;
+  return new UserDO(state, env) as unknown as UserDOInternals;
+}
+
+function createDO(opts: FakeStorageOptions = {}): UserDOInternals {
+  return createDOFromState(createFakeState(opts));
+}
+
+/** Storage key the DO uses for its processing lock (`PROCESSING_LOCK_KEY`). */
+const PROCESSING_LOCK_KEY = '_processing_lock';
+
+function lockReleased(state: DurableObjectState): boolean {
+  return vi.mocked(state.storage.delete).mock.calls.some(([key]) => key === PROCESSING_LOCK_KEY);
 }
 
 function createCallbacks(statuses: StatusUpdate[]): StreamCallbacks {
@@ -347,7 +376,14 @@ describe('UserDO queued SSE stream registration (#405 review P1)', () => {
     const prefsGate = deferred<UserPreferencesInternal>();
     const userDo = createDO({ preferences: prefsGate.promise });
     const logger = createMockLogger();
-    const processChat = vi.spyOn(userDo, 'processChat').mockResolvedValue(FAKE_RESPONSE);
+    // The turn is stubbed but still reports through the stream's own callbacks,
+    // so the queued notice → first turn status ordering is asserted on one wire.
+    const processChat = vi
+      .spyOn(userDo, 'processChat')
+      .mockImplementation(async (_body, _origin, turnLogger, _timing, callbacks) => {
+        await createStatusEmitter(callbacks, 'pt', turnLogger)?.('status_processing');
+        return FAKE_RESPONSE;
+      });
 
     // Client request arrives while the DO is busy: it is queued for SSE delivery.
     const pending = userDo.enqueueAndReturn(textBody, 'msg-race', '', false, logger);
@@ -366,12 +402,70 @@ describe('UserDO queued SSE stream registration (#405 review P1)', () => {
 
     const events = await eventsPending;
     expect(processChat).toHaveBeenCalledTimes(1);
-    expect(events.map((e) => e.type)).toEqual(['status', 'complete']);
-    expect(events[0]).toEqual({
-      type: 'status',
-      key: 'status_queued',
-      message: UI_STRINGS.pt.status_queued,
+    expect(events.map((e) => e.type)).toEqual(['status', 'status', 'complete']);
+    const statuses = events.filter((e): e is SSEStatusEvent => e.type === 'status');
+    expect(statuses.map((s) => s.key)).toEqual(['status_queued', 'status_processing']);
+    expect(statuses[0]?.message).toBe(UI_STRINGS.pt.status_queued);
+  });
+});
+
+describe('UserDO immediate transports release resources when the locale read throws (#405 review M1)', () => {
+  const readFailure = new Error('locale read exploded');
+
+  it('SSE: the error reaches the client, the writer closes and the lock is released', async () => {
+    const state = createFakeState();
+    const userDo = createDOFromState(state);
+    const logger = createMockLogger();
+    vi.spyOn(userDo, 'readStatusLocale').mockRejectedValue(readFailure);
+    const processChat = vi.spyOn(userDo, 'processChat').mockResolvedValue(FAKE_RESPONSE);
+
+    const res = userDo.processImmediateSSE(textBody, '', 'msg-sse-fail', logger);
+    const events = await readSSEEvents(res); // fails the test if the writer never closes
+    await settle(); // the lock release follows the writer close by a microtask
+
+    expect(events).toEqual([{ type: 'error', error: 'locale read exploded' }]);
+    expect(processChat).not.toHaveBeenCalled();
+    expect(lockReleased(state)).toBe(true);
+    expect(logger.error).toHaveBeenCalledWith(
+      'immediate_sse_error',
+      readFailure,
+      expect.objectContaining({ message_id: 'msg-sse-fail' })
+    );
+  });
+
+  it('callback: the failure is logged and the lock is released', async () => {
+    const state = createFakeState();
+    const userDo = createDOFromState(state);
+    const logger = createMockLogger();
+    vi.spyOn(userDo, 'readStatusLocale').mockRejectedValue(readFailure);
+
+    const res = userDo.processImmediateCallback(textBody, '', 'msg-cb-fail', logger);
+    expect(res.status).toBe(202);
+    await settle();
+
+    expect(lockReleased(state)).toBe(true);
+    expect(logger.error).toHaveBeenCalledWith(
+      'immediate_callback_error',
+      readFailure,
+      expect.objectContaining({ message_id: 'msg-cb-fail' })
+    );
+  });
+
+  it('final: a 500 with the English fallback title is returned and the lock is released', async () => {
+    const state = createFakeState();
+    const userDo = createDOFromState(state);
+    const logger = createMockLogger();
+    vi.spyOn(userDo, 'readStatusLocale').mockRejectedValue(readFailure);
+
+    const res = await userDo.processImmediateFinal(textBody, '', 'msg-final-fail', logger);
+    await settle(); // lock release + drain run in the background after the response
+
+    expect(res.status).toBe(500);
+    expect(await res.json()).toMatchObject({
+      error: UI_STRINGS.en.error_processing_failed,
+      message: 'locale read exploded',
     });
+    expect(lockReleased(state)).toBe(true);
   });
 });
 
@@ -517,6 +611,7 @@ describe('SSE status contract (#405)', () => {
     vi.spyOn(userDo, 'processChat').mockImplementation(
       async (_body, _origin, turnLogger, _timing, callbacks) => {
         const emit = createStatusEmitter(callbacks, 'pt', turnLogger);
+        await emit?.('status_processing');
         await userDo.transcribeAudioMessage(audioBody, turnLogger, emit);
         await userDo.generateVoiceResponse('unfoldingWord', 'u1', ['x'], turnLogger, emit);
         return FAKE_RESPONSE;
@@ -531,11 +626,13 @@ describe('SSE status contract (#405)', () => {
     const statuses = events.filter((e): e is SSEStatusEvent => e.type === 'status');
     expect(statuses.map((s) => s.key)).toEqual([
       'status_queued',
+      'status_processing',
       'status_transcribing',
       'status_tts_generating',
     ]);
     expect(statuses.map((s) => s.message)).toEqual([
       UI_STRINGS.pt.status_queued,
+      UI_STRINGS.pt.status_processing,
       UI_STRINGS.pt.status_transcribing,
       UI_STRINGS.pt.status_tts_generating,
     ]);
