@@ -160,7 +160,7 @@ curl -X POST "http://localhost:$PORT/api/v1/chat/stream" \
 **Response (SSE events):**
 
 ```
-data: {"type":"status","message":"Processing your request..."}
+data: {"type":"status","key":"status_processing","message":"Processing your request..."}
 
 data: {"type":"progress","text":"In the beginning"}
 

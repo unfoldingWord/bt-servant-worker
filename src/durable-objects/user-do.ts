@@ -92,7 +92,8 @@ import type { UnmatchedTrigger } from '../services/classifier/index.js';
 import { isAdminClient, validateChatBody } from '../utils/chat-validation.js';
 import { OrgLanguages, resolveEffectiveLanguage } from '../types/languages.js';
 import { InternalQueueEntry } from '../types/queue.js';
-import { statusUpdate, uiString, StatusKey, UiStringParams } from '../i18n/ui-strings.js';
+import { statusUpdate, uiString } from '../i18n/ui-strings.js';
+import { createStatusEmitter, StatusEmitter } from '../i18n/status-emitter.js';
 
 // ── Storage keys ───────────────────────────────────────────────────────────────
 const HISTORY_KEY = 'history';
@@ -485,32 +486,29 @@ function buildStoredIdentity(body: ChatRequest, defaultOrg: string): StoredIdent
 }
 
 /**
- * Emits one worker-authored status line by key through the turn's transport
- * callbacks, localized to the user's response_language (#405). The DO calls
- * these from sites that only need `onStatus` (voice pipeline), so the locale
- * is bound once instead of being threaded through every signature.
- */
-export type StatusEmitter = (key: StatusKey, params?: UiStringParams) => void | Promise<void>;
-
-/** Bind `callbacks.onStatus` to a locale. `undefined` callbacks → `undefined` (nothing to emit to). */
-export function createStatusEmitter(
-  callbacks: StreamCallbacks | undefined,
-  locale: string
-): StatusEmitter | undefined {
-  if (!callbacks) return undefined;
-  return (key, params) => callbacks.onStatus(statusUpdate(locale, key, params));
-}
-
-/**
- * Locale for worker-emitted status/notice strings on this turn: the gateway's
- * per-request `response_language_hint` when present, else the stored
- * preference. Mirrors how `processChat` derives `effectivePreferences`.
+ * Locale for everything the worker says in its own voice on a turn — status
+ * lines, notices, the error fallback, and the orchestrator's
+ * `response_language` — the gateway's per-request `response_language_hint`
+ * when present, else the stored preference. This is the one place that
+ * precedence is written (#405): `processChat` derives `effectivePreferences`
+ * from it and `readStatusLocale` wraps it for paths that have no turn context.
  */
 export function resolveStatusLocale(
   body: ChatRequest,
   preferences: UserPreferencesInternal
 ): string {
   return body.response_language_hint ?? preferences.response_language;
+}
+
+/**
+ * User-facing text for a failed turn. An upstream `Error.message` passes
+ * through unchanged (it is diagnostic — `ClaudeAPIError`, `MCPError` — and
+ * translating exceptions is out of scope); only the generic fallback for a
+ * non-Error throw is localized (#405). Pure: callers resolve `locale` before
+ * their `try`, so no storage read ever happens inside a catch block.
+ */
+export function processingFailureDetail(error: unknown, locale: string): string {
+  return error instanceof Error ? error.message : uiString(locale, 'error_processing_failed');
 }
 
 export class UserDO {
@@ -895,39 +893,14 @@ export class UserDO {
     logger: RequestLogger
   ): Promise<Response> {
     const timing = createTimingContext();
+    const locale = await this.readStatusLocale(body, logger);
     let response: Response;
     try {
       const chatResponse = await this.processChat(body, workerOrigin, logger, timing);
       logger.log('immediate_final_complete', { message_id: messageId });
       response = Response.json({ message_id: messageId, ...chatResponse });
     } catch (error) {
-      if (error instanceof AppError) {
-        // Surface structured app errors (ValidationError, MCPRequestCallLimitError,
-        // MCPCallLimitError, etc.) with their declared code + status so callers
-        // can distinguish 4xx user-correctable conditions (e.g. 429 rate-limit)
-        // from genuine 500 server failures. Without this, every AppError other
-        // than ValidationError collapsed to a generic 500.
-        const isClientError = error.statusCode >= 400 && error.statusCode < 500;
-        if (isClientError) {
-          logger.warn('immediate_final_app_error', {
-            message_id: messageId,
-            code: error.code,
-            status: error.statusCode,
-            error: error.message,
-          });
-        } else {
-          logger.error('immediate_final_app_error', error, {
-            message_id: messageId,
-            code: error.code,
-            status: error.statusCode,
-          });
-        }
-        response = createErrorResponse(error.name, error.code, error.message, error.statusCode);
-      } else {
-        logger.error('immediate_final_error', error, { message_id: messageId });
-        const failure = await this.describeProcessingFailure(error, body, logger);
-        response = createErrorResponse(failure.title, 'INTERNAL_ERROR', failure.detail, 500);
-      }
+      response = this.finalErrorResponse(error, locale, messageId, logger);
     }
 
     // Release the lock and drain the queue in the background so this
@@ -951,6 +924,45 @@ export class UserDO {
     return response;
   }
 
+  /** JSON error body for a failed final-mode turn; logs it with the right severity. */
+  private finalErrorResponse(
+    error: unknown,
+    locale: string,
+    messageId: string,
+    logger: RequestLogger
+  ): Response {
+    if (error instanceof AppError) {
+      // Surface structured app errors (ValidationError, MCPRequestCallLimitError,
+      // MCPCallLimitError, etc.) with their declared code + status so callers
+      // can distinguish 4xx user-correctable conditions (e.g. 429 rate-limit)
+      // from genuine 500 server failures. Without this, every AppError other
+      // than ValidationError collapsed to a generic 500.
+      const isClientError = error.statusCode >= 400 && error.statusCode < 500;
+      if (isClientError) {
+        logger.warn('immediate_final_app_error', {
+          message_id: messageId,
+          code: error.code,
+          status: error.statusCode,
+          error: error.message,
+        });
+      } else {
+        logger.error('immediate_final_app_error', error, {
+          message_id: messageId,
+          code: error.code,
+          status: error.statusCode,
+        });
+      }
+      return createErrorResponse(error.name, error.code, error.message, error.statusCode);
+    }
+    logger.error('immediate_final_error', error, { message_id: messageId });
+    return createErrorResponse(
+      uiString(locale, 'error_processing_failed'),
+      'INTERNAL_ERROR',
+      processingFailureDetail(error, locale),
+      500
+    );
+  }
+
   /** Process a callback-mode message immediately in the fetch handler. Returns 202. */
   private processImmediateCallback(
     body: ChatRequest,
@@ -962,14 +974,14 @@ export class UserDO {
     (async () => {
       const timing = createTimingContext();
       const callbacks = this.buildWebhookCallbacks(body, logger);
+      const locale = await this.readStatusLocale(body, logger);
       try {
         const response = await this.processChat(body, workerOrigin, logger, timing, callbacks);
         await callbacks?.onComplete?.(response);
         logger.log('immediate_callback_complete', { message_id: messageId });
       } catch (error) {
         logger.error('immediate_callback_error', error, { message_id: messageId });
-        const failure = await this.describeProcessingFailure(error, body, logger);
-        await callbacks?.onError?.(failure.detail);
+        await callbacks?.onError?.(processingFailureDetail(error, locale));
       } finally {
         await this.releaseLock();
         await this.drainQueue(logger);
@@ -1005,14 +1017,14 @@ export class UserDO {
 
     // Process in background — the Response is returned immediately with the SSE stream
     (async () => {
+      const locale = await this.readStatusLocale(body, logger);
       try {
         const timing = createTimingContext();
         const response = await this.processChat(body, workerOrigin, logger, timing, callbacks);
         await sendEvent({ type: 'complete', response });
       } catch (error) {
         logger.error('immediate_sse_error', error, { message_id: messageId });
-        const failure = await this.describeProcessingFailure(error, body, logger);
-        await sendEvent({ type: 'error', error: failure.detail });
+        await sendEvent({ type: 'error', error: processingFailureDetail(error, locale) });
       } finally {
         clearInterval(keepaliveInterval);
         try {
@@ -1181,12 +1193,13 @@ export class UserDO {
     const workerOrigin = body._worker_origin ?? '';
     const timing = createTimingContext();
     const callbacks = this.buildWebhookCallbacks(body, logger);
+    const locale = await this.readStatusLocale(body, logger);
 
     try {
       const response = await this.processChat(body, workerOrigin, logger, timing, callbacks);
       await callbacks?.onComplete?.(response);
     } catch (error) {
-      await callbacks?.onError?.(error instanceof Error ? error.message : 'Unknown error');
+      await callbacks?.onError?.(processingFailureDetail(error, locale));
       throw error;
     }
   }
@@ -1242,6 +1255,7 @@ export class UserDO {
     const body = entry.body;
     const writer = this.queuedWriters.get(entry.message_id);
     const { sendEvent, keepaliveInterval } = this.buildSSESender(writer, logger, Date.now());
+    const locale = await this.readStatusLocale(body, logger);
 
     try {
       const callbacks: StreamCallbacks = {
@@ -1267,8 +1281,7 @@ export class UserDO {
       // Send error to SSE client BEFORE closing the writer — if we let this propagate
       // to processQueueEntry's handleProcessingError, the writer is already closed.
       logger.error('sse_entry_processing_error', error, { message_id: entry.message_id });
-      const failure = await this.describeProcessingFailure(error, body, logger);
-      await sendEvent({ type: 'error', error: failure.detail });
+      await sendEvent({ type: 'error', error: processingFailureDetail(error, locale) });
       throw error; // Re-throw for retry logic in processQueueEntry
     } finally {
       clearInterval(keepaliveInterval);
@@ -1590,9 +1603,7 @@ export class UserDO {
     const triggerCtx = await this.classifyAndResolveTriggers(body, loaded, logger);
 
     // ── Build orchestrator options ────────────────────────────────────────────
-    const effectivePreferences = body.response_language_hint
-      ? { ...loaded.preferences, response_language: body.response_language_hint }
-      : loaded.preferences;
+    const effectivePreferences = { ...loaded.preferences, response_language: loaded.locale };
     const groupContext = this.maybeBuildGroupContext(body);
 
     const audioContext = this.buildAudioContext();
@@ -1605,9 +1616,8 @@ export class UserDO {
     );
     const ttsResponses = this.extractTtsResponses(orchResult, logger);
 
-    const emitStatus = createStatusEmitter(callbacks, effectivePreferences.response_language);
     const voiceAudio = await this.tracedPhase(ctx, 'audio_generation', () =>
-      this.maybeGenerateAudio(body, audioContext, ttsResponses, logger, emitStatus)
+      this.maybeGenerateAudio(body, audioContext, ttsResponses, logger, loaded.emitStatus)
     );
     const audioKey = voiceAudio?.audioKey ?? null;
 
@@ -1905,14 +1915,19 @@ export class UserDO {
   ) {
     const { logger } = ctx;
     // Preferences load first so the transcription status line (emitted inside
-    // resolve_message) can be localized to the user's response_language (#405).
-    const { preferences, history } = await this.tracedPhase(ctx, 'load_user_context', () =>
-      this.loadUserContext(logger)
+    // resolve_message) is localized to this turn's locale (#405). History is
+    // not needed until orchestration, so it loads alongside STT, not ahead of it.
+    const preferences = await this.tracedPhase(ctx, 'load_preferences', () =>
+      this.getPreferences()
     );
-    const emitStatus = createStatusEmitter(callbacks, resolveStatusLocale(body, preferences));
-    const resolved_message = await this.tracedPhase(ctx, 'resolve_message', () =>
-      this.resolveMessageText(body, logger, emitStatus)
-    );
+    const locale = resolveStatusLocale(body, preferences);
+    const emitStatus = createStatusEmitter(callbacks, locale, logger);
+    const [resolved_message, history] = await Promise.all([
+      this.tracedPhase(ctx, 'resolve_message', () =>
+        this.resolveMessageText(body, logger, emitStatus)
+      ),
+      this.tracedPhase(ctx, 'load_history', () => this.loadHistory(logger)),
+    ]);
     const catalog = await this.tracedPhase(ctx, 'mcp_discovery', () =>
       this.discoverMCPTools(body._mcp_servers ?? [], logger)
     );
@@ -1930,6 +1945,8 @@ export class UserDO {
       messageText: resolved_message.text,
       inboundVoiceKey: resolved_message.inboundVoiceKey,
       preferences,
+      locale,
+      emitStatus,
       history,
       catalog,
       resolved,
@@ -2152,14 +2169,14 @@ export class UserDO {
     return { memoryStore, formattedTOC: formattedTOC || undefined };
   }
 
-  private async loadUserContext(logger: RequestLogger) {
+  private async loadHistory(logger: RequestLogger) {
     const startTime = Date.now();
-    const [preferences, history] = await Promise.all([this.getPreferences(), this.getHistory()]);
+    const history = await this.getHistory();
     logger.log('phase_load_complete', {
       history_count: history.length,
       duration_ms: Date.now() - startTime,
     });
-    return { preferences, history };
+    return history;
   }
 
   private async discoverMCPTools(mcpServers: MCPServerConfig[], logger: RequestLogger) {
@@ -2277,13 +2294,8 @@ export class UserDO {
         keepalive_number: count,
         elapsed_seconds: Math.round((Date.now() - genStart) / 1000),
       });
-      Promise.resolve(emit('status_tts_still_generating')).catch((error: unknown) => {
-        logger.warn('tts_keepalive_failed', {
-          error: error instanceof Error ? error.message : String(error),
-          keepalive_number: count,
-        });
-        clearInterval(interval);
-      });
+      // Never rejects: a failing callback is logged inside the emitter.
+      emit('status_tts_still_generating');
     }, 15_000);
     return { interval, getCount: () => count };
   }
@@ -2760,38 +2772,22 @@ export class UserDO {
   }
 
   /**
-   * Locale for a worker-emitted string on a path that has not loaded the turn
-   * context yet (queued notice, error fallbacks). One preferences read; the
-   * DO runtime caches it. A failed read degrades to English — the string is a
-   * courtesy, not the turn — but is logged so it never fails invisibly.
+   * `resolveStatusLocale` for a path that has no turn context yet (queued
+   * notice, transport error fallbacks). One preferences read; the DO runtime
+   * caches it. A failed read degrades to the hint or English — the string is
+   * a courtesy, not the turn — but is logged so it never fails invisibly.
    */
   private async readStatusLocale(body: ChatRequest, logger: RequestLogger): Promise<string> {
-    if (body.response_language_hint) return body.response_language_hint;
     try {
-      return (await this.getPreferences()).response_language;
+      return resolveStatusLocale(body, await this.getPreferences());
     } catch (error) {
       logger.warn('status_locale_read_failed', {
         error: error instanceof Error ? error.message : String(error),
         user_id: body.user_id,
       });
-      // Explicitly continue — the notice is still sent, in English.
-      return DEFAULT_PREFERENCES.response_language;
+      // Explicitly continue — the string is still sent, from the hint or in English.
+      return resolveStatusLocale(body, DEFAULT_PREFERENCES);
     }
-  }
-
-  /**
-   * User-facing text for a failed turn. An upstream `Error.message` passes
-   * through unchanged (it is diagnostic — `ClaudeAPIError`, `MCPError` — and
-   * translating exceptions is out of scope); only the generic fallback for a
-   * non-Error throw is localized (#405).
-   */
-  private async describeProcessingFailure(
-    error: unknown,
-    body: ChatRequest,
-    logger: RequestLogger
-  ): Promise<{ title: string; detail: string }> {
-    const title = uiString(await this.readStatusLocale(body, logger), 'error_processing_failed');
-    return { title, detail: error instanceof Error ? error.message : title };
   }
 
   // ── Config helpers ────────────────────────────────────────────────────────────

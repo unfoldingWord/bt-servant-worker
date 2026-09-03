@@ -10,20 +10,21 @@
  *   - 'Processing failed'      → error_processing_failed (fallback only;
  *                                an upstream Error.message passes through)
  *
- * The DO is instantiated against a fake DurableObjectState whose storage
- * holds `preferences.response_language = 'pt'`. Only the audio service
- * boundary is mocked; everything from the emit site outward is real code.
- * The private methods are reached through a typed cast — the alternative
- * (driving a whole chat turn) needs the Anthropic API.
+ * The DO runs against a Map-backed fake DurableObjectState whose storage
+ * holds `preferences.response_language = 'pt'` and can gate individual reads.
+ * Only the audio service boundary is mocked; everything from the emit site
+ * outward — the queue, the SSE writer, the wire frames — is real code. Private
+ * methods are reached through a typed cast: the alternative (driving a whole
+ * chat turn) needs the Anthropic API.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
-  createStatusEmitter,
+  processingFailureDetail,
   resolveStatusLocale,
   UserDO,
-  type StatusEmitter,
 } from '../../src/durable-objects/user-do.js';
+import { createStatusEmitter, type StatusEmitter } from '../../src/i18n/status-emitter.js';
 import {
   synthesizeSpeech,
   transcribeAudio,
@@ -40,8 +41,8 @@ import type {
   StreamCallbacks,
   UserPreferencesInternal,
 } from '../../src/types/engine.js';
-import type { TimingContext } from '../../src/utils/timing.js';
 import type { RequestLogger } from '../../src/utils/logger.js';
+import { createTimingContext, type TimingContext } from '../../src/utils/timing.js';
 import type { Env } from '../../src/config/types.js';
 
 vi.mock('../../src/services/audio/index.js', async (importOriginal) => {
@@ -56,6 +57,8 @@ vi.mock('../../src/services/audio/index.js', async (importOriginal) => {
 });
 
 const PT_PREFS: UserPreferencesInternal = { response_language: 'pt', first_interaction: false };
+
+type PhaseCtx = { timing: TimingContext; logger: RequestLogger; startTime: number };
 
 /** The private surface this test reaches into. Kept in one place so a rename is one edit. */
 interface UserDOInternals {
@@ -76,6 +79,16 @@ interface UserDOInternals {
     callbacks?: StreamCallbacks
   ): Promise<ChatResponse>;
   readStatusLocale(body: ChatRequest, logger: RequestLogger): Promise<string>;
+  loadChatContext(
+    body: ChatRequest,
+    ctx: PhaseCtx,
+    callbacks?: StreamCallbacks
+  ): Promise<{
+    messageText: string;
+    history: ChatHistoryEntry[];
+    locale: string;
+    emitStatus: StatusEmitter | undefined;
+  }>;
   transcribeAudioMessage(
     body: ChatRequest,
     logger: RequestLogger,
@@ -93,15 +106,14 @@ interface UserDOInternals {
     genStart: number,
     logger: RequestLogger
   ): { interval: ReturnType<typeof setInterval>; getCount: () => number };
-  describeProcessingFailure(
-    error: unknown,
-    body: ChatRequest,
-    logger: RequestLogger
-  ): Promise<{ title: string; detail: string }>;
 }
 
 function createMockLogger(): RequestLogger {
   return { log: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as RequestLogger;
+}
+
+function phaseCtx(logger: RequestLogger): PhaseCtx {
+  return { timing: createTimingContext(), logger, startTime: Date.now() };
 }
 
 interface FakeStorageOptions {
@@ -150,6 +162,15 @@ function createDO(opts: FakeStorageOptions = {}): UserDOInternals {
   return new UserDO(createFakeState(opts), env) as unknown as UserDOInternals;
 }
 
+function createCallbacks(statuses: StatusUpdate[]): StreamCallbacks {
+  return {
+    onStatus: vi.fn((s: StatusUpdate) => statuses.push(s)),
+    onProgress: vi.fn(),
+    onComplete: vi.fn(),
+    onError: vi.fn(),
+  };
+}
+
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((r) => {
@@ -168,15 +189,6 @@ const FAKE_RESPONSE: ChatResponse = {
   response_language: 'pt',
   voice_audio_base64: null,
 };
-
-function createCallbacks(statuses: StatusUpdate[]): StreamCallbacks {
-  return {
-    onStatus: vi.fn((s: StatusUpdate) => statuses.push(s)),
-    onProgress: vi.fn(),
-    onComplete: vi.fn(),
-    onError: vi.fn(),
-  };
-}
 
 const textBody: ChatRequest = {
   client_id: 'web-client',
@@ -235,7 +247,21 @@ async function readFirstSSEEvent(res: Response): Promise<SSEStatusEvent> {
   return JSON.parse(frame.slice('data: '.length).trim()) as SSEStatusEvent;
 }
 
-describe('resolveStatusLocale', () => {
+/** Make the mocked audio boundary succeed: STT returns text, TTS returns bytes, R2 uploads resolve. */
+function primeAudioMocks(): void {
+  vi.mocked(transcribeAudio).mockResolvedValue({ text: 'olá', duration_ms: 5 });
+  vi.mocked(uploadVoiceSubmission).mockResolvedValue(undefined);
+  vi.mocked(synthesizeSpeech).mockResolvedValue({
+    audio_base64: 'AQIDBA==',
+    audio_bytes: new Uint8Array([1, 2, 3, 4]),
+    audio_format: 'opus',
+    duration_ms: 7,
+    input_chars: 3,
+  });
+  vi.mocked(uploadAudio).mockResolvedValue(undefined);
+}
+
+describe('resolveStatusLocale (the one locale rule)', () => {
   it('uses the stored response_language', () => {
     expect(resolveStatusLocale(textBody, PT_PREFS)).toBe('pt');
   });
@@ -247,32 +273,49 @@ describe('resolveStatusLocale', () => {
 
 describe('createStatusEmitter', () => {
   it('returns undefined when there are no callbacks (nothing to emit to)', () => {
-    expect(createStatusEmitter(undefined, 'pt')).toBeUndefined();
+    expect(createStatusEmitter(undefined, 'pt', createMockLogger())).toBeUndefined();
   });
 
   it('emits key + localized message through onStatus', async () => {
     const statuses: StatusUpdate[] = [];
-    const emit = createStatusEmitter(createCallbacks(statuses), 'pt');
+    const emit = createStatusEmitter(createCallbacks(statuses), 'pt', createMockLogger());
     await emit?.('status_executing_tools', { n: 2 });
     expect(statuses).toEqual([
-      { key: 'status_executing_tools', message: 'Executando 2 ferramenta(s)...' },
+      { key: 'status_executing_tools', message: 'Executando 2 ferramentas...' },
     ]);
+  });
+
+  it('logs and swallows a throwing callback (a status line never fails the turn)', async () => {
+    const logger = createMockLogger();
+    const callbacks: StreamCallbacks = {
+      onStatus: vi.fn(() => {
+        throw new Error('socket closed');
+      }),
+      onProgress: vi.fn(),
+      onComplete: vi.fn(),
+      onError: vi.fn(),
+    };
+    const emit = createStatusEmitter(callbacks, 'pt', logger)!;
+
+    await expect(emit('status_processing')).resolves.toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith(
+      'status_callback_failed',
+      expect.objectContaining({ key: 'status_processing', error: 'socket closed' })
+    );
   });
 });
 
 describe('UserDO queued SSE notice (#405)', () => {
-  it('emits status_queued with the Portuguese message for a pt user', async () => {
+  it('writes status_queued with the Portuguese message as the first frame', async () => {
     const logger = createMockLogger();
     const res = createDO().createQueuedSSEStream('pt', 'msg-1', logger);
     expect(res.headers.get('Content-Type')).toBe('text/event-stream');
 
-    const event = await readFirstSSEEvent(res);
-    expect(event).toEqual({
+    expect(await readFirstSSEEvent(res)).toEqual({
       type: 'status',
       key: 'status_queued',
       message: UI_STRINGS.pt.status_queued,
     });
-    expect(event.message).toBe('Na fila — o processamento começará em breve');
   });
 
   it('readStatusLocale honours response_language_hint over the stored preference', async () => {
@@ -285,14 +328,17 @@ describe('UserDO queued SSE notice (#405)', () => {
 
   it('readStatusLocale falls back to English and logs when the preferences read fails (no silent catch)', async () => {
     const logger = createMockLogger();
-    const locale = await createDO({
-      preferences: new Error('storage unavailable'),
-    }).readStatusLocale(textBody, logger);
-    expect(locale).toBe('en');
+    const failing = createDO({ preferences: new Error('storage unavailable') });
+
+    await expect(failing.readStatusLocale(textBody, logger)).resolves.toBe('en');
     expect(logger.warn).toHaveBeenCalledWith(
       'status_locale_read_failed',
       expect.objectContaining({ error: 'storage unavailable' })
     );
+    // A request hint still wins over the English default.
+    await expect(
+      failing.readStatusLocale({ ...textBody, response_language_hint: 'pt' }, logger)
+    ).resolves.toBe('pt');
   });
 });
 
@@ -329,34 +375,73 @@ describe('UserDO queued SSE stream registration (#405 review P1)', () => {
   });
 });
 
-/** Make the mocked audio boundary succeed: STT returns text, TTS returns bytes, R2 uploads resolve. */
-function primeAudioMocks(): void {
-  vi.mocked(transcribeAudio).mockResolvedValue({ text: 'olá', duration_ms: 5 });
-  vi.mocked(uploadVoiceSubmission).mockResolvedValue(undefined);
-  vi.mocked(synthesizeSpeech).mockResolvedValue({
-    audio_base64: 'AQIDBA==',
-    audio_bytes: new Uint8Array([1, 2, 3, 4]),
-    audio_format: 'opus',
-    duration_ms: 7,
-    input_chars: 3,
-  });
-  vi.mocked(uploadAudio).mockResolvedValue(undefined);
-}
-
-describe('UserDO transcription status (#405)', () => {
+describe('UserDO loadChatContext locale (#405)', () => {
   beforeEach(primeAudioMocks);
   afterEach(() => vi.clearAllMocks());
 
-  it('transcribing emits status_transcribing in Portuguese', async () => {
+  it('transcription status uses the stored pt preference when there is no hint', async () => {
     const statuses: StatusUpdate[] = [];
-    const emit = createStatusEmitter(createCallbacks(statuses), 'pt');
-    const result = await createDO().transcribeAudioMessage(audioBody, createMockLogger(), emit);
+    const logger = createMockLogger();
 
-    expect(result.text).toBe('olá');
+    const loaded = await createDO().loadChatContext(
+      audioBody,
+      phaseCtx(logger),
+      createCallbacks(statuses)
+    );
+
+    expect(loaded.locale).toBe('pt');
+    expect(loaded.messageText).toBe('olá');
     expect(statuses).toEqual([
       { key: 'status_transcribing', message: UI_STRINGS.pt.status_transcribing },
     ]);
-    expect(statuses[0]?.message).toBe('Transcrevendo o áudio...');
+  });
+
+  it('transcription status honours the body response_language_hint over the stored pt', async () => {
+    const statuses: StatusUpdate[] = [];
+    const logger = createMockLogger();
+
+    const loaded = await createDO().loadChatContext(
+      { ...audioBody, response_language_hint: 'en' },
+      phaseCtx(logger),
+      createCallbacks(statuses)
+    );
+
+    expect(loaded.locale).toBe('en');
+    expect(statuses).toEqual([
+      { key: 'status_transcribing', message: UI_STRINGS.en.status_transcribing },
+    ]);
+  });
+});
+
+describe('UserDO loadChatContext ordering (#405 review M1)', () => {
+  beforeEach(primeAudioMocks);
+  afterEach(() => vi.clearAllMocks());
+
+  it('STT starts (and its status goes out) without waiting for the history read', async () => {
+    const historyGate = deferred<ChatHistoryEntry[]>();
+    const sttStarted = deferred<void>();
+    vi.mocked(transcribeAudio).mockImplementation(async () => {
+      sttStarted.resolve();
+      return { text: 'olá', duration_ms: 5 };
+    });
+    const statuses: StatusUpdate[] = [];
+
+    const pending = createDO({ history: historyGate.promise }).loadChatContext(
+      audioBody,
+      phaseCtx(createMockLogger()),
+      createCallbacks(statuses)
+    );
+    await sttStarted.promise;
+
+    // Whisper is already running and the status already went out — history is still pending.
+    expect(statuses).toEqual([
+      { key: 'status_transcribing', message: UI_STRINGS.pt.status_transcribing },
+    ]);
+
+    historyGate.resolve([]);
+    const loaded = await pending;
+    expect(loaded.messageText).toBe('olá');
+    expect(loaded.history).toEqual([]);
   });
 });
 
@@ -369,7 +454,7 @@ describe('UserDO TTS status (#405)', () => {
 
   it('TTS generation emits status_tts_generating in Portuguese', async () => {
     const statuses: StatusUpdate[] = [];
-    const emit = createStatusEmitter(createCallbacks(statuses), 'pt');
+    const emit = createStatusEmitter(createCallbacks(statuses), 'pt', createMockLogger());
     const result = await createDO().generateVoiceResponse(
       'unfoldingWord',
       'u1',
@@ -382,13 +467,12 @@ describe('UserDO TTS status (#405)', () => {
     expect(statuses).toEqual([
       { key: 'status_tts_generating', message: UI_STRINGS.pt.status_tts_generating },
     ]);
-    expect(statuses[0]?.message).toBe('Gerando resposta em áudio...');
   });
 
   it('TTS keepalive emits status_tts_still_generating in Portuguese every 15s', async () => {
     vi.useFakeTimers();
     const statuses: StatusUpdate[] = [];
-    const emit = createStatusEmitter(createCallbacks(statuses), 'pt')!;
+    const emit = createStatusEmitter(createCallbacks(statuses), 'pt', createMockLogger())!;
     const keepalive = createDO().startTtsKeepalive(emit, Date.now(), createMockLogger());
     try {
       await vi.advanceTimersByTimeAsync(15_000);
@@ -398,70 +482,64 @@ describe('UserDO TTS status (#405)', () => {
     }
 
     expect(keepalive.getCount()).toBe(2);
-    expect(statuses).toHaveLength(2);
-    for (const s of statuses) {
-      expect(s).toEqual({
-        key: 'status_tts_still_generating',
-        message: UI_STRINGS.pt.status_tts_still_generating,
-      });
-    }
-    expect(statuses[0]?.message).toBe('Ainda gerando o áudio...');
+    expect(statuses).toEqual([
+      { key: 'status_tts_still_generating', message: UI_STRINGS.pt.status_tts_still_generating },
+      { key: 'status_tts_still_generating', message: UI_STRINGS.pt.status_tts_still_generating },
+    ]);
   });
 });
 
-describe('UserDO processing-failed fallback (#405)', () => {
-  it('localizes the generic fallback when the thrown value is not an Error', async () => {
-    const failure = await createDO().describeProcessingFailure(
-      'boom',
-      textBody,
-      createMockLogger()
-    );
-    expect(failure).toEqual({
-      title: UI_STRINGS.pt.error_processing_failed,
-      detail: UI_STRINGS.pt.error_processing_failed,
-    });
-    expect(failure.title).toBe('Falha no processamento');
+describe('processingFailureDetail (#405)', () => {
+  it('localizes the generic fallback when the thrown value is not an Error', () => {
+    expect(processingFailureDetail('boom', 'pt')).toBe(UI_STRINGS.pt.error_processing_failed);
   });
 
-  it('passes an upstream Error.message through unchanged (diagnostic, not translated)', async () => {
-    const failure = await createDO().describeProcessingFailure(
-      new Error('Anthropic API returned 529: overloaded'),
-      textBody,
-      createMockLogger()
+  it('passes an upstream Error.message through unchanged (diagnostic, not translated)', () => {
+    expect(processingFailureDetail(new Error('Anthropic API returned 529: overloaded'), 'pt')).toBe(
+      'Anthropic API returned 529: overloaded'
     );
-    expect(failure.detail).toBe('Anthropic API returned 529: overloaded');
-    expect(failure.title).toBe(UI_STRINGS.pt.error_processing_failed);
   });
 
-  it('uses English for an unsupported stored language', async () => {
-    const failure = await createDO({
-      preferences: { response_language: 'sw', first_interaction: false },
-    }).describeProcessingFailure('boom', textBody, createMockLogger());
-    expect(failure.detail).toBe('Processing failed');
+  it('uses English for an unsupported locale', () => {
+    expect(processingFailureDetail('boom', 'sw')).toBe(UI_STRINGS.en.error_processing_failed);
   });
 });
 
 describe('SSE status contract (#405)', () => {
-  it('every status event key emitted by the DO is drawn from the closed StatusKey union', async () => {
-    const statuses: StatusUpdate[] = [];
-    const emit = createStatusEmitter(createCallbacks(statuses), 'pt')!;
-    primeAudioMocks();
+  beforeEach(primeAudioMocks);
+  afterEach(() => vi.clearAllMocks());
 
+  it('every status frame on the wire carries a key from the closed StatusKey union and the pt message', async () => {
     const userDo = createDO();
     const logger = createMockLogger();
-    await userDo.transcribeAudioMessage(audioBody, logger, emit);
-    await userDo.generateVoiceResponse('unfoldingWord', 'u1', ['x'], logger, emit);
-    const queued = await readFirstSSEEvent(userDo.createQueuedSSEStream('pt', 'msg-c', logger));
+    // The turn itself is stubbed; the voice pipeline inside it is real and
+    // emits through the transport callbacks the DO built for this stream.
+    vi.spyOn(userDo, 'processChat').mockImplementation(
+      async (_body, _origin, turnLogger, _timing, callbacks) => {
+        const emit = createStatusEmitter(callbacks, 'pt', turnLogger);
+        await userDo.transcribeAudioMessage(audioBody, turnLogger, emit);
+        await userDo.generateVoiceResponse('unfoldingWord', 'u1', ['x'], turnLogger, emit);
+        return FAKE_RESPONSE;
+      }
+    );
 
-    const events: SSEStatusEvent[] = [
-      queued,
-      ...statuses.map((s) => ({ type: 'status' as const, ...s })),
-    ];
-    expect(events.length).toBe(3);
-    for (const e of events) {
-      expect(e.type).toBe('status');
-      expect(STATUS_KEYS).toContain(e.key);
-      expect(Object.keys(e).sort()).toEqual(['key', 'message', 'type']);
-    }
+    const res = await userDo.enqueueAndReturn(audioBody, 'msg-c', '', false, logger);
+    const eventsPending = readSSEEvents(res);
+    await userDo.drainQueue(logger);
+    const events = await eventsPending;
+
+    const statuses = events.filter((e): e is SSEStatusEvent => e.type === 'status');
+    expect(statuses.map((s) => s.key)).toEqual([
+      'status_queued',
+      'status_transcribing',
+      'status_tts_generating',
+    ]);
+    expect(statuses.map((s) => s.message)).toEqual([
+      UI_STRINGS.pt.status_queued,
+      UI_STRINGS.pt.status_transcribing,
+      UI_STRINGS.pt.status_tts_generating,
+    ]);
+    for (const s of statuses) expect(STATUS_KEYS).toContain(s.key);
+    expect(events.at(-1)?.type).toBe('complete');
   });
 });

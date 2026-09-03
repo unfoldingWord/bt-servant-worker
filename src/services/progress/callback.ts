@@ -65,7 +65,7 @@ export class ProgressCallbackSender {
   }
 
   async sendStatus(status: StatusUpdate): Promise<void> {
-    await this.post({ type: 'status', key: status.key, message: status.message });
+    await this.post({ type: 'status', ...status });
   }
 
   accumulateProgress(text: string): void {

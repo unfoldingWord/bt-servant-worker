@@ -9,38 +9,21 @@
  * `Unexpected stream event before message_start: ping` and aborted the turn.
  */
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import Anthropic from '@anthropic-ai/sdk';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import type Anthropic from '@anthropic-ai/sdk';
 import { orchestrate } from '../../src/services/claude/orchestrator.js';
-import { ToolCatalog } from '../../src/services/mcp/index.js';
-import { RequestLogger } from '../../src/utils/logger.js';
-import { StreamCallbacks } from '../../src/types/engine.js';
-import { Env } from '../../src/config/types.js';
+import {
+  buildSSEFrames,
+  createMockCallbacks,
+  createMockCatalog,
+  createMockEnv,
+  createMockLogger,
+  mockAnthropicFetch,
+} from '../helpers/anthropic-sse.js';
 
 vi.mock('@anthropic-ai/sdk', () => ({ default: vi.fn() }));
 
-function createMockEnv(): Env {
-  return { ANTHROPIC_API_KEY: 'test-key' } as Env;
-}
-
-function createMockCatalog(): ToolCatalog {
-  return { tools: [], serverMap: new Map() };
-}
-
-function createMockLogger(): RequestLogger {
-  return { log: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as RequestLogger;
-}
-
-function createMockCallbacks(progressChunks: string[]): StreamCallbacks {
-  return {
-    onProgress: vi.fn((text: string) => progressChunks.push(text)),
-    onStatus: vi.fn(),
-    onComplete: vi.fn(),
-    onError: vi.fn(),
-  };
-}
-
-const PING_FRAME = `data: ${JSON.stringify({ type: 'ping' })}\n`;
+const PING = { type: 'ping' };
 
 /**
  * Build an SSE body for a single-iteration, end_turn message with one text block.
@@ -53,10 +36,6 @@ function buildSSEBodyWithPings(opts: {
   beforeMessageStart?: boolean;
   betweenContentBlocks?: boolean;
 }): string {
-  const lines: string[] = [];
-
-  if (opts.beforeMessageStart) lines.push(PING_FRAME);
-
   const message: Anthropic.Message = {
     id: 'msg_test',
     type: 'message',
@@ -73,79 +52,54 @@ function buildSSEBodyWithPings(opts: {
     content: [{ type: 'text', text: opts.text, citations: null }],
   };
 
-  lines.push(
-    `data: ${JSON.stringify({ type: 'message_start', message: { ...message, content: [] } })}\n`
-  );
-  lines.push(
-    `data: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}\n`
-  );
-
-  if (opts.betweenContentBlocks) lines.push(PING_FRAME);
-
-  lines.push(
-    `data: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: opts.text } })}\n`
-  );
-  lines.push(`data: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n`);
-  lines.push(
-    `data: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: message.usage })}\n`
-  );
-  lines.push(`data: ${JSON.stringify({ type: 'message_stop' })}\n`);
-
-  return lines.join('\n');
+  return buildSSEFrames([
+    ...(opts.beforeMessageStart ? [PING] : []),
+    { type: 'message_start', message: { ...message, content: [] } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+    ...(opts.betweenContentBlocks ? [PING] : []),
+    { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: opts.text } },
+    { type: 'content_block_stop', index: 0 },
+    {
+      type: 'message_delta',
+      delta: { stop_reason: 'end_turn', stop_sequence: null },
+      usage: message.usage,
+    },
+    { type: 'message_stop' },
+  ]);
 }
 
-function mockFetchWithBody(body: string): void {
-  (Anthropic as unknown as ReturnType<typeof vi.fn>).mockImplementation(function MockAnthropic(
-    this: object
-  ) {
-    return this;
-  } as unknown as () => object);
-
-  vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
-    return new Response(body, {
-      status: 200,
-      headers: { 'content-type': 'text/event-stream' },
-    });
+async function runTurn(body: string): Promise<{ responses: string[]; progress: string[] }> {
+  mockAnthropicFetch(body);
+  const { callbacks, progress } = createMockCallbacks();
+  const result = await orchestrate('test message', {
+    env: createMockEnv(),
+    catalog: createMockCatalog(),
+    history: [],
+    preferences: { response_language: 'en', first_interaction: true },
+    logger: createMockLogger(),
+    callbacks,
   });
+  return { responses: result.responses, progress };
 }
 
 describe('Orchestrator SSE parser — Anthropic ping events', () => {
-  let progressChunks: string[];
-
-  beforeEach(() => {
-    progressChunks = [];
-  });
   afterEach(() => vi.restoreAllMocks());
 
   it('treats ping arriving before message_start as a no-op (issue #161)', async () => {
-    mockFetchWithBody(buildSSEBodyWithPings({ text: 'hello world', beforeMessageStart: true }));
+    const turn = await runTurn(
+      buildSSEBodyWithPings({ text: 'hello world', beforeMessageStart: true })
+    );
 
-    const result = await orchestrate('test message', {
-      env: createMockEnv(),
-      catalog: createMockCatalog(),
-      history: [],
-      preferences: { response_language: 'en', first_interaction: true },
-      logger: createMockLogger(),
-      callbacks: createMockCallbacks(progressChunks),
-    });
-
-    expect(result.responses).toEqual(['hello world']);
-    expect(progressChunks).toContain('hello world');
+    expect(turn.responses).toEqual(['hello world']);
+    expect(turn.progress).toContain('hello world');
   });
 
   it('treats ping between content blocks as a no-op (regression guard)', async () => {
-    mockFetchWithBody(buildSSEBodyWithPings({ text: 'hello world', betweenContentBlocks: true }));
+    const turn = await runTurn(
+      buildSSEBodyWithPings({ text: 'hello world', betweenContentBlocks: true })
+    );
 
-    const result = await orchestrate('test message', {
-      env: createMockEnv(),
-      catalog: createMockCatalog(),
-      history: [],
-      preferences: { response_language: 'en', first_interaction: true },
-      logger: createMockLogger(),
-      callbacks: createMockCallbacks(progressChunks),
-    });
-
-    expect(result.responses).toEqual(['hello world']);
-    expect(progressChunks).toContain('hello world');
+    expect(turn.responses).toEqual(['hello world']);
+    expect(turn.progress).toContain('hello world');
   });
 });

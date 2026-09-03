@@ -343,7 +343,7 @@ In addition to the standard `/api/v1/chat` endpoint, support a streaming endpoin
 
 | Event         | Purpose                                 | Payload                                                  |
 | ------------- | --------------------------------------- | -------------------------------------------------------- |
-| `status`      | Processing status messages              | `{ type: 'status', message: string }`                    |
+| `status`      | Processing status messages              | `{ type: 'status', key: StatusKey, message: string }`    |
 | `progress`    | Streaming text chunks as they arrive    | `{ type: 'progress', text: string }`                     |
 | `complete`    | Final response when finished            | `{ type: 'complete', response: ChatResponse }`           |
 | `error`       | Error messages                          | `{ type: 'error', error: string }`                       |
@@ -362,7 +362,8 @@ function formatSSEEvent(data: object): string {
 
 ```typescript
 interface StreamCallbacks {
-  onStatus: (message: string) => void;
+  /** `key` is the stable identifier clients branch on; `message` is localized to the user's response_language (src/i18n/ui-strings.ts). */
+  onStatus: (status: StatusUpdate) => void;
   onProgress: (text: string) => void;
   onComplete: (response: ChatResponse) => void;
   onError: (error: string) => void;

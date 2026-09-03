@@ -3,9 +3,8 @@
  * LLM output) is localized by `preferences.response_language` and carries a
  * stable `key` (issue #405).
  *
- * Harness follows `orchestrator-sse-ping.test.ts`: the Anthropic SDK is
- * mocked out and `fetch` returns a canned SSE body. Every iteration answers
- * with a `tool_use` for the internal `get_tool_definitions` tool (no network,
+ * Harness: `tests/helpers/anthropic-sse.ts`. Every iteration answers with a
+ * `tool_use` for the internal `get_tool_definitions` tool (no network,
  * succeeds with `{}` against an empty catalog), so the loop runs to
  * MAX_ORCHESTRATION_ITERATIONS and exercises all four status sites plus the
  * max-iterations notice in one turn:
@@ -15,46 +14,20 @@
  */
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import Anthropic from '@anthropic-ai/sdk';
 import { orchestrate } from '../../src/services/claude/orchestrator.js';
-import { ToolCatalog } from '../../src/services/mcp/index.js';
-import { RequestLogger } from '../../src/utils/logger.js';
-import { StreamCallbacks } from '../../src/types/engine.js';
-import { Env } from '../../src/config/types.js';
-import { STATUS_KEYS, UI_STRINGS, uiString, type StatusUpdate } from '../../src/i18n/ui-strings.js';
+import { STATUS_KEYS, UI_STRINGS, type StatusKey } from '../../src/i18n/ui-strings.js';
+import {
+  buildSSEFrames,
+  createMockCallbacks,
+  createMockCatalog,
+  createMockEnv,
+  createMockLogger,
+  mockAnthropicFetch,
+} from '../helpers/anthropic-sse.js';
 
 vi.mock('@anthropic-ai/sdk', () => ({ default: vi.fn() }));
 
 const MAX_ITERATIONS = 2;
-
-function createMockEnv(): Env {
-  return {
-    ANTHROPIC_API_KEY: 'test-key',
-    MAX_ORCHESTRATION_ITERATIONS: String(MAX_ITERATIONS),
-  } as Env;
-}
-
-function createMockCatalog(): ToolCatalog {
-  return { tools: [], serverMap: new Map() };
-}
-
-function createMockLogger(): RequestLogger {
-  return { log: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as RequestLogger;
-}
-
-interface Captured {
-  statuses: StatusUpdate[];
-  progress: string[];
-}
-
-function createMockCallbacks(captured: Captured): StreamCallbacks {
-  return {
-    onStatus: vi.fn((status: StatusUpdate) => captured.statuses.push(status)),
-    onProgress: vi.fn((text: string) => captured.progress.push(text)),
-    onComplete: vi.fn(),
-    onError: vi.fn(),
-  };
-}
 
 /** One Anthropic SSE message whose only content block is a tool_use for `get_tool_definitions`. */
 function buildToolUseSSEBody(): string {
@@ -74,130 +47,102 @@ function buildToolUseSSEBody(): string {
     usage,
     content: [],
   };
-  const lines = [
-    `data: ${JSON.stringify({ type: 'message_start', message })}\n`,
-    `data: ${JSON.stringify({
+  return buildSSEFrames([
+    { type: 'message_start', message },
+    {
       type: 'content_block_start',
       index: 0,
       content_block: { type: 'tool_use', id: 'toolu_1', name: 'get_tool_definitions', input: {} },
-    })}\n`,
-    `data: ${JSON.stringify({
+    },
+    {
       type: 'content_block_delta',
       index: 0,
       delta: { type: 'input_json_delta', partial_json: '{"tool_names":["search"]}' },
-    })}\n`,
-    `data: ${JSON.stringify({ type: 'content_block_stop', index: 0 })}\n`,
-    `data: ${JSON.stringify({
-      type: 'message_delta',
-      delta: { stop_reason: 'tool_use', stop_sequence: null },
-      usage,
-    })}\n`,
-    `data: ${JSON.stringify({ type: 'message_stop' })}\n`,
-  ];
-  return lines.join('\n');
+    },
+    { type: 'content_block_stop', index: 0 },
+    { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage },
+    { type: 'message_stop' },
+  ]);
 }
 
-function mockFetchWithToolUse(): void {
-  (Anthropic as unknown as ReturnType<typeof vi.fn>).mockImplementation(function MockAnthropic(
-    this: object
-  ) {
-    return this;
-  } as unknown as () => object);
-
-  vi.spyOn(globalThis, 'fetch').mockImplementation(
-    async () =>
-      new Response(buildToolUseSSEBody(), {
-        status: 200,
-        headers: { 'content-type': 'text/event-stream' },
-      })
-  );
+interface Turn {
+  keys: StatusKey[];
+  messages: string[];
+  progress: string[];
+  responses: string[];
 }
 
-async function runTurn(responseLanguage: string): Promise<Captured & { responses: string[] }> {
-  mockFetchWithToolUse();
-  const captured: Captured = { statuses: [], progress: [] };
+async function runTurn(responseLanguage: string): Promise<Turn> {
+  mockAnthropicFetch(buildToolUseSSEBody());
+  const { callbacks, statuses, progress } = createMockCallbacks();
   const result = await orchestrate('test message', {
-    env: createMockEnv(),
+    env: createMockEnv({ MAX_ORCHESTRATION_ITERATIONS: String(MAX_ITERATIONS) }),
     catalog: createMockCatalog(),
     history: [],
     preferences: { response_language: responseLanguage, first_interaction: true },
     logger: createMockLogger(),
-    callbacks: createMockCallbacks(captured),
+    callbacks,
   });
-  return { ...captured, responses: result.responses };
+  return {
+    keys: statuses.map((s) => s.key),
+    messages: statuses.map((s) => s.message),
+    progress,
+    responses: result.responses,
+  };
 }
 
-function expectedStatuses(locale: string): StatusUpdate[] {
-  return [
-    { key: 'status_processing', message: uiString(locale, 'status_processing') },
-    {
-      key: 'status_executing_tools',
-      message: uiString(locale, 'status_executing_tools', { n: 1 }),
-    },
-    { key: 'status_preparing', message: uiString(locale, 'status_preparing') },
-    {
-      key: 'status_executing_tools',
-      message: uiString(locale, 'status_executing_tools', { n: 1 }),
-    },
-  ];
-}
+/** `status_executing_tools` with n = 1, per table (a templated / plural value, so pinned). */
+const EXECUTING_ONE_TOOL = {
+  en: 'Executing 1 tool(s)...',
+  pt: 'Executando 1 ferramenta...',
+} as const;
+
+/** response_language → the table its strings must come from. */
+const LOCALE_CASES = [
+  ['pt', 'pt'],
+  ['en', 'en'],
+  ['sw', 'en'],
+] as const;
 
 describe('Orchestrator status locale (#405)', () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it('emits every status with key + Portuguese message for response_language pt', async () => {
-    const turn = await runTurn('pt');
+  it.each(LOCALE_CASES)(
+    'response_language %s → every status carries its key and the %s table message',
+    async (responseLanguage, table) => {
+      const turn = await runTurn(responseLanguage);
+      const strings = UI_STRINGS[table];
 
-    expect(turn.statuses).toEqual(expectedStatuses('pt'));
-    // Sanity: these really are the pt table values, not English fallbacks.
-    expect(turn.statuses[0]?.message).toBe(UI_STRINGS.pt.status_processing);
-    expect(turn.statuses[1]?.message).toBe('Executando 1 ferramenta(s)...');
-    expect(turn.statuses[2]?.message).toBe(UI_STRINGS.pt.status_preparing);
-  });
+      expect(turn.keys).toEqual([
+        'status_processing',
+        'status_executing_tools',
+        'status_preparing',
+        'status_executing_tools',
+      ]);
+      expect(turn.messages).toEqual([
+        strings.status_processing,
+        EXECUTING_ONE_TOOL[table],
+        strings.status_preparing,
+        EXECUTING_ONE_TOOL[table],
+      ]);
+    }
+  );
 
-  it('emits the English table values for response_language en', async () => {
-    const turn = await runTurn('en');
+  it.each(LOCALE_CASES)(
+    'response_language %s → max-iterations notice is the %s paragraph, pushed to the response and streamed',
+    async (responseLanguage, table) => {
+      const turn = await runTurn(responseLanguage);
+      const notice = UI_STRINGS[table].notice_max_iterations;
 
-    expect(turn.statuses).toEqual(expectedStatuses('en'));
-    expect(turn.statuses.map((s) => s.message)).toEqual([
-      'Processing your request...',
-      'Executing 1 tool(s)...',
-      'Preparing your response...',
-      'Executing 1 tool(s)...',
-    ]);
-  });
-
-  it('falls back to English for an unsupported response_language (sw)', async () => {
-    const turn = await runTurn('sw');
-    expect(turn.statuses).toEqual(expectedStatuses('en'));
-  });
-
-  it('max-iterations: pushed response and onProgress text are the same localized paragraph', async () => {
-    const turn = await runTurn('pt');
-    const notice = uiString('pt', 'notice_max_iterations');
-
-    expect(notice).toBe(UI_STRINGS.pt.notice_max_iterations);
-    expect(turn.responses.at(-1)).toBe(notice);
-    expect(turn.progress).toContain(notice);
-    // And it is not the English paragraph.
-    expect(turn.responses.at(-1)).not.toBe(UI_STRINGS.en.notice_max_iterations);
-  });
-
-  it('max-iterations notice is English for en and for unsupported locales', async () => {
-    const en = await runTurn('en');
-    expect(en.responses.at(-1)).toBe(UI_STRINGS.en.notice_max_iterations);
-    vi.restoreAllMocks();
-    const sw = await runTurn('sw');
-    expect(sw.responses.at(-1)).toBe(UI_STRINGS.en.notice_max_iterations);
-  });
+      expect(turn.responses.at(-1)).toBe(notice);
+      expect(turn.progress).toContain(notice);
+    }
+  );
 
   it('contract: every emitted key is drawn from the closed StatusKey union', async () => {
     const turn = await runTurn('pt');
-    expect(turn.statuses.length).toBeGreaterThan(0);
-    for (const s of turn.statuses) {
-      expect(STATUS_KEYS).toContain(s.key);
-      expect(typeof s.message).toBe('string');
-      expect(s.message.length).toBeGreaterThan(0);
-    }
+    expect(turn.keys.length).toBeGreaterThan(0);
+    for (const key of turn.keys) expect(STATUS_KEYS).toContain(key);
+    for (const message of turn.messages) expect(message.length).toBeGreaterThan(0);
   });
 });

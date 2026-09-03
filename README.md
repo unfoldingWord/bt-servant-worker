@@ -350,7 +350,7 @@ For `POST /api/v1/chat/stream`:
 
 | Event         | Payload                                                  | Description               |
 | ------------- | -------------------------------------------------------- | ------------------------- |
-| `status`      | `{ type: 'status', message: string }`                    | Processing status updates |
+| `status`      | `{ type: 'status', key: StatusKey, message: string }`    | Processing status updates |
 | `progress`    | `{ type: 'progress', text: string }`                     | Streaming text chunks     |
 | `complete`    | `{ type: 'complete', response: ChatResponse }`           | Final response            |
 | `error`       | `{ type: 'error', error: string }`                       | Error message             |
@@ -368,7 +368,8 @@ interface CallbackPayload {
   user_id: string;
   message_key: string;
   timestamp: string;
-  message?: string; // for 'status' type
+  key?: StatusKey; // for 'status' type — stable identifier to branch on (src/i18n/ui-strings.ts)
+  message?: string; // for 'status' type — localized to the user's response_language
   text?: string; // for 'progress' and 'complete' types
   error?: string; // for 'error' type
   voice_audio_url?: string | null; // for 'complete' — TTS audio URL (preferred)
