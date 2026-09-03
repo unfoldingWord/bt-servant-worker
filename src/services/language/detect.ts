@@ -81,9 +81,6 @@ export const LATIN_PREDOMINANCE_RATIO = 0.8;
  * 24-language light set lands on languages it does not know (Indonesian → tr
  * 0.057, Swahili → fi 0.047). It costs one in-set fixture, an English
  * sentence at 0.041, which is recorded as "und": precision over recall.
- * Residual collision accepted for telemetry: Yoruba carries lexical evidence
- * and unique-grams to phantom pl / it @ 1.0 (3 of 4 measured sentences);
- * nothing in tinyld's output distinguishes those hits from real Polish or Italian.
  */
 export const MIN_ACCURACY = 0.06;
 
@@ -118,6 +115,8 @@ const EMOJI_PATTERN = /[\p{Extended_Pictographic}\p{Emoji_Presentation}\uFE0F\u2
 const LETTER_PATTERN = /\p{L}/gu;
 const WORD_PATTERN = /\p{L}+/gu;
 const LATIN_LETTER_PATTERN = /\p{Script=Latin}/gu;
+/** Runs of Latin letters, for {@link latinProjection}. */
+const LATIN_RUN_PATTERN = /\p{Script=Latin}+/gu;
 /** A Latin letter carrying a combining mark; test on the NFD form. Latin-scoped so `が` or `书` cannot stand in. */
 const LATIN_DIACRITIC_PATTERN = /\p{Script=Latin}\p{M}/u;
 /** A whole word of 1–{@link LATIN_LEXICAL_EVIDENCE_SHORT_WORD_MAX_LETTERS} LATIN letters (`の` is not a short word). */
@@ -176,27 +175,39 @@ function isPredominantlyLatin(prepared: string): boolean {
 }
 
 /**
- * Predominantly Latin text needs a short word or a diacritic (see
- * {@link LATIN_LEXICAL_EVIDENCE_SHORT_WORD_MAX_LETTERS}); other text passes.
+ * The Latin-letter runs of the text joined by spaces (NFC first, so a
+ * decomposed diacritic does not split a word). Judged on its own whenever it
+ * is substantial: padding gibberish with Han characters lowers the Latin
+ * share but does not make the Latin tokens any more of a language.
  */
-function hasLexicalEvidence(prepared: string): boolean {
-  if (!isPredominantlyLatin(prepared)) return true;
-  return (
-    SHORT_WORD_PATTERN.test(prepared) || LATIN_DIACRITIC_PATTERN.test(prepared.normalize('NFD'))
-  );
+function latinProjection(prepared: string): string {
+  return (prepared.normalize('NFC').match(LATIN_RUN_PATTERN) ?? []).join(' ');
+}
+
+/** A short Latin word or a Latin letter with a diacritic (see {@link LATIN_LEXICAL_EVIDENCE_SHORT_WORD_MAX_LETTERS}). */
+function hasLatinLexicalEvidence(text: string): boolean {
+  return SHORT_WORD_PATTERN.test(text) || LATIN_DIACRITIC_PATTERN.test(text.normalize('NFD'));
 }
 
 /**
- * Enough letters, enough distinct words (unless a non-Latin-dominant text uses
- * a script without word spacing) and, for predominantly Latin text, lexical
- * evidence — before the detector's vote means anything.
+ * Enough letters, then:
+ *  - a Latin subsequence of at least {@link MIN_LETTERS} letters is judged as
+ *    Latin text on its own (word floor + lexical evidence on the projection),
+ *    whatever else surrounds it;
+ *  - otherwise the word floor applies unless a non-Latin-dominant text uses a
+ *    script without word spacing, and lexical evidence applies only to
+ *    predominantly Latin text.
  */
 function hasEnoughSignal(prepared: string): boolean {
   if (countLetters(prepared) < MIN_LETTERS) return false;
+  const latin = latinProjection(prepared);
+  if (countLetters(latin) >= MIN_LETTERS) {
+    return countDistinctWords(latin) >= MIN_DISTINCT_WORDS && hasLatinLexicalEvidence(latin);
+  }
   const skipWordFloor =
     !isPredominantlyLatin(prepared) && NO_WORD_SPACING_SCRIPT_PATTERN.test(prepared);
   if (!skipWordFloor && countDistinctWords(prepared) < MIN_DISTINCT_WORDS) return false;
-  return hasLexicalEvidence(prepared);
+  return !isPredominantlyLatin(prepared) || hasLatinLexicalEvidence(prepared);
 }
 
 function roundConfidence(value: number): number {
@@ -208,6 +219,11 @@ function roundConfidence(value: number): number {
  * Candidates arrive sorted by `accuracy` descending. `lang` is ISO 639-1 for
  * every language in the light set (pinned by a test over
  * `supportedLanguages`), so no further shape check is needed here.
+ *
+ * Unique-n-gram hits (accuracy 1.0, no runner-up) are accepted as-is. Residual
+ * collision accepted for telemetry: Yoruba carries Latin lexical evidence and
+ * unique-grams to phantom pl / it @ 1.0 (3 of 4 measured sentences); nothing
+ * in tinyld's output distinguishes those hits from real Polish or Italian.
  */
 function pickConfident(
   candidates: ReadonlyArray<{ lang: string; accuracy: number }>

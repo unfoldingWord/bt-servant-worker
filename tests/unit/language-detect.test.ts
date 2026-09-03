@@ -191,10 +191,17 @@ describe('detectWrittenLanguage — mixed-script bypass attempts', () => {
       'one repeated Cyrillic token (ru @ 1.0 if the word floor keyed on Latin predominance alone)',
       'привет привет привет привет привет',
     ],
+    [
+      'keyboard rows + eight 的 (Latin share < 0.8, so a predominance-only gate switched off)',
+      'qwerty asdfgh zxcvbn poiuyt lkjhgf 的的的的的的的的',
+    ],
+    ['one repeated Latin token + eight 的', 'xyzzy xyzzy xyzzy xyzzy 的的的的的的的的'],
+    ['keyboard rows + sixty 的', `qwerty asdfgh zxcvbn poiuyt lkjhgf ${'的'.repeat(60)}`],
   ])('returns null for %s', (_label, text) => {
-    // ≥ 80% Latin letters: the short-word and diacritic predicates are
-    // Latin-scoped, so one appended CJK character is not evidence, and the
-    // word floor still applies. Word-spaced non-Latin text keeps the floor too.
+    // The Latin subsequence is judged on its own whenever it has ≥ 20 letters
+    // (word floor + Latin-scoped lexical evidence), however much CJK is added;
+    // one appended CJK character is not evidence either. Word-spaced non-Latin
+    // text keeps the word floor.
     expect(detectWrittenLanguage(text, createMockLogger())).toBeNull();
   });
 });
