@@ -1,6 +1,6 @@
 {
   "name": "bt-servant-worker",
-  "version": "2.43.0",
+  "version": "2.43.1",
   "private": true,
   "type": "module",
   "scripts": {
@@ -84,7 +84,7 @@
       "@opentelemetry/core": "^2.8.0",
       "@opentelemetry/sdk-metrics": "2.10.0",
       "express-rate-limit": ">=8.2.2",
-      "fast-uri": ">=3.1.5 <4",
+      "fast-uri": ">=3.1.6 <4",
       "ip-address": ">=10.3.1",
       "@hono/node-server": ">=2.0.5",
       "path-to-regexp": ">=8.4.0",
