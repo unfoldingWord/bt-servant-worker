@@ -130,9 +130,9 @@ function isSafeStringKey(key: string): boolean {
  * Exact keys whose NUMERIC values are exempt from the sensitive-key mask.
  *
  * `SENSITIVE_KEY_PATTERN` matches any key containing "token". That is correct
- * for credentials, but it also catches the Anthropic usage counters, which are
- * small integers describing billing volume and cannot carry a credential or
- * message content. Masking them is worse than data loss: it replaces a number
+ * for credentials, but it also catches the Anthropic usage counters (and the
+ * billable counter derived from them), which are small integers describing
+ * billing volume and cannot carry a credential or message content. Masking them is worse than data loss: it replaces a number
  * with the string `[REDACTED]`, flipping the attribute's type in the sink.
  *
  * Renaming the fields is not an option — `/token/i` matches any substring, and
@@ -148,6 +148,9 @@ const SAFE_NUMERIC_ATTRIBUTE_KEYS = new Set([
   'output_tokens',
   'cache_creation_input_tokens',
   'cache_read_input_tokens',
+  // Computed by the orchestrator from the four counters above (cache-weighted
+  // input cost). Emitted on `chat_turn` and consumed by the D1 sink for spend.
+  'billable_input_tokens',
 ]);
 
 /**
