@@ -93,6 +93,9 @@ const TH = [
   'ฉันกำลังแปลพระกิตติคุณมาระโกเป็นภาษาแม่ของฉัน',
 ];
 
+/** A word-spaced non-Latin script: the distinct-word floor still applies and real prose passes it. */
+const RU = ['Я перевожу Евангелие от Марка на свой родной язык.'];
+
 /**
  * `[expected code, fixtures]`: plain prose sentences of 20–200 characters.
  * Every Latin-script fixture carries a short word or a diacritic, which the
@@ -106,6 +109,7 @@ const FIXTURES: ReadonlyArray<[string, readonly string[]]> = [
   ['zh', ZH],
   ['ja', JA],
   ['th', TH],
+  ['ru', RU],
 ];
 
 describe('detectWrittenLanguage — fixture set', () => {
@@ -116,28 +120,6 @@ describe('detectWrittenLanguage — fixture set', () => {
       expect(result?.confidence).toBeGreaterThanOrEqual(MIN_CONFIDENCE);
       expect(result?.confidence).toBeLessThanOrEqual(1);
     });
-  });
-
-  it('records a deliberate recall loss: an English sentence below MIN_ACCURACY is null', () => {
-    // tinyld scores this sentence en 0.041 — inside the band where the light
-    // set lands on languages it does not know (Indonesian → tr 0.057). No
-    // accuracy or margin cut separates the two, so the band is set to null
-    // both: "und" for one English sentence is a truthful record, "tr" for an
-    // Indonesian speaker is not. Lowering MIN_ACCURACY below 0.057 to recover
-    // this sentence would re-admit the Indonesian misread.
-    //
-    // Residual out-of-set collision, accepted for telemetry: Yoruba (Latin
-    // script with diacritics and short words, so it carries lexical evidence)
-    // unique-grams to phantom in-set codes. Measured on four sentences: three
-    // read pl / it / it @ 1.0, one gates out at it 0.54 / margin 0.14. Nothing
-    // in tinyld's output distinguishes those hits from real Polish or Italian.
-    expect(MIN_ACCURACY).toBe(0.06);
-    expect(
-      detectWrittenLanguage(
-        'We need help understanding this difficult passage.',
-        createMockLogger()
-      )
-    ).toBeNull();
   });
 
   it('returns null rather than a guess on a pt/it/es near-tie', () => {
@@ -160,6 +142,60 @@ describe('detectWrittenLanguage — fixture set', () => {
     for (const iso3 of tinyld.supportedLanguages) {
       expect(tinyld.toISO2(iso3)).toMatch(/^[a-z]{2}$/);
     }
+  });
+});
+
+describe('detectWrittenLanguage — documented recall losses (precision over recall)', () => {
+  it('an English sentence below MIN_ACCURACY is null', () => {
+    // tinyld scores this sentence en 0.041 — inside the band where the light
+    // set lands on languages it does not know (Indonesian → tr 0.057). No
+    // accuracy or margin cut separates the two, so the band is set to null
+    // both: "und" for one English sentence is a truthful record, "tr" for an
+    // Indonesian speaker is not. Lowering MIN_ACCURACY below 0.057 to recover
+    // this sentence would re-admit the Indonesian misread.
+    expect(MIN_ACCURACY).toBe(0.06);
+    expect(
+      detectWrittenLanguage(
+        'We need help understanding this difficult passage.',
+        createMockLogger()
+      )
+    ).toBeNull();
+  });
+
+  it.each([
+    'Biblical translators frequently discuss covenant terminology during weekly workshops together.',
+    'Translation teams gather weekly, comparing several versions before deciding anything.',
+  ])('real English with no word of ≤ 3 letters and no diacritic is null: %s', (text) => {
+    // The Latin lexical-evidence gate cannot tell these from a keyboard-row
+    // list (both unique-gram to an in-set code @ 1.0 or clear the floors), so
+    // it nulls both. Accepted for telemetry: such sentences are rare in chat,
+    // and "und" is a truthful record where "ro" for gibberish is not.
+    expect(detectWrittenLanguage(text, createMockLogger())).toBeNull();
+  });
+});
+
+describe('detectWrittenLanguage — mixed-script bypass attempts', () => {
+  it.each([
+    [
+      'keyboard rows + の (ja @ 1.0 without Latin-scoped predicates)',
+      'qwerty asdfgh zxcvbn poiuyt lkjhgf の',
+    ],
+    ['keyboard rows + 书 (zh @ 1.0)', 'qwerty asdfgh zxcvbn poiuyt lkjhgf 书'],
+    ['keyboard rows + が (ja @ 1.0)', 'qwerty asdfgh zxcvbn poiuyt lkjhgf が'],
+    ['low-entropy list + の (ja @ 1.0)', 'aaaa bbbb cccc dddd eeee ffff の'],
+    [
+      'one repeated Latin token + の (ja @ 1.0 if the word floor keyed on any CJK letter)',
+      'xyzzy xyzzy xyzzy xyzzy の',
+    ],
+    [
+      'one repeated Cyrillic token (ru @ 1.0 if the word floor keyed on Latin predominance alone)',
+      'привет привет привет привет привет',
+    ],
+  ])('returns null for %s', (_label, text) => {
+    // ≥ 80% Latin letters: the short-word and diacritic predicates are
+    // Latin-scoped, so one appended CJK character is not evidence, and the
+    // word floor still applies. Word-spaced non-Latin text keeps the floor too.
+    expect(detectWrittenLanguage(text, createMockLogger())).toBeNull();
   });
 });
 

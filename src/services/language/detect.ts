@@ -51,8 +51,8 @@ export const MIN_LETTERS = 20;
  * Minimum distinct words in the prepared text. tinyld scores word by word,
  * so one token repeated is one vote counted many times, not evidence of a
  * language (`xyzzy xyzzy xyzzy xyzzy xyzzy` otherwise reads as pl @ 0.99).
- * Not applied to scripts written without word spacing (see
- * {@link NO_WORD_SPACING_SCRIPT_PATTERN}).
+ * Skipped only for text that is not predominantly Latin AND contains a script
+ * written without word spacing (see {@link NO_WORD_SPACING_SCRIPT_PATTERN}).
  */
 export const MIN_DISTINCT_WORDS = 4;
 
@@ -81,6 +81,9 @@ export const LATIN_PREDOMINANCE_RATIO = 0.8;
  * 24-language light set lands on languages it does not know (Indonesian → tr
  * 0.057, Swahili → fi 0.047). It costs one in-set fixture, an English
  * sentence at 0.041, which is recorded as "und": precision over recall.
+ * Residual collision accepted for telemetry: Yoruba carries lexical evidence
+ * and unique-grams to phantom pl / it @ 1.0 (3 of 4 measured sentences);
+ * nothing in tinyld's output distinguishes those hits from real Polish or Italian.
  */
 export const MIN_ACCURACY = 0.06;
 
@@ -115,17 +118,19 @@ const EMOJI_PATTERN = /[\p{Extended_Pictographic}\p{Emoji_Presentation}\uFE0F\u2
 const LETTER_PATTERN = /\p{L}/gu;
 const WORD_PATTERN = /\p{L}+/gu;
 const LATIN_LETTER_PATTERN = /\p{Script=Latin}/gu;
-/** Any combining mark after NFD: a letter carrying a diacritic. */
-const COMBINING_MARK_PATTERN = /\p{M}/u;
-/** A whole word of 1–{@link LATIN_LEXICAL_EVIDENCE_SHORT_WORD_MAX_LETTERS} letters. */
+/** A Latin letter carrying a combining mark; test on the NFD form. Latin-scoped so `が` or `书` cannot stand in. */
+const LATIN_DIACRITIC_PATTERN = /\p{Script=Latin}\p{M}/u;
+/** A whole word of 1–{@link LATIN_LEXICAL_EVIDENCE_SHORT_WORD_MAX_LETTERS} LATIN letters (`の` is not a short word). */
 const SHORT_WORD_PATTERN = new RegExp(
-  `(?<!\\p{L})\\p{L}{1,${LATIN_LEXICAL_EVIDENCE_SHORT_WORD_MAX_LETTERS}}(?!\\p{L})`,
+  `(?<!\\p{L})\\p{Script=Latin}{1,${LATIN_LEXICAL_EVIDENCE_SHORT_WORD_MAX_LETTERS}}(?!\\p{L})`,
   'u'
 );
 /**
  * Scripts in tinyld's set that are written without spaces between words
  * (Chinese, Japanese, Thai). Word counting is meaningless there, and their
- * unique n-grams are strong, so such text goes straight to the detector.
+ * unique n-grams are strong, so text dominated by them skips the word floor.
+ * Only when the text is NOT predominantly Latin: a Latin gibberish list with
+ * one appended CJK character is still counted in words.
  */
 const NO_WORD_SPACING_SCRIPT_PATTERN =
   /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Thai}]/u;
@@ -177,22 +182,20 @@ function isPredominantlyLatin(prepared: string): boolean {
 function hasLexicalEvidence(prepared: string): boolean {
   if (!isPredominantlyLatin(prepared)) return true;
   return (
-    SHORT_WORD_PATTERN.test(prepared) || COMBINING_MARK_PATTERN.test(prepared.normalize('NFD'))
+    SHORT_WORD_PATTERN.test(prepared) || LATIN_DIACRITIC_PATTERN.test(prepared.normalize('NFD'))
   );
 }
 
 /**
- * Enough letters, enough distinct words (where words are space-delimited) and,
- * for Latin script, lexical evidence — before the detector's vote means anything.
+ * Enough letters, enough distinct words (unless a non-Latin-dominant text uses
+ * a script without word spacing) and, for predominantly Latin text, lexical
+ * evidence — before the detector's vote means anything.
  */
 function hasEnoughSignal(prepared: string): boolean {
   if (countLetters(prepared) < MIN_LETTERS) return false;
-  if (
-    !NO_WORD_SPACING_SCRIPT_PATTERN.test(prepared) &&
-    countDistinctWords(prepared) < MIN_DISTINCT_WORDS
-  ) {
-    return false;
-  }
+  const skipWordFloor =
+    !isPredominantlyLatin(prepared) && NO_WORD_SPACING_SCRIPT_PATTERN.test(prepared);
+  if (!skipWordFloor && countDistinctWords(prepared) < MIN_DISTINCT_WORDS) return false;
   return hasLexicalEvidence(prepared);
 }
 
