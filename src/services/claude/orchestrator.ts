@@ -1543,6 +1543,25 @@ function buildSeedMessages(
   ];
 }
 
+/**
+ * The env-derived execution limits, lifted out of `createOrchestrationContext`
+ * so that function stays within the repo's 50-line budget. Pure projection --
+ * the field names and values are identical to reading `config` inline.
+ */
+function executionLimits(
+  config: ReturnType<typeof parseEnvConfig>
+): Pick<
+  OrchestrationContext,
+  'codeExecTimeout' | 'maxMcpCalls' | 'maxMcpResponseSize' | 'maxMcpCallsPerRequest'
+> {
+  return {
+    codeExecTimeout: config.codeExecTimeout,
+    maxMcpCalls: config.maxMcpCalls,
+    maxMcpResponseSize: config.maxMcpResponseSize,
+    maxMcpCallsPerRequest: config.maxMcpCallsPerRequest,
+  };
+}
+
 function createOrchestrationContext(
   userMessage: string,
   options: OrchestratorOptions,
@@ -1576,10 +1595,7 @@ function createOrchestrationContext(
     messages: buildSeedMessages(userMessage, options, llmMax),
     responses: [],
     lastIterationStartIndex: 0,
-    codeExecTimeout: config.codeExecTimeout,
-    maxMcpCalls: config.maxMcpCalls,
-    maxMcpResponseSize: config.maxMcpResponseSize,
-    maxMcpCallsPerRequest: config.maxMcpCallsPerRequest,
+    ...executionLimits(config),
     mcpCallsMade: { count: 0 },
     turnId: options.turnId,
     telemetry: createTelemetryAccumulator(),
