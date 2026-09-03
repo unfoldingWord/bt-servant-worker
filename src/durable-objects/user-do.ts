@@ -762,6 +762,14 @@ export class UserDO {
     const messageId = crypto.randomUUID();
     const workerOrigin = request.headers.get('X-Worker-Origin') ?? '';
 
+    // Locale for everything the worker says in its own voice on this request
+    // (#405). Resolved BEFORE the busy check on purpose: nothing may yield
+    // between inspecting the lock and enqueueing, or an active turn that
+    // finishes in the gap drains an empty queue and this request is left to
+    // alarm(), which cannot reach Anthropic (see below). One cached read,
+    // shared by the immediate and queued paths.
+    const locale = await this.readStatusLocale(body, logger);
+
     // Try to process immediately in the fetch handler if idle.
     // Outbound fetch to api.anthropic.com fails from DO alarm() contexts
     // (Cloudflare 1003), so we MUST process in the fetch handler.
@@ -773,12 +781,12 @@ export class UserDO {
         transport,
       });
       if (transport === 'final') {
-        return this.processImmediateFinal(body, workerOrigin, messageId, logger);
+        return this.processImmediateFinal(body, workerOrigin, messageId, locale, logger);
       }
       if (transport === 'callback') {
-        return this.processImmediateCallback(body, workerOrigin, messageId, logger);
+        return this.processImmediateCallback(body, workerOrigin, messageId, locale, logger);
       }
-      return this.processImmediateSSE(body, workerOrigin, messageId, logger);
+      return this.processImmediateSSE(body, workerOrigin, messageId, locale, logger);
     }
 
     // DO is busy. The final transport cannot queue because we have no
@@ -803,23 +811,26 @@ export class UserDO {
       );
     }
 
-    return this.enqueueAndReturn(body, messageId, workerOrigin, transport === 'callback', logger);
+    return this.enqueueAndReturn(body, messageId, workerOrigin, locale, logger);
   }
 
-  /** Enqueue a message and return 202 (callback) or SSE stream (SSE delivery). */
+  /**
+   * Enqueue a message and return 202 (callback) or SSE stream (SSE delivery).
+   * Delivery follows `body._transport`, stamped by `dispatchUnifiedChat`.
+   *
+   * No await may precede `enqueueEntry` here or sit between it and the SSE
+   * writer registration: the caller already resolved `locale` (the queued
+   * notice is localized, #405), so the busy check → enqueue → register
+   * sequence never yields to a finishing turn's drain.
+   */
   private async enqueueAndReturn(
     body: ChatRequest,
     messageId: string,
     workerOrigin: string,
-    isCallbackDelivery: boolean,
+    locale: string,
     logger: RequestLogger
   ): Promise<Response> {
-    // The queued notice is localized (#405), so its locale is resolved BEFORE
-    // the entry exists. Once enqueued, the SSE writer must be registered with
-    // no intervening await: a drain that lands in that gap processes the entry
-    // with no writer (every event dropped) and the late-registered writer is
-    // never closed, so the client hangs. One cached preferences read.
-    const locale = await this.readStatusLocale(body, logger);
+    const isCallbackDelivery = body._transport === 'callback';
     const entry: InternalQueueEntry = {
       message_id: messageId,
       body: { ...body, _worker_origin: workerOrigin },
@@ -890,15 +901,12 @@ export class UserDO {
     body: ChatRequest,
     workerOrigin: string,
     messageId: string,
+    locale: string,
     logger: RequestLogger
   ): Promise<Response> {
     const timing = createTimingContext();
-    // Resolved inside the try: if the read ever throws, the lock release and
-    // drain below must still run, and the error still reach the caller.
-    let locale = DEFAULT_PREFERENCES.response_language;
     let response: Response;
     try {
-      locale = await this.readStatusLocale(body, logger);
       const chatResponse = await this.processChat(body, workerOrigin, logger, timing);
       logger.log('immediate_final_complete', { message_id: messageId });
       response = Response.json({ message_id: messageId, ...chatResponse });
@@ -971,16 +979,14 @@ export class UserDO {
     body: ChatRequest,
     workerOrigin: string,
     messageId: string,
+    locale: string,
     logger: RequestLogger
   ): Response {
     // Start processing in background — return 202 immediately
     (async () => {
       const timing = createTimingContext();
       const callbacks = this.buildWebhookCallbacks(body, logger);
-      // Resolved inside the try so the finally (lock release, drain) always runs.
-      let locale = DEFAULT_PREFERENCES.response_language;
       try {
-        locale = await this.readStatusLocale(body, logger);
         const response = await this.processChat(body, workerOrigin, logger, timing, callbacks);
         await callbacks?.onComplete?.(response);
         logger.log('immediate_callback_complete', { message_id: messageId });
@@ -1005,6 +1011,7 @@ export class UserDO {
     body: ChatRequest,
     workerOrigin: string,
     messageId: string,
+    locale: string,
     logger: RequestLogger
   ): Response {
     const { readable, writable } = new TransformStream<Uint8Array>();
@@ -1022,11 +1029,7 @@ export class UserDO {
 
     // Process in background — the Response is returned immediately with the SSE stream
     (async () => {
-      // Resolved inside the try so the finally (writer close, lock release,
-      // drain) always runs, even if the read itself throws.
-      let locale = DEFAULT_PREFERENCES.response_language;
       try {
-        locale = await this.readStatusLocale(body, logger);
         const timing = createTimingContext();
         const response = await this.processChat(body, workerOrigin, logger, timing, callbacks);
         await sendEvent({ type: 'complete', response });

@@ -63,13 +63,20 @@ type PhaseCtx = { timing: TimingContext; logger: RequestLogger; startTime: numbe
 
 /** The private surface this test reaches into. Kept in one place so a rename is one edit. */
 interface UserDOInternals {
+  dispatchUnifiedChat(
+    body: ChatRequest,
+    request: Request,
+    transport: 'sse' | 'callback' | 'final',
+    logger: RequestLogger
+  ): Promise<Response>;
   enqueueAndReturn(
     body: ChatRequest,
     messageId: string,
     workerOrigin: string,
-    isCallbackDelivery: boolean,
+    locale: string,
     logger: RequestLogger
   ): Promise<Response>;
+  releaseLock(): Promise<void>;
   createQueuedSSEStream(locale: string, messageId: string, logger: RequestLogger): Response;
   drainQueue(logger: RequestLogger): Promise<void>;
   processChat(
@@ -82,24 +89,6 @@ interface UserDOInternals {
   readStatusLocale(body: ChatRequest, logger: RequestLogger): Promise<string>;
   processCallbackEntry(entry: InternalQueueEntry, logger: RequestLogger): Promise<void>;
   buildWebhookCallbacks(body: ChatRequest, logger: RequestLogger): StreamCallbacks | undefined;
-  processImmediateFinal(
-    body: ChatRequest,
-    workerOrigin: string,
-    messageId: string,
-    logger: RequestLogger
-  ): Promise<Response>;
-  processImmediateCallback(
-    body: ChatRequest,
-    workerOrigin: string,
-    messageId: string,
-    logger: RequestLogger
-  ): Response;
-  processImmediateSSE(
-    body: ChatRequest,
-    workerOrigin: string,
-    messageId: string,
-    logger: RequestLogger
-  ): Response;
   loadChatContext(
     body: ChatRequest,
     ctx: PhaseCtx,
@@ -189,10 +178,6 @@ function createDO(opts: FakeStorageOptions = {}): UserDOInternals {
 
 /** Storage key the DO uses for its processing lock (`PROCESSING_LOCK_KEY`). */
 const PROCESSING_LOCK_KEY = '_processing_lock';
-
-function lockReleased(state: DurableObjectState): boolean {
-  return vi.mocked(state.storage.delete).mock.calls.some(([key]) => key === PROCESSING_LOCK_KEY);
-}
 
 function createCallbacks(statuses: StatusUpdate[]): StreamCallbacks {
   return {
@@ -374,36 +359,78 @@ describe('UserDO queued SSE notice (#405)', () => {
   });
 });
 
-describe('UserDO queued SSE stream registration (#405 review P1)', () => {
-  it('a drain that lands during the locale read still delivers every event to the queued client and closes the stream', async () => {
-    const prefsGate = deferred<UserPreferencesInternal>();
-    const userDo = createDO({ preferences: prefsGate.promise });
-    const logger = createMockLogger();
-    // The turn is stubbed but still reports through the stream's own callbacks,
-    // so the queued notice → first turn status ordering is asserted on one wire.
-    const processChat = vi
-      .spyOn(userDo, 'processChat')
-      .mockImplementation(async (_body, _origin, turnLogger, _timing, callbacks) => {
-        await createStatusEmitter(callbacks, 'pt', turnLogger)?.('status_processing');
-        return FAKE_RESPONSE;
-      });
+/** Stub the turn so it reports `status_processing` through the stream's own callbacks. */
+function stubTurn(userDo: UserDOInternals) {
+  return vi
+    .spyOn(userDo, 'processChat')
+    .mockImplementation(async (_body, _origin, turnLogger, _timing, callbacks) => {
+      await createStatusEmitter(callbacks, 'pt', turnLogger)?.('status_processing');
+      return FAKE_RESPONSE;
+    });
+}
 
-    // Client request arrives while the DO is busy: it is queued for SSE delivery.
-    const pending = userDo.enqueueAndReturn(textBody, 'msg-race', '', false, logger);
+describe('UserDO chat dispatch: the locale read never yields between busy check and enqueue (#405 review round 4)', () => {
+  it('active turn finishes while the preferences read is pending → this request runs in the fetch context, not alarm()', async () => {
+    const prefsGate = deferred<UserPreferencesInternal>();
+    const state = createFakeState({ preferences: prefsGate.promise });
+    const userDo = createDOFromState(state);
+    const logger = createMockLogger();
+    const processChat = stubTurn(userDo);
+    await state.storage.put(PROCESSING_LOCK_KEY, Date.now()); // another turn is active
+
+    const pending = userDo.dispatchUnifiedChat(
+      textBody,
+      new Request('https://do.test/chat'),
+      'sse',
+      logger
+    );
     await settle(); // runs up to the (still pending) preferences read
 
-    // The active turn finishes now and drains the queue while that read is pending.
+    // The active turn finishes now: releases the lock and drains an (empty) queue.
+    await userDo.releaseLock();
     await userDo.drainQueue(logger);
 
     prefsGate.resolve(PT_PREFS);
     const res = await pending;
+    const events = await readSSEEvents(res); // fails the test if the writer never closes
+
+    expect(state.storage.setAlarm).not.toHaveBeenCalled(); // never handed to alarm()
+    expect(processChat).toHaveBeenCalledTimes(1);
+    expect(events.map((e) => e.type)).toEqual(['status', 'complete']);
+    expect(events[0]).toEqual({
+      type: 'status',
+      key: 'status_processing',
+      message: UI_STRINGS.pt.status_processing,
+    });
+  });
+});
+
+describe('UserDO chat dispatch: busy DO queues with the localized notice (#405 review P1)', () => {
+  it('DO stays busy → the request is queued with the localized notice and drained in order', async () => {
+    const prefsGate = deferred<UserPreferencesInternal>();
+    const state = createFakeState({ preferences: prefsGate.promise });
+    const userDo = createDOFromState(state);
+    const logger = createMockLogger();
+    const processChat = stubTurn(userDo);
+    await state.storage.put(PROCESSING_LOCK_KEY, Date.now()); // another turn is active
+
+    const pending = userDo.dispatchUnifiedChat(
+      textBody,
+      new Request('https://do.test/chat'),
+      'sse',
+      logger
+    );
+    await settle();
+    prefsGate.resolve(PT_PREFS);
+    const res = await pending;
 
     // The client reads concurrently (a TransformStream backpressures otherwise)
-    // while the alarm fires for whatever is (still) queued.
+    // while the active turn finishes and drains the queue.
     const eventsPending = readSSEEvents(res);
+    await userDo.releaseLock();
     await userDo.drainQueue(logger);
-
     const events = await eventsPending;
+
     expect(processChat).toHaveBeenCalledTimes(1);
     expect(events.map((e) => e.type)).toEqual(['status', 'status', 'complete']);
     const statuses = events.filter((e): e is SSEStatusEvent => e.type === 'status');
@@ -421,7 +448,7 @@ describe('UserDO queued transports release resources when the locale read throws
     const logger = createMockLogger();
     const processChat = vi.spyOn(userDo, 'processChat').mockResolvedValue(FAKE_RESPONSE);
 
-    const res = await userDo.enqueueAndReturn(textBody, 'msg-q-fail', '', false, logger);
+    const res = await userDo.enqueueAndReturn(textBody, 'msg-q-fail', '', 'pt', logger);
     // The queued notice already resolved its locale; the turn's own read fails.
     vi.spyOn(userDo, 'readStatusLocale').mockRejectedValue(readFailure);
 
@@ -462,66 +489,6 @@ describe('UserDO queued transports release resources when the locale read throws
 
     expect(onError).toHaveBeenCalledWith('locale read exploded');
     expect(processChat).not.toHaveBeenCalled();
-  });
-});
-
-describe('UserDO immediate transports release resources when the locale read throws (#405 review M1)', () => {
-  const readFailure = new Error('locale read exploded');
-
-  it('SSE: the error reaches the client, the writer closes and the lock is released', async () => {
-    const state = createFakeState();
-    const userDo = createDOFromState(state);
-    const logger = createMockLogger();
-    vi.spyOn(userDo, 'readStatusLocale').mockRejectedValue(readFailure);
-    const processChat = vi.spyOn(userDo, 'processChat').mockResolvedValue(FAKE_RESPONSE);
-
-    const res = userDo.processImmediateSSE(textBody, '', 'msg-sse-fail', logger);
-    const events = await readSSEEvents(res); // fails the test if the writer never closes
-    await settle(); // the lock release follows the writer close by a microtask
-
-    expect(events).toEqual([{ type: 'error', error: 'locale read exploded' }]);
-    expect(processChat).not.toHaveBeenCalled();
-    expect(lockReleased(state)).toBe(true);
-    expect(logger.error).toHaveBeenCalledWith(
-      'immediate_sse_error',
-      readFailure,
-      expect.objectContaining({ message_id: 'msg-sse-fail' })
-    );
-  });
-
-  it('callback: the failure is logged and the lock is released', async () => {
-    const state = createFakeState();
-    const userDo = createDOFromState(state);
-    const logger = createMockLogger();
-    vi.spyOn(userDo, 'readStatusLocale').mockRejectedValue(readFailure);
-
-    const res = userDo.processImmediateCallback(textBody, '', 'msg-cb-fail', logger);
-    expect(res.status).toBe(202);
-    await settle();
-
-    expect(lockReleased(state)).toBe(true);
-    expect(logger.error).toHaveBeenCalledWith(
-      'immediate_callback_error',
-      readFailure,
-      expect.objectContaining({ message_id: 'msg-cb-fail' })
-    );
-  });
-
-  it('final: a 500 with the English fallback title is returned and the lock is released', async () => {
-    const state = createFakeState();
-    const userDo = createDOFromState(state);
-    const logger = createMockLogger();
-    vi.spyOn(userDo, 'readStatusLocale').mockRejectedValue(readFailure);
-
-    const res = await userDo.processImmediateFinal(textBody, '', 'msg-final-fail', logger);
-    await settle(); // lock release + drain run in the background after the response
-
-    expect(res.status).toBe(500);
-    expect(await res.json()).toMatchObject({
-      error: UI_STRINGS.en.error_processing_failed,
-      message: 'locale read exploded',
-    });
-    expect(lockReleased(state)).toBe(true);
   });
 });
 
@@ -700,7 +667,7 @@ describe('SSE status contract (#405)', () => {
       }
     );
 
-    const res = await userDo.enqueueAndReturn(audioBody, 'msg-c', '', false, logger);
+    const res = await userDo.enqueueAndReturn(audioBody, 'msg-c', '', 'pt', logger);
     const eventsPending = readSSEEvents(res);
     await userDo.drainQueue(logger);
     const events = await eventsPending;
