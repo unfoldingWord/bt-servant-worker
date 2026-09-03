@@ -816,6 +816,12 @@ export class UserDO {
     isCallbackDelivery: boolean,
     logger: RequestLogger
   ): Promise<Response> {
+    // The queued notice is localized (#405), so its locale is resolved BEFORE
+    // the entry exists. Once enqueued, the SSE writer must be registered with
+    // no intervening await: a drain that lands in that gap processes the entry
+    // with no writer (every event dropped) and the late-registered writer is
+    // never closed, so the client hangs. One cached preferences read.
+    const locale = await this.readStatusLocale(body, logger);
     const entry: InternalQueueEntry = {
       message_id: messageId,
       body: { ...body, _worker_origin: workerOrigin },
@@ -859,7 +865,7 @@ export class UserDO {
       return Response.json({ message_id: messageId }, { status: 202 });
     }
 
-    return this.createQueuedSSEStream(body, messageId, logger);
+    return this.createQueuedSSEStream(locale, messageId, logger);
   }
 
   /**
@@ -1032,15 +1038,15 @@ export class UserDO {
 
   /**
    * Create an SSE stream for a queued message. Events flow when the alarm
-   * processes it. The queued notice fires before the turn loads its context,
-   * so the locale comes from one cheap preferences read here (#405).
+   * processes it. Synchronous on purpose: the writer is registered before
+   * any await can let a drain run (see `enqueueAndReturn`). `locale` is for
+   * the queued notice (#405).
    */
-  private async createQueuedSSEStream(
-    body: ChatRequest,
+  private createQueuedSSEStream(
+    locale: string,
     messageId: string,
     logger: RequestLogger
-  ): Promise<Response> {
-    const locale = await this.readStatusLocale(body, logger);
+  ): Response {
     const { readable, writable } = new TransformStream<Uint8Array>();
     const writer = writable.getWriter();
     const encoder = new TextEncoder();

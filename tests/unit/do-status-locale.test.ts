@@ -32,11 +32,15 @@ import {
 } from '../../src/services/audio/index.js';
 import { STATUS_KEYS, UI_STRINGS, type StatusUpdate } from '../../src/i18n/ui-strings.js';
 import type {
+  ChatHistoryEntry,
   ChatRequest,
+  ChatResponse,
+  SSEEvent,
   SSEStatusEvent,
   StreamCallbacks,
   UserPreferencesInternal,
 } from '../../src/types/engine.js';
+import type { TimingContext } from '../../src/utils/timing.js';
 import type { RequestLogger } from '../../src/utils/logger.js';
 import type { Env } from '../../src/config/types.js';
 
@@ -55,11 +59,23 @@ const PT_PREFS: UserPreferencesInternal = { response_language: 'pt', first_inter
 
 /** The private surface this test reaches into. Kept in one place so a rename is one edit. */
 interface UserDOInternals {
-  createQueuedSSEStream(
+  enqueueAndReturn(
     body: ChatRequest,
     messageId: string,
+    workerOrigin: string,
+    isCallbackDelivery: boolean,
     logger: RequestLogger
   ): Promise<Response>;
+  createQueuedSSEStream(locale: string, messageId: string, logger: RequestLogger): Response;
+  drainQueue(logger: RequestLogger): Promise<void>;
+  processChat(
+    body: ChatRequest,
+    workerOrigin: string,
+    logger: RequestLogger,
+    timing: TimingContext,
+    callbacks?: StreamCallbacks
+  ): Promise<ChatResponse>;
+  readStatusLocale(body: ChatRequest, logger: RequestLogger): Promise<string>;
   transcribeAudioMessage(
     body: ChatRequest,
     logger: RequestLogger,
@@ -88,28 +104,70 @@ function createMockLogger(): RequestLogger {
   return { log: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as RequestLogger;
 }
 
-function createFakeState(prefs: UserPreferencesInternal | Error): DurableObjectState {
-  const storage = {
-    get: vi.fn(async (key: string) => {
-      if (key !== 'preferences') return undefined;
-      if (prefs instanceof Error) throw prefs;
-      return prefs;
-    }),
-    put: vi.fn(async () => undefined),
-    delete: vi.fn(async () => true),
-  };
-  return { storage } as unknown as DurableObjectState;
+interface FakeStorageOptions {
+  /** Stored preferences; an Error makes the read throw; a Promise gates it. */
+  preferences?: UserPreferencesInternal | Error | Promise<UserPreferencesInternal>;
+  /** Gate the history read (defaults to an immediate empty history). */
+  history?: Promise<ChatHistoryEntry[]>;
 }
 
-function createDO(prefs: UserPreferencesInternal | Error = PT_PREFS): UserDOInternals {
+/**
+ * Map-backed DurableObjectState. Enough of the storage API for the queue
+ * (`enqueueAndReturn` / `drainQueue`): get/put/delete, `setAlarm`, and a
+ * `blockConcurrencyWhile` that just runs its callback.
+ */
+function createFakeState(opts: FakeStorageOptions = {}): DurableObjectState {
+  const store = new Map<string, unknown>();
+  const storage = {
+    get: vi.fn(async (key: string) => {
+      if (key === 'preferences') {
+        const prefs = opts.preferences ?? PT_PREFS;
+        if (prefs instanceof Error) throw prefs;
+        return prefs;
+      }
+      if (key === 'history' && opts.history) return opts.history;
+      return store.get(key);
+    }),
+    put: vi.fn(async (key: string, value: unknown) => {
+      store.set(key, value);
+    }),
+    delete: vi.fn(async (key: string) => store.delete(key)),
+    setAlarm: vi.fn(async () => undefined),
+  };
+  return {
+    storage,
+    blockConcurrencyWhile: <T>(fn: () => Promise<T>) => fn(),
+  } as unknown as DurableObjectState;
+}
+
+function createDO(opts: FakeStorageOptions = {}): UserDOInternals {
   const env = {
     DEFAULT_ORG: 'unfoldingWord',
     AI: {},
     OPENAI_API_KEY: 'test-openai-key',
     AUDIO_BUCKET: {},
   } as unknown as Env;
-  return new UserDO(createFakeState(prefs), env) as unknown as UserDOInternals;
+  return new UserDO(createFakeState(opts), env) as unknown as UserDOInternals;
 }
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+/** Yield a macrotask so every pending microtask (storage reads, spans) settles. */
+function settle(): Promise<void> {
+  return new Promise((r) => setTimeout(r, 0));
+}
+
+const FAKE_RESPONSE: ChatResponse = {
+  responses: ['ok'],
+  response_language: 'pt',
+  voice_audio_base64: null,
+};
 
 function createCallbacks(statuses: StatusUpdate[]): StreamCallbacks {
   return {
@@ -134,6 +192,39 @@ const audioBody: ChatRequest = {
   audio_base64: 'AAAA',
   audio_format: 'ogg',
 };
+
+/**
+ * Read every SSE frame until the stream closes. Fails (instead of hanging the
+ * test) if the producer never closes the writer.
+ */
+async function readSSEEvents(res: Response, timeoutMs = 2_000): Promise<SSEEvent[]> {
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`SSE stream did not close within ${timeoutMs}ms`)),
+      timeoutMs
+    );
+  });
+  try {
+    for (;;) {
+      const { value, done } = await Promise.race([reader.read(), timeout]);
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+  return buffer
+    .split('\n\n')
+    .filter((frame) => frame.length > 0)
+    .map((frame) => {
+      expect(frame.startsWith('data: ')).toBe(true);
+      return JSON.parse(frame.slice('data: '.length)) as SSEEvent;
+    });
+}
 
 async function readFirstSSEEvent(res: Response): Promise<SSEStatusEvent> {
   const reader = res.body!.getReader();
@@ -172,7 +263,7 @@ describe('createStatusEmitter', () => {
 describe('UserDO queued SSE notice (#405)', () => {
   it('emits status_queued with the Portuguese message for a pt user', async () => {
     const logger = createMockLogger();
-    const res = await createDO().createQueuedSSEStream(textBody, 'msg-1', logger);
+    const res = createDO().createQueuedSSEStream('pt', 'msg-1', logger);
     expect(res.headers.get('Content-Type')).toBe('text/event-stream');
 
     const event = await readFirstSSEEvent(res);
@@ -184,34 +275,57 @@ describe('UserDO queued SSE notice (#405)', () => {
     expect(event.message).toBe('Na fila — o processamento começará em breve');
   });
 
-  it('honours response_language_hint over the stored preference', async () => {
+  it('readStatusLocale honours response_language_hint over the stored preference', async () => {
     const logger = createMockLogger();
-    const res = await createDO().createQueuedSSEStream(
-      { ...textBody, response_language_hint: 'en' },
-      'msg-2',
-      logger
-    );
-    const event = await readFirstSSEEvent(res);
-    expect(event.message).toBe(UI_STRINGS.en.status_queued);
+    await expect(
+      createDO().readStatusLocale({ ...textBody, response_language_hint: 'en' }, logger)
+    ).resolves.toBe('en');
+    await expect(createDO().readStatusLocale(textBody, logger)).resolves.toBe('pt');
   });
 
-  it('falls back to English and logs when the preferences read fails (no silent catch)', async () => {
+  it('readStatusLocale falls back to English and logs when the preferences read fails (no silent catch)', async () => {
     const logger = createMockLogger();
-    const res = await createDO(new Error('storage unavailable')).createQueuedSSEStream(
-      textBody,
-      'msg-3',
-      logger
-    );
-    const event = await readFirstSSEEvent(res);
-    expect(event).toEqual({
-      type: 'status',
-      key: 'status_queued',
-      message: UI_STRINGS.en.status_queued,
-    });
+    const locale = await createDO({
+      preferences: new Error('storage unavailable'),
+    }).readStatusLocale(textBody, logger);
+    expect(locale).toBe('en');
     expect(logger.warn).toHaveBeenCalledWith(
       'status_locale_read_failed',
       expect.objectContaining({ error: 'storage unavailable' })
     );
+  });
+});
+
+describe('UserDO queued SSE stream registration (#405 review P1)', () => {
+  it('a drain that lands during the locale read still delivers every event to the queued client and closes the stream', async () => {
+    const prefsGate = deferred<UserPreferencesInternal>();
+    const userDo = createDO({ preferences: prefsGate.promise });
+    const logger = createMockLogger();
+    const processChat = vi.spyOn(userDo, 'processChat').mockResolvedValue(FAKE_RESPONSE);
+
+    // Client request arrives while the DO is busy: it is queued for SSE delivery.
+    const pending = userDo.enqueueAndReturn(textBody, 'msg-race', '', false, logger);
+    await settle(); // runs up to the (still pending) preferences read
+
+    // The active turn finishes now and drains the queue while that read is pending.
+    await userDo.drainQueue(logger);
+
+    prefsGate.resolve(PT_PREFS);
+    const res = await pending;
+
+    // The client reads concurrently (a TransformStream backpressures otherwise)
+    // while the alarm fires for whatever is (still) queued.
+    const eventsPending = readSSEEvents(res);
+    await userDo.drainQueue(logger);
+
+    const events = await eventsPending;
+    expect(processChat).toHaveBeenCalledTimes(1);
+    expect(events.map((e) => e.type)).toEqual(['status', 'complete']);
+    expect(events[0]).toEqual({
+      type: 'status',
+      key: 'status_queued',
+      message: UI_STRINGS.pt.status_queued,
+    });
   });
 });
 
@@ -321,8 +435,7 @@ describe('UserDO processing-failed fallback (#405)', () => {
 
   it('uses English for an unsupported stored language', async () => {
     const failure = await createDO({
-      response_language: 'sw',
-      first_interaction: false,
+      preferences: { response_language: 'sw', first_interaction: false },
     }).describeProcessingFailure('boom', textBody, createMockLogger());
     expect(failure.detail).toBe('Processing failed');
   });
@@ -338,9 +451,7 @@ describe('SSE status contract (#405)', () => {
     const logger = createMockLogger();
     await userDo.transcribeAudioMessage(audioBody, logger, emit);
     await userDo.generateVoiceResponse('unfoldingWord', 'u1', ['x'], logger, emit);
-    const queued = await readFirstSSEEvent(
-      await userDo.createQueuedSSEStream(textBody, 'msg-c', logger)
-    );
+    const queued = await readFirstSSEEvent(userDo.createQueuedSSEStream('pt', 'msg-c', logger));
 
     const events: SSEStatusEvent[] = [
       queued,
