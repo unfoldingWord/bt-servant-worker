@@ -2,6 +2,8 @@
  * Template variable replacement for prompt overrides.
  *
  * Supports {{name}} placeholders in prompt text. Unknown variables are left as-is.
+ * Also the interpolation engine for the worker's own UI strings
+ * (`src/i18n/ui-strings.ts`).
  */
 
 import { APP_VERSION } from '../generated/version.js';
@@ -21,12 +23,12 @@ const TEMPLATE_VARIABLES: Record<string, string> = {
  */
 export function replaceTemplateVariables(
   text: string,
-  variables: Record<string, string> = TEMPLATE_VARIABLES
+  variables: Readonly<Record<string, string | number>> = TEMPLATE_VARIABLES
 ): string {
   return text.replace(/\{\{(\w+)\}\}/g, (match, name: string) => {
     // eslint-disable-next-line security/detect-object-injection -- name is from regex match on \w+
     const value = variables[name];
-    return value !== undefined ? value : match;
+    return value !== undefined ? String(value) : match;
   });
 }
 

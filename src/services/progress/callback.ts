@@ -6,6 +6,7 @@
  */
 
 import { Attachment, ChatResponse, ProgressMode, StreamCallbacks } from '../../types/engine.js';
+import type { StatusKey, StatusUpdate } from '../../i18n/ui-strings.js';
 import { RequestLogger, safeAsync } from '../../utils/logger.js';
 import { countMetric } from '../telemetry/index.js';
 
@@ -32,6 +33,9 @@ interface CallbackPayload {
   user_id: string;
   message_key: string;
   timestamp: string;
+  /** Stable status identifier — `type: 'status'` only (#405). */
+  key?: StatusKey;
+  /** Localized status text — `type: 'status'` only. */
   message?: string;
   text?: string;
   error?: string;
@@ -60,8 +64,8 @@ export class ProgressCallbackSender {
     this.logger = logger;
   }
 
-  async sendStatus(message: string): Promise<void> {
-    await this.post({ type: 'status', message });
+  async sendStatus(status: StatusUpdate): Promise<void> {
+    await this.post({ type: 'status', ...status });
   }
 
   accumulateProgress(text: string): void {
@@ -362,13 +366,13 @@ export function createWebhookCallbacks(
   let lastSentText = '';
 
   const callbacks: StreamCallbacks = {
-    onStatus: (message) => {
+    onStatus: (status) => {
       // In 'complete' mode the caller only wants the final completion event.
       // The synchronous 202 response has already signaled "request received",
       // so a status webhook POST would be noise. Matches the docs on
       // ProgressMode.'complete' ("Legacy behavior - only send on completion").
       if (mode === 'complete') return;
-      runSafe(logger, 'webhook_status_failed', () => sender.sendStatus(message));
+      runSafe(logger, 'webhook_status_failed', () => sender.sendStatus(status));
     },
     onProgress: (text) => {
       if (incrementalSender) {

@@ -12,6 +12,8 @@ import Anthropic from '@anthropic-ai/sdk';
 import { Env } from '../../config/types.js';
 import { AudioContext, VOICE_SUBMISSION_PREFIX, voiceSubmissionKeyToUrl } from '../audio/index.js';
 import { ChatHistoryEntry, StreamCallbacks } from '../../types/engine.js';
+import { uiString } from '../../i18n/ui-strings.js';
+import { createStatusEmitter, StatusEmitter } from '../../i18n/status-emitter.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig } from '../../types/org-config.js';
 import {
   DEFAULT_PROMPT_VALUES,
@@ -315,6 +317,13 @@ interface OrchestrationContext {
   catalog: ToolCatalog;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
+  /**
+   * Locale for the notice the orchestrator writes into the response itself
+   * (`notice_max_iterations`). Status lines go through `emitStatus` (#405).
+   */
+  locale: string;
+  /** `callbacks.onStatus` bound to `locale`; `undefined` when there are no callbacks. */
+  emitStatus?: StatusEmitter | undefined;
   healthTracker: HealthTracker;
   memoryStore: UserMemoryStore | undefined;
   modeContext: ModeContext | undefined;
@@ -1334,7 +1343,7 @@ function processIteration(ctx: OrchestrationContext, iteration: number): Promise
 
     if (iteration > 0 && ctx.callbacks) {
       notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress('\n'));
-      notifyCallback(ctx.logger, () => ctx.callbacks?.onStatus('Preparing your response...'));
+      ctx.emitStatus?.('status_preparing');
     }
 
     const response = await callClaudeForIteration(ctx, iteration, iterStart);
@@ -1353,9 +1362,7 @@ function processIteration(ctx: OrchestrationContext, iteration: number): Promise
       return true;
     }
 
-    notifyCallback(ctx.logger, () =>
-      ctx.callbacks?.onStatus(`Executing ${toolCalls.length} tool(s)...`)
-    );
+    ctx.emitStatus?.('status_executing_tools', { n: toolCalls.length });
     const toolResults = await executeIterationTools(toolCalls, ctx, iteration, iterStart);
     ctx.messages.push({ role: 'assistant', content: response.content as Anthropic.ContentBlock[] });
     ctx.messages.push({ role: 'user', content: toolResults });
@@ -1536,12 +1543,32 @@ function buildSeedMessages(
   ];
 }
 
+/**
+ * The env-derived execution limits, lifted out of `createOrchestrationContext`
+ * so that function stays within the repo's 50-line budget. Pure projection --
+ * the field names and values are identical to reading `config` inline.
+ */
+function executionLimits(
+  config: ReturnType<typeof parseEnvConfig>
+): Pick<
+  OrchestrationContext,
+  'codeExecTimeout' | 'maxMcpCalls' | 'maxMcpResponseSize' | 'maxMcpCallsPerRequest'
+> {
+  return {
+    codeExecTimeout: config.codeExecTimeout,
+    maxMcpCalls: config.maxMcpCalls,
+    maxMcpResponseSize: config.maxMcpResponseSize,
+    maxMcpCallsPerRequest: config.maxMcpCallsPerRequest,
+  };
+}
+
 function createOrchestrationContext(
   userMessage: string,
   options: OrchestratorOptions,
   config: ReturnType<typeof parseEnvConfig>
 ): OrchestrationContext {
   const { env, catalog, history, preferences, orgConfig, logger, callbacks } = options;
+  const locale = preferences.response_language;
   const rawPromptValues = options.resolvedPromptValues ?? DEFAULT_PROMPT_VALUES;
   const { values: promptValues, languageDocument } = stripPromptComments(
     rawPromptValues,
@@ -1568,16 +1595,15 @@ function createOrchestrationContext(
     messages: buildSeedMessages(userMessage, options, llmMax),
     responses: [],
     lastIterationStartIndex: 0,
-    codeExecTimeout: config.codeExecTimeout,
-    maxMcpCalls: config.maxMcpCalls,
-    maxMcpResponseSize: config.maxMcpResponseSize,
-    maxMcpCallsPerRequest: config.maxMcpCallsPerRequest,
+    ...executionLimits(config),
     mcpCallsMade: { count: 0 },
     turnId: options.turnId,
     telemetry: createTelemetryAccumulator(),
     catalog,
     logger,
     callbacks,
+    locale,
+    emitStatus: createStatusEmitter(callbacks, locale, logger),
     healthTracker: createHealthTracker(),
     memoryStore: options.memoryStore,
     modeContext: options.modeContext,
@@ -1588,28 +1614,6 @@ function createOrchestrationContext(
     env: options.env,
   };
 }
-
-/**
- * User-facing message appended to the response when the orchestration loop
- * exits because it hit MAX_ORCHESTRATION_ITERATIONS. Without this, the user
- * sees only whatever progress text Claude streamed during the final iteration
- * — typically a mid-thought like "Let me fix by adding fontsize too:" — with
- * no indication that the bot has stopped trying. Observed live on
- * 2026-04-30 (request `de4c4d28-…`): a user got an abrupt half-sentence and
- * had no way to know the bot wasn't about to send the next message.
- *
- * This text is both pushed through `callbacks.onProgress` (so it lands in
- * the user's chat client immediately as a final webhook delivery) and
- * appended to `ctx.responses` (so it persists in the saved history and the
- * next conversation turn has the right context — otherwise next turn would
- * see only the partial mid-thought as the assistant's "previous reply").
- */
-const MAX_ITERATIONS_USER_MESSAGE =
-  "\n\n⚠️ I've reached my limit on how many steps I can take in a single turn while " +
-  'working on this. The work above is what I got done; some of it may be incomplete. ' +
-  "If you'd like me to keep going, send me a follow-up telling me what to focus on " +
-  '(e.g. "just submit the standard PDF" or "try once more with X"), and I\'ll pick ' +
-  'up from here without re-doing the parts that already worked.';
 
 async function runOrchestrationLoop(
   ctx: OrchestrationContext,
@@ -1635,8 +1639,17 @@ async function runOrchestrationLoop(
       max_iterations: maxIterations,
       last_iteration: lastIteration,
     });
-    notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress(MAX_ITERATIONS_USER_MESSAGE));
-    ctx.responses.push(MAX_ITERATIONS_USER_MESSAGE);
+    // User-facing notice for hitting MAX_ORCHESTRATION_ITERATIONS. Without it
+    // the user sees only whatever Claude streamed in the final iteration —
+    // typically a mid-thought like "Let me fix by adding fontsize too:" — with
+    // no sign the bot has stopped (observed live 2026-04-30, request
+    // `de4c4d28-…`). Pushed through `onProgress` so it reaches the chat client
+    // now, AND appended to `ctx.responses` so it persists in history and the
+    // next turn does not see the partial mid-thought as the previous reply.
+    // Text: `notice_max_iterations` in `src/i18n/ui-strings.ts`, localized (#405).
+    const notice = uiString(ctx.locale, 'notice_max_iterations');
+    notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress(notice));
+    ctx.responses.push(notice);
   }
   ctx.logger.log('orchestration_loop_end', {
     exit_reason: exitReason,
@@ -1733,7 +1746,7 @@ export async function orchestrate(
 
   const ctx = createOrchestrationContext(effectiveMessage, options, config);
 
-  notifyCallback(ctx.logger, () => ctx.callbacks?.onStatus('Processing your request...'));
+  ctx.emitStatus?.('status_processing');
 
   try {
     await runOrchestrationLoop(ctx, config.maxIterations);
