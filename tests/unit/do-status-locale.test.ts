@@ -41,6 +41,7 @@ import type {
   StreamCallbacks,
   UserPreferencesInternal,
 } from '../../src/types/engine.js';
+import type { InternalQueueEntry } from '../../src/types/queue.js';
 import type { RequestLogger } from '../../src/utils/logger.js';
 import { createTimingContext, type TimingContext } from '../../src/utils/timing.js';
 import type { Env } from '../../src/config/types.js';
@@ -79,6 +80,8 @@ interface UserDOInternals {
     callbacks?: StreamCallbacks
   ): Promise<ChatResponse>;
   readStatusLocale(body: ChatRequest, logger: RequestLogger): Promise<string>;
+  processCallbackEntry(entry: InternalQueueEntry, logger: RequestLogger): Promise<void>;
+  buildWebhookCallbacks(body: ChatRequest, logger: RequestLogger): StreamCallbacks | undefined;
   processImmediateFinal(
     body: ChatRequest,
     workerOrigin: string,
@@ -406,6 +409,59 @@ describe('UserDO queued SSE stream registration (#405 review P1)', () => {
     const statuses = events.filter((e): e is SSEStatusEvent => e.type === 'status');
     expect(statuses.map((s) => s.key)).toEqual(['status_queued', 'status_processing']);
     expect(statuses[0]?.message).toBe(UI_STRINGS.pt.status_queued);
+    expect(statuses[1]?.message).toBe(UI_STRINGS.pt.status_processing);
+  });
+});
+
+describe('UserDO queued transports release resources when the locale read throws (#405 review L1)', () => {
+  const readFailure = new Error('locale read exploded');
+
+  it('queued SSE: the drain sends the error frame and still closes the writer', async () => {
+    const userDo = createDO();
+    const logger = createMockLogger();
+    const processChat = vi.spyOn(userDo, 'processChat').mockResolvedValue(FAKE_RESPONSE);
+
+    const res = await userDo.enqueueAndReturn(textBody, 'msg-q-fail', '', false, logger);
+    // The queued notice already resolved its locale; the turn's own read fails.
+    vi.spyOn(userDo, 'readStatusLocale').mockRejectedValue(readFailure);
+
+    const eventsPending = readSSEEvents(res); // fails the test if the writer never closes
+    await userDo.drainQueue(logger);
+    const events = await eventsPending;
+
+    expect(events.map((e) => e.type)).toEqual(['status', 'error']);
+    expect(events[1]).toEqual({ type: 'error', error: 'locale read exploded' });
+    expect(processChat).not.toHaveBeenCalled();
+    expect(logger.error).toHaveBeenCalledWith(
+      'sse_entry_processing_error',
+      readFailure,
+      expect.objectContaining({ message_id: 'msg-q-fail' })
+    );
+  });
+
+  it('queued callback: onError runs and the error propagates to the retry logic', async () => {
+    const userDo = createDO();
+    const logger = createMockLogger();
+    const onError = vi.fn();
+    vi.spyOn(userDo, 'buildWebhookCallbacks').mockReturnValue({
+      onStatus: vi.fn(),
+      onProgress: vi.fn(),
+      onComplete: vi.fn(),
+      onError,
+    });
+    vi.spyOn(userDo, 'readStatusLocale').mockRejectedValue(readFailure);
+    const processChat = vi.spyOn(userDo, 'processChat').mockResolvedValue(FAKE_RESPONSE);
+    const entry: InternalQueueEntry = {
+      message_id: 'msg-cb-q-fail',
+      body: { ...textBody, progress_callback_url: 'https://example.test/cb', message_key: 'k' },
+      enqueued_at: Date.now(),
+      retry_count: 0,
+    };
+
+    await expect(userDo.processCallbackEntry(entry, logger)).rejects.toBe(readFailure);
+
+    expect(onError).toHaveBeenCalledWith('locale read exploded');
+    expect(processChat).not.toHaveBeenCalled();
   });
 });
 
@@ -580,6 +636,32 @@ describe('UserDO TTS status (#405)', () => {
       { key: 'status_tts_still_generating', message: UI_STRINGS.pt.status_tts_still_generating },
       { key: 'status_tts_still_generating', message: UI_STRINGS.pt.status_tts_still_generating },
     ]);
+  });
+});
+
+describe('UserDO TTS keepalive failure (#405 review L3)', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it('logs tts_keepalive_failed and stops when an emit rejects', async () => {
+    vi.useFakeTimers();
+    const logger = createMockLogger();
+    const emit = vi.fn<StatusEmitter>().mockRejectedValueOnce(new Error('transport gone'));
+    const keepalive = createDO().startTtsKeepalive(emit, Date.now(), logger);
+    try {
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(emit).toHaveBeenCalledTimes(1);
+      expect(logger.warn).toHaveBeenCalledWith(
+        'tts_keepalive_failed',
+        expect.objectContaining({ error: 'transport gone', keepalive_number: 1 })
+      );
+
+      // The interval is cleared: another tick emits nothing more.
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(emit).toHaveBeenCalledTimes(1);
+      expect(keepalive.getCount()).toBe(1);
+    } finally {
+      clearInterval(keepalive.interval);
+    }
   });
 });
 

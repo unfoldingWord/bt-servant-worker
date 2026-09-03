@@ -68,8 +68,8 @@ const pt = {
   status_tts_still_generating: 'Ainda gerando o áudio...',
   notice_max_iterations:
     '\n\n⚠️ Atingi o limite de etapas que consigo executar em um único turno. ' +
-    'O que está acima é o que consegui fazer; parte pode estar ' +
-    'incompleta. Se quiser que eu continue, envie uma nova mensagem dizendo no que devo ' +
+    'O que está acima é o que consegui fazer; pode estar incompleta. ' +
+    'Se quiser que eu continue, envie uma nova mensagem dizendo no que devo ' +
     'focar (por exemplo, "apenas envie o PDF padrão" ou "tente mais uma vez com X"), e ' +
     'eu retomo daqui sem refazer o que já funcionou.',
   error_processing_failed: 'Falha no processamento',

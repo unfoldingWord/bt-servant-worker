@@ -1197,9 +1197,11 @@ export class UserDO {
     const workerOrigin = body._worker_origin ?? '';
     const timing = createTimingContext();
     const callbacks = this.buildWebhookCallbacks(body, logger);
-    const locale = await this.readStatusLocale(body, logger);
+    // Resolved inside the try so a throwing read still reaches onError (and the retry logic).
+    let locale = DEFAULT_PREFERENCES.response_language;
 
     try {
+      locale = await this.readStatusLocale(body, logger);
       const response = await this.processChat(body, workerOrigin, logger, timing, callbacks);
       await callbacks?.onComplete?.(response);
     } catch (error) {
@@ -1259,9 +1261,11 @@ export class UserDO {
     const body = entry.body;
     const writer = this.queuedWriters.get(entry.message_id);
     const { sendEvent, keepaliveInterval } = this.buildSSESender(writer, logger, Date.now());
-    const locale = await this.readStatusLocale(body, logger);
+    // Resolved inside the try so the finally (writer close) always runs.
+    let locale = DEFAULT_PREFERENCES.response_language;
 
     try {
+      locale = await this.readStatusLocale(body, logger);
       const callbacks: StreamCallbacks = {
         onStatus: async (status) => sendEvent({ type: 'status', ...status }),
         onProgress: async (text) => sendEvent({ type: 'progress', text }),

@@ -100,8 +100,16 @@ describe('ui-strings literals', () => {
     expect(UI_STRINGS.en.notice_max_iterations).toBe(EN_NOTICE_MAX_ITERATIONS);
   });
 
-  it('pt max-iterations notice keeps the leading warning marker', () => {
-    expect(UI_STRINGS.pt.notice_max_iterations.startsWith('\n\n⚠️ ')).toBe(true);
+  it('pt max-iterations notice is the owner-reviewed paragraph (native BR-PT)', () => {
+    // Wording fixed by the repo owner in review; pinned so "turno" and the
+    // second sentence cannot regress. Same "\n\n⚠️ " prefix as English.
+    expect(UI_STRINGS.pt.notice_max_iterations).toBe(
+      '\n\n⚠️ Atingi o limite de etapas que consigo executar em um único turno. ' +
+        'O que está acima é o que consegui fazer; pode estar incompleta. ' +
+        'Se quiser que eu continue, envie uma nova mensagem dizendo no que devo focar ' +
+        '(por exemplo, "apenas envie o PDF padrão" ou "tente mais uma vez com X"), e eu ' +
+        'retomo daqui sem refazer o que já funcionou.'
+    );
   });
 
   it('every {{placeholder}} in en also appears in every pt form', () => {
