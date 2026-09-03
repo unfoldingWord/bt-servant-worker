@@ -158,6 +158,15 @@ describe('detectWrittenLanguage — inputs without enough linguistic signal', ()
     }
   });
 
+  it.each([
+    ['punctuation variants', 'xyzzy, xyzzy. xyzzy! xyzzy?'],
+    ['punctuation and case variants', 'Xyzzy, xyzzy. XYZZY! xyZZy?'],
+  ])('collapses %s of one token to one word before the distinct-word check', (_label, text) => {
+    // Splitting on whitespace alone counted these as four distinct words and
+    // tinyld then reported Polish confidently (pl @ 0.99).
+    expect(detectWrittenLanguage(text, createMockLogger())).toBeNull();
+  });
+
   it(`requires at least ${MIN_LETTERS} letters after stripping`, () => {
     const belowMin = 'obrigado amigo';
     expect(belowMin.replace(/\P{L}/gu, '').length).toBeLessThan(MIN_LETTERS);

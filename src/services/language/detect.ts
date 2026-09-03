@@ -93,6 +93,7 @@ const HASHTAG_OR_HANDLE_PATTERN = /(?<![\p{L}\p{N}])[#@][\p{L}\p{N}_-]+/gu;
 const EMOJI_PATTERN = /[\p{Extended_Pictographic}\p{Emoji_Presentation}\uFE0F\u200D]/gu;
 
 const LETTER_PATTERN = /\p{L}/gu;
+const WORD_PATTERN = /\p{L}+/gu;
 
 /**
  * Remove URLs, residual hashtags / handles and emoji, collapsing the
@@ -119,13 +120,13 @@ function countLetters(text: string): number {
   return text.match(LETTER_PATTERN)?.length ?? 0;
 }
 
+/**
+ * Distinct word tokens after normalization: NFC, case-folded, letters only.
+ * Punctuation and case variants of one token (`xyzzy, Xyzzy. XYZZY!`) must
+ * collapse to one word, or the repeated-token safeguard is trivially bypassed.
+ */
 function countDistinctWords(text: string): number {
-  return new Set(
-    text
-      .toLowerCase()
-      .split(' ')
-      .filter((word) => word.length > 0)
-  ).size;
+  return new Set(text.normalize('NFC').toLowerCase().match(WORD_PATTERN) ?? []).size;
 }
 
 /** Enough letters and enough distinct words for the detector's vote to mean anything. */
