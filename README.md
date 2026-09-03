@@ -242,6 +242,7 @@ interface ChatRequest {
 interface ChatResponse {
   responses: string[];
   response_language: string;
+  input_language?: string; // ISO 639-1 code of the language the user wrote in, 'und' when undetermined; telemetry, never drives reply language
   voice_audio_base64: string | null; // deprecated — always null (legacy compat)
   voice_audio_url?: string | null; // URL to fetch TTS audio from R2 (e.g., /api/v1/audio/...)
   attachments?: Attachment[]; // tool-produced artifacts (PDFs, archived audio)

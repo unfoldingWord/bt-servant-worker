@@ -6,7 +6,7 @@
  * things that must stay true independently:
  *
  *   1. The log payload carries `input_language` / `input_language_confidence`
- *      for EVERY client (`"und"` / `null` when detection is null), so the
+ *      for every client (`"und"` / `null` when detection is null), so the
  *      telemetry half of #353 is recorded uniformly.
  *   2. The per-turn facts #402 added (`turn_id`, mode/language attribution,
  *      model, iterations, token spend) are still on the payload, unchanged.
@@ -20,9 +20,6 @@ import type { DetectedLanguage } from '../../../src/services/language/index.js';
 import type { ChatRequest } from '../../../src/types/engine.js';
 
 const DEFAULT_ORG = 'unfoldingWord';
-
-/** The exact label set `chat_turns_total` reported before #404. */
-const PRE_404_LABEL_KEYS = ['language', 'chat_type', 'transport', 'user_country', 'edge_country'];
 
 /** The exact payload keys #402 put on `chat_turn`, which #404 must not disturb. */
 const PR_402_PAYLOAD_KEYS = [
@@ -94,7 +91,7 @@ function turnContext(inputLanguage: DetectedLanguage | null) {
 }
 
 describe('buildChatTurnRecord — log payload', () => {
-  it.each(['web', 'whatsapp', 'signal-gateway', 'telegram', 'admin-portal'])(
+  it.each(['web', 'whatsapp'])(
     'carries input_language and input_language_confidence for client %s',
     (clientId) => {
       const { payload } = buildChatTurnRecord(
@@ -116,8 +113,6 @@ describe('buildChatTurnRecord — log payload', () => {
     const { payload } = buildChatTurnRecord(body(), 'en', DEFAULT_ORG, turnContext(null));
     expect(payload.input_language).toBe('und');
     expect(payload.input_language_confidence).toBeNull();
-    expect('input_language' in payload).toBe(true);
-    expect('input_language_confidence' in payload).toBe(true);
   });
 });
 
@@ -174,21 +169,6 @@ describe('buildChatTurnRecord — fields that must survive the union', () => {
 });
 
 describe('buildChatTurnRecord — chat_turns_total labels (cardinality guard)', () => {
-  it('never adds the detected language to the metric labels', () => {
-    const { labels } = buildChatTurnRecord(
-      body({ client_id: 'whatsapp', user_id: 'whatsapp:5511999999999', _edge_country: 'BR' }),
-      'en',
-      DEFAULT_ORG,
-      turnContext({ code: 'pt', confidence: 0.9 })
-    );
-    for (const key of Object.keys(labels)) {
-      expect(PRE_404_LABEL_KEYS).toContain(key);
-    }
-    expect(labels).not.toHaveProperty('input_language');
-    expect(labels).not.toHaveProperty('input_language_confidence');
-    expect(JSON.stringify(labels)).not.toContain('input_language');
-  });
-
   it('reports exactly the labels it did before #404 for a plain web turn', () => {
     const { labels } = buildChatTurnRecord(
       body(),

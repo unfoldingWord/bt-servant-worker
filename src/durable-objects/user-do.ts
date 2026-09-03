@@ -90,8 +90,12 @@ import {
 } from '../services/telemetry/index.js';
 import { classifyTriggers, ClassifierResult } from '../services/classifier/index.js';
 import type { UnmatchedTrigger } from '../services/classifier/index.js';
-import { detectWrittenLanguage, DetectedLanguage } from '../services/language/index.js';
-import { isAdminClient, validateChatBody } from '../utils/chat-validation.js';
+import {
+  detectWrittenLanguage,
+  DetectedLanguage,
+  UNDETERMINED_LANGUAGE,
+} from '../services/language/index.js';
+import { isAdminClient, isValidLanguageCode, validateChatBody } from '../utils/chat-validation.js';
 import { OrgLanguages, resolveEffectiveLanguage } from '../types/languages.js';
 import { InternalQueueEntry } from '../types/queue.js';
 import { statusUpdate, uiString } from '../i18n/ui-strings.js';
@@ -104,8 +108,6 @@ const PREFERENCES_KEY = 'preferences';
 const PROMPT_OVERRIDES_KEY = 'prompt_overrides';
 const SELECTED_MODE_KEY = 'selected_mode';
 const SELECTED_LANGUAGE_KEY = 'selected_language';
-/** Hysteresis marker for response_language auto-follow (#404); see DetectedLanguageStreak. */
-const DETECTED_LANGUAGE_STREAK_KEY = 'detected_language_streak';
 const PROCESSING_LOCK_KEY = '_processing_lock';
 const QUEUE_KEY = 'queue';
 const QUEUE_PROCESSING_KEY = 'queue_processing';
@@ -118,83 +120,10 @@ const ENQUEUE_RATE_WINDOW_MS = 60_000; // 1 minute
 const ENQUEUE_RATE_LIMIT = 300;
 const SSE_KEEPALIVE_INTERVAL_MS = 30_000; // 30 seconds
 
-/**
- * Validates ISO 639-1 language code format (2 lowercase letters).
- */
-const ISO_639_1_PATTERN = /^[a-z]{2}$/;
-
-function isValidLanguageCode(code: string): boolean {
-  return ISO_639_1_PATTERN.test(code);
-}
-
 const DEFAULT_PREFERENCES: UserPreferencesInternal = {
   response_language: 'en',
   first_interaction: true,
 };
-
-// ── response_language auto-follow (#404) ───────────────────────────────────────
-
-/**
- * Clients whose persisted `response_language` follows the language the user
- * writes in. Web only for now: gateway clients (WhatsApp, Signal, Telegram)
- * keep their existing behavior. Opting one in is a one-line change here plus
- * a test in tests/unit/response-language-follow.test.ts.
- */
-export const AUTO_FOLLOW_CLIENTS: readonly string[] = ['web'];
-
-/**
- * Consecutive detected turns in the SAME new language required before the
- * preference switches away from a non-default language. Leaving the default
- * (`en`) needs only one — a user who writes Portuguese once is served
- * Portuguese immediately; a Portuguese user pasting one English verse is not
- * flipped back.
- */
-const FOLLOW_STREAK_TO_LEAVE_NON_DEFAULT = 2;
-
-/**
- * What survives between turns for the hysteresis rule: the last confidently
- * detected code and how many consecutive detected turns produced it (capped
- * at the threshold so a steady user does not cost a storage write per turn).
- * Stored under its own key rather than inside `preferences` so the API-facing
- * preference record keeps its shape.
- */
-export interface DetectedLanguageStreak {
-  code: string;
-  streak: number;
-}
-
-/**
- * Pure decision for one turn of response_language auto-follow.
- *
- * - Non-allow-listed client or no confident detection → nothing changes and
- *   the streak is left untouched (an undetectable turn neither extends nor
- *   breaks a streak).
- * - Detected code differs from the previous streak's code → streak restarts at 1.
- * - Switching away from `en` needs a streak of 1; away from anything else
- *   needs {@link FOLLOW_STREAK_TO_LEAVE_NON_DEFAULT}.
- */
-export function decideResponseLanguageFollow(input: {
-  clientId: string;
-  currentLanguage: string;
-  detected: DetectedLanguage | null;
-  previous: DetectedLanguageStreak | null;
-}): { nextStreak: DetectedLanguageStreak | null; newLanguage: string | null } {
-  const { clientId, currentLanguage, detected, previous } = input;
-  if (!AUTO_FOLLOW_CLIENTS.includes(clientId) || detected === null) {
-    return { nextStreak: previous, newLanguage: null };
-  }
-  const continued = previous?.code === detected.code;
-  const streak = continued
-    ? Math.min((previous?.streak ?? 0) + 1, FOLLOW_STREAK_TO_LEAVE_NON_DEFAULT)
-    : 1;
-  const nextStreak = { code: detected.code, streak };
-  if (detected.code === currentLanguage) return { nextStreak, newLanguage: null };
-  const required =
-    currentLanguage === DEFAULT_PREFERENCES.response_language
-      ? 1
-      : FOLLOW_STREAK_TO_LEAVE_NON_DEFAULT;
-  return { nextStreak, newLanguage: streak >= required ? detected.code : null };
-}
 
 function createErrorResponse(
   error: string,
@@ -489,7 +418,7 @@ function buildChatTurnPayload(
     response_language: responseLanguage,
     // #404: the language the user wrote in. `und` (not null) when the detector
     // abstained, so the field is always present for the tail consumer.
-    input_language: turn.inputLanguage ? turn.inputLanguage.code : 'und',
+    input_language: turn.inputLanguage ? turn.inputLanguage.code : UNDETERMINED_LANGUAGE,
     input_language_confidence: turn.inputLanguage ? turn.inputLanguage.confidence : null,
     user_country: dims.userCountry ?? null,
     edge_country: dims.edgeCountry ?? null,
@@ -1730,25 +1659,14 @@ export class UserDO {
     // Extract #mode/@language trigger tokens and resolve per-turn overrides
     const triggerCtx = await this.classifyAndResolveTriggers(body, loaded, logger);
 
-    // #404: detect the language the user WROTE in (once per turn) and, for
-    // allow-listed clients, let the persisted preference follow it. Must run
-    // before the orchestrator options are built so the system prompt's
-    // "Respond in <code>" line reflects the switch on this same turn.
-    const inputLanguage = detectWrittenLanguage(loaded.messageText, logger);
-    const preferences = await this.followInputLanguage(
-      body,
-      loaded.preferences,
-      inputLanguage,
-      logger
-    );
+    // #404: detect the language the user WROTE in, once per turn, on the text
+    // the classifier already stripped of matched trigger tokens. Telemetry
+    // only: it is recorded on chat_turn and echoed on the response, and never
+    // touches the persisted response_language preference.
+    const inputLanguage = detectWrittenLanguage(triggerCtx.messageText, logger);
 
     // ── Build orchestrator options ────────────────────────────────────────────
-    // #405 resolved the status locale as `hint ?? stored preference`; #404 may
-    // have moved the stored preference this turn, so an absent hint must fall
-    // through to the (possibly followed) preferences rather than the snapshot.
-    const effectivePreferences = body.response_language_hint
-      ? { ...preferences, response_language: loaded.locale }
-      : preferences;
+    const effectivePreferences = { ...loaded.preferences, response_language: loaded.locale };
     const groupContext = this.maybeBuildGroupContext(body);
 
     const audioContext = this.buildAudioContext();
@@ -1768,7 +1686,7 @@ export class UserDO {
 
     // prettier-ignore
     await this.tracedPhase(ctx, 'save_conversation', () =>
-      this.saveConversation(triggerCtx.messageText, orchResult.responses, preferences, body._org_config ?? {}, { logger, audioKey, inboundVoiceKey: loaded.inboundVoiceKey, speaker: body.speaker, attachments: attachmentsContext.list() })
+      this.saveConversation(triggerCtx.messageText, orchResult.responses, loaded.preferences, body._org_config ?? {}, { logger, audioKey, inboundVoiceKey: loaded.inboundVoiceKey, speaker: body.speaker, attachments: attachmentsContext.list() })
     );
 
     // prettier-ignore
@@ -1776,61 +1694,6 @@ export class UserDO {
 
     // prettier-ignore
     return this.assembleChatResponse({ responses: orchResult.responses, audioKey, workerOrigin, attachmentsContext, effectivePreferences, inputLanguage, logger, startTime: ctx.startTime });
-  }
-
-  /**
-   * Apply response_language auto-follow (#404) for this turn and return the
-   * preferences the rest of the turn must use.
-   *
-   * An explicit `response_language_hint` is a per-turn instruction from the
-   * client; it wins over inference, so auto-follow is skipped for that turn.
-   * Non-allow-listed clients and undetectable turns return early without
-   * touching storage. Otherwise the streak marker is read, the pure rule is
-   * applied, the marker is written back only when it changed, and a switch
-   * is persisted through `updatePreferences` and logged once as
-   * `response_language_auto_updated`.
-   */
-  private async followInputLanguage(
-    body: ChatRequest,
-    preferences: UserPreferencesInternal,
-    inputLanguage: DetectedLanguage | null,
-    logger: RequestLogger
-  ): Promise<UserPreferencesInternal> {
-    if (body.response_language_hint) return preferences;
-    if (!AUTO_FOLLOW_CLIENTS.includes(body.client_id) || inputLanguage === null) return preferences;
-
-    const previous =
-      (await this.state.storage.get<DetectedLanguageStreak>(DETECTED_LANGUAGE_STREAK_KEY)) ?? null;
-    const decision = decideResponseLanguageFollow({
-      clientId: body.client_id,
-      currentLanguage: preferences.response_language,
-      detected: inputLanguage,
-      previous,
-    });
-    await this.persistDetectedStreak(previous, decision.nextStreak);
-    if (!decision.newLanguage || !decision.nextStreak) return preferences;
-
-    const updated = { ...preferences, response_language: decision.newLanguage };
-    await this.updatePreferences(updated);
-    logger.log('response_language_auto_updated', {
-      user_id: body.user_id,
-      client_id: body.client_id,
-      old_language: preferences.response_language,
-      new_language: decision.newLanguage,
-      confidence: inputLanguage.confidence,
-      streak: decision.nextStreak.streak,
-    });
-    return updated;
-  }
-
-  /** Write the hysteresis marker only when it actually changed (one write, not one per turn). */
-  private async persistDetectedStreak(
-    previous: DetectedLanguageStreak | null,
-    next: DetectedLanguageStreak | null
-  ): Promise<void> {
-    if (!next) return;
-    if (previous && previous.code === next.code && previous.streak === next.streak) return;
-    await this.state.storage.put(DETECTED_LANGUAGE_STREAK_KEY, next);
   }
 
   /**
@@ -2710,7 +2573,7 @@ export class UserDO {
     return {
       responses,
       response_language: effectivePreferences.response_language,
-      input_language: inputLanguage?.code ?? 'und',
+      input_language: inputLanguage?.code ?? UNDETERMINED_LANGUAGE,
       voice_audio_base64: null,
       voice_audio_url: voiceAudioUrl,
       ...(attachments.length > 0 ? { attachments } : {}),

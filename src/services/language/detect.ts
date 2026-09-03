@@ -9,13 +9,23 @@
  * (franc returns ISO 639-3 and would need a mapping table). See the #404 PR
  * body for the measurements.
  *
+ * The result is telemetry. It is recorded on the `chat_turn` log record and
+ * echoed as `ChatResponse.input_language`; it never drives the reply
+ * language. `response_language` is set only through `PUT /preferences` and
+ * the per-turn `response_language_hint`.
+ *
  * What callers get back:
  *   - `{ code, confidence }` when the text carries enough linguistic signal
  *     AND the detector's top candidate wins by a clear margin, or
- *   - `null` — meaning "no confident read", never "English". Short acks,
- *     bare scripture references, `#mode` / `@language` trigger tokens, emoji
- *     and URLs are stripped first; if fewer than {@link MIN_LETTERS} letters
- *     remain there is nothing to detect.
+ *   - `null` — meaning "no confident read", never "English". Callers record
+ *     it as {@link UNDETERMINED_LANGUAGE}. URLs, scripture references,
+ *     residual `#hashtag` / `@handle` words and emoji are stripped first; if
+ *     fewer than {@link MIN_LETTERS} letters remain there is nothing to detect.
+ *
+ * Callers pass the classifier's already-stripped message: leading `#mode` /
+ * `@language` tokens that matched a configured mode or language are gone by
+ * then. A trigger-only turn reaches this function as the bare token(s) the
+ * user typed, strips to nothing, and returns `null`.
  *
  * Confidence is the relative margin between the top two candidates,
  * `1 - second / top`, in [0, 1]. tinyld's raw per-language `accuracy` is NOT
@@ -27,9 +37,6 @@
  *
  * This function never throws. A detector failure is logged once as
  * `language_detect_failed` on the request logger and treated as `null`.
- * `logger` is optional only so the function stays a pure utility for callers
- * outside a request context (tests, scripts); every request-path caller MUST
- * pass the request logger so a failure stays observable and correlated.
  */
 
 import { detectAll } from 'tinyld/light';
@@ -42,11 +49,25 @@ export interface DetectedLanguage {
   confidence: number;
 }
 
+/**
+ * Recorded as `input_language` when detection returns `null`: ISO 639-2's
+ * "undetermined" code, so the field is always a string and can never collide
+ * with a real ISO 639-1 value.
+ */
+export const UNDETERMINED_LANGUAGE = 'und';
+
 /** Minimum letters (Unicode `\p{L}`) remaining after the pre-strip. */
 export const MIN_LETTERS = 20;
 
 /** Minimum {@link DetectedLanguage.confidence} for a non-null result. */
 export const MIN_CONFIDENCE = 0.3;
+
+/**
+ * Upper bound on the characters handed to the detector. Detection cost grows
+ * with input length (a single 20,000-letter token measured ~21 ms) and the
+ * first two thousand characters carry all the signal a per-turn read needs.
+ */
+export const MAX_DETECT_CHARS = 2000;
 
 // ── Pre-strip patterns ────────────────────────────────────────────────────────
 // Anything that carries no information about the language the user WRITES in.
@@ -54,8 +75,14 @@ export const MIN_CONFIDENCE = 0.3;
 /** `https://…`, `http://…`, `www.…` up to the next whitespace. */
 const URL_PATTERN = /(?:https?:\/\/|www\.)\S+/gi;
 
-/** `#mode` / `@language` trigger tokens (any hashtag or handle — never prose). */
-const TRIGGER_TOKEN_PATTERN = /(?<![\p{L}\p{N}])[#@][\p{L}\p{N}_-]+/gu;
+/**
+ * Residual `#hashtag` / `@handle` words. The classifier has already removed
+ * leading trigger tokens that matched a configured mode or language; whatever
+ * still starts with `#` or `@` (unmatched tokens the classifier leaves in
+ * place, social hashtags, email handles, addressee mentions) carries no
+ * signal about the language the user writes in.
+ */
+const HASHTAG_OR_HANDLE_PATTERN = /(?<![\p{L}\p{N}])[#@][\p{L}\p{N}_-]+/gu;
 
 /**
  * `book chapter:verse[-verse][, verse…]` with an optional leading book number:
@@ -71,21 +98,28 @@ const NUMBERED_BOOK_REF_PATTERN = /(?<![\p{L}\p{N}])[1-3]\s*\p{L}+\.?\s*\d+(?![\
 const EMOJI_PATTERN = /[\p{Extended_Pictographic}\p{Emoji_Presentation}\uFE0F\u200D]/gu;
 
 const LETTER_PATTERN = /\p{L}/gu;
-const ISO_639_1_PATTERN = /^[a-z]{2}$/;
 
 /**
- * Remove URLs, scripture references, trigger tokens and emoji, collapsing the
- * whitespace they leave behind. Exported for direct testing.
+ * Remove URLs, scripture references, residual hashtags / handles and emoji,
+ * collapsing the whitespace they leave behind. Exported for direct testing.
  */
 export function stripNonLinguistic(text: string): string {
   return text
     .replace(URL_PATTERN, ' ')
-    .replace(TRIGGER_TOKEN_PATTERN, ' ')
+    .replace(HASHTAG_OR_HANDLE_PATTERN, ' ')
     .replace(CHAPTER_VERSE_REF_PATTERN, ' ')
     .replace(NUMBERED_BOOK_REF_PATTERN, ' ')
     .replace(EMOJI_PATTERN, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+/**
+ * The exact text handed to the detector: {@link stripNonLinguistic}, then
+ * capped at {@link MAX_DETECT_CHARS}. Exported for direct testing.
+ */
+export function prepareForDetection(text: string): string {
+  return stripNonLinguistic(text).slice(0, MAX_DETECT_CHARS);
 }
 
 function countLetters(text: string): number {
@@ -98,17 +132,15 @@ function roundConfidence(value: number): number {
 
 /**
  * Reduce tinyld's ranked candidates to one confident read, or `null`.
- * Candidates arrive sorted by `accuracy` descending.
+ * Candidates arrive sorted by `accuracy` descending. `lang` is ISO 639-1 for
+ * every language in the light set (pinned by a test over
+ * `supportedLanguages`), so no further shape check is needed here.
  */
 function pickConfident(
   candidates: ReadonlyArray<{ lang: string; accuracy: number }>
 ): DetectedLanguage | null {
   const [top, second] = candidates;
   if (!top || !(top.accuracy > 0)) return null;
-  // tinyld/light reports ISO 639-1 for every language in its light set, but
-  // the wider tinyld table carries a few 3-letter codes; `response_language`
-  // is validated as ISO 639-1 downstream, so anything else is not a usable read.
-  if (!ISO_639_1_PATTERN.test(top.lang)) return null;
   const confidence = roundConfidence(second ? 1 - second.accuracy / top.accuracy : 1);
   if (confidence < MIN_CONFIDENCE) return null;
   return { code: top.lang, confidence };
@@ -120,20 +152,20 @@ function pickConfident(
  */
 export function detectWrittenLanguage(
   text: string,
-  logger?: RequestLogger
+  logger: RequestLogger
 ): DetectedLanguage | null {
-  const stripped = stripNonLinguistic(text);
-  if (countLetters(stripped) < MIN_LETTERS) return null;
+  const prepared = prepareForDetection(text);
+  if (countLetters(prepared) < MIN_LETTERS) return null;
   try {
-    return pickConfident(detectAll(stripped));
+    return pickConfident(detectAll(prepared));
   } catch (error) {
-    logger?.warn('language_detect_failed', {
+    logger.warn('language_detect_failed', {
       error: error instanceof Error ? error.message : String(error),
       text_length: text.length,
-      stripped_length: stripped.length,
+      prepared_length: prepared.length,
     });
-    // Explicitly degrade to "no read": detection is advisory input to the
-    // response-language preference and must never fail a chat turn.
+    // Explicitly degrade to "no read": detection is telemetry and must never
+    // fail a chat turn.
     return null;
   }
 }
