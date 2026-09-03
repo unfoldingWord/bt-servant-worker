@@ -13,10 +13,54 @@
 
 /* eslint-disable max-lines-per-function -- established pattern for e2e suites (see user-session.test.ts) */
 import { env, SELF } from 'cloudflare:test';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { StoredIdentity, ChatHistoryResponse } from '../../src/types/engine';
 
 const AUTH = { Authorization: 'Bearer test-api-key' };
+const ANTHROPIC_MARKER_HOST = 'api.anthropic.com';
+
+/**
+ * Keep the chat turns in this suite off the network.
+ *
+ * The orchestrator calls `globalThis.fetch` directly rather than going through
+ * the Anthropic SDK (the SDK's own fetch trips Cloudflare error 1003 inside a
+ * Durable Object), and `vitest.config.ts` injects a real `ANTHROPIC_API_KEY`
+ * whenever one is present in `.dev.vars`. Without this stub, every local
+ * `pnpm test` — including the husky pre-commit hook, which runs the full suite
+ * on each commit — would make billed API calls.
+ *
+ * The response shape only has to be well-formed enough to reach
+ * `extractTextResponses`; the turn's outcome is irrelevant here, because
+ * identity persistence happens before orchestration (see the comment on the
+ * chat turn below). Non-Anthropic requests fall through to the real fetch so
+ * `SELF.fetch` and DO stub calls are unaffected.
+ */
+function stubAnthropicFetch(): void {
+  const realFetch = globalThis.fetch.bind(globalThis);
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+    const url =
+      typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    if (!url.includes(ANTHROPIC_MARKER_HOST)) return realFetch(input, init);
+    return new Response(
+      JSON.stringify({
+        id: 'msg_identity_stub',
+        type: 'message',
+        role: 'assistant',
+        model: 'claude-sonnet-test',
+        stop_reason: 'end_turn',
+        stop_sequence: null,
+        usage: {
+          input_tokens: 1,
+          output_tokens: 1,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+        },
+        content: [{ type: 'text', text: 'ok' }],
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } }
+    );
+  });
+}
 
 interface SnapshotResponse {
   do_id: string;
@@ -25,6 +69,14 @@ interface SnapshotResponse {
 }
 
 describe('DO identity persistence + admin snapshot', () => {
+  beforeEach(() => {
+    stubAnthropicFetch();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it('returns null identity for a fresh DO', async () => {
     const stub = env.USER_DO.get(env.USER_DO.newUniqueId());
     const res = await stub.fetch('http://fake-host/identity');
@@ -38,8 +90,8 @@ describe('DO identity persistence + admin snapshot', () => {
     const id = env.USER_DO.idFromName(doName);
     const stub = env.USER_DO.get(id);
 
-    // The turn itself may fail downstream (no live engine in tests); identity
-    // persistence happens before orchestration, so the outcome does not matter.
+    // Anthropic is stubbed (see stubAnthropicFetch); identity persistence
+    // happens before orchestration, so the turn's outcome does not matter.
     await stub.fetch('http://fake-host/chat/final', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

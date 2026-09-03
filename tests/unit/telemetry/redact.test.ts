@@ -52,6 +52,42 @@ describe('attributeValueFor — fail-closed classifier', () => {
   });
 });
 
+/**
+ * SENSITIVE_KEY_PATTERN matches any key containing "token", which is right for
+ * credentials but also catches the Anthropic usage counters. Those are small
+ * integers describing billing volume — they cannot carry a credential or message
+ * content — and masking them replaces a number with the string "[REDACTED]",
+ * flipping the attribute's type in the sink.
+ */
+describe('attributeValueFor — numeric token-count carve-out', () => {
+  it('passes NUMERIC LLM token counts raw despite the sensitive-key mask', () => {
+    expect(attributeValueFor('input_tokens', 1420)).toBe(1420);
+    expect(attributeValueFor('output_tokens', 87)).toBe(87);
+    expect(attributeValueFor('cache_creation_input_tokens', 0)).toBe(0);
+    expect(attributeValueFor('cache_read_input_tokens', 2048)).toBe(2048);
+  });
+
+  it('passes the computed billable_input_tokens counter raw (chat_turn cost contract)', () => {
+    // Derived by the orchestrator, not returned by Anthropic — but it is the one
+    // number downstream spend calculations key on, so it must egress as a number.
+    expect(attributeValueFor('billable_input_tokens', 270)).toBe(270);
+    expect(attributeValueFor('billable_input_tokens', 0)).toBe(0);
+  });
+
+  it('still masks a STRING under those same keys', () => {
+    // Numeric-only: a credential mistakenly logged as `input_tokens` must not escape.
+    expect(attributeValueFor('input_tokens', 'sk-ant-leaked')).toBe('[REDACTED]');
+    expect(attributeValueFor('output_tokens', 'bearer x')).toBe('[REDACTED]');
+    expect(attributeValueFor('billable_input_tokens', 'sk-ant-leaked')).toBe('[REDACTED]');
+  });
+
+  it('still masks numbers under token-ish keys that are NOT allow-listed', () => {
+    // Exact allow-list, not a suffix or pattern.
+    expect(attributeValueFor('auth_token', 12345)).toBe('[REDACTED]');
+    expect(attributeValueFor('refresh_token_count', 3)).toBe('[REDACTED]');
+  });
+});
+
 describe('buildSafeAttributes', () => {
   it('classifies every key and drops null/undefined (no reserved-key skip)', () => {
     const attrs = buildSafeAttributes({

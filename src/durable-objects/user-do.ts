@@ -363,6 +363,79 @@ function isCountryCode(value: string | undefined): value is string {
  * gateway's egress location, so substituting it for user geography would
  * misattribute every WhatsApp/Telegram user to wherever the gateway runs.
  */
+/**
+ * Everything `logChatTurn` needs that is NOT derivable from the ChatRequest.
+ *
+ * Passed as one object rather than as positional parameters: the repo caps
+ * functions at 5 params (eslint `max-params`), and these travel together.
+ */
+interface ChatTurnContext {
+  /** Per-turn id. Joins `chat_turn` to the generation-level orchestrator logs. */
+  turnId: string;
+  /** Mode that GOVERNED this turn (mode at turn start). The attribution key. */
+  activeModeName: string | undefined;
+  /** Resolved language name for this turn, if any. */
+  activeLanguageName: string | undefined;
+  /** How the language was resolved — bounded enum. */
+  languageSource: LanguageSource;
+  /** Per-turn facts from the orchestration run. */
+  orchestration: OrchestrationResult['telemetry'];
+  /** Wall-clock for the whole turn, measured from processChat entry. */
+  durationMs: number;
+  /** Turn was produced from an inbound voice message (STT cost, uncaptured here). */
+  hadInboundVoice: boolean;
+  /** Turn produced a voice reply (TTS cost, uncaptured here). */
+  hadOutboundVoice: boolean;
+}
+
+/**
+ * Build the full `chat_turn` log payload.
+ *
+ * Deliberately separate from `buildChatTurnDimensions`, which exists ONLY to
+ * bound `countMetric` label cardinality. The log has no such constraint (it
+ * already reads `user_id`/`client_id` straight off the body), so conflating the
+ * two would push unbounded dimensions into the OTLP metric pipeline.
+ */
+function buildChatTurnPayload(
+  body: ChatRequest,
+  dims: ReturnType<typeof buildChatTurnDimensions>,
+  responseLanguage: string,
+  turn: ChatTurnContext
+): Record<string, unknown> {
+  const { usage } = turn.orchestration;
+  return {
+    turn_id: turn.turnId,
+    user_id: body.user_id,
+    org: dims.org,
+    client_id: body.client_id,
+    transport: dims.transport ?? null,
+    chat_type: dims.chatType,
+    response_language: responseLanguage,
+    user_country: dims.userCountry ?? null,
+    edge_country: dims.edgeCountry ?? null,
+    // Mode that governed this turn. `mode_switched_to` is a NEXT-turn selection
+    // (switch_mode: "This will take effect on your next message") and must never
+    // be used to attribute this turn's cost or content.
+    mode: turn.activeModeName ?? null,
+    mode_switched_to: turn.orchestration.modeSwitchedTo,
+    language: turn.activeLanguageName ?? null,
+    language_source: turn.languageSource,
+    model: turn.orchestration.model,
+    iterations: turn.orchestration.iterations,
+    exit_reason: turn.orchestration.exitReason,
+    stop_reason: turn.orchestration.finalStopReason,
+    mcp_calls_made: turn.orchestration.mcpCallsMade,
+    input_tokens: usage.input_tokens,
+    output_tokens: usage.output_tokens,
+    cache_creation_input_tokens: usage.cache_creation_input_tokens,
+    cache_read_input_tokens: usage.cache_read_input_tokens,
+    billable_input_tokens: usage.billable_input_tokens,
+    duration_ms: turn.durationMs,
+    had_inbound_voice: turn.hadInboundVoice,
+    had_outbound_voice: turn.hadOutboundVoice,
+  };
+}
+
 function buildChatTurnDimensions(
   body: ChatRequest,
   defaultOrg: string
@@ -1422,19 +1495,15 @@ export class UserDO {
    * short-circuit path produces no response, so `response_language` would be
    * meaningless there and it is deliberately excluded).
    */
-  private logChatTurn(body: ChatRequest, responseLanguage: string, logger: RequestLogger): void {
+  private logChatTurn(
+    body: ChatRequest,
+    responseLanguage: string,
+    logger: RequestLogger,
+    turn: ChatTurnContext
+  ): void {
     try {
       const dims = buildChatTurnDimensions(body, this.env.DEFAULT_ORG);
-      logger.log('chat_turn', {
-        user_id: body.user_id,
-        org: dims.org,
-        client_id: body.client_id,
-        transport: dims.transport ?? null,
-        chat_type: dims.chatType,
-        response_language: responseLanguage,
-        user_country: dims.userCountry ?? null,
-        edge_country: dims.edgeCountry ?? null,
-      });
+      logger.log('chat_turn', buildChatTurnPayload(body, dims, responseLanguage, turn));
       countMetric('chat_turns_total', {
         language: responseLanguage,
         chat_type: dims.chatType,
@@ -1463,8 +1532,11 @@ export class UserDO {
     callbacks?: StreamCallbacks
   ): Promise<ChatResponse> {
     const ctx = { timing, logger, startTime: Date.now() };
+    // Per-turn id. NOT the same as `request_id`: drainQueue reuses the triggering
+    // request's logger across every entry it drains, so request_id can span turns.
+    const turnId = crypto.randomUUID();
     // prettier-ignore
-    logger.log('process_chat_start', { message_type: body.message_type, has_audio: !!body.audio_base64, has_callbacks: !!callbacks, chat_type: body.chat_type ?? 'private' });
+    logger.log('process_chat_start', { turn_id: turnId, message_type: body.message_type, has_audio: !!body.audio_base64, has_callbacks: !!callbacks, chat_type: body.chat_type ?? 'private' });
 
     const loaded = await this.loadChatContext(body, ctx, callbacks);
 
@@ -1483,7 +1555,7 @@ export class UserDO {
     const audioContext = this.buildAudioContext();
     const attachmentsContext = createAttachmentsContext();
     // prettier-ignore
-    const orchOpts = this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, triggerCtx.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, triggerCtx.activeModeName, audioContext, attachmentsContext, workerOrigin, logger, callbacks, groupContext, triggerCtx.languageDocument, triggerCtx.unmatchedTriggers, loaded.inboundVoiceKey, { triggerOnly: triggerCtx.triggerOnly });
+    const orchOpts = { ...this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, triggerCtx.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, triggerCtx.activeModeName, audioContext, attachmentsContext, workerOrigin, logger, callbacks, groupContext, triggerCtx.languageDocument, triggerCtx.unmatchedTriggers, loaded.inboundVoiceKey, { triggerOnly: triggerCtx.triggerOnly }), turnId };
 
     const orchResult = await this.tracedPhase(ctx, 'orchestration', () =>
       this.runOrchestration(triggerCtx.messageText, orchOpts)
@@ -1500,7 +1572,8 @@ export class UserDO {
       this.saveConversation(triggerCtx.messageText, orchResult.responses, loaded.preferences, body._org_config ?? {}, { logger, audioKey, inboundVoiceKey: loaded.inboundVoiceKey, speaker: body.speaker, attachments: attachmentsContext.list() })
     );
 
-    this.logChatTurn(body, effectivePreferences.response_language, logger);
+    // prettier-ignore
+    this.logChatTurn(body, effectivePreferences.response_language, logger, { turnId, activeModeName: triggerCtx.activeModeName, activeLanguageName: triggerCtx.activeLanguageName, languageSource: triggerCtx.languageSource, orchestration: orchResult.telemetry, durationMs: Date.now() - ctx.startTime, hadInboundVoice: !!loaded.inboundVoiceKey, hadOutboundVoice: audioKey !== null });
 
     // prettier-ignore
     return this.assembleChatResponse({ responses: orchResult.responses, audioKey, workerOrigin, attachmentsContext, effectivePreferences, logger, startTime: ctx.startTime });

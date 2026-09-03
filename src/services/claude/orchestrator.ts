@@ -208,6 +208,8 @@ interface OrchestratorOptions {
   /** The org for this request. Used by tools like `read_r2_object` / `attach_audio`
    *  to scope-check that the requested R2 key belongs to this org. */
   org?: string | undefined;
+  /** Per-turn id minted by the caller; stamped on every log this run emits. */
+  turnId?: string | undefined;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
 }
@@ -301,6 +303,15 @@ interface OrchestrationContext {
   maxMcpCallsPerRequest: number;
   /** Mutable counter — increments inside handleMCPToolCall before each call. */
   mcpCallsMade: { count: number };
+  /**
+   * Per-turn id, minted by the caller (UserDO). Distinct from `request_id`:
+   * `drainQueue` reuses the TRIGGERING request's logger for every entry it
+   * drains, so `request_id` is not a per-turn key on that path and joining
+   * generations on it would silently merge two users' turns.
+   */
+  turnId: string | undefined;
+  /** Mutable per-run telemetry accumulator. See `TelemetryAccumulator`. */
+  telemetry: TelemetryAccumulator;
   catalog: ToolCatalog;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
@@ -316,12 +327,82 @@ interface OrchestrationContext {
   env: Env;
 }
 
+/**
+ * Per-turn facts accumulated across every iteration of one orchestration run.
+ *
+ * Exists because `OrchestrationResult` was previously the only channel out of
+ * `orchestrate()`, and it carried nothing but text — so the model that answered,
+ * what the turn cost, how many steps it took and why it stopped were all computed
+ * and then discarded. Every downstream analytics question depends on these five
+ * facts escaping the run.
+ */
+export interface OrchestrationTelemetry {
+  /** Model requested for this run (`ctx.model`), not necessarily the one served. */
+  model: string;
+  /** Iterations actually run. 0 only if the loop never entered. */
+  iterations: number;
+  /** How the loop terminated. Bounded enum — safe as a metric label or log field. */
+  exitReason: 'done' | 'max_iterations';
+  /** `stop_reason` of the LAST Anthropic response; null if no iteration completed. */
+  finalStopReason: string | null;
+  /** Token counts SUMMED across every iteration (not last-write-wins). */
+  usage: UsageSummary;
+  /** MCP/host-function calls made this run. */
+  mcpCallsMade: number;
+  /**
+   * Active mode slug at turn START. This is the correct — and only — attribution
+   * key for "which mode governed this turn": the system prompt is built once,
+   * before the loop, so a mid-turn `switch_mode` cannot affect this turn.
+   */
+  mode: string | undefined;
+  /**
+   * Mode selected via the `switch_mode` tool during this turn, which by design
+   * takes effect on the user's NEXT message ("This will take effect on your next
+   * message"). A forward-looking selection signal — never an attribution key.
+   * `null` when no switch happened; the string `'__cleared__'` when mode was cleared.
+   */
+  modeSwitchedTo: string | null;
+}
+
+/**
+ * Sentinel for `modeSwitchedTo` when the user cleared their mode rather than
+ * selecting a new one. A distinct string (not null) so "cleared" is
+ * distinguishable from "no switch happened" in analytics.
+ */
+export const MODE_CLEARED = '__cleared__';
+
+/**
+ * Mutable accumulator threaded on `OrchestrationContext`, following the same
+ * cell pattern as `mcpCallsMade`. Only holds what must survive ACROSS iterations;
+ * everything else on `OrchestrationTelemetry` is read off the context at return.
+ */
+interface TelemetryAccumulator {
+  iterations: number;
+  exitReason: 'done' | 'max_iterations';
+  finalStopReason: string | null;
+  usage: UsageSummary;
+  modeSwitchedTo: string | null;
+}
+
+/** Fresh accumulator for one run. Extracted to keep createOrchestrationContext under its line cap. */
+function createTelemetryAccumulator(): TelemetryAccumulator {
+  return {
+    iterations: 0,
+    exitReason: 'max_iterations',
+    finalStopReason: null,
+    usage: { ...EMPTY_USAGE },
+    modeSwitchedTo: null,
+  };
+}
+
 /** Result of an orchestration run. */
 export interface OrchestrationResult {
   /** All text responses from all iterations (for display and history). */
   responses: string[];
   /** Index into responses[] where the final iteration's text begins. */
   finalIterationStartIndex: number;
+  /** Per-turn facts for telemetry. Always populated — see `OrchestrationTelemetry`. */
+  telemetry: OrchestrationTelemetry;
 }
 
 function extractToolCalls(content: Anthropic.ContentBlock[]): ToolUseBlock[] {
@@ -435,6 +516,24 @@ const EMPTY_USAGE: UsageSummary = {
 /** Coerce a possibly-null/absent token count to a number. */
 function tokenCount(value: number | null | undefined): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+/**
+ * Add one call's usage into a running total, in place.
+ *
+ * Summing (rather than last-write-wins) is the whole point: one turn can run up
+ * to MAX_ORCHESTRATION_ITERATIONS generations, and the cost of the turn is their
+ * sum. Reading only the final response — the obvious mistake — under-reports a
+ * multi-step turn by however many tool round-trips it took.
+ */
+function addUsage(into: UsageSummary, from: UsageSummary): void {
+  into.input_tokens += from.input_tokens;
+  into.output_tokens += from.output_tokens;
+  into.cache_creation_input_tokens += from.cache_creation_input_tokens;
+  into.cache_read_input_tokens += from.cache_read_input_tokens;
+  into.cache_write_5m_tokens += from.cache_write_5m_tokens;
+  into.cache_write_1h_tokens += from.cache_write_1h_tokens;
+  into.billable_input_tokens += from.billable_input_tokens;
 }
 
 /**
@@ -1202,7 +1301,11 @@ function reportClaudeResponse(
 ): void {
   const { iteration, response, toolCalls, iterStart } = args;
   const usage = summarizeUsage(response.usage);
+  // Accumulate BEFORE logging so a throw in the log path cannot lose the counts.
+  addUsage(ctx.telemetry.usage, usage);
+  ctx.telemetry.finalStopReason = response.stop_reason;
   ctx.logger.log('claude_response', {
+    ...(ctx.turnId ? { turn_id: ctx.turnId } : {}),
     iteration,
     stop_reason: response.stop_reason,
     tool_calls_count: toolCalls.length,
@@ -1222,6 +1325,7 @@ function processIteration(ctx: OrchestrationContext, iteration: number): Promise
     const iterStart = Date.now();
     ctx.logger.log('iteration_start', { iteration, message_count: ctx.messages.length });
     ctx.logger.log('claude_request', {
+      ...(ctx.turnId ? { turn_id: ctx.turnId } : {}),
       iteration,
       message_count: ctx.messages.length,
       system_stable_hash: ctx.systemStableHash,
@@ -1469,6 +1573,8 @@ function createOrchestrationContext(
     maxMcpResponseSize: config.maxMcpResponseSize,
     maxMcpCallsPerRequest: config.maxMcpCallsPerRequest,
     mcpCallsMade: { count: 0 },
+    turnId: options.turnId,
+    telemetry: createTelemetryAccumulator(),
     catalog,
     logger,
     callbacks,
@@ -1536,6 +1642,12 @@ async function runOrchestrationLoop(
     exit_reason: exitReason,
     last_iteration: lastIteration,
   });
+  // Surface the loop's own locals onto the context so they can escape the run.
+  // Without this they reach only the metric below, which is a no-op on the
+  // alarm-drained path (see UserDO.alarm / runWithMetricsSuppressed).
+  ctx.telemetry.iterations = lastIteration + 1;
+  ctx.telemetry.exitReason = exitReason;
+
   // Iterations actually run this request (lastIteration is 0-based), labeled by how
   // the loop exited — bounded reason enum, no ids.
   recordMetric('orchestration_iterations', lastIteration + 1, {
@@ -1552,6 +1664,11 @@ function logOrchestrationSummary(ctx: OrchestrationContext): void {
   const healthSummary = getHealthSummary(ctx.healthTracker);
 
   ctx.logger.log('orchestration_summary', {
+    ...(ctx.turnId ? { turn_id: ctx.turnId } : {}),
+    iterations: ctx.telemetry.iterations,
+    exit_reason: ctx.telemetry.exitReason,
+    stop_reason: ctx.telemetry.finalStopReason,
+    model: ctx.model,
     mcp_calls_made: ctx.mcpCallsMade.count,
     mcp_calls_limit: ctx.maxMcpCallsPerRequest,
     mcp_calls_pct_of_limit: Math.round((ctx.mcpCallsMade.count / ctx.maxMcpCallsPerRequest) * 100),
@@ -1627,6 +1744,21 @@ export async function orchestrate(
   return {
     responses: ctx.responses,
     finalIterationStartIndex: ctx.lastIterationStartIndex,
+    telemetry: buildOrchestrationTelemetry(ctx),
+  };
+}
+
+/** Collapse the mutable accumulator plus static context into the exported shape. */
+function buildOrchestrationTelemetry(ctx: OrchestrationContext): OrchestrationTelemetry {
+  return {
+    model: ctx.model,
+    iterations: ctx.telemetry.iterations,
+    exitReason: ctx.telemetry.exitReason,
+    finalStopReason: ctx.telemetry.finalStopReason,
+    usage: ctx.telemetry.usage,
+    mcpCallsMade: ctx.mcpCallsMade.count,
+    mode: ctx.activeMode,
+    modeSwitchedTo: ctx.telemetry.modeSwitchedTo,
   };
 }
 
@@ -2077,6 +2209,7 @@ async function handleSwitchMode(input: unknown, ctx: OrchestrationContext): Prom
   // Clearing mode selection
   if (mode === null) {
     await ctx.modeContext.setSelectedMode(null);
+    ctx.telemetry.modeSwitchedTo = MODE_CLEARED;
     ctx.logger.log('mode_tool_dispatch', { tool_name: 'switch_mode', mode: null });
     return { success: true, mode: null, message: 'Mode cleared. Using default settings.' };
   }
@@ -2094,6 +2227,7 @@ async function handleSwitchMode(input: unknown, ctx: OrchestrationContext): Prom
   // Persist the canonical name, not the requested slug, so an alias selection is
   // normalized in storage immediately.
   await ctx.modeContext.setSelectedMode(found.name);
+  ctx.telemetry.modeSwitchedTo = found.name;
   ctx.logger.log('mode_tool_dispatch', {
     tool_name: 'switch_mode',
     mode: found.name,
