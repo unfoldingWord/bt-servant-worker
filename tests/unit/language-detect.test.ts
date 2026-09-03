@@ -31,6 +31,7 @@ import {
   stripNonLinguistic,
   MAX_DETECT_CHARS,
   LATIN_LEXICAL_EVIDENCE_SHORT_WORD_MAX_LETTERS,
+  LATIN_PREDOMINANCE_RATIO,
   MIN_ACCURACY,
   MIN_CONFIDENCE,
   MIN_DISTINCT_WORDS,
@@ -198,6 +199,14 @@ describe('detectWrittenLanguage — inputs without enough linguistic signal', ()
     expect(detectWrittenLanguage(text, createMockLogger())).toBeNull();
   });
 
+  it(`requires at least ${MIN_LETTERS} letters after stripping`, () => {
+    const belowMin = 'obrigado amigo';
+    expect(belowMin.replace(/\P{L}/gu, '').length).toBeLessThan(MIN_LETTERS);
+    expect(detectWrittenLanguage(belowMin, createMockLogger())).toBeNull();
+  });
+});
+
+describe('detectWrittenLanguage — lexical evidence for Latin script', () => {
   it.each([
     ['a keyboard-row list that unique-grams to ro @ 1.0', 'qwerty asdfgh zxcvbn poiuyt lkjhgf'],
     ['a low-entropy list that clears both floors as nl 0.069', 'aaaa bbbb cccc dddd eeee ffff'],
@@ -210,11 +219,28 @@ describe('detectWrittenLanguage — inputs without enough linguistic signal', ()
     }
   );
 
-  it(`requires at least ${MIN_LETTERS} letters after stripping`, () => {
-    const belowMin = 'obrigado amigo';
-    expect(belowMin.replace(/\P{L}/gu, '').length).toBeLessThan(MIN_LETTERS);
-    expect(detectWrittenLanguage(belowMin, createMockLogger())).toBeNull();
-  });
+  it.each([
+    [
+      'zh',
+      'Chinese prose mentioning Bible',
+      '我正在读 Bible 的马可福音，请帮我理解这段经文的意思。',
+    ],
+    [
+      'ja',
+      'Japanese prose mentioning ChatGPT',
+      '私は ChatGPT を使ってマルコの福音書を母語に翻訳しています。',
+    ],
+    [
+      'pt',
+      'Portuguese prose with one CJK character',
+      'Estou traduzindo o evangelho de Marcos 書 para a minha língua materna.',
+    ],
+  ])(
+    `applies the lexical gate only when ≥ ${LATIN_PREDOMINANCE_RATIO * 100}% of letters are Latin: %s (%s)`,
+    (code, _label, text) => {
+      expect(detectWrittenLanguage(text, createMockLogger())?.code).toBe(code);
+    }
+  );
 });
 
 describe('detectWrittenLanguage — languages outside the tinyld/light set', () => {

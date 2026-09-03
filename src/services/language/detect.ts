@@ -67,6 +67,14 @@ export const MIN_DISTINCT_WORDS = 4;
 export const LATIN_LEXICAL_EVIDENCE_SHORT_WORD_MAX_LETTERS = 3;
 
 /**
+ * Share of letters that must be Latin script before the lexical-evidence
+ * gate applies. Chinese or Japanese prose that mentions `Bible` or `ChatGPT`
+ * is not Latin text and must reach the detector; a Portuguese sentence with
+ * one stray CJK character still is.
+ */
+export const LATIN_PREDOMINANCE_RATIO = 0.8;
+
+/**
  * Minimum tinyld `accuracy` for the top candidate. Below a unique-n-gram hit
  * (1.0), accuracy is roughly (words voting for the top language) / letters,
  * so under 0.06 well under half the words agree. That is the band where the
@@ -106,7 +114,7 @@ const EMOJI_PATTERN = /[\p{Extended_Pictographic}\p{Emoji_Presentation}\uFE0F\u2
 
 const LETTER_PATTERN = /\p{L}/gu;
 const WORD_PATTERN = /\p{L}+/gu;
-const LATIN_LETTER_PATTERN = /\p{Script=Latin}/u;
+const LATIN_LETTER_PATTERN = /\p{Script=Latin}/gu;
 /** Any combining mark after NFD: a letter carrying a diacritic. */
 const COMBINING_MARK_PATTERN = /\p{M}/u;
 /** A whole word of 1–{@link LATIN_LEXICAL_EVIDENCE_SHORT_WORD_MAX_LETTERS} letters. */
@@ -156,12 +164,18 @@ function countDistinctWords(text: string): number {
   return new Set(text.normalize('NFC').toLowerCase().match(WORD_PATTERN) ?? []).size;
 }
 
+/** True when at least {@link LATIN_PREDOMINANCE_RATIO} of the letters are Latin script. */
+function isPredominantlyLatin(prepared: string): boolean {
+  const latin = prepared.match(LATIN_LETTER_PATTERN)?.length ?? 0;
+  return latin >= LATIN_PREDOMINANCE_RATIO * countLetters(prepared);
+}
+
 /**
- * Latin-script text needs a short word or a diacritic (see
- * {@link LATIN_LEXICAL_EVIDENCE_SHORT_WORD_MAX_LETTERS}); other scripts pass.
+ * Predominantly Latin text needs a short word or a diacritic (see
+ * {@link LATIN_LEXICAL_EVIDENCE_SHORT_WORD_MAX_LETTERS}); other text passes.
  */
 function hasLexicalEvidence(prepared: string): boolean {
-  if (!LATIN_LETTER_PATTERN.test(prepared)) return true;
+  if (!isPredominantlyLatin(prepared)) return true;
   return (
     SHORT_WORD_PATTERN.test(prepared) || COMBINING_MARK_PATTERN.test(prepared.normalize('NFD'))
   );
