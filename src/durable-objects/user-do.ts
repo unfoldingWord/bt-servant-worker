@@ -88,6 +88,7 @@ import {
   withUserPseudonym,
   type MetricLabels,
 } from '../services/telemetry/index.js';
+import { chatTurnText, type ChatTurnText } from '../services/telemetry/chat-turn-text.js';
 import { classifyTriggers, ClassifierResult } from '../services/classifier/index.js';
 import type { UnmatchedTrigger } from '../services/classifier/index.js';
 import {
@@ -391,6 +392,12 @@ interface ChatTurnContext {
    * `buildChatTurnRecord`).
    */
   inputLanguage: DetectedLanguage | null;
+  /**
+   * The user's message and the assistant's reply
+   * (services/telemetry/chat-turn-text.ts). Log payload only — never a
+   * metric label.
+   */
+  text: ChatTurnText;
 }
 
 /**
@@ -442,6 +449,8 @@ function buildChatTurnPayload(
     duration_ms: turn.durationMs,
     had_inbound_voice: turn.hadInboundVoice,
     had_outbound_voice: turn.hadOutboundVoice,
+    // The conversation itself: user_message / assistant_reply (chat-turn-text.ts).
+    ...turn.text,
   };
 }
 
@@ -1690,7 +1699,7 @@ export class UserDO {
     );
 
     // prettier-ignore
-    this.logChatTurn(body, effectivePreferences.response_language, logger, { turnId, activeModeName: triggerCtx.activeModeName, activeLanguageName: triggerCtx.activeLanguageName, languageSource: triggerCtx.languageSource, orchestration: orchResult.telemetry, durationMs: Date.now() - ctx.startTime, hadInboundVoice: !!loaded.inboundVoiceKey, hadOutboundVoice: audioKey !== null, inputLanguage });
+    this.logChatTurn(body, effectivePreferences.response_language, logger, { turnId, activeModeName: triggerCtx.activeModeName, activeLanguageName: triggerCtx.activeLanguageName, languageSource: triggerCtx.languageSource, orchestration: orchResult.telemetry, durationMs: Date.now() - ctx.startTime, hadInboundVoice: !!loaded.inboundVoiceKey, hadOutboundVoice: audioKey !== null, inputLanguage, text: chatTurnText(triggerCtx.messageText, orchResult.responses) });
 
     // prettier-ignore
     return this.assembleChatResponse({ responses: orchResult.responses, audioKey, workerOrigin, attachmentsContext, effectivePreferences, inputLanguage, logger, startTime: ctx.startTime });
