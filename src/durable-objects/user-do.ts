@@ -86,10 +86,16 @@ import {
   runWithMetricsSuppressed,
   withSpan,
   withUserPseudonym,
+  type MetricLabels,
 } from '../services/telemetry/index.js';
 import { classifyTriggers, ClassifierResult } from '../services/classifier/index.js';
 import type { UnmatchedTrigger } from '../services/classifier/index.js';
-import { isAdminClient, validateChatBody } from '../utils/chat-validation.js';
+import {
+  detectWrittenLanguage,
+  DetectedLanguage,
+  UNDETERMINED_LANGUAGE,
+} from '../services/language/index.js';
+import { isAdminClient, isValidLanguageCode, validateChatBody } from '../utils/chat-validation.js';
 import { OrgLanguages, resolveEffectiveLanguage } from '../types/languages.js';
 import { InternalQueueEntry } from '../types/queue.js';
 import { statusUpdate, uiString } from '../i18n/ui-strings.js';
@@ -113,15 +119,6 @@ const DEFAULT_MAX_RETRIES = 3;
 const ENQUEUE_RATE_WINDOW_MS = 60_000; // 1 minute
 const ENQUEUE_RATE_LIMIT = 300;
 const SSE_KEEPALIVE_INTERVAL_MS = 30_000; // 30 seconds
-
-/**
- * Validates ISO 639-1 language code format (2 lowercase letters).
- */
-const ISO_639_1_PATTERN = /^[a-z]{2}$/;
-
-function isValidLanguageCode(code: string): boolean {
-  return ISO_639_1_PATTERN.test(code);
-}
 
 const DEFAULT_PREFERENCES: UserPreferencesInternal = {
   response_language: 'en',
@@ -388,6 +385,12 @@ interface ChatTurnContext {
   hadInboundVoice: boolean;
   /** Turn produced a voice reply (TTS cost, uncaptured here). */
   hadOutboundVoice: boolean;
+  /**
+   * Language the user WROTE this turn in (#404), or null when the detector
+   * abstained. Log payload only — never a metric label (see
+   * `buildChatTurnRecord`).
+   */
+  inputLanguage: DetectedLanguage | null;
 }
 
 /**
@@ -413,6 +416,10 @@ function buildChatTurnPayload(
     transport: dims.transport ?? null,
     chat_type: dims.chatType,
     response_language: responseLanguage,
+    // #404: the language the user wrote in. `und` (not null) when the detector
+    // abstained, so the field is always present for the tail consumer.
+    input_language: turn.inputLanguage ? turn.inputLanguage.code : UNDETERMINED_LANGUAGE,
+    input_language_confidence: turn.inputLanguage ? turn.inputLanguage.confidence : null,
     user_country: dims.userCountry ?? null,
     edge_country: dims.edgeCountry ?? null,
     // Mode that governed this turn. `mode_switched_to` is a NEXT-turn selection
@@ -454,6 +461,41 @@ function buildChatTurnDimensions(
     transport: body._transport,
     userCountry: countryFromPhoneUserId(body.user_id, body.client_id),
     edgeCountry: isCountryCode(body._edge_country) ? body._edge_country : undefined,
+  };
+}
+
+/**
+ * Build the `chat_turn` log payload and the `chat_turns_total` counter labels
+ * from one source so they cannot drift.
+ *
+ * `input_language` / `input_language_confidence` (#404) go on the LOG PAYLOAD
+ * ONLY. Metric labels bound series cardinality; the detector can emit any of
+ * ~20 codes per turn and must never become a label.
+ */
+export function buildChatTurnRecord(
+  body: ChatRequest,
+  responseLanguage: string,
+  defaultOrg: string,
+  turn: ChatTurnContext
+): { payload: Record<string, unknown>; labels: MetricLabels } {
+  const dims = buildChatTurnDimensions(body, defaultOrg);
+  return {
+    payload: buildChatTurnPayload(body, dims, responseLanguage, turn),
+    labels: buildChatTurnLabels(dims, responseLanguage),
+  };
+}
+
+/** Bounded counter labels for `chat_turns_total` — unchanged since before #404. */
+function buildChatTurnLabels(
+  dims: ReturnType<typeof buildChatTurnDimensions>,
+  responseLanguage: string
+): MetricLabels {
+  return {
+    language: responseLanguage,
+    chat_type: dims.chatType,
+    ...(dims.transport ? { transport: dims.transport } : {}),
+    ...(dims.userCountry ? { user_country: dims.userCountry } : {}),
+    ...(dims.edgeCountry ? { edge_country: dims.edgeCountry } : {}),
   };
 }
 
@@ -1579,15 +1621,9 @@ export class UserDO {
     turn: ChatTurnContext
   ): void {
     try {
-      const dims = buildChatTurnDimensions(body, this.env.DEFAULT_ORG);
-      logger.log('chat_turn', buildChatTurnPayload(body, dims, responseLanguage, turn));
-      countMetric('chat_turns_total', {
-        language: responseLanguage,
-        chat_type: dims.chatType,
-        ...(dims.transport ? { transport: dims.transport } : {}),
-        ...(dims.userCountry ? { user_country: dims.userCountry } : {}),
-        ...(dims.edgeCountry ? { edge_country: dims.edgeCountry } : {}),
-      });
+      const record = buildChatTurnRecord(body, responseLanguage, this.env.DEFAULT_ORG, turn);
+      logger.log('chat_turn', record.payload);
+      countMetric('chat_turns_total', record.labels);
     } catch (error) {
       logger.warn('chat_turn_telemetry_failed', {
         error: error instanceof Error ? error.message : String(error),
@@ -1623,6 +1659,12 @@ export class UserDO {
     // Extract #mode/@language trigger tokens and resolve per-turn overrides
     const triggerCtx = await this.classifyAndResolveTriggers(body, loaded, logger);
 
+    // #404: detect the language the user WROTE in, once per turn, on the text
+    // the classifier already stripped of matched trigger tokens. Telemetry
+    // only: it is recorded on chat_turn and echoed on the response, and never
+    // touches the persisted response_language preference.
+    const inputLanguage = detectWrittenLanguage(triggerCtx.messageText, logger);
+
     // ── Build orchestrator options ────────────────────────────────────────────
     const effectivePreferences = { ...loaded.preferences, response_language: loaded.locale };
     const groupContext = this.maybeBuildGroupContext(body);
@@ -1648,10 +1690,10 @@ export class UserDO {
     );
 
     // prettier-ignore
-    this.logChatTurn(body, effectivePreferences.response_language, logger, { turnId, activeModeName: triggerCtx.activeModeName, activeLanguageName: triggerCtx.activeLanguageName, languageSource: triggerCtx.languageSource, orchestration: orchResult.telemetry, durationMs: Date.now() - ctx.startTime, hadInboundVoice: !!loaded.inboundVoiceKey, hadOutboundVoice: audioKey !== null });
+    this.logChatTurn(body, effectivePreferences.response_language, logger, { turnId, activeModeName: triggerCtx.activeModeName, activeLanguageName: triggerCtx.activeLanguageName, languageSource: triggerCtx.languageSource, orchestration: orchResult.telemetry, durationMs: Date.now() - ctx.startTime, hadInboundVoice: !!loaded.inboundVoiceKey, hadOutboundVoice: audioKey !== null, inputLanguage });
 
     // prettier-ignore
-    return this.assembleChatResponse({ responses: orchResult.responses, audioKey, workerOrigin, attachmentsContext, effectivePreferences, logger, startTime: ctx.startTime });
+    return this.assembleChatResponse({ responses: orchResult.responses, audioKey, workerOrigin, attachmentsContext, effectivePreferences, inputLanguage, logger, startTime: ctx.startTime });
   }
 
   /**
@@ -2510,6 +2552,7 @@ export class UserDO {
     workerOrigin: string;
     attachmentsContext: AttachmentsContext;
     effectivePreferences: { response_language: string };
+    inputLanguage: DetectedLanguage | null;
     logger: RequestLogger;
     startTime: number;
   }): ChatResponse {
@@ -2519,6 +2562,7 @@ export class UserDO {
       workerOrigin,
       attachmentsContext,
       effectivePreferences,
+      inputLanguage,
       logger,
       startTime,
     } = opts;
@@ -2529,6 +2573,7 @@ export class UserDO {
     return {
       responses,
       response_language: effectivePreferences.response_language,
+      input_language: inputLanguage?.code ?? UNDETERMINED_LANGUAGE,
       voice_audio_base64: null,
       voice_audio_url: voiceAudioUrl,
       ...(attachments.length > 0 ? { attachments } : {}),

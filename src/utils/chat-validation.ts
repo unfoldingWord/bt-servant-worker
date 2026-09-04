@@ -12,6 +12,18 @@ import type { ChatRequest, ChatTransport } from '../types/engine.js';
 
 const VALID_CHAT_TYPES: ReadonlySet<string> = new Set(['private', 'group', 'supergroup']);
 
+/** ISO 639-1 language code shape: exactly two lowercase letters. */
+const ISO_639_1_PATTERN = /^[a-z]{2}$/;
+
+/**
+ * True when `code` has the shape of an ISO 639-1 language code. The single
+ * definition shared by the request-body `response_language_hint` check here
+ * and the persisted `response_language` check in UserDO (`PUT /preferences`).
+ */
+export function isValidLanguageCode(code: string): boolean {
+  return ISO_639_1_PATTERN.test(code);
+}
+
 /**
  * client_id values that identify admin-origin callers.
  *
@@ -34,7 +46,7 @@ export function isAdminClient(clientId: string | undefined): boolean {
 /** Validate an optional ISO 639-1 language code. */
 function validateLanguageHint(hint: unknown): string | null {
   if (hint === undefined) return null;
-  if (typeof hint !== 'string' || !/^[a-z]{2}$/.test(hint)) {
+  if (typeof hint !== 'string' || !isValidLanguageCode(hint)) {
     return 'response_language_hint must be a valid ISO 639-1 language code (2 lowercase letters)';
   }
   return null;

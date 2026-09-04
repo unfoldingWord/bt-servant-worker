@@ -192,6 +192,18 @@ export interface ChatResponse {
   /** Language code for the response (e.g., 'en', 'es', 'fr') */
   response_language: string;
 
+  /**
+   * ISO 639-1 code of the language the user's message was WRITTEN in, as
+   * detected by the worker (#404), or `"und"` when no confident read was
+   * possible (short acks, bare scripture references, emoji, URLs).
+   *
+   * Informational: it reports what the user wrote; `response_language`
+   * remains the effective reply preference for the turn. Present on every
+   * response that processed a turn; absent on the ambient group-chat
+   * short-circuit, which never examines the message.
+   */
+  input_language?: string;
+
   /** @deprecated Use voice_audio_url instead. Always null when R2 is enabled. */
   voice_audio_base64: string | null;
 
