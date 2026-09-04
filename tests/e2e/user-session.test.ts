@@ -152,6 +152,44 @@ describe('UserDO Durable Object', () => {
       const internal = await readInternalPreferences(stub);
       expect(internal.response_language).toBe('pt');
     });
+
+    it('empty PUT (no response_language) reports null, consistent with GET', async () => {
+      // A valid PUT carrying no response_language must not record an explicit
+      // choice, and its response must match what GET reports — null, not the
+      // internal default. Regression guard for the codex P2 where the PUT
+      // echoed "en" while a subsequent GET returned null (#408).
+      const response = await stub.fetch('http://fake-host/preferences', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const data = (await response.json()) as Record<string, unknown>;
+
+      expect(response.status).toBe(200);
+      expect(data.response_language).toBeNull();
+
+      const stored = await readStoredPreferences(stub);
+      expect(stored?.response_language_explicit).toBeUndefined();
+
+      expect(await getReportedLanguage(stub)).toBeNull();
+    });
+
+    it('empty PUT after an explicit choice still reports the chosen language', async () => {
+      // The flag persists, so a later no-op PUT echoes the real choice and
+      // stays consistent with GET.
+      await putPreferredLanguage(stub, 'pt');
+
+      const response = await stub.fetch('http://fake-host/preferences', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const data = (await response.json()) as Record<string, unknown>;
+
+      expect(response.status).toBe(200);
+      expect(data.response_language).toBe('pt');
+      expect(await getReportedLanguage(stub)).toBe('pt');
+    });
   });
 
   describe('PUT /preferences - valid updates', () => {

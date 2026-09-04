@@ -2658,7 +2658,13 @@ export class UserDO {
       };
       await this.updatePreferences(updated);
 
-      const apiPrefs: UserPreferencesAPI = { response_language: updated.response_language };
+      // Report the language only when it is explicitly set, mirroring
+      // handleGetPreferences — otherwise an empty PUT (no response_language, a
+      // valid request) would echo the internal default while a subsequent GET
+      // returns null, contradicting itself (see #408).
+      const apiPrefs: UserPreferencesAPI = {
+        response_language: updated.response_language_explicit ? updated.response_language : null,
+      };
       return Response.json(apiPrefs);
     });
   }
