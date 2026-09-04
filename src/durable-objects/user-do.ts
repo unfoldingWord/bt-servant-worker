@@ -1275,7 +1275,9 @@ export class UserDO {
 
     const sendEvent = async (event: SSEEvent): Promise<void> => {
       if (state.clientDisconnected || !writer) return;
-      if (event.type === 'progress' && state.firstTokenTime === null) {
+      // Non-whitespace only: the metric should time the first real word, not an
+      // inter-iteration separator or a whitespace-only text delta (#410).
+      if (event.type === 'progress' && event.text.trim() !== '' && state.firstTokenTime === null) {
         state.firstTokenTime = Date.now() - startTime;
         logger.log('stream_first_token', { time_to_first_token_ms: state.firstTokenTime });
       }
