@@ -18,6 +18,7 @@ import { describe, it, expect } from 'vitest';
 import { buildChatTurnRecord } from '../../../src/durable-objects/user-do.js';
 import type { DetectedLanguage } from '../../../src/services/language/index.js';
 import type { ChatRequest } from '../../../src/types/engine.js';
+import type { ChatTurnText } from '../../../src/services/telemetry/chat-turn-text.js';
 
 const DEFAULT_ORG = 'unfoldingWord';
 
@@ -59,6 +60,11 @@ function body(overrides: Partial<ChatRequest> = {}): ChatRequest {
  * exercise the SAME payload builder production uses rather than a #404-only
  * subset of it.
  */
+const TEXT: ChatTurnText = {
+  user_message: 'What does John 3:16 mean? My pastor Bob asked.',
+  assistant_reply: 'John 3:16 says that God loved the world…',
+};
+
 function turnContext(inputLanguage: DetectedLanguage | null) {
   return {
     turnId: 'turn-1',
@@ -87,6 +93,7 @@ function turnContext(inputLanguage: DetectedLanguage | null) {
     hadInboundVoice: false,
     hadOutboundVoice: true,
     inputLanguage,
+    text: TEXT,
   };
 }
 
@@ -188,5 +195,16 @@ describe('buildChatTurnRecord — chat_turns_total labels (cardinality guard)', 
     );
     const undetected = buildChatTurnRecord(body(), 'en', DEFAULT_ORG, turnContext(null));
     expect(detected.labels).toEqual(undetected.labels);
+  });
+});
+
+describe('buildChatTurnRecord — conversation text', () => {
+  it('carries both fields verbatim on the payload, and never on the metric labels', () => {
+    const { payload, labels } = buildChatTurnRecord(body(), 'en', DEFAULT_ORG, turnContext(null));
+    expect(payload.user_message).toBe(TEXT.user_message);
+    expect(payload.assistant_reply).toBe(TEXT.assistant_reply);
+    expect(Object.keys(labels)).not.toContain('user_message');
+    expect(Object.keys(labels)).not.toContain('assistant_reply');
+    expect(JSON.stringify(labels)).not.toContain('Bob');
   });
 });

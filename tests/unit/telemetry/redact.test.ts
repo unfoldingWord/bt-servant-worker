@@ -35,6 +35,11 @@ describe('attributeValueFor — fail-closed classifier', () => {
     expect(v).not.toContain('John');
   });
 
+  it('never egresses conversation text: both chat_turn text keys summarize to length', () => {
+    expect(attributeValueFor('user_message', 'My pastor Bob asked me')).toBe('string(22)');
+    expect(attributeValueFor('assistant_reply', 'Hello Bob, John 3:16 says…')).toBe('string(26)');
+  });
+
   it('caps an over-long allow-listed string', () => {
     const long = 'a'.repeat(600);
     const v = attributeValueFor('reason', long) as string;
