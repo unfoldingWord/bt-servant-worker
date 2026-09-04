@@ -2615,7 +2615,12 @@ export class UserDO {
   private async handleGetPreferences(): Promise<Response> {
     return withEndpointLogging(this.getLogger(), 'get_preferences', async () => {
       const prefs = await this.getPreferences();
-      const apiPrefs: UserPreferencesAPI = { response_language: prefs.response_language };
+      // Report a language only when the user explicitly set one. Otherwise the
+      // stored value is a default the worker never asked for; reporting it would
+      // let clients mistake "never chose" for "chose English" (see #408).
+      const apiPrefs: UserPreferencesAPI = {
+        response_language: prefs.response_language_explicit ? prefs.response_language : null,
+      };
       return Response.json(apiPrefs);
     });
   }
@@ -2645,6 +2650,10 @@ export class UserDO {
         ...current,
         ...(updates.response_language !== undefined && {
           response_language: updates.response_language,
+          // Mark the language as explicitly chosen. This is the ONLY place the
+          // flag is set, so GET /preferences can tell an explicit choice from a
+          // worker-supplied default (see #408).
+          response_language_explicit: true,
         }),
       };
       await this.updatePreferences(updated);

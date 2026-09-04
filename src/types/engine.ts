@@ -278,6 +278,14 @@ export interface ChatHistoryResponse {
 export interface UserPreferencesInternal {
   response_language: string;
   first_interaction: boolean;
+  /**
+   * True only when the user explicitly set `response_language` via
+   * `PUT /preferences`. Absent/false means the stored `response_language`
+   * is a default the worker never asked for. Lets `GET /preferences`
+   * distinguish "chose a language" from "never chose" (see #408). Never set
+   * by the first-interaction flip or any other internal write.
+   */
+  response_language_explicit?: boolean;
 }
 
 /**

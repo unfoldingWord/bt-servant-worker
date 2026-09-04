@@ -9,8 +9,53 @@
  */
 
 /* eslint-disable max-lines-per-function */
-import { env } from 'cloudflare:test';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { env, runInDurableObject } from 'cloudflare:test';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import {
+  buildChatBody,
+  postChatFinal,
+  putPreferredLanguage,
+  setupAnthropicFetchCapture,
+} from '../helpers/anthropic-capture.js';
+import type { UserPreferencesInternal } from '../../src/types/engine.js';
+
+// The #408 turn-driving tests below run real chat turns through the DO; the
+// harness intercepts the orchestrator at globalThis.fetch, but the SDK
+// constructor must still be stubbed (hoisted per file). Inert for every other
+// test in this file since the orchestrator calls globalThis.fetch directly.
+vi.mock('@anthropic-ai/sdk', () => ({ default: vi.fn() }));
+
+/** GET /preferences and return the API-reported response_language (may be null). */
+async function getReportedLanguage(stub: DurableObjectStub): Promise<string | null> {
+  const response = await stub.fetch('http://fake-host/preferences');
+  expect(response.status).toBe(200);
+  const data = (await response.json()) as { response_language: string | null };
+  return data.response_language;
+}
+
+/** Read the raw persisted preferences record straight from DO storage. */
+function readStoredPreferences(
+  stub: DurableObjectStub
+): Promise<UserPreferencesInternal | undefined> {
+  return runInDurableObject(stub, (_instance, state) =>
+    state.storage.get<UserPreferencesInternal>('preferences')
+  );
+}
+
+/** Invoke the DO's internal getPreferences() — what reply-language logic reads. */
+function readInternalPreferences(stub: DurableObjectStub): Promise<UserPreferencesInternal> {
+  return runInDurableObject(stub, (instance) =>
+    (instance as unknown as { getPreferences(): Promise<UserPreferencesInternal> }).getPreferences()
+  );
+}
+
+/** Seed a raw preferences record directly into DO storage (migration setup). */
+function seedStoredPreferences(
+  stub: DurableObjectStub,
+  prefs: UserPreferencesInternal
+): Promise<void> {
+  return runInDurableObject(stub, (_instance, state) => state.storage.put('preferences', prefs));
+}
 
 describe('UserDO Durable Object', () => {
   let stub: DurableObjectStub;
@@ -21,14 +66,91 @@ describe('UserDO Durable Object', () => {
   });
 
   describe('GET /preferences', () => {
-    it('returns default preferences for new user', async () => {
+    it('reports response_language: null for a user who has never set one', async () => {
+      // Post-#408: the API reports null (never chosen) instead of leaking the
+      // internal 'en' default, so clients can seed a first-visit default.
       const response = await stub.fetch('http://fake-host/preferences');
       const data = (await response.json()) as Record<string, unknown>;
 
       expect(response.status).toBe(200);
       expect(data).toEqual({
-        response_language: 'en',
+        response_language: null,
       });
+    });
+  });
+
+  // ── #408: GET /preferences must distinguish "never chose" from "chose en" ──
+  describe('response_language explicit reporting (#408)', () => {
+    let captured: ReturnType<typeof setupAnthropicFetchCapture>;
+
+    beforeEach(() => {
+      captured = setupAnthropicFetchCapture();
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it('never set: GET reports null while internal reads still default to en', async () => {
+      expect(await getReportedLanguage(stub)).toBeNull();
+
+      const internal = await readInternalPreferences(stub);
+      expect(internal.response_language).toBe('en');
+      expect(internal.response_language_explicit).toBeUndefined();
+    });
+
+    it('PUT { response_language: "pt" }: GET reports pt and the flag is persisted', async () => {
+      await putPreferredLanguage(stub, 'pt');
+
+      expect(await getReportedLanguage(stub)).toBe('pt');
+
+      const stored = await readStoredPreferences(stub);
+      expect(stored?.response_language).toBe('pt');
+      expect(stored?.response_language_explicit).toBe(true);
+    });
+
+    it('first-interaction flip on a never-set user keeps GET reporting null', async () => {
+      // A real turn (no @-trigger, no explicit language) triggers the
+      // first_interaction flip, which persists the record — the storage
+      // pollution path from #408. It must NOT set the explicit flag.
+      const response = await postChatFinal(stub, buildChatBody({ message: 'hello there' }));
+      expect(response.status).toBe(200);
+      expect(captured.calls.length).toBeGreaterThan(0);
+
+      const stored = await readStoredPreferences(stub);
+      expect(stored?.first_interaction).toBe(false);
+      expect(stored?.response_language_explicit).toBeUndefined();
+
+      expect(await getReportedLanguage(stub)).toBeNull();
+    });
+
+    it('response_language_hint on a turn does not set the flag or change GET', async () => {
+      const response = await postChatFinal(
+        stub,
+        buildChatBody({ message: 'hello there', response_language_hint: 'pt' })
+      );
+      expect(response.status).toBe(200);
+
+      const stored = await readStoredPreferences(stub);
+      expect(stored?.response_language_explicit).toBeUndefined();
+
+      expect(await getReportedLanguage(stub)).toBeNull();
+    });
+
+    it('migration: a pre-existing stored language with no flag reports null', async () => {
+      // Seed a record written before #408: a real response_language but no
+      // explicit flag (e.g. the flip baked in the default, or a pre-#408 PUT).
+      await seedStoredPreferences(stub, {
+        response_language: 'pt',
+        first_interaction: false,
+      });
+
+      expect(await getReportedLanguage(stub)).toBeNull();
+
+      // Internal reads still honour the stored language — reply behavior is
+      // unchanged; only the API report gates on the flag.
+      const internal = await readInternalPreferences(stub);
+      expect(internal.response_language).toBe('pt');
     });
   });
 
@@ -240,8 +362,10 @@ describe('UserDO user-scoped DO isolation', () => {
       body: JSON.stringify({ response_language: 'es' }),
     });
 
+    // org2's user never set a language, so post-#408 the API reports null —
+    // crucially not org1's 'es', which is the isolation this test guards.
     const org2Prefs = await org2Stub.fetch('http://fake-host/preferences');
-    const org2Data = (await org2Prefs.json()) as { response_language: string };
-    expect(org2Data.response_language).toBe('en');
+    const org2Data = (await org2Prefs.json()) as { response_language: string | null };
+    expect(org2Data.response_language).toBeNull();
   });
 });
