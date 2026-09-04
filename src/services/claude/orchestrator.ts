@@ -1341,8 +1341,19 @@ function processIteration(ctx: OrchestrationContext, iteration: number): Promise
       system_stable_chars: ctx.systemStable.length,
     });
 
-    if (iteration > 0 && ctx.callbacks) {
-      notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress('\n'));
+    if (iteration > 0) {
+      // The separator divides prose from prose. On a tools-first turn (iteration 0
+      // returns tool_use with no text block — the normal shape for a fresh account's
+      // first question) nothing has been streamed yet, so emitting it would put
+      // whitespace ahead of the first word: stream consumers that treat `progress`
+      // as "the answer has started" blank out for the whole tool phase, and the
+      // streamed text diverges from the final joined `responses` (#410).
+      // `ctx.responses` only ever holds non-whitespace blocks (extractTextResponses),
+      // so a non-empty array means real prose has already gone out.
+      if (ctx.callbacks && ctx.responses.length > 0) {
+        notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress('\n'));
+      }
+      // Status stays unconditional — the tool phase should still narrate itself.
       ctx.emitStatus?.('status_preparing');
     }
 

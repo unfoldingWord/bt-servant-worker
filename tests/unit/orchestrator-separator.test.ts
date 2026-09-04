@@ -128,6 +128,40 @@ function setupMultiIterationMock() {
   });
 }
 
+/**
+ * Tools-first turn: iteration 0 returns `tool_use` with NO text block — the
+ * normal shape for a fresh account's first question (#410).
+ */
+function setupToolsFirstMock() {
+  let callCount = 0;
+  const firstMessage = createMockMessage('msg_1', 'tool_use', [
+    {
+      type: 'tool_use',
+      id: 'tool_1',
+      name: 'execute_code',
+      input: { code: '__result__ = "test"' },
+    },
+  ]);
+  const secondMessage = createMockMessage('msg_2', 'end_turn', [
+    { type: 'text', text: 'Here is the answer' },
+  ]);
+
+  (Anthropic as unknown as ReturnType<typeof vi.fn>).mockImplementation(function MockAnthropic(
+    this: object
+  ) {
+    return this;
+  } as unknown as () => object);
+
+  vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+    const isFirst = callCount === 0;
+    callCount++;
+    return new Response(buildSSEBody(isFirst ? firstMessage : secondMessage), {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    });
+  });
+}
+
 function setupSingleIterationMock() {
   const message = createMockMessage('msg_1', 'end_turn', [
     { type: 'text', text: 'Single response' },
@@ -217,5 +251,27 @@ describe('Orchestrator iteration separator - single iteration', () => {
     });
     expect(result.finalIterationStartIndex).toBe(0);
     expect(result.responses).toEqual(['Single response']);
+  });
+});
+
+describe('Orchestrator iteration separator - tools-first turn', () => {
+  let progressChunks: string[];
+
+  beforeEach(() => {
+    progressChunks = [];
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('streams no separator before the first text (#410)', async () => {
+    setupToolsFirstMock();
+    await orchestrate('test message', {
+      env: createMockEnv(),
+      catalog: createMockCatalog(),
+      history: [],
+      preferences: { response_language: 'en', first_interaction: true },
+      logger: createMockLogger(),
+      callbacks: createMockCallbacks(progressChunks),
+    });
+    expect(progressChunks).toEqual(['Here is the answer']);
   });
 });
