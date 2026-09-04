@@ -113,7 +113,9 @@ describe('detection never writes response_language', () => {
     async (clientId, userId) => {
       const body = (message: string) =>
         buildBody({ client_id: clientId, user_id: userId, message });
-      expect(await getPreferredLanguage(stub)).toBe('en');
+      // Never explicitly chosen: GET reports null post-#408. Reply behavior
+      // (still English) is asserted below via each turn's response_language.
+      expect(await getPreferredLanguage(stub)).toBeNull();
 
       const first = await postChatFinalJson(stub, body(PT_MESSAGE));
       const second = await postChatFinalJson(stub, body(PT_MESSAGE_2));
@@ -121,7 +123,9 @@ describe('detection never writes response_language', () => {
       expect(first.input_language).toBe('pt');
       expect(first.response_language).toBe('en');
       expect(second.response_language).toBe('en');
-      expect(await getPreferredLanguage(stub)).toBe('en');
+      // The first-interaction flip persisted the record but not an explicit
+      // choice, so GET still reports null.
+      expect(await getPreferredLanguage(stub)).toBeNull();
       expect(captured.calls).toHaveLength(2);
       for (const call of captured.calls) expect(call.system).not.toContain('Respond in');
       expect(chatTurns(captured.logs).map((t) => t.payload?.response_language)).toEqual([
@@ -154,7 +158,9 @@ describe('detection never writes response_language', () => {
     expect(response.response_language).toBe('fr');
     expect(response.input_language).toBe('pt');
     expect(captured.calls[0]?.system).toContain('Respond in fr when possible');
-    expect(await getPreferredLanguage(stub)).toBe('en');
+    // The hint is transient and never persisted, and the user never chose a
+    // language, so GET reports null post-#408.
+    expect(await getPreferredLanguage(stub)).toBeNull();
     expect(chatTurns(captured.logs)[0]?.payload).toMatchObject({
       response_language: 'fr',
       input_language: 'pt',
