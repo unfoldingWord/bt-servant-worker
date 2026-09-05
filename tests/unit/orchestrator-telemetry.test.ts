@@ -213,3 +213,32 @@ describe('orchestration telemetry — rollup on orchestration_summary', () => {
     expect(typeof summary?.data.model).toBe('string');
   });
 });
+
+describe('orchestration telemetry — tool calls', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it('records each tool call by name with server, timing and outcome — never its arguments', async () => {
+    mockJsonResponses(TOOL_THEN_ANSWER());
+    const result = await orchestrate('test', baseOptions(createMockLogger([])));
+
+    expect(result.telemetry.toolCalls).toHaveLength(1);
+    const [call] = result.telemetry.toolCalls;
+    expect(call?.name).toBe('execute_code');
+    expect(call?.server_id).toBeNull(); // a host tool, not an MCP server
+    expect(typeof call?.started_at).toBe('number');
+    expect(call?.duration_ms).toBeGreaterThanOrEqual(0);
+    expect(typeof call?.ok).toBe('boolean');
+    // The fixture's tool input must not leak into the record.
+    expect(JSON.stringify(result.telemetry.toolCalls)).not.toContain('__result__');
+  });
+
+  it('records nothing for a turn that called no tools', async () => {
+    mockJsonResponses([
+      createMockMessage('msg_1', 'end_turn', [
+        { type: 'text', text: 'ok' } as Anthropic.ContentBlock,
+      ]),
+    ]);
+    const result = await orchestrate('test', baseOptions(createMockLogger([])));
+    expect(result.telemetry.toolCalls).toEqual([]);
+  });
+});

@@ -147,6 +147,8 @@ const GOLDEN = [
       duration_ms: 900, had_inbound_voice: false, had_outbound_voice: false,
       user_message: 'What does John 3:16 mean? My pastor Bob asked.',
       assistant_reply: 'John 3:16 says that God loved the world…',
+      engine_version: '2.49.0',
+      tool_calls: [{ name: 'fetch_scripture', server_id: 'translation-helps', started_at: 1750000000000, duration_ms: 812, ok: true }],
     },
     expected: JSON.stringify({
       event: 'chat_turn',
@@ -180,6 +182,57 @@ const GOLDEN = [
       had_outbound_voice: false,
       user_message: 'What does John 3:16 mean? My pastor Bob asked.',
       assistant_reply: 'John 3:16 says that God loved the world…',
+      engine_version: '2.49.0',
+      tool_calls: [
+        {
+          name: 'fetch_scripture',
+          server_id: 'translation-helps',
+          started_at: 1750000000000,
+          duration_ms: 812,
+          ok: true,
+        },
+      ],
+    }),
+  },
+  {
+    // A turn that failed for good (buildFailedChatTurnRecord): exit_reason
+    // error, a bounded error_type, no tokens or steps, the unanswered question
+    // and an empty reply. bt-servant-telemetry flags it `$ai_is_error`.
+    label: 'chat_turn (failed turn)',
+    event: 'chat_turn',
+    requestId: 'req-791',
+    userId: undefined as string | undefined,
+    // prettier-ignore
+    payload: {
+      turn_id: 'turn-err', user_id: 'whatsapp:15551234567', org: 'unfoldingWord',
+      client_id: 'whatsapp', transport: 'whatsapp', chat_type: 'private',
+      user_country: 'US', edge_country: 'US', model: 'claude-sonnet-4-6',
+      exit_reason: 'error', error_type: 'MCPError',
+      had_inbound_voice: false, had_outbound_voice: false,
+      engine_version: '2.49.0', tool_calls: [],
+      user_message: 'What does Luke 2:3 say?', assistant_reply: '',
+    },
+    expected: JSON.stringify({
+      event: 'chat_turn',
+      request_id: 'req-791',
+      timestamp: FIXED_MS,
+      turn_id: 'turn-err',
+      user_id: 'whatsapp:15551234567',
+      org: 'unfoldingWord',
+      client_id: 'whatsapp',
+      transport: 'whatsapp',
+      chat_type: 'private',
+      user_country: 'US',
+      edge_country: 'US',
+      model: 'claude-sonnet-4-6',
+      exit_reason: 'error',
+      error_type: 'MCPError',
+      had_inbound_voice: false,
+      had_outbound_voice: false,
+      engine_version: '2.49.0',
+      tool_calls: [],
+      user_message: 'What does Luke 2:3 say?',
+      assistant_reply: '',
     }),
   },
   {
