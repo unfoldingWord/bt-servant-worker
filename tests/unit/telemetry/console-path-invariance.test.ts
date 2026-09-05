@@ -195,6 +195,47 @@ const GOLDEN = [
     }),
   },
   {
+    // A turn that failed for good (buildFailedChatTurnRecord): exit_reason
+    // error, a bounded error_type, no tokens or steps, the unanswered question
+    // and an empty reply. bt-servant-telemetry flags it `$ai_is_error`.
+    label: 'chat_turn (failed turn)',
+    event: 'chat_turn',
+    requestId: 'req-791',
+    userId: undefined as string | undefined,
+    // prettier-ignore
+    payload: {
+      turn_id: 'turn-err', user_id: 'whatsapp:15551234567', org: 'unfoldingWord',
+      client_id: 'whatsapp', transport: 'whatsapp', chat_type: 'private',
+      user_country: 'US', edge_country: 'US', model: 'claude-sonnet-4-6',
+      exit_reason: 'error', error_type: 'MCPError',
+      had_inbound_voice: false, had_outbound_voice: false,
+      engine_version: '2.49.0', tool_calls: [],
+      user_message: 'What does Luke 2:3 say?', assistant_reply: '',
+    },
+    expected: JSON.stringify({
+      event: 'chat_turn',
+      request_id: 'req-791',
+      timestamp: FIXED_MS,
+      turn_id: 'turn-err',
+      user_id: 'whatsapp:15551234567',
+      org: 'unfoldingWord',
+      client_id: 'whatsapp',
+      transport: 'whatsapp',
+      chat_type: 'private',
+      user_country: 'US',
+      edge_country: 'US',
+      model: 'claude-sonnet-4-6',
+      exit_reason: 'error',
+      error_type: 'MCPError',
+      had_inbound_voice: false,
+      had_outbound_voice: false,
+      engine_version: '2.49.0',
+      tool_calls: [],
+      user_message: 'What does Luke 2:3 say?',
+      assistant_reply: '',
+    }),
+  },
+  {
     label: 'request_timing_summary',
     event: 'request_timing_summary',
     requestId: 'req-456',

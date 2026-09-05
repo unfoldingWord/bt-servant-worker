@@ -152,7 +152,7 @@ function assertRequestBodyWithinLimit(body: string, ctx: OrchestrationContext): 
 }
 
 /** Default Claude model - can be overridden via CLAUDE_MODEL env var */
-const DEFAULT_MODEL = 'claude-sonnet-4-6';
+export const DEFAULT_MODEL = 'claude-sonnet-4-6';
 
 /** Default max tokens - can be overridden via CLAUDE_MAX_TOKENS env var */
 const DEFAULT_MAX_TOKENS = 4096;

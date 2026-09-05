@@ -21,6 +21,7 @@ import {
   orchestrate,
   OrchestrationResult,
   TriggerOnlyContext,
+  DEFAULT_MODEL,
 } from '../services/claude/index.js';
 import { formatTOCForPrompt, JsonMemoryStore } from '../services/memory/index.js';
 import { buildToolCatalog, discoverAllTools } from '../services/mcp/index.js';
@@ -508,6 +509,52 @@ export function buildChatTurnRecord(
   };
 }
 
+/** Bounded label for why a turn failed: an AppError's code, else the error's class name. Never the message. */
+export function failureType(error: unknown): string {
+  if (error instanceof AppError) return error.code;
+  if (error instanceof Error) return error.name || 'Error';
+  return 'unknown';
+}
+
+type FailedTurnEnv = Pick<Env, 'DEFAULT_ORG' | 'CLAUDE_MODEL'>;
+
+/**
+ * The `chat_turn` record for a turn that failed for GOOD — retries exhausted,
+ * or a path that never retries. Without it an outage reads as silence: every
+ * turn that reached telemetry had succeeded, so an error rate could only ever
+ * be zero. Carries what is known at that point (who, which channel, what was
+ * asked) plus `exit_reason: 'error'` and a bounded `error_type`; never the
+ * error message, which can quote user input. Mints its own turn_id — a failed
+ * turn never has a successful twin.
+ */
+export function buildFailedChatTurnRecord(
+  body: ChatRequest,
+  env: FailedTurnEnv,
+  error: unknown
+): Record<string, unknown> {
+  const dims = buildChatTurnDimensions(body, env.DEFAULT_ORG);
+  return {
+    turn_id: crypto.randomUUID(),
+    user_id: body.user_id,
+    org: dims.org,
+    client_id: body.client_id,
+    transport: dims.transport ?? null,
+    chat_type: dims.chatType,
+    user_country: dims.userCountry ?? null,
+    edge_country: dims.edgeCountry ?? null,
+    model: env.CLAUDE_MODEL ?? DEFAULT_MODEL,
+    exit_reason: 'error',
+    error_type: failureType(error),
+    had_inbound_voice: body.message_type === 'audio',
+    had_outbound_voice: false,
+    engine_version: APP_VERSION,
+    tool_calls: [],
+    // The question that went unanswered (scrubbed downstream like any turn); no reply exists.
+    user_message: body.message ?? '',
+    assistant_reply: '',
+  };
+}
+
 /** Bounded counter labels for `chat_turns_total` — unchanged since before #404. */
 function buildChatTurnLabels(
   dims: ReturnType<typeof buildChatTurnDimensions>,
@@ -976,6 +1023,7 @@ export class UserDO {
       logger.log('immediate_final_complete', { message_id: messageId });
       response = Response.json({ message_id: messageId, ...chatResponse });
     } catch (error) {
+      this.logFailedChatTurn(body, error, logger);
       response = this.finalErrorResponse(error, locale, messageId, logger);
     }
 
@@ -1056,6 +1104,7 @@ export class UserDO {
         await callbacks?.onComplete?.(response);
         logger.log('immediate_callback_complete', { message_id: messageId });
       } catch (error) {
+        this.logFailedChatTurn(body, error, logger);
         logger.error('immediate_callback_error', error, { message_id: messageId });
         await callbacks?.onError?.(processingFailureDetail(error, locale));
       } finally {
@@ -1099,6 +1148,7 @@ export class UserDO {
         const response = await this.processChat(body, workerOrigin, logger, timing, callbacks);
         await sendEvent({ type: 'complete', response });
       } catch (error) {
+        this.logFailedChatTurn(body, error, logger);
         logger.error('immediate_sse_error', error, { message_id: messageId });
         await sendEvent({ type: 'error', error: processingFailureDetail(error, locale) });
       } finally {
@@ -1469,7 +1519,8 @@ export class UserDO {
       return;
     }
 
-    // Permanent failure — notify SSE client if connected
+    // Permanent failure: count the turn as failed, then notify the SSE client if connected.
+    this.logFailedChatTurn(entry.body, error, logger);
     const writer = this.queuedWriters.get(entry.message_id);
     if (writer) {
       try {
@@ -1630,6 +1681,22 @@ export class UserDO {
       });
       // Explicitly continue — identity is enumeration metadata; the chat turn
       // itself must not fail because this bookkeeping write did.
+    }
+  }
+
+  /**
+   * Emit a `chat_turn` for a turn that failed for good, so failures are
+   * counted rather than read as silence. Observability for a turn that has
+   * ALREADY failed: it must never turn one failure into two.
+   */
+  private logFailedChatTurn(body: ChatRequest, error: unknown, logger: RequestLogger): void {
+    try {
+      logger.log('chat_turn', buildFailedChatTurnRecord(body, this.env, error));
+    } catch (logError) {
+      logger.warn('chat_turn_telemetry_failed', {
+        error: logError instanceof Error ? logError.message : String(logError),
+        user_id: body.user_id,
+      });
     }
   }
 
