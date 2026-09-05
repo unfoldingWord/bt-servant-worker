@@ -147,6 +147,8 @@ const GOLDEN = [
       duration_ms: 900, had_inbound_voice: false, had_outbound_voice: false,
       user_message: 'What does John 3:16 mean? My pastor Bob asked.',
       assistant_reply: 'John 3:16 says that God loved the world…',
+      engine_version: '2.49.0',
+      tool_calls: [{ name: 'fetch_scripture', server_id: 'translation-helps', started_at: 1750000000000, duration_ms: 812, ok: true }],
     },
     expected: JSON.stringify({
       event: 'chat_turn',
@@ -180,6 +182,16 @@ const GOLDEN = [
       had_outbound_voice: false,
       user_message: 'What does John 3:16 mean? My pastor Bob asked.',
       assistant_reply: 'John 3:16 says that God loved the world…',
+      engine_version: '2.49.0',
+      tool_calls: [
+        {
+          name: 'fetch_scripture',
+          server_id: 'translation-helps',
+          started_at: 1750000000000,
+          duration_ms: 812,
+          ok: true,
+        },
+      ],
     }),
   },
   {

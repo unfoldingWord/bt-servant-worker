@@ -15,6 +15,7 @@
 
 import { Hono } from 'hono';
 import { Env } from '../config/types.js';
+import { APP_VERSION } from '../generated/version.js';
 import {
   GroupChatContext,
   orchestrate,
@@ -451,6 +452,19 @@ function buildChatTurnPayload(
     had_outbound_voice: turn.hadOutboundVoice,
     // The conversation itself: user_message / assistant_reply (chat-turn-text.ts).
     ...turn.text,
+    ...turnProvenance(turn),
+  };
+}
+
+/**
+ * Which engine produced the turn and what it did along the way: the build
+ * version, so any metric can be split by deploy, and the tool calls the
+ * orchestrator made — names, servers and timings only, never arguments.
+ */
+function turnProvenance(turn: ChatTurnContext): Record<string, unknown> {
+  return {
+    engine_version: APP_VERSION,
+    tool_calls: turn.orchestration.toolCalls,
   };
 }
 
