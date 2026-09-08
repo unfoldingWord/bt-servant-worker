@@ -102,6 +102,11 @@ describe('parseResourcePriorityOrder - block scoping and validity', () => {
     const order = parseResourcePriorityOrder(slotWithBlock('<!-- order: ["aquifer:Notes]"] -->'));
     expect(order).toEqual(['aquifer:Notes]']);
   });
+
+  it('reports corrupt when there are multiple blocks', () => {
+    const two = `${slotWithBlock(VALID_ORDER)}\n\n${slotWithBlock(VALID_ORDER)}`;
+    expect(parseResourcePriorityOrder(two)).toBe('corrupt');
+  });
 });
 
 describe('splitResourceId / resourceNameFromId', () => {
@@ -257,5 +262,24 @@ describe('applyResourcePriority - corrupt-comment stripping and spacing', () => 
     const input = slotWithBlock(VALID_ORDER, { trail: '    indented author line' });
     const result = applyResourcePriority(input);
     expect(result.toolGuidance).toContain('    indented author line');
+  });
+
+  it("treats multiple blocks as corrupt and strips every block's markers", () => {
+    const two = `${slotWithBlock(VALID_ORDER)}\n\n${slotWithBlock('<!-- order: ["aquifer:x"] -->')}`;
+    const result = applyResourcePriority(two);
+    expect(result.order).toBe('corrupt');
+    expect(result.applied).toBe(false);
+    expect(result.toolGuidance).not.toContain(RESOURCE_PRIORITY_BEGIN);
+    expect(result.toolGuidance).not.toContain(RESOURCE_PRIORITY_END);
+    expect(result.toolGuidance).not.toContain('<!-- order:');
+    // Author-visible prose from the blocks survives.
+    expect(result.toolGuidance).toContain('strongly prefer the sources below');
+  });
+
+  it('leaves an author comment OUTSIDE any block untouched even in the multi-block path', () => {
+    const two = `<!-- keep me -->\n\n${slotWithBlock(VALID_ORDER)}\n\n${slotWithBlock(VALID_ORDER)}`;
+    const result = applyResourcePriority(two);
+    expect(result.order).toBe('corrupt');
+    expect(result.toolGuidance).toContain('<!-- keep me -->');
   });
 });

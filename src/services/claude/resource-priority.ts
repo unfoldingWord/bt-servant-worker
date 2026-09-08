@@ -82,17 +82,47 @@ interface BlockBounds {
   end: number | null;
 }
 
-/** Locate the first whole-line opening marker and its following closing marker. */
-function findBlockBounds(lines: readonly string[]): BlockBounds | null {
-  const begin = lines.findIndex((line) => BEGIN_LINE_RE.test(line));
-  if (begin === -1) return null;
-  for (let i = begin + 1; i < lines.length; i += 1) {
+/**
+ * Locate every fenced block: each whole-line opening marker paired with the
+ * next whole-line closing marker. An opening marker with no closing marker (an
+ * orphan) claims the rest of the slot and ends the scan. The portal emits
+ * exactly one block; more than one means duplicated/conflicting edits.
+ */
+function findAllBlocks(lines: readonly string[]): BlockBounds[] {
+  const blocks: BlockBounds[] = [];
+  let i = 0;
+  while (i < lines.length) {
     const line = lines[i];
-    if (line !== undefined && END_LINE_RE.test(line)) {
-      return { begin, end: i };
+    if (line !== undefined && BEGIN_LINE_RE.test(line)) {
+      let end: number | null = null;
+      for (let j = i + 1; j < lines.length; j += 1) {
+        const inner = lines[j];
+        if (inner !== undefined && END_LINE_RE.test(inner)) {
+          end = j;
+          break;
+        }
+      }
+      blocks.push({ begin: i, end });
+      if (end === null) break;
+      i = end + 1;
+    } else {
+      i += 1;
     }
   }
-  return { begin, end: null };
+  return blocks;
+}
+
+/** Indices of the machine lines (markers + order comments) inside every block region. */
+function machineLineIndices(lines: readonly string[], blocks: readonly BlockBounds[]): Set<number> {
+  const indices = new Set<number>();
+  for (const block of blocks) {
+    const last = block.end ?? lines.length - 1;
+    for (let i = block.begin; i <= last; i += 1) {
+      const line = lines[i];
+      if (line !== undefined && isBlockMachineLine(line)) indices.add(i);
+    }
+  }
+  return indices;
 }
 
 /** Parse the order comment out of the block's own lines (never `null` — a block is present). */
@@ -124,10 +154,13 @@ function parseOrderFromBlockLines(blockLines: readonly string[]): readonly strin
 export function parseResourcePriorityOrder(toolGuidance: string): PriorityOrder {
   if (typeof toolGuidance !== 'string') return null;
   const lines = toolGuidance.split('\n');
-  const bounds = findBlockBounds(lines);
-  if (!bounds) return null;
-  if (bounds.end === null) return 'corrupt';
-  return parseOrderFromBlockLines(lines.slice(bounds.begin, bounds.end + 1));
+  const blocks = findAllBlocks(lines);
+  if (blocks.length === 0) return null;
+  // More than one block, or an orphan opening marker, is ambiguous — corrupt.
+  if (blocks.length > 1) return 'corrupt';
+  const [block] = blocks;
+  if (!block || block.end === null) return 'corrupt';
+  return parseOrderFromBlockLines(lines.slice(block.begin, block.end + 1));
 }
 
 /** Split a `serverId:name` composite on its FIRST colon (server ids carry none). */
@@ -235,19 +268,19 @@ export function applyResourcePriority(toolGuidance: string): AppliedResourcePrio
     return { toolGuidance, order: null, applied: false };
   }
   const lines = toolGuidance.split('\n');
-  const bounds = findBlockBounds(lines);
-  if (!bounds) {
+  const blocks = findAllBlocks(lines);
+  if (blocks.length === 0) {
     return { toolGuidance, order: null, applied: false };
   }
 
-  // Orphan opening marker (no closing): strip the opening marker and any order
-  // line at or after it so raw comments don't leak, but trust nothing — no
-  // directive. Author prose is preserved (only marker/order lines are dropped).
-  if (bounds.end === null) {
-    const kept = lines.filter((line, index) => {
-      if (index < bounds.begin) return true;
-      return !BEGIN_LINE_RE.test(line) && !ORDER_STRIP_RE.test(line);
-    });
+  // More than one block (duplicated/conflicting edits) or an orphan opening
+  // marker is ambiguous: we won't guess a ranking. Strip every machine line
+  // inside every block region so no marker leaks — author prose and any comment
+  // OUTSIDE a block region are left untouched — and report corrupt.
+  const [bounds] = blocks;
+  if (blocks.length > 1 || !bounds || bounds.end === null) {
+    const drop = machineLineIndices(lines, blocks);
+    const kept = lines.filter((_line, index) => !drop.has(index));
     return {
       toolGuidance: collapseBlankRuns(kept.join('\n')).trimEnd(),
       order: 'corrupt',
