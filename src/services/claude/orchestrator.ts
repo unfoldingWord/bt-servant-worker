@@ -1588,9 +1588,10 @@ function applyResourcePriorityToPrompt(
   const priority = applyResourcePriority(values.tool_guidance);
   if (priority.order === 'corrupt') {
     logger.warn('resource_priority_corrupt', { source: 'prompt_slot:tool_guidance' });
-  } else if (priority.applied) {
-    logger.info('resource_priority_applied', {
-      count: Array.isArray(priority.order) ? priority.order.length : 0,
+  } else if (priority.applied && Array.isArray(priority.order)) {
+    logger.log('resource_priority_applied', {
+      count: priority.order.length,
+      ids: priority.order,
     });
   }
   if (priority.toolGuidance === values.tool_guidance) return values;
