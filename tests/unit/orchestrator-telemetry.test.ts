@@ -20,6 +20,15 @@ import { Env } from '../../src/config/types.js';
 
 vi.mock('@anthropic-ai/sdk', () => ({ default: vi.fn() }));
 
+// Only `callMCPTool` is faked; the rest of the MCP module (catalog helpers,
+// health tracking) is the real thing, so a sandbox call still walks the whole
+// validate → health-check → count path before it reaches the wire.
+const callMCPToolMock = vi.hoisted(() => vi.fn());
+vi.mock('../../src/services/mcp/index.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/services/mcp/index.js')>()),
+  callMCPTool: callMCPToolMock,
+}));
+
 const PER_CALL_INPUT = 10;
 const PER_CALL_OUTPUT = 20;
 
@@ -94,6 +103,53 @@ const TOOL_THEN_ANSWER = (): Anthropic.Message[] => [
       id: 'tool_1',
       name: 'execute_code',
       input: { code: '__result__ = "x"' },
+    } as unknown as Anthropic.ContentBlock,
+  ]),
+  createMockMessage('msg_2', 'end_turn', [
+    { type: 'text', text: 'Here is the answer' } as Anthropic.ContentBlock,
+  ]),
+];
+
+/** A one-tool catalog so `fetch_scripture` is a real host function inside the sandbox. */
+function scriptureCatalogOptions(logger: RequestLogger) {
+  return {
+    ...baseOptions(logger),
+    catalog: {
+      tools: [
+        {
+          name: 'fetch_scripture',
+          description: 'Fetch a passage',
+          inputSchema: { type: 'object' as const, properties: {} },
+          serverId: 'translation-helps',
+          serverUrl: 'https://example.invalid/mcp',
+        },
+      ],
+      serverMap: new Map([
+        [
+          'translation-helps',
+          {
+            id: 'translation-helps',
+            name: 'Translation Helps',
+            url: 'https://example.invalid/mcp',
+            enabled: true,
+            priority: 1,
+          },
+        ],
+      ]),
+    } as ToolCatalog,
+  };
+}
+
+/** execute_code whose body calls an MCP tool through its sandbox host function. */
+const SANDBOX_MCP_CALL = (): Anthropic.Message[] => [
+  createMockMessage('msg_1', 'tool_use', [
+    {
+      type: 'tool_use',
+      id: 'tool_1',
+      name: 'execute_code',
+      input: {
+        code: 'const p = await fetch_scripture({ reference: "John 3:16" }); __result__ = "done";',
+      },
     } as unknown as Anthropic.ContentBlock,
   ]),
   createMockMessage('msg_2', 'end_turn', [
@@ -240,5 +296,54 @@ describe('orchestration telemetry — tool calls', () => {
     ]);
     const result = await orchestrate('test', baseOptions(createMockLogger([])));
     expect(result.telemetry.toolCalls).toEqual([]);
+  });
+});
+
+/**
+ * The calls the sandbox makes are the ones that actually hit an MCP server.
+ * They never pass through the outer ToolUseBlock hook, so a turn whose
+ * `execute_code` fetched scripture used to record the wrapper alone —
+ * `tool_calls` said `execute_code`, `mcp_calls_made` said 1, and no consumer
+ * could name the server tool that ran.
+ */
+describe('orchestration telemetry — tool calls made inside execute_code', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    callMCPToolMock.mockReset();
+  });
+
+  it('records the MCP tool a sandbox host function called, with its server and via', async () => {
+    callMCPToolMock.mockResolvedValue({
+      result: { text: 'For God so loved the world' },
+      metadata: undefined,
+      responseTimeMs: 5,
+    });
+    mockJsonResponses(SANDBOX_MCP_CALL());
+    const result = await orchestrate('test', scriptureCatalogOptions(createMockLogger([])));
+
+    expect(result.telemetry.mcpCallsMade).toBe(1);
+    expect(result.telemetry.toolCalls.map((c) => [c.name, c.server_id, c.via, c.ok])).toEqual([
+      // The nested call completes first — the wrapper is only done once the sandbox is.
+      ['fetch_scripture', 'translation-helps', 'execute_code', true],
+      ['execute_code', null, null, true],
+    ]);
+    const [nested] = result.telemetry.toolCalls;
+    expect(typeof nested?.started_at).toBe('number');
+    expect(nested?.duration_ms).toBeGreaterThanOrEqual(0);
+    // The reference the sandbox asked for is an argument, and arguments never ride along.
+    expect(JSON.stringify(result.telemetry.toolCalls)).not.toContain('John 3:16');
+  });
+
+  it('records a failed sandbox call as a call that happened, not as silence', async () => {
+    callMCPToolMock.mockRejectedValue(new Error('upstream exploded'));
+    mockJsonResponses(SANDBOX_MCP_CALL());
+    const result = await orchestrate('test', scriptureCatalogOptions(createMockLogger([])));
+
+    const nested = result.telemetry.toolCalls.find((c) => c.name === 'fetch_scripture');
+    expect(nested?.ok).toBe(false);
+    expect(nested?.via).toBe('execute_code');
+    expect(nested?.server_id).toBe('translation-helps');
+    // The failure reached the model as a tool error, not as a silently empty result.
+    expect(JSON.stringify(result.telemetry.toolCalls)).not.toContain('upstream exploded');
   });
 });
