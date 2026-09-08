@@ -60,6 +60,14 @@ function body(overrides: Partial<ChatRequest> = {}): ChatRequest {
  * exercise the SAME payload builder production uses rather than a #404-only
  * subset of it.
  */
+const TOOL_CALL = {
+  name: 'fetch_scripture',
+  server_id: 'translation-helps',
+  started_at: 1_750_000_000_000,
+  duration_ms: 812,
+  ok: true,
+};
+
 const TEXT: ChatTurnText = {
   user_message: 'What does John 3:16 mean? My pastor Bob asked.',
   assistant_reply: 'John 3:16 says that God loved the world…',
@@ -88,6 +96,7 @@ function turnContext(inputLanguage: DetectedLanguage | null) {
       mcpCallsMade: 2,
       mode: 'dbs-coach',
       modeSwitchedTo: null,
+      toolCalls: [TOOL_CALL],
     },
     durationMs: 4200,
     hadInboundVoice: false,
@@ -206,5 +215,16 @@ describe('buildChatTurnRecord — conversation text', () => {
     expect(Object.keys(labels)).not.toContain('user_message');
     expect(Object.keys(labels)).not.toContain('assistant_reply');
     expect(JSON.stringify(labels)).not.toContain('Bob');
+  });
+});
+
+describe('buildChatTurnRecord — provenance', () => {
+  it('carries the engine version and the tool calls on the payload, never on the labels', () => {
+    const { payload, labels } = buildChatTurnRecord(body(), 'en', DEFAULT_ORG, turnContext(null));
+    expect(typeof payload.engine_version).toBe('string');
+    expect(payload.engine_version).toMatch(/^\d+\.\d+\.\d+/);
+    expect(payload.tool_calls).toEqual([TOOL_CALL]);
+    expect(Object.keys(labels)).not.toContain('tool_calls');
+    expect(Object.keys(labels)).not.toContain('engine_version');
   });
 });

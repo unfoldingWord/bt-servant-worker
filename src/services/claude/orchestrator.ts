@@ -152,7 +152,7 @@ function assertRequestBodyWithinLimit(body: string, ctx: OrchestrationContext): 
 }
 
 /** Default Claude model - can be overridden via CLAUDE_MODEL env var */
-const DEFAULT_MODEL = 'claude-sonnet-4-6';
+export const DEFAULT_MODEL = 'claude-sonnet-4-6';
 
 /** Default max tokens - can be overridden via CLAUDE_MAX_TOKENS env var */
 const DEFAULT_MAX_TOKENS = 4096;
@@ -371,6 +371,13 @@ export interface OrchestrationTelemetry {
    * `null` when no switch happened; the string `'__cleared__'` when mode was cleared.
    */
   modeSwitchedTo: string | null;
+  /**
+   * Every tool call made this turn, in order — names, servers and timings only,
+   * never arguments (see `ToolCallRecord`). Includes the calls the `execute_code`
+   * sandbox makes through its host functions, tagged `via: 'execute_code'`.
+   * Capped at MAX_TOOL_CALL_RECORDS.
+   */
+  toolCalls: ToolCallRecord[];
 }
 
 /**
@@ -379,6 +386,33 @@ export interface OrchestrationTelemetry {
  * distinguishable from "no switch happened" in analytics.
  */
 export const MODE_CLEARED = '__cleared__';
+
+/**
+ * One tool call the orchestrator made during a turn: WHICH tool, on which MCP
+ * server, when, for how long, and whether it succeeded. Names and numbers
+ * only — never the arguments or the result, which can carry user text.
+ */
+export interface ToolCallRecord {
+  /** Tool name as the model called it (e.g. `fetch_scripture`, `execute_code`). */
+  name: string;
+  /** MCP server that owns the tool; null for host tools (execute_code, switch_mode, …). */
+  server_id: string | null;
+  /**
+   * Host tool this call was made from INSIDE — `'execute_code'` for a call the
+   * sandbox made through a host function — or null when the model called the
+   * tool directly. Without it a sandbox-driven `fetch_scripture` is
+   * indistinguishable from a top-level one, and `tool_calls` reads as if the
+   * model asked for both.
+   */
+  via: string | null;
+  /** Epoch ms when the call started. */
+  started_at: number;
+  duration_ms: number;
+  ok: boolean;
+}
+
+/** Cap on recorded calls per turn so a runaway loop cannot bloat the log line. `mcpCallsMade` is never capped. */
+export const MAX_TOOL_CALL_RECORDS = 50;
 
 /**
  * Mutable accumulator threaded on `OrchestrationContext`, following the same
@@ -391,6 +425,7 @@ interface TelemetryAccumulator {
   finalStopReason: string | null;
   usage: UsageSummary;
   modeSwitchedTo: string | null;
+  toolCalls: ToolCallRecord[];
 }
 
 /** Fresh accumulator for one run. Extracted to keep createOrchestrationContext under its line cap. */
@@ -401,6 +436,7 @@ function createTelemetryAccumulator(): TelemetryAccumulator {
     finalStopReason: null,
     usage: { ...EMPTY_USAGE },
     modeSwitchedTo: null,
+    toolCalls: [],
   };
 }
 
@@ -1783,6 +1819,7 @@ function buildOrchestrationTelemetry(ctx: OrchestrationContext): OrchestrationTe
     mcpCallsMade: ctx.mcpCallsMade.count,
     mode: ctx.activeMode,
     modeSwitchedTo: ctx.telemetry.modeSwitchedTo,
+    toolCalls: ctx.telemetry.toolCalls,
   };
 }
 
@@ -2266,11 +2303,39 @@ async function handleSwitchMode(input: unknown, ctx: OrchestrationContext): Prom
   };
 }
 
+/** MCP server that owns `toolName`, or null for a host tool. */
+function serverIdForTool(ctx: OrchestrationContext, toolName: string): string | null {
+  return ctx.catalog.tools.find((t) => t.name === toolName)?.serverId ?? null;
+}
+
+/**
+ * Remember one tool call for the turn record (`chat_turn.tool_calls`). Capped
+ * so a runaway loop cannot bloat the log line; `mcpCallsMade` still counts all.
+ */
+function recordToolCall(
+  ctx: OrchestrationContext,
+  toolName: string,
+  startTime: number,
+  ok: boolean,
+  via: string | null = null
+): void {
+  if (ctx.telemetry.toolCalls.length >= MAX_TOOL_CALL_RECORDS) return;
+  ctx.telemetry.toolCalls.push({
+    name: toolName,
+    server_id: serverIdForTool(ctx, toolName),
+    via,
+    started_at: startTime,
+    duration_ms: Date.now() - startTime,
+    ok,
+  });
+}
+
 function logToolSuccess(
   ctx: OrchestrationContext,
   toolCall: ToolUseBlock,
   startTime: number
 ): void {
+  recordToolCall(ctx, toolCall.name, startTime, true);
   ctx.logger.log('tool_execution_complete', {
     tool_name: toolCall.name,
     tool_id: toolCall.id,
@@ -2287,6 +2352,7 @@ function handleToolError(
   startTime: number
 ): Anthropic.ToolResultBlockParam {
   const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+  recordToolCall(ctx, toolCall.name, startTime, false);
   ctx.logger.error('tool_execution_error', error, {
     tool_name: toolCall.name,
     tool_id: toolCall.id,
@@ -2339,19 +2405,42 @@ async function dispatchSandboxInternalTool(
   throw new ValidationError(`Unknown sandbox-internal tool: ${name}`);
 }
 
+/**
+ * Dispatch one host-function call made from inside the `execute_code` sandbox,
+ * recording it on the turn like any other tool call.
+ *
+ * The outer `ToolUseBlock` hook only ever sees `execute_code` itself, so
+ * without this a turn whose sandbox fetched scripture recorded the wrapper and
+ * nothing else — `tool_calls` disagreed with `mcp_calls_made`, which counts the
+ * nested call. Recorded with `via: 'execute_code'` so a sandbox call stays
+ * distinguishable from one the model made directly. Errors are recorded and
+ * re-thrown: the sandbox still sees the failure.
+ */
+function createSandboxToolCaller(
+  ctx: OrchestrationContext
+): (name: string, args: unknown) => Promise<unknown> {
+  return async (name: string, args: unknown): Promise<unknown> => {
+    const startTime = Date.now();
+    try {
+      const result = isSandboxInternalTool(name)
+        ? await dispatchSandboxInternalTool(name, args, ctx)
+        : await handleMCPToolCall(name, args, ctx);
+      recordToolCall(ctx, name, startTime, true, 'execute_code');
+      return result;
+    } catch (error) {
+      recordToolCall(ctx, name, startTime, false, 'execute_code');
+      throw error;
+    }
+  };
+}
+
 async function handleExecuteCode(
   input: { code: string },
   ctx: OrchestrationContext
 ): Promise<unknown> {
   const mcpToolNames = getToolNames(ctx.catalog);
   const toolNames = [...mcpToolNames, ...SANDBOX_INTERNAL_TOOLS];
-  const toolCaller = async (name: string, args: unknown): Promise<unknown> => {
-    if (isSandboxInternalTool(name)) {
-      return dispatchSandboxInternalTool(name, args, ctx);
-    }
-    return handleMCPToolCall(name, args, ctx);
-  };
-  const hostFunctions = createMCPHostFunctions(toolCaller, toolNames);
+  const hostFunctions = createMCPHostFunctions(createSandboxToolCaller(ctx), toolNames);
 
   const result = await executeCode(
     input.code,
