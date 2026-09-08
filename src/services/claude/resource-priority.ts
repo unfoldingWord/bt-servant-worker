@@ -54,9 +54,19 @@ export const RESOURCE_PRIORITY_END = '<!-- /bt:resource-priorities -->';
 // mention of the marker text does not count.
 const BEGIN_LINE_RE = /^[ \t]*<!--[ \t]*bt:resource-priorities[ \t]*-->[ \t\r]*$/;
 const END_LINE_RE = /^[ \t]*<!--[ \t]*\/bt:resource-priorities[ \t]*-->[ \t\r]*$/;
-// The machine-readable order line. Greedy capture to the line's last `]` so an
-// id containing `]` still parses. Indent-tolerant, matching the marker lines.
+// The machine-readable order line, for PARSING. Greedy capture to the line's
+// last `]` so an id containing `]` still parses. Indent-tolerant.
 const ORDER_LINE_RE = /^[ \t]*<!--[ \t]*order:[ \t]*(\[.*\])[ \t]*-->[ \t\r]*$/;
+// A broader matcher for STRIPPING: any `<!-- order: ... -->` line, even one too
+// malformed to parse (e.g. `<!-- order: not-json -->`). Parsing stays strict via
+// ORDER_LINE_RE; stripping must be broad so a corrupt machine comment inside the
+// block never leaks into the prompt.
+const ORDER_STRIP_RE = /^[ \t]*<!--[ \t]*order:.*-->[ \t\r]*$/;
+
+/** True for any block machine line (opening/closing marker or an order comment). */
+function isBlockMachineLine(line: string): boolean {
+  return BEGIN_LINE_RE.test(line) || END_LINE_RE.test(line) || ORDER_STRIP_RE.test(line);
+}
 
 /**
  * The parsed ranking:
@@ -190,10 +200,21 @@ function collapseBlankRuns(text: string): string {
   return text.replace(/\n{3,}/g, '\n\n');
 }
 
+/** Drop leading blank lines while preserving indentation on the first content line. */
+function dropLeadingBlankLines(text: string): string {
+  const lines = text.split('\n');
+  let start = 0;
+  for (const line of lines) {
+    if (line.trim().length > 0) break;
+    start += 1;
+  }
+  return lines.slice(start).join('\n');
+}
+
 /** Join non-empty segments with exactly one blank line between them. */
 function assembleSlot(before: string, middle: string, after: string): string {
   const head = before.replace(/[ \t\r\n]+$/, '');
-  const tail = after.replace(/^[ \t\r\n]+/, '');
+  const tail = dropLeadingBlankLines(after);
   const parts = [head, middle, tail].filter((part) => part.length > 0);
   return collapseBlankRuns(parts.join('\n\n')).trimEnd();
 }
@@ -225,7 +246,7 @@ export function applyResourcePriority(toolGuidance: string): AppliedResourcePrio
   if (bounds.end === null) {
     const kept = lines.filter((line, index) => {
       if (index < bounds.begin) return true;
-      return !BEGIN_LINE_RE.test(line) && !ORDER_LINE_RE.test(line);
+      return !BEGIN_LINE_RE.test(line) && !ORDER_STRIP_RE.test(line);
     });
     return {
       toolGuidance: collapseBlankRuns(kept.join('\n')).trimEnd(),
@@ -237,11 +258,10 @@ export function applyResourcePriority(toolGuidance: string): AppliedResourcePrio
   const blockLines = lines.slice(bounds.begin, bounds.end + 1);
   const order = parseOrderFromBlockLines(blockLines);
 
-  // Rebuild the block from its prose only (drop the three machine lines).
+  // Rebuild the block from its prose only (drop the machine lines — markers and
+  // any order comment, including a malformed one that failed strict parsing).
   const prose = blockLines
-    .filter(
-      (line) => !BEGIN_LINE_RE.test(line) && !END_LINE_RE.test(line) && !ORDER_LINE_RE.test(line)
-    )
+    .filter((line) => !isBlockMachineLine(line))
     .join('\n')
     .trim();
 

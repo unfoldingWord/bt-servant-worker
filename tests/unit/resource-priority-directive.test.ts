@@ -243,3 +243,19 @@ describe('applyResourcePriority - edge cases', () => {
     expect(result.toolGuidance).toContain('1. Literal Text');
   });
 });
+
+describe('applyResourcePriority - corrupt-comment stripping and spacing', () => {
+  it('strips a malformed order comment (no array) so it never leaks to the model', () => {
+    const result = applyResourcePriority(slotWithBlock('<!-- order: not-json -->'));
+    expect(result.order).toBe('corrupt');
+    expect(result.applied).toBe(false);
+    expect(result.toolGuidance).not.toContain('<!-- order:');
+    expect(result.toolGuidance).not.toContain(RESOURCE_PRIORITY_BEGIN);
+  });
+
+  it('preserves indentation on the first content line after the block', () => {
+    const input = slotWithBlock(VALID_ORDER, { trail: '    indented author line' });
+    const result = applyResourcePriority(input);
+    expect(result.toolGuidance).toContain('    indented author line');
+  });
+});
