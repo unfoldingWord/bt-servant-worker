@@ -370,7 +370,7 @@ app.get('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
       const serverStatuses = servers.map((server) => {
         const manifest = manifests.find((m) => m.serverId === server.id);
         return {
-          ...toPublicServerConfig(server),
+          ...toPublicServerConfig(server, c.env.DEFAULT_ORG),
           discovery_status: manifest ? (manifest.error ? 'error' : 'ok') : 'skipped',
           discovery_error: manifest?.error ?? null,
           tools_count: manifest?.tools.length ?? 0,
@@ -380,7 +380,7 @@ app.get('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
       return c.json({ org, ...state, servers: serverStatuses });
     }
 
-    return c.json({ org, ...state, servers: toPublicServerConfigs(servers) });
+    return c.json({ org, ...state, servers: toPublicServerConfigs(servers, c.env.DEFAULT_ORG) });
   } catch (error) {
     logger.error('admin_action', error, { action: 'list_mcp_servers', org });
     return c.json({ error: 'Failed to read MCP servers from storage' }, 500);
@@ -515,7 +515,7 @@ app.put('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
     if (!pool.migrated) {
       return poolNotMigratedResponse(c, logger, 'replace_mcp_servers', org, pool);
     }
-    const servers = mergeServerPool(writes, pool.servers);
+    const servers = mergeServerPool(writes, pool.servers, org);
 
     await c.env.MCP_SERVERS.put(MCP_GLOBAL_KEY, JSON.stringify(servers));
     logger.log('admin_action', {
@@ -525,7 +525,11 @@ app.put('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
       server_count: servers.length,
       server_ids: servers.map((s) => s.id),
     });
-    return c.json({ org, servers: toPublicServerConfigs(servers), message: 'MCP servers updated' });
+    return c.json({
+      org,
+      servers: toPublicServerConfigs(servers, c.env.DEFAULT_ORG),
+      message: 'MCP servers updated',
+    });
   } catch (error) {
     logger.error('admin_action', error, { action: 'replace_mcp_servers', org });
     return c.json({ error: 'Failed to write MCP servers to storage' }, 500);
@@ -613,7 +617,7 @@ app.post('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
     // preserve, null/"" → clear, string → set).
     // NOTE: This read-modify-write pattern can race with concurrent requests (last write wins).
     // This is acceptable for admin endpoints which are low-volume and authenticated.
-    const servers = upsertServer(write, existing);
+    const servers = upsertServer(write, existing, org);
 
     await c.env.MCP_SERVERS.put(MCP_GLOBAL_KEY, JSON.stringify(servers));
     logger.log('admin_action', {
@@ -625,7 +629,11 @@ app.post('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
       updated: isUpdate,
       server_count: servers.length,
     });
-    return c.json({ org, servers: toPublicServerConfigs(servers), message: 'MCP server added' });
+    return c.json({
+      org,
+      servers: toPublicServerConfigs(servers, c.env.DEFAULT_ORG),
+      message: 'MCP server added',
+    });
   } catch (error) {
     logger.error('admin_action', error, { action: 'add_mcp_server', org });
     return c.json({ error: 'Failed to update MCP servers in storage' }, 500);
@@ -664,7 +672,11 @@ app.delete('/api/v1/admin/orgs/:org/mcp-servers/:serverId', async (c) => {
       server_id: serverId,
       server_count: filtered.length,
     });
-    return c.json({ org, servers: toPublicServerConfigs(filtered), message: 'MCP server removed' });
+    return c.json({
+      org,
+      servers: toPublicServerConfigs(filtered, c.env.DEFAULT_ORG),
+      message: 'MCP server removed',
+    });
   } catch (error) {
     logger.error('admin_action', error, { action: 'remove_mcp_server', org });
     return c.json({ error: 'Failed to update MCP servers in storage' }, 500);

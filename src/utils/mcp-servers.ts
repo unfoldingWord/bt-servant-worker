@@ -398,8 +398,15 @@ export async function readMcpServerPoolOrEmpty(
  * Project a stored config to its public shape. Built from an allowlist, not by
  * deleting `authToken`: the pre-#278 POST persisted `{...body}` verbatim, so a
  * stored object may carry unknown keys that must not reach every org's admins.
+ *
+ * `ownerOrg` is always reported (admin-portal#292 / worker#417): a stored value
+ * is passed through; a pre-#292 entry with none stored defaults to `defaultOrg`
+ * (the migrated `unfoldingWord` pool), so the portal can always attribute a row.
  */
-export function toPublicServerConfig(server: MCPServerConfig): MCPServerConfigPublic {
+export function toPublicServerConfig(
+  server: MCPServerConfig,
+  defaultOrg: string
+): MCPServerConfigPublic {
   const pub: MCPServerConfigPublic = {
     id: server.id,
     name: server.name,
@@ -407,6 +414,7 @@ export function toPublicServerConfig(server: MCPServerConfig): MCPServerConfigPu
     enabled: server.enabled,
     priority: server.priority,
     hasAuthToken: typeof server.authToken === 'string' && server.authToken.length > 0,
+    ownerOrg: server.ownerOrg ?? defaultOrg,
   };
   if (server.allowedTools !== undefined) pub.allowedTools = server.allowedTools;
   if (server.transport !== undefined) pub.transport = server.transport;
@@ -414,8 +422,11 @@ export function toPublicServerConfig(server: MCPServerConfig): MCPServerConfigPu
 }
 
 /** Project a whole pool to its public shape, preserving order. */
-export function toPublicServerConfigs(servers: MCPServerConfig[]): MCPServerConfigPublic[] {
-  return servers.map(toPublicServerConfig);
+export function toPublicServerConfigs(
+  servers: MCPServerConfig[],
+  defaultOrg: string
+): MCPServerConfigPublic[] {
+  return servers.map((server) => toPublicServerConfig(server, defaultOrg));
 }
 
 // ─── Write rule ───────────────────────────────────────────────────────────────
@@ -444,17 +455,41 @@ export function resolveAuthToken(
 }
 
 /**
- * Build the stored config for one write, merging the token against `existing`.
+ * Resolve the stored owning-org for one write (admin-portal#292 / worker#417):
+ *
+ * - create (no `existing`) → stamp `actingOrg`, the org from the write route.
+ * - edit (an `existing` entry) → preserve its stored `ownerOrg`. An edit never
+ *   transfers ownership, so a partner cannot claim a uW-owned row by editing it.
+ *   A pre-#292 entry has no stored `ownerOrg`; it stays absent and the public
+ *   projection reports it as DEFAULT_ORG — the edit does not stamp the acting
+ *   org onto it.
+ *
+ * Ownership is taken from the trusted route param, never from the request body
+ * (`ownerOrg` is not part of MCPServerWrite). Returns `undefined` when nothing
+ * should be persisted so the field is dropped from the stored JSON.
+ */
+export function resolveOwnerOrg(
+  existing: MCPServerConfig | undefined,
+  actingOrg: string
+): string | undefined {
+  return existing === undefined ? actingOrg : existing.ownerOrg;
+}
+
+/**
+ * Build the stored config for one write, merging the token and owning-org
+ * against `existing`. `actingOrg` is the org from the write route, stamped as
+ * the owner on create (worker#417).
  *
  * Only known MCPServerConfig fields are persisted (allowlist): the pool is
  * shown to every org's admins, so an unknown key such as `password` or the
  * public shape's `hasAuthToken` must not round-trip into KV and back out.
  * Optional fields absent from the write are dropped, matching the previous
- * replace semantics for everything except the token.
+ * replace semantics for everything except the token and owner.
  */
 export function mergeServerWrite(
   write: MCPServerWrite,
-  existing: MCPServerConfig | undefined
+  existing: MCPServerConfig | undefined,
+  actingOrg: string
 ): MCPServerConfig {
   const stored: MCPServerConfig = {
     id: write.id,
@@ -467,33 +502,39 @@ export function mergeServerWrite(
   if (write.transport !== undefined) stored.transport = write.transport;
   const authToken = resolveAuthToken(write, existing);
   if (authToken !== undefined) stored.authToken = authToken;
+  const ownerOrg = resolveOwnerOrg(existing, actingOrg);
+  if (ownerOrg !== undefined) stored.ownerOrg = ownerOrg;
   return stored;
 }
 
 /**
  * Apply a replace-all write (PUT) to the pool: the result contains exactly the
- * servers in `writes`, in that order, with each entry's token merged by `id`
- * against the current pool. Servers absent from `writes` are dropped.
+ * servers in `writes`, in that order, with each entry's token and owner merged
+ * by `id` against the current pool. Servers absent from `writes` are dropped.
+ * `actingOrg` is the write route's org, stamped as the owner of new entries.
  * Callers must reject duplicate ids first (findDuplicateServerIds).
  */
 export function mergeServerPool(
   writes: MCPServerWrite[],
-  existing: MCPServerConfig[]
+  existing: MCPServerConfig[],
+  actingOrg: string
 ): MCPServerConfig[] {
   const byId = new Map(existing.map((s) => [s.id, s] as const));
-  return writes.map((write) => mergeServerWrite(write, byId.get(write.id)));
+  return writes.map((write) => mergeServerWrite(write, byId.get(write.id), actingOrg));
 }
 
 /**
  * Apply a single-server upsert (POST) to the pool: replaces the entry with the
- * same `id` in place, or appends. Token merged by `id` as above.
+ * same `id` in place, or appends. Token and owner merged by `id` as above;
+ * `actingOrg` is stamped as the owner only when the entry is new.
  */
 export function upsertServer(
   write: MCPServerWrite,
-  existing: MCPServerConfig[]
+  existing: MCPServerConfig[],
+  actingOrg: string
 ): MCPServerConfig[] {
   const current = existing.find((s) => s.id === write.id);
-  const merged = mergeServerWrite(write, current);
+  const merged = mergeServerWrite(write, current, actingOrg);
   if (current !== undefined) {
     return existing.map((s) => (s.id === write.id ? merged : s));
   }
