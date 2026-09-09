@@ -62,8 +62,14 @@ const ORDER_LINE_RE = /^[ \t]*<!--[ \t]*order:[ \t]*(\[.*\])[ \t]*-->[ \t\r]*$/;
 // ORDER_LINE_RE; stripping must be broad so a corrupt machine comment inside the
 // block never leaks into the prompt.
 const ORDER_STRIP_RE = /^[ \t]*<!--[ \t]*order:.*-->[ \t\r]*$/;
+// Loosest matcher, for the CORRUPT path only: a line that OPENS a bt marker or
+// order comment, terminator-agnostic. A hand-truncated comment (e.g.
+// `<!-- order: [...]` with no `-->`) is not a well-formed marker, so detection
+// and parsing ignore it — but the corrupt-block fallback must still strip it so
+// no machine metadata ever leaks into the prompt.
+const MACHINE_LINE_LOOSE_RE = /^[ \t]*<!--[ \t]*(?:\/?bt:resource-priorities|order:)/;
 
-/** True for any block machine line (opening/closing marker or an order comment). */
+/** True for any well-formed block machine line (opening/closing marker or an order comment). */
 function isBlockMachineLine(line: string): boolean {
   return BEGIN_LINE_RE.test(line) || END_LINE_RE.test(line) || ORDER_STRIP_RE.test(line);
 }
@@ -269,11 +275,13 @@ export function applyResourcePriority(toolGuidance: string): AppliedResourcePrio
   // content OUTSIDE that span, including the author's own comments, is left
   // untouched — and report corrupt.
   if (!block) {
-    const marked = [...markers.begins, ...markers.ends, ...markers.orders];
-    const lo = Math.min(...marked);
-    const hi = Math.max(...marked);
+    // begins.length >= 1 is guaranteed above. From the first opener onward, drop
+    // any line that opens a bt marker or order comment — terminator-agnostic, so
+    // a truncated/hand-mangled comment can't leak. Content before the first
+    // opener (author prose and their own comments) is left untouched.
+    const firstBegin = markers.begins[0]!;
     const kept = lines.filter(
-      (line, index) => !(index >= lo && index <= hi && isBlockMachineLine(line))
+      (line, index) => !(index >= firstBegin && MACHINE_LINE_LOOSE_RE.test(line))
     );
     return {
       toolGuidance: collapseBlankRuns(kept.join('\n')).trimEnd(),

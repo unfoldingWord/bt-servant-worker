@@ -289,6 +289,18 @@ describe('applyResourcePriority - corrupt-comment stripping and spacing', () => 
     expect(result.order).toBe('corrupt');
     expect(result.toolGuidance).toContain('<!-- keep me -->');
   });
+});
+
+describe('applyResourcePriority - ambiguous structures', () => {
+  it('strips a truncated order comment (missing -->) so it never leaks', () => {
+    const truncated = `${RESOURCE_PRIORITY_BEGIN}\n<!-- order: ["translation-helps:ult"]\n### Resource priorities\n1. ult\n${RESOURCE_PRIORITY_END}`;
+    const result = applyResourcePriority(truncated);
+    expect(result.order).toBe('corrupt');
+    expect(result.applied).toBe(false);
+    expect(result.toolGuidance).not.toContain('<!-- order:');
+    expect(result.toolGuidance).not.toContain(RESOURCE_PRIORITY_BEGIN);
+    expect(result.toolGuidance).not.toContain(RESOURCE_PRIORITY_END);
+  });
 
   it('treats nested opening markers as corrupt and strips every marker', () => {
     const nested = `${RESOURCE_PRIORITY_BEGIN}\n${RESOURCE_PRIORITY_BEGIN}\n${VALID_ORDER}\n### Resource priorities\n1. ult\n${RESOURCE_PRIORITY_END}`;
