@@ -59,6 +59,7 @@ import {
   TriggerOnlyContext,
   VOICE_WRITING_RULES,
 } from './system-prompt.js';
+import { applyResourcePriority } from './resource-priority.js';
 import {
   buildAllTools,
   getToolDefinitions,
@@ -1573,6 +1574,30 @@ function stripPromptComments(
   return { values: cleanedSlots, languageDocument: cleanedLang };
 }
 
+/**
+ * Apply the per-mode resource-priority ranking (#366) to the `tool_guidance`
+ * slot: strip the portal's HTML-comment markers so they never reach the model,
+ * and append an actionable directive when a readable ranking is present. Logs
+ * the corrupt and applied cases so both are visible in CF logs. Returns the
+ * slot map unchanged when there is no block (the common case).
+ */
+function applyResourcePriorityToPrompt(
+  values: Required<Record<PromptSlot, string>>,
+  logger: RequestLogger
+): Required<Record<PromptSlot, string>> {
+  const priority = applyResourcePriority(values.tool_guidance);
+  if (priority.order === 'corrupt') {
+    logger.warn('resource_priority_corrupt', { source: 'prompt_slot:tool_guidance' });
+  } else if (priority.applied && Array.isArray(priority.order)) {
+    logger.log('resource_priority_applied', {
+      count: priority.order.length,
+      ids: priority.order,
+    });
+  }
+  if (priority.toolGuidance === values.tool_guidance) return values;
+  return { ...values, tool_guidance: priority.toolGuidance };
+}
+
 /** Build the seed `messages` array for an orchestration run. */
 function buildSeedMessages(
   userMessage: string,
@@ -1617,11 +1642,12 @@ function createOrchestrationContext(
   const { env, catalog, history, preferences, orgConfig, logger, callbacks } = options;
   const locale = preferences.response_language;
   const rawPromptValues = options.resolvedPromptValues ?? DEFAULT_PROMPT_VALUES;
-  const { values: promptValues, languageDocument } = stripPromptComments(
+  const { values: strippedValues, languageDocument } = stripPromptComments(
     rawPromptValues,
     options.languageDocument,
     logger
   );
+  const promptValues = applyResourcePriorityToPrompt(strippedValues, logger);
   const llmMax = orgConfig?.max_history_llm ?? DEFAULT_ORG_CONFIG.max_history_llm;
 
   // prettier-ignore
