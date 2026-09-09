@@ -109,6 +109,15 @@ describe('toPublicServerConfig ownerOrg', () => {
   it('defaults an absent ownerOrg to DEFAULT_ORG (a pre-#292 entry is in the migrated pool)', () => {
     expect(toPublicServerConfig(stored('a'), DEFAULT_ORG).ownerOrg).toBe(DEFAULT_ORG);
   });
+
+  it('defaults an empty or malformed stored ownerOrg to DEFAULT_ORG', () => {
+    // A pre-#278 record could persist junk verbatim; the public shape must
+    // still be a usable org id.
+    const empty = { ...stored('a'), ownerOrg: '' } as unknown as MCPServerConfig;
+    const nonString = { ...stored('a'), ownerOrg: 123 } as unknown as MCPServerConfig;
+    expect(toPublicServerConfig(empty, DEFAULT_ORG).ownerOrg).toBe(DEFAULT_ORG);
+    expect(toPublicServerConfig(nonString, DEFAULT_ORG).ownerOrg).toBe(DEFAULT_ORG);
+  });
 });
 
 describe('resolveAuthToken (write rule)', () => {
@@ -199,6 +208,17 @@ describe('resolveOwnerOrg (write rule)', () => {
     // The public projection reports the absent value as DEFAULT_ORG; the edit
     // does not stamp the acting org onto a legacy row.
     expect(resolveOwnerOrg(stored('a'), ACTING_ORG)).toBeUndefined();
+  });
+
+  it('does not re-persist an empty or malformed stored ownerOrg on edit', () => {
+    const empty = { ...stored('a'), ownerOrg: '' } as unknown as MCPServerConfig;
+    const nonString = { ...stored('a'), ownerOrg: 123 } as unknown as MCPServerConfig;
+    expect(resolveOwnerOrg(empty, ACTING_ORG)).toBeUndefined();
+    expect(resolveOwnerOrg(nonString, ACTING_ORG)).toBeUndefined();
+  });
+
+  it('does not stamp an empty acting org on create', () => {
+    expect(resolveOwnerOrg(undefined, '')).toBeUndefined();
   });
 });
 

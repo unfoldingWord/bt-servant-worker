@@ -395,13 +395,25 @@ export async function readMcpServerPoolOrEmpty(
 // ─── Public projection ────────────────────────────────────────────────────────
 
 /**
+ * The stored owning-org if it is a usable org id, else `undefined`. Storage is
+ * not trusted (the pre-#278 POST persisted `{...body}` verbatim and
+ * `isStoredServer` does not validate `ownerOrg`), so a legacy record may carry
+ * a non-string or empty `ownerOrg`. Both the public projection and the
+ * write-preserve path normalise it here, the same way `authToken` is guarded.
+ */
+function validOwnerOrg(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+/**
  * Project a stored config to its public shape. Built from an allowlist, not by
  * deleting `authToken`: the pre-#278 POST persisted `{...body}` verbatim, so a
  * stored object may carry unknown keys that must not reach every org's admins.
  *
- * `ownerOrg` is always reported (admin-portal#292 / worker#417): a stored value
- * is passed through; a pre-#292 entry with none stored defaults to `defaultOrg`
- * (the migrated `unfoldingWord` pool), so the portal can always attribute a row.
+ * `ownerOrg` is always reported as a non-empty string (admin-portal#292 /
+ * worker#417): a valid stored value is passed through; an absent, empty, or
+ * malformed one defaults to `defaultOrg` (the migrated `unfoldingWord` pool),
+ * so the portal can always attribute a row.
  */
 export function toPublicServerConfig(
   server: MCPServerConfig,
@@ -414,7 +426,7 @@ export function toPublicServerConfig(
     enabled: server.enabled,
     priority: server.priority,
     hasAuthToken: typeof server.authToken === 'string' && server.authToken.length > 0,
-    ownerOrg: server.ownerOrg ?? defaultOrg,
+    ownerOrg: validOwnerOrg(server.ownerOrg) ?? defaultOrg,
   };
   if (server.allowedTools !== undefined) pub.allowedTools = server.allowedTools;
   if (server.transport !== undefined) pub.transport = server.transport;
@@ -465,14 +477,17 @@ export function resolveAuthToken(
  *   org onto it.
  *
  * Ownership is taken from the trusted route param, never from the request body
- * (`ownerOrg` is not part of MCPServerWrite). Returns `undefined` when nothing
- * should be persisted so the field is dropped from the stored JSON.
+ * (`ownerOrg` is not part of MCPServerWrite). The result is normalised to a
+ * non-empty string so an empty acting org, or an edit that would re-persist a
+ * malformed legacy `ownerOrg`, drops the field instead (the projection then
+ * reports it as DEFAULT_ORG). Returns `undefined` when nothing should be
+ * persisted so the field is dropped from the stored JSON.
  */
 export function resolveOwnerOrg(
   existing: MCPServerConfig | undefined,
   actingOrg: string
 ): string | undefined {
-  return existing === undefined ? actingOrg : existing.ownerOrg;
+  return validOwnerOrg(existing === undefined ? actingOrg : existing.ownerOrg);
 }
 
 /**
