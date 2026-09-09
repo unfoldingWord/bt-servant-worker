@@ -76,68 +76,59 @@ function isBlockMachineLine(line: string): boolean {
  */
 export type PriorityOrder = readonly string[] | 'corrupt' | null;
 
-/** Line-index bounds of the fenced block; `end` is `null` for an orphan opening marker. */
-interface BlockBounds {
+/** A well-formed block: its opening, closing, and single order-comment line indices. */
+interface WellFormedBlock {
   begin: number;
-  end: number | null;
+  end: number;
+  order: number;
+}
+
+/** Line indices of every whole-line opening, closing, and order marker. */
+interface Markers {
+  begins: number[];
+  ends: number[];
+  orders: number[];
+}
+
+/** Collect the line indices of every whole-line marker. A line is one kind at most. */
+function collectMarkers(lines: readonly string[]): Markers {
+  const begins: number[] = [];
+  const ends: number[] = [];
+  const orders: number[] = [];
+  lines.forEach((line, index) => {
+    if (BEGIN_LINE_RE.test(line)) begins.push(index);
+    else if (END_LINE_RE.test(line)) ends.push(index);
+    else if (ORDER_STRIP_RE.test(line)) orders.push(index);
+  });
+  return { begins, ends, orders };
 }
 
 /**
- * Locate every fenced block: each whole-line opening marker paired with the
- * next whole-line closing marker. An opening marker with no closing marker (an
- * orphan) claims the rest of the slot and ends the scan. The portal emits
- * exactly one block; more than one means duplicated/conflicting edits.
+ * The one well-formed block, or `null` when the marker structure is ambiguous.
+ *
+ * The only valid shape is exactly one opening marker, exactly one closing marker
+ * after it, and exactly one order comment strictly between them. Anything else —
+ * multiple blocks, a nested opener, an orphan opener, a stray closer, or zero /
+ * multiple order comments (from a hand-edit or merge conflict) — is ambiguous
+ * and rejected, so we can never apply a guessed ranking.
  */
-function findAllBlocks(lines: readonly string[]): BlockBounds[] {
-  const blocks: BlockBounds[] = [];
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-    if (line !== undefined && BEGIN_LINE_RE.test(line)) {
-      let end: number | null = null;
-      for (let j = i + 1; j < lines.length; j += 1) {
-        const inner = lines[j];
-        if (inner !== undefined && END_LINE_RE.test(inner)) {
-          end = j;
-          break;
-        }
-      }
-      blocks.push({ begin: i, end });
-      if (end === null) break;
-      i = end + 1;
-    } else {
-      i += 1;
-    }
-  }
-  return blocks;
+function wellFormedBlock(markers: Markers): WellFormedBlock | null {
+  if (markers.begins.length !== 1 || markers.ends.length !== 1) return null;
+  const begin = markers.begins[0]!;
+  const end = markers.ends[0]!;
+  if (begin >= end) return null;
+  const inside = markers.orders.filter((index) => index > begin && index < end);
+  if (inside.length !== 1) return null;
+  return { begin, end, order: inside[0]! };
 }
 
-/** Indices of the machine lines (markers + order comments) inside every block region. */
-function machineLineIndices(lines: readonly string[], blocks: readonly BlockBounds[]): Set<number> {
-  const indices = new Set<number>();
-  for (const block of blocks) {
-    const last = block.end ?? lines.length - 1;
-    for (let i = block.begin; i <= last; i += 1) {
-      const line = lines[i];
-      if (line !== undefined && isBlockMachineLine(line)) indices.add(i);
-    }
-  }
-  return indices;
-}
-
-/** Parse the order comment out of the block's own lines (never `null` — a block is present). */
-function parseOrderFromBlockLines(blockLines: readonly string[]): readonly string[] | 'corrupt' {
-  // Exactly one order comment must be present. Zero is missing; more than one
-  // (e.g. from a merge conflict or hand-edit) is ambiguous — like the multiple-
-  // block case, we won't guess which ranking wins.
-  const orderLines = blockLines.filter((line) => ORDER_STRIP_RE.test(line));
-  if (orderLines.length !== 1) return 'corrupt';
-  const match = ORDER_LINE_RE.exec(orderLines[0] ?? '');
+/** Parse a single order-comment line into ids, or `'corrupt'`. */
+function parseOrderLine(line: string): readonly string[] | 'corrupt' {
+  const match = ORDER_LINE_RE.exec(line);
   if (!match?.[1]) return 'corrupt';
-  const raw = match[1];
   let parsed: unknown;
   try {
-    parsed = JSON.parse(raw);
+    parsed = JSON.parse(match[1]);
   } catch {
     // A hand-mangled order line is reported as corrupt (the caller logs it),
     // not silently applied — we never act on an unreadable ranking.
@@ -153,13 +144,11 @@ function parseOrderFromBlockLines(blockLines: readonly string[]): readonly strin
 export function parseResourcePriorityOrder(toolGuidance: string): PriorityOrder {
   if (typeof toolGuidance !== 'string') return null;
   const lines = toolGuidance.split('\n');
-  const blocks = findAllBlocks(lines);
-  if (blocks.length === 0) return null;
-  // More than one block, or an orphan opening marker, is ambiguous — corrupt.
-  if (blocks.length > 1) return 'corrupt';
-  const [block] = blocks;
-  if (!block || block.end === null) return 'corrupt';
-  return parseOrderFromBlockLines(lines.slice(block.begin, block.end + 1));
+  const markers = collectMarkers(lines);
+  if (markers.begins.length === 0) return null; // no block opener → not a block
+  const block = wellFormedBlock(markers);
+  if (!block) return 'corrupt';
+  return parseOrderLine(lines[block.order] ?? '');
 }
 
 /** Split a `serverId:name` composite on its FIRST colon (server ids carry none). */
@@ -267,19 +256,25 @@ export function applyResourcePriority(toolGuidance: string): AppliedResourcePrio
     return { toolGuidance, order: null, applied: false };
   }
   const lines = toolGuidance.split('\n');
-  const blocks = findAllBlocks(lines);
-  if (blocks.length === 0) {
+  const markers = collectMarkers(lines);
+  if (markers.begins.length === 0) {
     return { toolGuidance, order: null, applied: false };
   }
 
-  // More than one block (duplicated/conflicting edits) or an orphan opening
-  // marker is ambiguous: we won't guess a ranking. Strip every machine line
-  // inside every block region so no marker leaks — author prose and any comment
-  // OUTSIDE a block region are left untouched — and report corrupt.
-  const [bounds] = blocks;
-  if (blocks.length > 1 || !bounds || bounds.end === null) {
-    const drop = machineLineIndices(lines, blocks);
-    const kept = lines.filter((_line, index) => !drop.has(index));
+  const block = wellFormedBlock(markers);
+
+  // Ambiguous marker structure (multiple/nested blocks, an orphan opener, a
+  // stray closer, or not exactly one order comment): we won't guess a ranking.
+  // Strip every machine line within the span the markers occupy so none leaks —
+  // content OUTSIDE that span, including the author's own comments, is left
+  // untouched — and report corrupt.
+  if (!block) {
+    const marked = [...markers.begins, ...markers.ends, ...markers.orders];
+    const lo = Math.min(...marked);
+    const hi = Math.max(...marked);
+    const kept = lines.filter(
+      (line, index) => !(index >= lo && index <= hi && isBlockMachineLine(line))
+    );
     return {
       toolGuidance: collapseBlankRuns(kept.join('\n')).trimEnd(),
       order: 'corrupt',
@@ -287,12 +282,12 @@ export function applyResourcePriority(toolGuidance: string): AppliedResourcePrio
     };
   }
 
-  const blockLines = lines.slice(bounds.begin, bounds.end + 1);
-  const order = parseOrderFromBlockLines(blockLines);
+  const order = parseOrderLine(lines[block.order] ?? '');
 
   // Rebuild the block from its prose only (drop the machine lines — markers and
-  // any order comment, including a malformed one that failed strict parsing).
-  const prose = blockLines
+  // the order comment, including a malformed one that failed strict parsing).
+  const prose = lines
+    .slice(block.begin, block.end + 1)
     .filter((line) => !isBlockMachineLine(line))
     .join('\n')
     .trim();
@@ -307,7 +302,7 @@ export function applyResourcePriority(toolGuidance: string): AppliedResourcePrio
     }
   }
 
-  const before = lines.slice(0, bounds.begin).join('\n');
-  const after = lines.slice(bounds.end + 1).join('\n');
+  const before = lines.slice(0, block.begin).join('\n');
+  const after = lines.slice(block.end + 1).join('\n');
   return { toolGuidance: assembleSlot(before, middle, after), order, applied };
 }

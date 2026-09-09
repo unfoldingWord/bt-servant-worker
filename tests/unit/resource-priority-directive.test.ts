@@ -283,6 +283,16 @@ describe('applyResourcePriority - corrupt-comment stripping and spacing', () => 
     expect(result.toolGuidance).toContain('<!-- keep me -->');
   });
 
+  it('treats nested opening markers as corrupt and strips every marker', () => {
+    const nested = `${RESOURCE_PRIORITY_BEGIN}\n${RESOURCE_PRIORITY_BEGIN}\n${VALID_ORDER}\n### Resource priorities\n1. ult\n${RESOURCE_PRIORITY_END}`;
+    const result = applyResourcePriority(nested);
+    expect(result.order).toBe('corrupt');
+    expect(result.applied).toBe(false);
+    expect(result.toolGuidance).not.toContain(RESOURCE_PRIORITY_BEGIN);
+    expect(result.toolGuidance).not.toContain('<!-- order:');
+    expect(parseResourcePriorityOrder(nested)).toBe('corrupt');
+  });
+
   it('treats a single block with two order comments as corrupt and strips both', () => {
     const twoOrders = `${RESOURCE_PRIORITY_BEGIN}\n<!-- order: ["translation-helps:ult"] -->\n<!-- order: ["aquifer:x"] -->\n### Resource priorities\n1. x\n${RESOURCE_PRIORITY_END}`;
     const result = applyResourcePriority(twoOrders);
