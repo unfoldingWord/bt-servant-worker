@@ -32,6 +32,17 @@ export interface MCPServerConfig {
   priority: number;
   allowedTools?: string[];
   transport?: MCPTransport;
+  /**
+   * The org that owns this entry (admin-portal#292). Stamped from the write
+   * route's org on create and preserved across edits — ownership never
+   * transfers via an edit. Pre-#292 entries have none stored; the public
+   * projection defaults them to DEFAULT_ORG (the migrated `unfoldingWord`
+   * pool). This is a display/attribution attribute only: the pool is one
+   * shared library and the portal — which knows the logged-in admin's org —
+   * enforces per-row edit rights. The worker does not gate on it. See
+   * worker#417.
+   */
+  ownerOrg?: string;
 }
 
 /**
@@ -39,9 +50,14 @@ export interface MCPServerConfig {
  * secret is never serialised; `hasAuthToken` says whether one is stored.
  * Every admin route that returns stored configs uses this shape
  * (admin-portal#278 guardrail 2 — the pool is shared with every org's admins).
+ *
+ * `ownerOrg` is always present here even though it is optional in storage: the
+ * projection resolves an absent value to DEFAULT_ORG so the portal can always
+ * attribute a row (admin-portal#292 / worker#417).
  */
-export type MCPServerConfigPublic = Omit<MCPServerConfig, 'authToken'> & {
+export type MCPServerConfigPublic = Omit<MCPServerConfig, 'authToken' | 'ownerOrg'> & {
   hasAuthToken: boolean;
+  ownerOrg: string;
 };
 
 /**
@@ -52,7 +68,10 @@ export type MCPServerConfigPublic = Omit<MCPServerConfig, 'authToken'> & {
  * - key omitted → preserve whatever is stored for that `id`
  * - `null` or `""` → clear the stored token
  * - non-empty string → set it
+ *
+ * `ownerOrg` is not a write field: ownership is stamped from the route's org
+ * on create and preserved on edit, never taken from the body (worker#417).
  */
-export type MCPServerWrite = Omit<MCPServerConfig, 'authToken'> & {
+export type MCPServerWrite = Omit<MCPServerConfig, 'authToken' | 'ownerOrg'> & {
   authToken?: string | null;
 };

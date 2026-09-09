@@ -16,6 +16,7 @@ import {
   readMcpServerPoolOrEmpty,
   resetChatFallbackWarning,
   resolveAuthToken,
+  resolveOwnerOrg,
   toPublicServerConfig,
   toPublicServerConfigs,
   upsertServer,
@@ -32,9 +33,14 @@ const stored = (id: string, extra: Partial<MCPServerConfig> = {}): MCPServerConf
   ...extra,
 });
 
+/** DEFAULT_ORG: the migrated `unfoldingWord` pool, used as the ownerOrg default. */
+const DEFAULT_ORG = 'unfoldingWord';
+/** A non-default acting org, as a partner admin's write route would carry. */
+const ACTING_ORG = 'wordcollective';
+
 describe('toPublicServerConfig', () => {
   it('drops authToken and reports hasAuthToken=true for a non-empty token', () => {
-    const pub = toPublicServerConfig(stored('a', { authToken: 'secret-123' }));
+    const pub = toPublicServerConfig(stored('a', { authToken: 'secret-123' }), DEFAULT_ORG);
     expect(pub).toEqual({
       id: 'a',
       name: 'Server a',
@@ -42,14 +48,17 @@ describe('toPublicServerConfig', () => {
       enabled: true,
       priority: 1,
       hasAuthToken: true,
+      ownerOrg: DEFAULT_ORG,
     });
     expect('authToken' in pub).toBe(false);
     expect(JSON.stringify(pub)).not.toContain('secret-123');
   });
 
   it('reports hasAuthToken=false when the token is absent or empty', () => {
-    expect(toPublicServerConfig(stored('a')).hasAuthToken).toBe(false);
-    expect(toPublicServerConfig(stored('a', { authToken: '' })).hasAuthToken).toBe(false);
+    expect(toPublicServerConfig(stored('a'), DEFAULT_ORG).hasAuthToken).toBe(false);
+    expect(toPublicServerConfig(stored('a', { authToken: '' }), DEFAULT_ORG).hasAuthToken).toBe(
+      false
+    );
   });
 
   it('is an allowlist: unknown stored keys never reach the public shape', () => {
@@ -58,9 +67,9 @@ describe('toPublicServerConfig', () => {
       password: 'hunter2',
       hasAuthToken: false, // stale public-shape field persisted pre-#278
     } as unknown as MCPServerConfig;
-    const pub = toPublicServerConfig(legacyStored);
+    const pub = toPublicServerConfig(legacyStored, DEFAULT_ORG);
     expect(Object.keys(pub).sort()).toEqual(
-      ['enabled', 'hasAuthToken', 'id', 'name', 'priority', 'url'].sort()
+      ['enabled', 'hasAuthToken', 'id', 'name', 'ownerOrg', 'priority', 'url'].sort()
     );
     expect(pub.hasAuthToken).toBe(true);
     expect(JSON.stringify(pub)).not.toMatch(/hunter2|sekrit/);
@@ -68,7 +77,8 @@ describe('toPublicServerConfig', () => {
 
   it('keeps every other field, including optional ones', () => {
     const pub = toPublicServerConfig(
-      stored('a', { allowedTools: ['x'], transport: 'streamable-http', enabled: false })
+      stored('a', { allowedTools: ['x'], transport: 'streamable-http', enabled: false }),
+      DEFAULT_ORG
     );
     expect(pub).toMatchObject({
       allowedTools: ['x'],
@@ -77,13 +87,36 @@ describe('toPublicServerConfig', () => {
       hasAuthToken: false,
     });
   });
+});
 
+describe('toPublicServerConfigs', () => {
   it('projects a pool in order', () => {
     const pool = [stored('b', { authToken: 't' }), stored('a')];
-    expect(toPublicServerConfigs(pool).map((s) => [s.id, s.hasAuthToken])).toEqual([
+    expect(toPublicServerConfigs(pool, DEFAULT_ORG).map((s) => [s.id, s.hasAuthToken])).toEqual([
       ['b', true],
       ['a', false],
     ]);
+  });
+});
+
+describe('toPublicServerConfig ownerOrg', () => {
+  it('reports a stored ownerOrg', () => {
+    expect(toPublicServerConfig(stored('a', { ownerOrg: ACTING_ORG }), DEFAULT_ORG).ownerOrg).toBe(
+      ACTING_ORG
+    );
+  });
+
+  it('defaults an absent ownerOrg to DEFAULT_ORG (a pre-#292 entry is in the migrated pool)', () => {
+    expect(toPublicServerConfig(stored('a'), DEFAULT_ORG).ownerOrg).toBe(DEFAULT_ORG);
+  });
+
+  it('defaults an empty or malformed stored ownerOrg to DEFAULT_ORG', () => {
+    // A pre-#278 record could persist junk verbatim; the public shape must
+    // still be a usable org id.
+    const empty = { ...stored('a'), ownerOrg: '' } as unknown as MCPServerConfig;
+    const nonString = { ...stored('a'), ownerOrg: 123 } as unknown as MCPServerConfig;
+    expect(toPublicServerConfig(empty, DEFAULT_ORG).ownerOrg).toBe(DEFAULT_ORG);
+    expect(toPublicServerConfig(nonString, DEFAULT_ORG).ownerOrg).toBe(DEFAULT_ORG);
   });
 });
 
@@ -120,33 +153,36 @@ describe('resolveAuthToken (write rule)', () => {
 
 describe('mergeServerWrite', () => {
   it('never persists a null or empty authToken field', () => {
-    expect('authToken' in mergeServerWrite({ ...stored('a'), authToken: null }, undefined)).toBe(
-      false
-    );
-    expect('authToken' in mergeServerWrite({ ...stored('a'), authToken: '' }, stored('a'))).toBe(
-      false
-    );
+    expect(
+      'authToken' in mergeServerWrite({ ...stored('a'), authToken: null }, undefined, ACTING_ORG)
+    ).toBe(false);
+    expect(
+      'authToken' in mergeServerWrite({ ...stored('a'), authToken: '' }, stored('a'), ACTING_ORG)
+    ).toBe(false);
   });
 
-  it('persists only known MCPServerConfig fields (allowlist)', () => {
+  it('persists only known MCPServerConfig fields (allowlist), plus the stamped owner', () => {
     const write = {
       ...stored('a'),
       hasAuthToken: true, // public-shape field from a GET → PUT round-trip
       password: 'hunter2', // unknown secret-looking key
+      ownerOrg: 'attacker', // body cannot claim ownership — stamped from the route
       allowedTools: ['t'],
       transport: 'json-rpc',
     } as unknown as MCPServerWrite;
-    const merged = mergeServerWrite(write, undefined);
+    const merged = mergeServerWrite(write, undefined, ACTING_ORG);
     expect(Object.keys(merged).sort()).toEqual(
-      ['allowedTools', 'enabled', 'id', 'name', 'priority', 'transport', 'url'].sort()
+      ['allowedTools', 'enabled', 'id', 'name', 'ownerOrg', 'priority', 'transport', 'url'].sort()
     );
+    expect(merged.ownerOrg).toBe(ACTING_ORG); // route wins over the body value
     expect(JSON.stringify(merged)).not.toContain('hunter2');
   });
 
   it('takes every non-token field from the write, not from existing', () => {
     const merged = mergeServerWrite(
       { ...stored('a', { name: 'Renamed', priority: 7 }) },
-      stored('a', { authToken: 'keep-me', allowedTools: ['old'] })
+      stored('a', { authToken: 'keep-me', allowedTools: ['old'] }),
+      ACTING_ORG
     );
     expect(merged).toEqual({
       id: 'a',
@@ -159,52 +195,106 @@ describe('mergeServerWrite', () => {
   });
 });
 
+describe('resolveOwnerOrg (write rule)', () => {
+  it('stamps the acting org on create (no existing entry)', () => {
+    expect(resolveOwnerOrg(undefined, ACTING_ORG)).toBe(ACTING_ORG);
+  });
+
+  it('preserves the stored owner on edit — an edit never transfers ownership', () => {
+    expect(resolveOwnerOrg(stored('a', { ownerOrg: DEFAULT_ORG }), ACTING_ORG)).toBe(DEFAULT_ORG);
+  });
+
+  it('leaves a pre-#292 entry unowned on edit (absent stays absent)', () => {
+    // The public projection reports the absent value as DEFAULT_ORG; the edit
+    // does not stamp the acting org onto a legacy row.
+    expect(resolveOwnerOrg(stored('a'), ACTING_ORG)).toBeUndefined();
+  });
+
+  it('does not re-persist an empty or malformed stored ownerOrg on edit', () => {
+    const empty = { ...stored('a'), ownerOrg: '' } as unknown as MCPServerConfig;
+    const nonString = { ...stored('a'), ownerOrg: 123 } as unknown as MCPServerConfig;
+    expect(resolveOwnerOrg(empty, ACTING_ORG)).toBeUndefined();
+    expect(resolveOwnerOrg(nonString, ACTING_ORG)).toBeUndefined();
+  });
+
+  it('does not stamp an empty acting org on create', () => {
+    expect(resolveOwnerOrg(undefined, '')).toBeUndefined();
+  });
+});
+
+describe('mergeServerWrite ownerOrg', () => {
+  it('stamps the acting org as owner on create', () => {
+    expect(mergeServerWrite(stored('a'), undefined, ACTING_ORG).ownerOrg).toBe(ACTING_ORG);
+  });
+
+  it('preserves an existing owner and ignores the acting org on edit', () => {
+    const merged = mergeServerWrite(
+      stored('a'),
+      stored('a', { ownerOrg: DEFAULT_ORG }),
+      ACTING_ORG
+    );
+    expect(merged.ownerOrg).toBe(DEFAULT_ORG);
+  });
+
+  it('does not stamp an owner when editing a pre-#292 entry', () => {
+    expect('ownerOrg' in mergeServerWrite(stored('a'), stored('a'), ACTING_ORG)).toBe(false);
+  });
+});
+
 describe('mergeServerPool (PUT)', () => {
   const pool = [
-    stored('a', { authToken: 'tok-a' }),
-    stored('b', { authToken: 'tok-b' }),
+    stored('a', { authToken: 'tok-a', ownerOrg: DEFAULT_ORG }),
+    stored('b', { authToken: 'tok-b', ownerOrg: DEFAULT_ORG }),
     stored('c'),
   ];
 
-  it('keeps exactly the written servers, in write order, merging tokens by id', () => {
+  it('keeps exactly the written servers, in write order, merging tokens and owners by id', () => {
     const next = mergeServerPool(
       [stored('c'), stored('a'), stored('d', { authToken: 'tok-d' })],
-      pool
+      pool,
+      ACTING_ORG
     );
     expect(next).toEqual([
+      // 'c' pre-existed unowned → stays unowned (projection defaults it later).
       stored('c'),
-      stored('a', { authToken: 'tok-a' }),
-      stored('d', { authToken: 'tok-d' }),
+      // 'a' pre-existed → owner preserved, not reassigned to the acting org.
+      stored('a', { authToken: 'tok-a', ownerOrg: DEFAULT_ORG }),
+      // 'd' is new → stamped with the acting org.
+      stored('d', { authToken: 'tok-d', ownerOrg: ACTING_ORG }),
     ]);
   });
 
   it('clears a token when the write says null', () => {
-    const next = mergeServerPool([{ ...stored('a'), authToken: null }], pool);
-    expect(next).toEqual([stored('a')]);
+    const next = mergeServerPool([{ ...stored('a'), authToken: null }], pool, ACTING_ORG);
+    expect(next).toEqual([stored('a', { ownerOrg: DEFAULT_ORG })]);
   });
 
   it('empties the pool for an empty write', () => {
-    expect(mergeServerPool([], pool)).toEqual([]);
+    expect(mergeServerPool([], pool, ACTING_ORG)).toEqual([]);
   });
 });
 
 describe('upsertServer (POST)', () => {
-  const pool = [stored('a', { authToken: 'tok-a' }), stored('b')];
+  const pool = [stored('a', { authToken: 'tok-a', ownerOrg: DEFAULT_ORG }), stored('b')];
 
-  it('replaces in place by id and preserves the token when omitted', () => {
-    const next = upsertServer(stored('a', { priority: 9 }), pool);
-    expect(next).toEqual([stored('a', { priority: 9, authToken: 'tok-a' }), stored('b')]);
+  it('replaces in place by id, preserving the token and owner when omitted', () => {
+    const next = upsertServer(stored('a', { priority: 9 }), pool, ACTING_ORG);
+    expect(next).toEqual([
+      stored('a', { priority: 9, authToken: 'tok-a', ownerOrg: DEFAULT_ORG }),
+      stored('b'),
+    ]);
   });
 
-  it('appends a new id', () => {
-    const next = upsertServer(stored('z', { authToken: 'tok-z' }), pool);
+  it('appends a new id and stamps it with the acting org', () => {
+    const next = upsertServer(stored('z', { authToken: 'tok-z' }), pool, ACTING_ORG);
     expect(next.map((s) => s.id)).toEqual(['a', 'b', 'z']);
     expect(next[2].authToken).toBe('tok-z');
+    expect(next[2].ownerOrg).toBe(ACTING_ORG);
   });
 
   it('does not mutate the input pool', () => {
     const before = JSON.stringify(pool);
-    upsertServer({ ...stored('a'), authToken: null }, pool);
+    upsertServer({ ...stored('a'), authToken: null }, pool, ACTING_ORG);
     expect(JSON.stringify(pool)).toBe(before);
   });
 });

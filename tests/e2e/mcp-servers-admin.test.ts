@@ -43,7 +43,7 @@ const server = (id: string, extra: Partial<MCPServerConfig> = {}): MCPServerConf
   ...extra,
 });
 
-type PublicServer = { id: string; hasAuthToken: boolean; authToken?: unknown };
+type PublicServer = { id: string; hasAuthToken: boolean; ownerOrg?: string; authToken?: unknown };
 type ListBody = {
   org: string;
   migrated: boolean;
@@ -135,6 +135,36 @@ describe('global pool: :org is ignored for storage', () => {
     expect(await readKey(MCP_GLOBAL_KEY)).toEqual([]);
     expect((await readKey(LEGACY_KEY))?.map((s) => s.id)).toEqual(['legacy']);
     expect((await get(ORG_A)).body).toMatchObject({ migrated: true, servers: [] });
+  });
+});
+
+describe('ownerOrg attribution (worker#417)', () => {
+  const ownerOf = async (id: string) =>
+    (await readKey(MCP_GLOBAL_KEY))?.find((s) => s.id === id)?.ownerOrg;
+
+  it('POST stamps the route org as the owner; every org sees it on the shared list', async () => {
+    await seedGlobal();
+    expect((await post(ORG_A, server('alpha'))).status).toBe(200);
+
+    expect(await ownerOf('alpha')).toBe(ORG_A);
+    // The pool is shared, so ORG_B reads the same list — with ORG_A's ownership.
+    const list = await get(ORG_B);
+    expect(list.body.servers.find((s) => s.id === 'alpha')?.ownerOrg).toBe(ORG_A);
+  });
+
+  it('reports a legacy unowned row as DEFAULT_ORG, not the requesting org', async () => {
+    await seedGlobal([server('legacy')]); // no ownerOrg stored
+    const list = await get(ORG_B);
+    expect(list.body.servers.find((s) => s.id === 'legacy')?.ownerOrg).toBe(LEGACY_KEY);
+  });
+
+  it('a GET → edit → PUT round-trip from another org cannot transfer ownership', async () => {
+    await seedGlobal([server('owned', { ownerOrg: ORG_A })]);
+    // The portal edits by PUTting the public shape (which carries no ownerOrg)
+    // back from the acting admin's org. ORG_B must not become the owner.
+    expect((await put(ORG_B, [server('owned', { priority: 9 })])).status).toBe(200);
+    expect(await ownerOf('owned')).toBe(ORG_A);
+    expect((await get(ORG_B)).body.servers.find((s) => s.id === 'owned')?.ownerOrg).toBe(ORG_A);
   });
 });
 
