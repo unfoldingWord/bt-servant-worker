@@ -140,6 +140,13 @@ describe('renderResourcePriorityDirective', () => {
     expect(directive).toContain('`fetch_scripture`');
   });
 
+  it('keeps the coverage qualifier in the disclosure sentence', () => {
+    const directive = renderResourcePriorityDirective(['translation-helps:ult']);
+    // Disclosure fires only when bypassing the top source THAT COVERS the
+    // question — matching the portal prose; not on any non-top source.
+    expect(directive).toContain('highest-ranked source that covers the question, say so');
+  });
+
   it('keeps the same name under different servers as distinct ranked entries', () => {
     const directive = renderResourcePriorityDirective(['translation-helps:ult', 'aquifer:ult']);
     expect(directive).toContain('1. ult — translation-helps');

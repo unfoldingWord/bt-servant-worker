@@ -196,7 +196,7 @@ export function renderResourcePriorityDirective(order: readonly string[]): strin
     'Honor the ranking below when you choose tools and resources — it is not advisory background.',
     'Prefer the highest-ranked resource that covers the question, and fall back to a lower-ranked or',
     'unranked source only when it does not. When your answer draws on anything other than the',
-    'highest-ranked source, say so briefly in the same reply.',
+    'highest-ranked source that covers the question, say so briefly in the same reply.',
     'When a tool exposes a parameter that targets a specific resource, set it to honor this order —',
     "for scripture, `fetch_scripture`'s `resource` parameter takes resource names such as `ult`,",
     '`ust`, `t4t`, `ueb`. Match each resource below to the tool from its server; never pass one',
