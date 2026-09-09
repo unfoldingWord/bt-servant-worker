@@ -127,15 +127,14 @@ function machineLineIndices(lines: readonly string[], blocks: readonly BlockBoun
 
 /** Parse the order comment out of the block's own lines (never `null` — a block is present). */
 function parseOrderFromBlockLines(blockLines: readonly string[]): readonly string[] | 'corrupt' {
-  let raw: string | undefined;
-  for (const line of blockLines) {
-    const match = ORDER_LINE_RE.exec(line);
-    if (match?.[1]) {
-      raw = match[1];
-      break;
-    }
-  }
-  if (raw === undefined) return 'corrupt';
+  // Exactly one order comment must be present. Zero is missing; more than one
+  // (e.g. from a merge conflict or hand-edit) is ambiguous — like the multiple-
+  // block case, we won't guess which ranking wins.
+  const orderLines = blockLines.filter((line) => ORDER_STRIP_RE.test(line));
+  if (orderLines.length !== 1) return 'corrupt';
+  const match = ORDER_LINE_RE.exec(orderLines[0] ?? '');
+  if (!match?.[1]) return 'corrupt';
+  const raw = match[1];
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
