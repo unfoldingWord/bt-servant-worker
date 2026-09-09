@@ -69,11 +69,6 @@ const ORDER_STRIP_RE = /^[ \t]*<!--[ \t]*order:.*-->[ \t\r]*$/;
 // no machine metadata ever leaks into the prompt.
 const MACHINE_LINE_LOOSE_RE = /^[ \t]*<!--[ \t]*(?:\/?bt:resource-priorities|order:)/;
 
-/** True for any well-formed block machine line (opening/closing marker or an order comment). */
-function isBlockMachineLine(line: string): boolean {
-  return BEGIN_LINE_RE.test(line) || END_LINE_RE.test(line) || ORDER_STRIP_RE.test(line);
-}
-
 /**
  * The parsed ranking:
  * - `string[]` — the ordered `serverId:name` ids (may be empty)
@@ -238,65 +233,39 @@ function dropLeadingBlankLines(text: string): string {
   return lines.slice(start).join('\n');
 }
 
-/** Join non-empty segments with exactly one blank line between them. */
+/**
+ * Join non-empty segments with exactly one blank line between them. Blank runs
+ * WITHIN a segment are left as-is — the block-derived `middle` is pre-collapsed
+ * by the caller, and `before`/`after` are author content we must not rewrite.
+ */
 function assembleSlot(before: string, middle: string, after: string): string {
   const head = before.replace(/[ \t\r\n]+$/, '');
   const tail = dropLeadingBlankLines(after);
-  const parts = [head, middle, tail].filter((part) => part.length > 0);
-  return collapseBlankRuns(parts.join('\n\n')).trimEnd();
+  return [head, middle, tail]
+    .filter((part) => part.length > 0)
+    .join('\n\n')
+    .trimEnd();
+}
+
+/** Drop every marker-ish line (terminator-agnostic), so no machine metadata leaks. */
+function stripMarkerLines(lines: readonly string[]): string[] {
+  return lines.filter((line) => !MACHINE_LINE_LOOSE_RE.test(line));
 }
 
 /**
- * Transform a `## Tool Guidance` slot value for chat-time assembly: within the
- * fenced resource-priority block, strip the HTML-comment markers (so they never
- * reach the model) and, when a usable ranking is present, replace the block with
- * its prose plus the actionable directive. Everything outside the block — the
- * author's own guidance, including any of their own HTML comments — is
- * untouched.
- *
- * Pure and non-mutating: returns the original string unchanged when there is no
- * block, so the common case is a cheap identity.
+ * Rebuild a slot around one well-formed block: replace the block with its prose
+ * (marker lines dropped, gaps collapsed) plus the actionable directive, and keep
+ * the author content before/after verbatim (blank runs and all) minus any stray
+ * marker-ish line.
  */
-export function applyResourcePriority(toolGuidance: string): AppliedResourcePriority {
-  if (typeof toolGuidance !== 'string') {
-    return { toolGuidance, order: null, applied: false };
-  }
-  const lines = toolGuidance.split('\n');
-  const markers = collectMarkers(lines);
-  if (markers.begins.length === 0) {
-    return { toolGuidance, order: null, applied: false };
-  }
-
-  const block = wellFormedBlock(markers);
-
-  // Ambiguous marker structure (multiple/nested blocks, an orphan opener, a
-  // stray closer, or not exactly one order comment): we won't guess a ranking.
-  // Strip every machine line within the span the markers occupy so none leaks —
-  // content OUTSIDE that span, including the author's own comments, is left
-  // untouched — and report corrupt.
-  if (!block) {
-    // Drop every line that opens a bt marker or order comment, anywhere and
-    // terminator-agnostic (covers stray closers before the opener, truncated
-    // comments, nested/duplicate markers). These are our own machine markers —
-    // an author would not write one verbatim — so genuine prose and ordinary
-    // comments (e.g. `<!-- note -->`) are untouched.
-    const kept = lines.filter((line) => !MACHINE_LINE_LOOSE_RE.test(line));
-    return {
-      toolGuidance: collapseBlankRuns(kept.join('\n')).trimEnd(),
-      order: 'corrupt',
-      applied: false,
-    };
-  }
-
+function applyValidBlock(
+  lines: readonly string[],
+  block: WellFormedBlock
+): AppliedResourcePriority {
   const order = parseOrderLine(lines[block.order] ?? '');
-
-  // Rebuild the block from its prose only (drop the machine lines — markers and
-  // the order comment, including a malformed one that failed strict parsing).
-  const prose = lines
-    .slice(block.begin, block.end + 1)
-    .filter((line) => !isBlockMachineLine(line))
-    .join('\n')
-    .trim();
+  const prose = collapseBlankRuns(
+    stripMarkerLines(lines.slice(block.begin, block.end + 1)).join('\n')
+  ).trim();
 
   let middle = prose;
   let applied = false;
@@ -308,7 +277,47 @@ export function applyResourcePriority(toolGuidance: string): AppliedResourcePrio
     }
   }
 
-  const before = lines.slice(0, block.begin).join('\n');
-  const after = lines.slice(block.end + 1).join('\n');
+  const before = stripMarkerLines(lines.slice(0, block.begin)).join('\n');
+  const after = stripMarkerLines(lines.slice(block.end + 1)).join('\n');
   return { toolGuidance: assembleSlot(before, middle, after), order, applied };
+}
+
+/**
+ * Transform a `## Tool Guidance` slot value for chat-time assembly: replace a
+ * well-formed resource-priority block with its prose plus the actionable
+ * directive, strip the HTML-comment markers so they never reach the model, and
+ * leave author content outside the block untouched (a stray marker-ish line
+ * aside). Any ambiguous marker arrangement is reported corrupt with all
+ * marker-ish lines stripped.
+ *
+ * Pure and non-mutating: returns the original string unchanged when there is no
+ * marker syntax at all, so the common case is a cheap identity.
+ */
+export function applyResourcePriority(toolGuidance: string): AppliedResourcePriority {
+  if (typeof toolGuidance !== 'string') {
+    return { toolGuidance, order: null, applied: false };
+  }
+  const lines = toolGuidance.split('\n');
+
+  // Common case: no bt-marker/order syntax at all → a true, cheap identity.
+  if (!lines.some((line) => MACHINE_LINE_LOOSE_RE.test(line))) {
+    return { toolGuidance, order: null, applied: false };
+  }
+
+  const markers = collectMarkers(lines);
+  const block =
+    markers.begins.length > 0 && markers.ends.length > 0 ? wellFormedBlock(markers) : null;
+  if (block) {
+    return applyValidBlock(lines, block);
+  }
+
+  // A marker is present but there is no single well-formed block (multiple or
+  // nested blocks, an orphan/stray/truncated marker, or not exactly one order
+  // comment): we won't guess a ranking. Drop every marker-ish line so nothing
+  // leaks; genuine prose and ordinary comments are kept, and report corrupt.
+  return {
+    toolGuidance: collapseBlankRuns(stripMarkerLines(lines).join('\n')).trimEnd(),
+    order: 'corrupt',
+    applied: false,
+  };
 }

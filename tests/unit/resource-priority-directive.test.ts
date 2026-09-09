@@ -226,6 +226,14 @@ describe('applyResourcePriority - surrounding prose', () => {
     );
     expect(result.toolGuidance).not.toMatch(/\n{3,}/);
   });
+
+  it("preserves the author's own blank runs outside the block", () => {
+    const input = `Author line one.\n\n\n\nAuthor line two.\n\n${slotWithBlock(VALID_ORDER)}`;
+    const result = applyResourcePriority(input);
+    expect(result.applied).toBe(true);
+    // The 4-newline run in author content is left intact (not normalized).
+    expect(result.toolGuidance).toContain('Author line one.\n\n\n\nAuthor line two.');
+  });
 });
 
 describe('applyResourcePriority - edge cases', () => {
@@ -309,6 +317,15 @@ describe('applyResourcePriority - ambiguous structures', () => {
     expect(result.applied).toBe(false);
     expect(result.toolGuidance).not.toContain(RESOURCE_PRIORITY_END);
     expect(result.toolGuidance).not.toContain(RESOURCE_PRIORITY_BEGIN);
+    expect(result.toolGuidance).not.toContain('<!-- order:');
+  });
+
+  it('does not leak a truncated opener that has no closing -->', () => {
+    const truncatedOpener = `<!-- bt:resource-priorities\n${VALID_ORDER}\n### Resource priorities\n1. ult\n${RESOURCE_PRIORITY_END}`;
+    const result = applyResourcePriority(truncatedOpener);
+    expect(result.order).toBe('corrupt');
+    expect(result.applied).toBe(false);
+    expect(result.toolGuidance).not.toContain('<!-- bt:resource-priorities');
     expect(result.toolGuidance).not.toContain('<!-- order:');
   });
 
