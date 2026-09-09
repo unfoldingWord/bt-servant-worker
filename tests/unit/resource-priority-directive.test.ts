@@ -302,6 +302,16 @@ describe('applyResourcePriority - ambiguous structures', () => {
     expect(result.toolGuidance).not.toContain(RESOURCE_PRIORITY_END);
   });
 
+  it('strips a stray closing marker that appears before the opener', () => {
+    const strayCloser = `${RESOURCE_PRIORITY_END}\n\n${slotWithBlock(VALID_ORDER)}`;
+    const result = applyResourcePriority(strayCloser);
+    expect(result.order).toBe('corrupt');
+    expect(result.applied).toBe(false);
+    expect(result.toolGuidance).not.toContain(RESOURCE_PRIORITY_END);
+    expect(result.toolGuidance).not.toContain(RESOURCE_PRIORITY_BEGIN);
+    expect(result.toolGuidance).not.toContain('<!-- order:');
+  });
+
   it('treats nested opening markers as corrupt and strips every marker', () => {
     const nested = `${RESOURCE_PRIORITY_BEGIN}\n${RESOURCE_PRIORITY_BEGIN}\n${VALID_ORDER}\n### Resource priorities\n1. ult\n${RESOURCE_PRIORITY_END}`;
     const result = applyResourcePriority(nested);

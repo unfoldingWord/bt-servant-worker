@@ -275,14 +275,12 @@ export function applyResourcePriority(toolGuidance: string): AppliedResourcePrio
   // content OUTSIDE that span, including the author's own comments, is left
   // untouched — and report corrupt.
   if (!block) {
-    // begins.length >= 1 is guaranteed above. From the first opener onward, drop
-    // any line that opens a bt marker or order comment — terminator-agnostic, so
-    // a truncated/hand-mangled comment can't leak. Content before the first
-    // opener (author prose and their own comments) is left untouched.
-    const firstBegin = markers.begins[0]!;
-    const kept = lines.filter(
-      (line, index) => !(index >= firstBegin && MACHINE_LINE_LOOSE_RE.test(line))
-    );
+    // Drop every line that opens a bt marker or order comment, anywhere and
+    // terminator-agnostic (covers stray closers before the opener, truncated
+    // comments, nested/duplicate markers). These are our own machine markers —
+    // an author would not write one verbatim — so genuine prose and ordinary
+    // comments (e.g. `<!-- note -->`) are untouched.
+    const kept = lines.filter((line) => !MACHINE_LINE_LOOSE_RE.test(line));
     return {
       toolGuidance: collapseBlankRuns(kept.join('\n')).trimEnd(),
       order: 'corrupt',
