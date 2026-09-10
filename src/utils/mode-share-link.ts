@@ -31,8 +31,10 @@ const E164_DIGITS = /^[1-9][0-9]{6,14}$/;
 // is one of these would produce `wa.me/…?text=%23default`, and scanning that QR
 // would DEACTIVATE the recipient's mode instead of selecting it — a self-
 // defeating link. Kept as a local copy (like the portal builder) so this module
-// stays dependency-free; `CLEAR_TOKENS` is the canonical source if they change.
-const RESERVED_CLEAR_TRIGGERS: ReadonlySet<string> = new Set(['default', 'none', 'clear']);
+// stays dependency-free; the classifier's exported `CLEAR_TOKENS` is the canonical
+// source, and `mode-share-link.test.ts` asserts this set stays in parity with it
+// so the two cannot silently drift.
+export const RESERVED_CLEAR_TRIGGERS: ReadonlySet<string> = new Set(['default', 'none', 'clear']);
 
 /**
  * Reduce an operator-entered WhatsApp number to the digit string `wa.me`

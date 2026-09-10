@@ -2300,8 +2300,33 @@ export class UserDO {
       if (welcome.keys) await this.state.storage.put(welcome.keys.pending, true);
       return { handledOutOfBand: true, delivered: false };
     }
-    await this.recordWelcomeDelivered(welcome);
+    // The send landed — the user has seen the welcome, so this is handled
+    // out-of-band regardless of what the flag write does next.
+    await this.recordWelcomeDeliveredBestEffort(welcome, logger);
     return { handledOutOfBand: true, delivered: true };
+  }
+
+  /**
+   * Record the one-time welcome flag after a SUCCESSFUL out-of-band send —
+   * best-effort. If the storage write throws (hiccup/eviction) we log and
+   * degrade rather than propagate: propagating would leave `handledOutOfBand`
+   * unset in the caller and make processChat's finally arm `mode_welcome_pending`,
+   * re-emitting a welcome the user already received. Worst case the flag stays
+   * unset and an explicit re-scan re-welcomes once (double-send > pending skip).
+   * Partial-write atomicity of `recordWelcomeDelivered` itself is tracked in #422.
+   */
+  private async recordWelcomeDeliveredBestEffort(
+    welcome: ModeWelcome,
+    logger: RequestLogger
+  ): Promise<void> {
+    try {
+      await this.recordWelcomeDelivered(welcome);
+    } catch (error) {
+      logger.warn('mode_welcome_record_failed', {
+        error: error instanceof Error ? error.message : String(error),
+        welcomed_key: welcome.keys?.welcomed ?? null,
+      });
+    }
   }
 
   /**
@@ -2526,6 +2551,11 @@ export class UserDO {
    * as long as it is not yet `mode_welcomed`. Non-admins only (admins never
    * write pending). Returns `undefined` when nothing is pending.
    */
+  // TODO(review, #422): this runs on every plain (non-#) turn with an active mode
+  // and does 1 + |aliases| durable storage.get calls to detect the rare failed-
+  // delivery re-emit — an N+1 read on the chat hot path. Gate it behind a cheap
+  // signal (e.g. a single cached "has any pending" marker) so steady-state turns
+  // skip the per-alias reads. Tracked with the other welcome hardening in #422.
   private async maybePendingWelcome(
     body: ChatRequest,
     loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,

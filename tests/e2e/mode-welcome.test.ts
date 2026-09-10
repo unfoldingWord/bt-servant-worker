@@ -668,6 +668,53 @@ describe('per-mode welcome — suppresses the model welcome (#311 FIX A)', () =>
   });
 });
 
+// #423 review: a webhook welcome that SENDS successfully but whose one-time flag
+// write then throws must NOT arm mode_welcome_pending — arming it would re-emit,
+// on the next same-mode turn, a welcome the user already received.
+describe('per-mode welcome — flag write failure after a successful send (#311)', () => {
+  beforeEach(() => {
+    setupAnthropicSSE();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('does not arm pending (or re-emit) when recordWelcomeDelivered throws post-send', async () => {
+    const stub = env.USER_DO.get(env.USER_DO.newUniqueId());
+    let welcomed = false;
+
+    const result = await runInDurableObject(stub, (instance) => {
+      vi.spyOn(
+        instance as unknown as { recordWelcomeDelivered(w: unknown): Promise<void> },
+        'recordWelcomeDelivered'
+      ).mockRejectedValue(new Error('storage boom'));
+      return (instance as unknown as ProcessChatInstance).processChat(
+        triggerBody('#spoken hi'),
+        '',
+        createRequestLogger('test-record-fail'),
+        createTimingContext(),
+        callbackStreamCallbacks({
+          onWelcome: async () => {
+            welcomed = true;
+          },
+        })
+      );
+    });
+
+    // The welcome was sent out-of-band (webhook path ⇒ not in `responses`), and
+    // the turn completed normally with the model answer.
+    expect(welcomed).toBe(true);
+    expect(result.responses).toEqual(['ok']);
+
+    // The flag write failed, so mode_welcomed is unset — acceptable (an explicit
+    // re-scan re-welcomes once). Crucially pending is NOT armed, so a plain
+    // follow-up turn will not re-emit the welcome the user already saw.
+    expect(await readWelcomedFlag(stub, 'spoken')).toBeUndefined();
+    expect(await readPendingFlag(stub, 'spoken')).toBeUndefined();
+  });
+});
+
 // FIX B/3: admins re-preview freely, but only on a mode CHANGE — the real
 // re-preview flow (edit copy → switch away → switch back). No one-time flag is
 // written, so an author iterating on welcome_message sees every (re-)entry. FIX

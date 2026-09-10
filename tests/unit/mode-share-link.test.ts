@@ -4,7 +4,18 @@ import {
   normalizeWhatsAppNumber,
   modeShareTrigger,
   buildModeShareLink,
+  RESERVED_CLEAR_TRIGGERS,
 } from '../../src/utils/mode-share-link.js';
+import { CLEAR_TOKENS } from '../../src/services/classifier/index.js';
+
+// The reserved-slug guard hand-copies the classifier's CLEAR_TOKENS so the util
+// stays dependency-free. This pins the two sets in parity so a future token added
+// to the classifier can never silently leave a self-defeating share QR behind.
+describe('RESERVED_CLEAR_TRIGGERS parity with classifier CLEAR_TOKENS', () => {
+  it('matches the classifier CLEAR_TOKENS set exactly', () => {
+    expect([...RESERVED_CLEAR_TRIGGERS].sort()).toEqual([...CLEAR_TOKENS].sort());
+  });
+});
 
 // Parity target: bt-servant-admin-portal/src/lib/mode-share-link.ts
 // `buildModeShareLink` emits `https://wa.me/<digits>?text=%23<slug>`. These
