@@ -122,6 +122,32 @@ function seedSelectedMode(stub: DurableObjectStub, slug: string): Promise<void> 
   return runInDurableObject(stub, (_instance, state) => state.storage.put('selected_mode', slug));
 }
 
+/** Read a raw `mode_welcome_pending:<suffix>` bit straight from DO storage. */
+function readPendingFlagRaw(stub: DurableObjectStub, suffix: string): Promise<boolean | undefined> {
+  return runInDurableObject(stub, (_instance, state) =>
+    state.storage.get<boolean>(`mode_welcome_pending:${suffix}`)
+  );
+}
+
+/** Read the `mode_welcome_pending:<slug>` bit for a 1:1 mode. */
+function readPendingFlag(stub: DurableObjectStub, slug: string): Promise<boolean | undefined> {
+  return readPendingFlagRaw(stub, slug);
+}
+
+/** Seed a `mode_welcome_pending:<slug>` bit directly into DO storage. */
+function seedPendingFlag(stub: DurableObjectStub, slug: string): Promise<void> {
+  return runInDurableObject(stub, (_instance, state) =>
+    state.storage.put(`mode_welcome_pending:${slug}`, true)
+  );
+}
+
+/** Seed a `mode_welcomed:<slug>` flag directly into DO storage. */
+function seedWelcomedFlag(stub: DurableObjectStub, slug: string): Promise<void> {
+  return runInDurableObject(stub, (_instance, state) =>
+    state.storage.put(`mode_welcomed:${slug}`, true)
+  );
+}
+
 /** Read the persisted history entries from the DO. */
 async function getHistoryEntries(
   stub: DurableObjectStub
@@ -321,32 +347,127 @@ describe('per-mode welcome — callback path (#311)', () => {
     expect(await readWelcomedFlag(stub, 'spoken')).toBe(true);
   });
 
-  it('does NOT set the flag when callback delivery throws, and re-emits on retry', async () => {
+  // FIX C: welcome delivery is NON-FATAL. A throw from onWelcome must NOT abort
+  // the turn — the user still gets the model answer — and it queues a pending
+  // re-emit instead of losing the welcome.
+  it('completes the turn when callback delivery throws, and sets the pending bit', async () => {
     const throwing = callbackStreamCallbacks({
       onWelcome: async () => {
         throw new Error('webhook down');
       },
     });
 
-    await expect(runProcessChat(stub, triggerBody('#spoken hi'), throwing)).rejects.toThrow(
-      /webhook down/
-    );
-    // Delivery failed ⇒ flag stays unset so the welcome re-emits on retry.
-    expect(await readWelcomedFlag(stub, 'spoken')).toBeUndefined();
+    // The turn RESOLVES (non-fatal) and still returns the model answer.
+    const response = await runProcessChat(stub, triggerBody('#spoken hi'), throwing);
+    expect(response.responses).toEqual(['ok']);
 
-    // Retry with a working callback: the welcome is re-emitted and now recorded.
+    // Delivery failed ⇒ one-time flag stays unset, pending bit is set.
+    expect(await readWelcomedFlag(stub, 'spoken')).toBeUndefined();
+    expect(await readPendingFlag(stub, 'spoken')).toBe(true);
+  });
+});
+
+// FIX C: the pending bit re-emits the welcome on the NEXT turn in that mode even
+// WITHOUT a `#` trigger; a successful (re)delivery sets the flag and clears
+// pending. Split from the callback-path suite to keep each describe body small.
+describe('per-mode welcome — pending re-emit (#311 FIX C)', () => {
+  let stub: DurableObjectStub;
+
+  beforeEach(() => {
+    stub = env.USER_DO.get(env.USER_DO.newUniqueId());
+    setupAnthropicSSE();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('re-emits a pending welcome on the next same-mode turn without a #trigger', async () => {
+    await seedSelectedMode(stub, 'spoken');
+    // Turn 1: delivery throws ⇒ pending set.
+    await runProcessChat(
+      stub,
+      triggerBody('#spoken hi'),
+      callbackStreamCallbacks({
+        onWelcome: async () => {
+          throw new Error('webhook down');
+        },
+      })
+    );
+    expect(await readPendingFlag(stub, 'spoken')).toBe(true);
+
+    // Turn 2: plain message (NO #), spoken still the active mode ⇒ re-emit.
     const delivered: string[] = [];
-    const ok = callbackStreamCallbacks({
-      onWelcome: async (text) => {
-        delivered.push(text);
-      },
-    });
-    const response = await runProcessChat(stub, triggerBody('#spoken hi'), ok);
+    const plainBody = buildChatBody({ message: 'hello again', _org_modes: ORG_MODES });
+    const response = await runProcessChat(
+      stub,
+      plainBody,
+      callbackStreamCallbacks({
+        onWelcome: async (text) => {
+          delivered.push(text);
+        },
+      })
+    );
 
     expect(delivered).toHaveLength(1);
     expect(delivered[0]).toContain('Welcome to Spoken mode!');
     expect(response.responses).toEqual(['ok']);
+    // Success ⇒ flag set, pending cleared.
     expect(await readWelcomedFlag(stub, 'spoken')).toBe(true);
+    expect(await readPendingFlag(stub, 'spoken')).toBeUndefined();
+  });
+});
+
+// FIX C: the pending re-emit is scoped to the mode that failed — a DIFFERENT
+// active mode must not re-emit, and a mode already welcomed must not re-emit.
+describe('per-mode welcome — pending scoping (#311 FIX C)', () => {
+  let stub: DurableObjectStub;
+
+  beforeEach(() => {
+    stub = env.USER_DO.get(env.USER_DO.newUniqueId());
+    setupAnthropicSSE();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** Drive a plain (no-`#`) turn with a delivery-recording onWelcome. */
+  function plainTurn(delivered: string[]): Promise<ChatResponse> {
+    return runProcessChat(
+      stub,
+      buildChatBody({ message: 'hello', _org_modes: ORG_MODES }),
+      callbackStreamCallbacks({
+        onWelcome: async (text) => {
+          delivered.push(text);
+        },
+      })
+    );
+  }
+
+  it('does NOT re-emit pending for a DIFFERENT active mode', async () => {
+    await seedPendingFlag(stub, 'spoken'); // spoken pending…
+    await seedSelectedMode(stub, 'fia-coach'); // …but fia-coach is active.
+
+    const delivered: string[] = [];
+    const response = await plainTurn(delivered);
+
+    expect(delivered).toHaveLength(0);
+    expect(response.responses).toEqual(['ok']);
+    // spoken's pending bit is untouched (still queued for a spoken turn).
+    expect(await readPendingFlag(stub, 'spoken')).toBe(true);
+  });
+
+  it('does NOT re-emit pending when the mode is already welcomed', async () => {
+    await seedPendingFlag(stub, 'spoken');
+    await seedWelcomedFlag(stub, 'spoken');
+    await seedSelectedMode(stub, 'spoken');
+
+    const delivered: string[] = [];
+    const response = await plainTurn(delivered);
+
+    expect(delivered).toHaveLength(0);
+    expect(response.responses).toEqual(['ok']);
   });
 });
 
@@ -378,5 +499,112 @@ describe('per-mode welcome — group chats key per user (#311)', () => {
     expect(await readWelcomedFlagRaw(groupStub, 'spoken')).toBeUndefined();
 
     vi.restoreAllMocks();
+  });
+
+  // FIX C: pending keying is per-user too. Member A's FAILED delivery must set
+  // pending only for A, never for B in the shared group DO.
+  it("one member's failed delivery does not queue a pending re-emit for another", async () => {
+    const groupStub = env.USER_DO.get(env.USER_DO.newUniqueId());
+    setupAnthropicSSE();
+
+    const groupBody = (userId: string): ChatRequest =>
+      buildChatBody({
+        message: '#spoken hi',
+        _org_modes: ORG_MODES,
+        user_id: userId,
+        chat_type: 'group',
+        chat_id: 'grp-1',
+      });
+
+    // Alice's delivery throws ⇒ pending queued for Alice only.
+    await runProcessChat(
+      groupStub,
+      groupBody('alice'),
+      callbackStreamCallbacks({
+        onWelcome: async () => {
+          throw new Error('webhook down');
+        },
+      })
+    );
+
+    expect(await readPendingFlagRaw(groupStub, 'alice:spoken')).toBe(true);
+    expect(await readPendingFlagRaw(groupStub, 'bob:spoken')).toBeUndefined();
+    // The bare slug-only pending key was NOT written either.
+    expect(await readPendingFlagRaw(groupStub, 'spoken')).toBeUndefined();
+
+    vi.restoreAllMocks();
+  });
+});
+
+// FIX A: a brand-new user (first_interaction: true) who receives OUR authored
+// mode welcome must NOT also get the model's own "Briefly welcome them."
+// injection — that per-turn suppression is threaded into the orchestrator's
+// effective preferences and is observable in the system prompt.
+describe('per-mode welcome — suppresses the model welcome (#311 FIX A)', () => {
+  let capture: ReturnType<typeof setupAnthropicFetchCapture>;
+
+  beforeEach(() => {
+    capture = setupAnthropicFetchCapture();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const WELCOME_NOTE = 'Briefly welcome them.';
+
+  it('omits the model welcome note when our mode welcome is emitted for a new user', async () => {
+    const stub = env.USER_DO.get(env.USER_DO.newUniqueId());
+    const result = await postChatFinalJson(stub, triggerBody('#spoken hi'));
+
+    // Exactly ONE welcome — ours — rides ahead of the model answer.
+    expect(result.responses).toHaveLength(2);
+    expect(result.responses[0]).toContain('Welcome to Spoken mode!');
+    expect(result.responses[1]).toBe('ok');
+
+    // first_interaction: false reached the system prompt this turn.
+    expect(capture.calls).toHaveLength(1);
+    expect(capture.calls[0]?.system).not.toContain(WELCOME_NOTE);
+  });
+
+  it('still injects the model welcome note for a new user when NO mode welcome emits', async () => {
+    // #silent opts out (no welcome_message) ⇒ nothing suppresses the note.
+    const stub = env.USER_DO.get(env.USER_DO.newUniqueId());
+    const result = await postChatFinalJson(stub, triggerBody('#silent hi'));
+
+    expect(result.responses).toEqual(['ok']);
+    expect(capture.calls).toHaveLength(1);
+    expect(capture.calls[0]?.system).toContain(WELCOME_NOTE);
+  });
+});
+
+// FIX B: admins re-preview freely. On an explicit #mode an admin ALWAYS gets
+// the welcome and no one-time flag is written, so an author iterating on
+// welcome_message sees every save.
+describe('per-mode welcome — admin re-preview (#311 FIX B)', () => {
+  let stub: DurableObjectStub;
+
+  beforeEach(() => {
+    stub = env.USER_DO.get(env.USER_DO.newUniqueId());
+    setupAnthropicFetchCapture();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const adminBody = (message: string): ChatRequest =>
+    buildChatBody({ message, _org_modes: ORG_MODES, client_id: 'admin-portal' });
+
+  it('re-emits the welcome on every #mode scan and never writes the flag', async () => {
+    const first = await postChatFinalJson(stub, adminBody('#spoken hi'));
+    const second = await postChatFinalJson(stub, adminBody('#spoken again'));
+
+    expect(first.responses[0]).toContain('Welcome to Spoken mode!');
+    expect(second.responses[0]).toContain('Welcome to Spoken mode!');
+
+    // No one-time flag (or pending bit) is written for admins.
+    expect(await readWelcomedFlag(stub, 'spoken')).toBeUndefined();
+    expect(await readPendingFlag(stub, 'spoken')).toBeUndefined();
   });
 });

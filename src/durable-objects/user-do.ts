@@ -120,6 +120,14 @@ const SELECTED_LANGUAGE_KEY = 'selected_language';
  * welcome the first time they scan its QR.
  */
 const MODE_WELCOMED_PREFIX = 'mode_welcomed:';
+/**
+ * Prefix for the durable pending-welcome bit (#311, FIX C). Set when a welcome
+ * DELIVERY fails (the send threw) so the welcome is not lost: a later turn in
+ * the same mode re-emits it even WITHOUT an explicit `#` trigger, and clears
+ * this bit on a successful (re)delivery. Keyed identically to
+ * `mode_welcomed:<key>` (per-user in group chats — see `modeWelcomePendingKey`).
+ */
+const MODE_WELCOME_PENDING_PREFIX = 'mode_welcome_pending:';
 const PROCESSING_LOCK_KEY = '_processing_lock';
 const QUEUE_KEY = 'queue';
 const QUEUE_PROCESSING_KEY = 'queue_processing';
@@ -526,6 +534,20 @@ export function failureType(error: unknown): string {
 }
 
 type FailedTurnEnv = Pick<Env, 'DEFAULT_ORG' | 'CLAUDE_MODEL'>;
+
+/**
+ * A first-contact mode welcome resolved for the current turn (#311).
+ *
+ * `keys` carries the durable storage keys the delivery outcome writes:
+ * `welcomed` (the one-time flag) is set and `pending` cleared on a SUCCESSFUL
+ * delivery; `pending` is set on a FAILED delivery so a later turn re-emits.
+ * `keys` is absent for admin re-previews (FIX B) — admins always re-emit and
+ * neither read nor write either bit.
+ */
+interface ModeWelcome {
+  text: string;
+  keys?: { welcomed: string; pending: string };
+}
 
 /**
  * The `chat_turn` record for a turn that failed for GOOD — retries exhausted,
@@ -1767,7 +1789,17 @@ export class UserDO {
     const inputLanguage = detectWrittenLanguage(triggerCtx.messageText, logger);
 
     // ── Build orchestrator options ────────────────────────────────────────────
-    const effectivePreferences = { ...loaded.preferences, response_language: loaded.locale };
+    // FIX A (#311): when we emit our OWN mode welcome this turn, suppress the
+    // model's "This is the user's first interaction. Briefly welcome them."
+    // injection (system-prompt.ts) so a brand-new user isn't welcomed twice.
+    // Per-turn ONLY — the persisted record is untouched, so `saveConversation`
+    // still flips `first_interaction` from `loaded.preferences` at turn end.
+    const emittingWelcome = !!triggerCtx.welcome;
+    const effectivePreferences = {
+      ...loaded.preferences,
+      response_language: loaded.locale,
+      ...(emittingWelcome ? { first_interaction: false } : {}),
+    };
     const groupContext = this.maybeBuildGroupContext(body);
 
     const audioContext = this.buildAudioContext();
@@ -1781,7 +1813,7 @@ export class UserDO {
     // SSE/`/chat/final` there is no onWelcome and it is prepended to `responses`
     // below instead. Returns true only when it was delivered here.
     const welcome = triggerCtx.welcome;
-    const welcomeSentOutOfBand = await this.deliverWelcomeOutOfBand(welcome, callbacks);
+    const welcomeSentOutOfBand = await this.deliverWelcomeOutOfBand(welcome, callbacks, logger);
 
     const orchResult = await this.tracedPhase(ctx, 'orchestration', () =>
       this.runOrchestration(triggerCtx.messageText, orchOpts)
@@ -2010,7 +2042,7 @@ export class UserDO {
       language.newEffectiveLanguageName
     );
     await this.dispatchSelectionPersistence(SELECTED_LANGUAGE_KEY, languagePersistence);
-    const welcome = await this.resolveTurnWelcome(body, loaded, classified, newEffectiveModeName, logger); // prettier-ignore
+    const welcome = await this.resolveTurnWelcome(body, loaded, classified, { newEffective: newEffectiveModeName, active: activeModeName }, logger); // prettier-ignore
 
     return {
       resolved,
@@ -2027,30 +2059,61 @@ export class UserDO {
   /**
    * #311: deliver the welcome as its own message before the model runs, on
    * transports that render each send discretely (webhook/WhatsApp, i.e.
-   * `onWelcome` present). Writes the one-time flag only after the send resolves;
-   * a failed send throws (so the flag stays unset and the welcome re-emits on
-   * retry — a rare double-send beats a permanent skip). Returns true when the
-   * welcome was delivered here, so the caller does NOT also prepend it.
+   * `onWelcome` present).
+   *
+   * FIX C: delivery is NON-FATAL. On success it records the one-time flag and
+   * clears any pending bit; on failure it LOGS (structured, per the no-silent-
+   * catch policy), sets the durable pending bit so a later turn re-emits, and
+   * RETURNS WITHOUT RETHROWING so `processChat` still returns the model answer.
+   * Either way it returns true (handled out of band) so the caller does NOT
+   * also prepend the welcome into `responses`.
+   *
+   * A residual failure this worker cannot observe — the gateway returns 200 but
+   * Meta then rejects the send — is tracked in bt-servant-whatsapp-gateway#45.
    */
   private async deliverWelcomeOutOfBand(
-    welcome: { text: string; flagKey: string } | undefined,
-    callbacks: StreamCallbacks | undefined
+    welcome: ModeWelcome | undefined,
+    callbacks: StreamCallbacks | undefined,
+    logger: RequestLogger
   ): Promise<boolean> {
     if (!welcome || !callbacks?.onWelcome) return false;
-    await callbacks.onWelcome(welcome.text);
-    await this.state.storage.put(welcome.flagKey, true);
+    try {
+      await callbacks.onWelcome(welcome.text);
+    } catch (error) {
+      logger.warn('mode_welcome_delivery_failed', {
+        error: error instanceof Error ? error.message : String(error),
+        pending_key: welcome.keys?.pending ?? null,
+        // Residual (gateway-200-then-Meta-failure) is invisible here — see
+        // bt-servant-whatsapp-gateway#45.
+      });
+      if (welcome.keys) await this.state.storage.put(welcome.keys.pending, true);
+      return true;
+    }
+    await this.recordWelcomeDelivered(welcome);
     return true;
   }
 
   /**
-   * #311: on SSE/final the welcome ships inside `responses`; write the one-time
-   * flag only after the turn is saved, so a throw before that point re-emits.
+   * #311: on SSE/final the welcome ships inside `responses`; record it as
+   * delivered only after the turn is saved, so a throw before that point
+   * re-emits. Out-of-band delivery already recorded itself.
    */
   private async recordInBandWelcome(
-    welcome: { text: string; flagKey: string } | undefined,
+    welcome: ModeWelcome | undefined,
     sentOutOfBand: boolean
   ): Promise<void> {
-    if (welcome && !sentOutOfBand) await this.state.storage.put(welcome.flagKey, true);
+    if (welcome && !sentOutOfBand) await this.recordWelcomeDelivered(welcome);
+  }
+
+  /**
+   * #311: mark a welcome as successfully delivered — set the one-time
+   * `mode_welcomed` flag and clear any `mode_welcome_pending` bit. No-op for
+   * admin re-previews (FIX B), which carry no keys.
+   */
+  private async recordWelcomeDelivered(welcome: ModeWelcome): Promise<void> {
+    if (!welcome.keys) return;
+    await this.state.storage.put(welcome.keys.welcomed, true);
+    await this.state.storage.delete(welcome.keys.pending);
   }
 
   /**
@@ -2066,16 +2129,24 @@ export class UserDO {
     body: ChatRequest,
     loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
     classified: ClassifierResult,
-    newEffectiveModeName: string | undefined,
+    modes: { newEffective: string | undefined; active: string | undefined },
     logger: RequestLogger
-  ): Promise<{ text: string; flagKey: string } | undefined> {
+  ): Promise<ModeWelcome | undefined> {
+    // Explicit `#mode` path: first-time emit (or admin re-preview, FIX B, or an
+    // already-active re-trigger) still REQUIRES a `#` token this turn.
     const triggeredMode =
       classified.clearMode || !classified.modeName
         ? undefined
-        : (newEffectiveModeName ?? this.resolveTriggeredMode(body, loaded, classified.modeName));
-    return triggeredMode
-      ? this.maybeBuildModeWelcome(body, loaded, triggeredMode, logger)
-      : undefined;
+        : (modes.newEffective ?? this.resolveTriggeredMode(body, loaded, classified.modeName));
+    if (triggeredMode) {
+      const explicit = await this.maybeBuildModeWelcome(body, loaded, triggeredMode, logger);
+      if (explicit) return explicit;
+    }
+    // FIX C: pending re-emit path — a PRIOR delivery for this turn's active mode
+    // failed and left a `mode_welcome_pending` bit. Re-emit WITHOUT an explicit
+    // `#` trigger. Runs only when the explicit path produced nothing, so exactly
+    // ONE welcome is emitted per turn.
+    return this.maybePendingWelcome(body, loaded, modes.active, logger);
   }
 
   /**
@@ -2094,25 +2165,76 @@ export class UserDO {
     loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
     effectiveModeName: string,
     logger: RequestLogger
-  ): Promise<{ text: string; flagKey: string } | undefined> {
+  ): Promise<ModeWelcome | undefined> {
     const mode = loaded.orgModes.modes.find((m) => m.name === effectiveModeName);
     const welcomeCopy = mode?.welcome_message?.trim();
     if (!welcomeCopy) return undefined;
 
-    const flagKey = this.modeWelcomedKey(body, effectiveModeName);
-    const alreadyWelcomed = await this.state.storage.get<boolean>(flagKey);
+    const text = buildModeWelcomeText(welcomeCopy, effectiveModeName, this.env.WHATSAPP_NUMBER);
+
+    // FIX B (#311): admins re-preview freely. On an explicit `#mode` trigger an
+    // admin ALWAYS gets the welcome, and we neither read nor write the one-time
+    // flag or the pending bit — so an author iterating on `welcome_message` sees
+    // every save, not just the first.
+    if (loaded.isAdmin) {
+      this.logModeWelcomePrepared(logger, effectiveModeName, text, { reason: 'admin_preview' });
+      return { text };
+    }
+
+    const welcomedKey = this.modeWelcomedKey(body, effectiveModeName);
+    const alreadyWelcomed = await this.state.storage.get<boolean>(welcomedKey);
     if (alreadyWelcomed === true) return undefined;
 
-    const text = buildModeWelcomeText(welcomeCopy, effectiveModeName, this.env.WHATSAPP_NUMBER);
+    this.logModeWelcomePrepared(logger, effectiveModeName, text, { reason: 'first_contact' });
+    return { text, keys: this.modeWelcomeKeys(body, effectiveModeName) };
+  }
+
+  /**
+   * FIX C (#311): pending RE-EMIT. When a prior delivery for the turn's active
+   * mode failed, a `mode_welcome_pending:<key>` bit was set. Re-emit that mode's
+   * welcome on ANY subsequent turn in that mode — even without a `#` trigger —
+   * as long as it is not yet `mode_welcomed`. Non-admins only (admins never
+   * write pending). Returns `undefined` when nothing is pending.
+   */
+  private async maybePendingWelcome(
+    body: ChatRequest,
+    loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
+    activeModeName: string | undefined,
+    logger: RequestLogger
+  ): Promise<ModeWelcome | undefined> {
+    if (!activeModeName || loaded.isAdmin) return undefined;
+
+    const keys = this.modeWelcomeKeys(body, activeModeName);
+    const pending = await this.state.storage.get<boolean>(keys.pending);
+    if (pending !== true) return undefined;
+    const alreadyWelcomed = await this.state.storage.get<boolean>(keys.welcomed);
+    if (alreadyWelcomed === true) return undefined;
+
+    const mode = loaded.orgModes.modes.find((m) => m.name === activeModeName);
+    const welcomeCopy = mode?.welcome_message?.trim();
+    if (!welcomeCopy) return undefined;
+
+    const text = buildModeWelcomeText(welcomeCopy, activeModeName, this.env.WHATSAPP_NUMBER);
+    this.logModeWelcomePrepared(logger, activeModeName, text, { reason: 'pending_reemit' });
+    return { text, keys };
+  }
+
+  /** Structured `mode_welcome_prepared` log shared by the emit paths (#311). */
+  private logModeWelcomePrepared(
+    logger: RequestLogger,
+    mode: string,
+    text: string,
+    extra: { reason: 'first_contact' | 'admin_preview' | 'pending_reemit' }
+  ): void {
     logger.log('mode_welcome_prepared', {
-      mode: effectiveModeName,
+      mode,
+      reason: extra.reason,
       // A missing/typo'd WHATSAPP_NUMBER silently drops the forwarding link;
       // surface it in logs rather than swallowing it.
       whatsapp_number_configured: !!this.env.WHATSAPP_NUMBER,
       has_share_link: text.includes(WA_ME_ORIGIN),
       welcome_length: text.length,
     });
-    return { text, flagKey };
   }
 
   /**
@@ -2125,6 +2247,25 @@ export class UserDO {
     return this.isGroupChatType(body)
       ? `${MODE_WELCOMED_PREFIX}${body.user_id}:${slug}`
       : `${MODE_WELCOMED_PREFIX}${slug}`;
+  }
+
+  /**
+   * Storage key for the pending-welcome bit (#311, FIX C). Same per-user/group
+   * keying as `modeWelcomedKey` so member A's failed delivery only queues a
+   * re-emit for member A, never member B in a shared group DO.
+   */
+  private modeWelcomePendingKey(body: ChatRequest, slug: string): string {
+    return this.isGroupChatType(body)
+      ? `${MODE_WELCOME_PENDING_PREFIX}${body.user_id}:${slug}`
+      : `${MODE_WELCOME_PENDING_PREFIX}${slug}`;
+  }
+
+  /** The paired `mode_welcomed` / `mode_welcome_pending` keys for a mode (#311). */
+  private modeWelcomeKeys(body: ChatRequest, slug: string): { welcomed: string; pending: string } {
+    return {
+      welcomed: this.modeWelcomedKey(body, slug),
+      pending: this.modeWelcomePendingKey(body, slug),
+    };
   }
 
   /**

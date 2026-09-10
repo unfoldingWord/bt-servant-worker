@@ -370,8 +370,11 @@ export interface StreamCallbacks {
    * ahead of the model's answer. Present only on transports that render each
    * send as a discrete message (the webhook/WhatsApp path); absent on SSE and
    * `/chat/final`, where the welcome is carried as a `responses[]` entry
-   * instead. MUST reject on a delivery failure so the caller can withhold the
-   * `mode_welcomed` flag and re-emit on retry.
+   * instead. MUST reject on a delivery failure. The DO caller treats that
+   * rejection as NON-FATAL (#311, FIX C): it logs, withholds the `mode_welcomed`
+   * flag, sets a durable `mode_welcome_pending` bit so a later turn re-emits,
+   * and still returns the model's answer — the failed welcome never aborts the
+   * turn.
    */
   onWelcome?: (text: string) => Promise<void>;
 }
