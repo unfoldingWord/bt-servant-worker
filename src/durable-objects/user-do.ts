@@ -571,6 +571,22 @@ interface WelcomeDelivery {
 }
 
 /**
+ * #311 FIX B: mutable tracker threaded from `processChat` into `runChatTurn` so
+ * the wrapper's finally can arm a pending re-emit when the turn throws AFTER the
+ * mode was persisted but BEFORE the in-band welcome's flag/pending write ran.
+ *
+ * `due` — the welcome resolved for this turn (undefined when none). `handledOutOfBand`
+ * — the webhook path already recorded/pended it (guard skips). `finalized` — the
+ * in-band recording ran (or was deferred to the SSE caller), so the guard must
+ * NOT also arm pending.
+ */
+interface InBandWelcomeTracker {
+  due: ModeWelcome | undefined;
+  handledOutOfBand: boolean;
+  finalized: boolean;
+}
+
+/**
  * The `chat_turn` record for a turn that failed for GOOD — retries exhausted,
  * or a path that never retries. Without it an outage reads as silence: every
  * turn that reached telemetry had succeeded, so an error rate could only ever
@@ -1405,7 +1421,19 @@ export class UserDO {
     startTime: number
   ) {
     const encoder = new TextEncoder();
-    const state = { clientDisconnected: false, firstTokenTime: null as number | null };
+    // #311 FIX A: a MISSING writer means the welcome was never delivered. The
+    // queued-SSE caller (`processSSEEntry`) builds a sender from
+    // `queuedWriters.get(id)`, which is `undefined` when the writer was deleted
+    // on a client disconnect (`createQueuedSSEStream`) or never registered (a
+    // retry). `sendEvent`/keepalive already no-op on `!writer` WITHOUT throwing,
+    // so `clientDisconnected` would otherwise stay `false` and
+    // `finalizeSseWelcomeRecord` would burn the one-time flag on a `complete`
+    // that never went out. Seed `clientDisconnected` from writer presence so a
+    // missing writer flows through as not-delivered ⇒ pending is armed instead.
+    const state = {
+      clientDisconnected: writer === undefined,
+      firstTokenTime: null as number | null,
+    };
 
     const sendEvent = async (event: SSEEvent): Promise<void> => {
       if (state.clientDisconnected || !writer) return;
@@ -1818,7 +1846,50 @@ export class UserDO {
     timing: TimingContext,
     callbacks?: StreamCallbacks
   ): Promise<ChatResponse> {
+    // #311 FIX B: track the in-band welcome so the finally can arm a pending
+    // re-emit when orchestration or save throws AFTER the mode was persisted (at
+    // `classifyAndResolveTriggers`) but BEFORE `finalizeEmittedWelcome` ran the
+    // flag/pending write. Without it a later plain same-mode turn — no `#` token,
+    // so `classified.modeName` is unset — never welcomes. The webhook path is
+    // unaffected (`deliverWelcomeOutOfBand` records/pends before orchestration and
+    // sets `handledOutOfBand`, which the guard skips).
+    const welcomeTracker: InBandWelcomeTracker = {
+      due: undefined,
+      handledOutOfBand: false,
+      finalized: false,
+    };
     const ctx = { timing, logger, startTime: Date.now() };
+    try {
+      return await this.runChatTurn(body, workerOrigin, ctx, welcomeTracker, callbacks);
+    } finally {
+      // #311 FIX B: arm the pending re-emit when an in-band welcome was DUE but
+      // its flag/pending write never ran. No-ops on the success path
+      // (`finalized`), for admins (no keys), for the webhook path
+      // (`handledOutOfBand`), and when no welcome was due.
+      await this.armInBandWelcomePendingOnThrow(
+        welcomeTracker.due,
+        welcomeTracker.handledOutOfBand,
+        welcomeTracker.finalized,
+        logger
+      );
+    }
+  }
+
+  /**
+   * The per-turn chat pipeline proper. Split from `processChat` so the wrapper
+   * can own the FIX B pending-on-throw finally without tipping the lint
+   * complexity limits. Mutates `welcomeTracker` as the in-band welcome resolves,
+   * delivers, and records, so the wrapper's finally can arm a pending re-emit
+   * when this throws before that recording ran.
+   */
+  private async runChatTurn(
+    body: ChatRequest,
+    workerOrigin: string,
+    ctx: { timing: TimingContext; logger: RequestLogger; startTime: number },
+    welcomeTracker: InBandWelcomeTracker,
+    callbacks?: StreamCallbacks
+  ): Promise<ChatResponse> {
+    const { logger } = ctx;
     // Per-turn id. NOT the same as `request_id`: drainQueue reuses the triggering
     // request's logger across every entry it drains, so request_id can span turns.
     const turnId = crypto.randomUUID();
@@ -1849,11 +1920,18 @@ export class UserDO {
     // Delivery runs FIRST so its outcome is known before `buildOrchOpts` reads
     // the preferences. `handledOutOfBand` decides the in-band prepend.
     const welcome = triggerCtx.welcome;
+    // #311 FIX B: capture the due welcome for the wrapper's finally guard. Set
+    // here — after `classifyAndResolveTriggers` has already persisted
+    // `selected_mode` — so a later orchestration/save throw can still arm the
+    // pending re-emit.
+    welcomeTracker.due = welcome;
     // `emittingWelcome` — an authored welcome is DUE this turn (first-contact or
     // a pending re-emit). It drives model-welcome suppression regardless of
     // out-of-band delivery success (FIX 2).
     const emittingWelcome = !!welcome;
     const welcomeDelivery = await this.deliverWelcomeOutOfBand(welcome, callbacks, logger);
+    // #311 FIX B: the webhook path already recorded/pended before orchestration.
+    welcomeTracker.handledOutOfBand = welcomeDelivery.handledOutOfBand;
 
     // ── Build orchestrator options ────────────────────────────────────────────
     // FIX 2 (#311): suppress the model's "This is the user's first interaction.
@@ -1870,22 +1948,21 @@ export class UserDO {
       response_language: loaded.locale,
       ...(emittingWelcome ? { first_interaction: false } : {}),
     };
-    const groupContext = this.maybeBuildGroupContext(body);
-
     const audioContext = this.buildAudioContext();
     const attachmentsContext = createAttachmentsContext();
     // prettier-ignore
-    const orchOpts = { ...this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, triggerCtx.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, triggerCtx.activeModeName, audioContext, attachmentsContext, workerOrigin, logger, callbacks, groupContext, triggerCtx.languageDocument, triggerCtx.unmatchedTriggers, loaded.inboundVoiceKey, { triggerOnly: triggerCtx.triggerOnly }), turnId };
+    const orchOpts = { ...this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, triggerCtx.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, triggerCtx.activeModeName, audioContext, attachmentsContext, workerOrigin, logger, callbacks, this.maybeBuildGroupContext(body), triggerCtx.languageDocument, triggerCtx.unmatchedTriggers, loaded.inboundVoiceKey, { triggerOnly: triggerCtx.triggerOnly }), turnId };
 
-    const orchResult = await this.tracedPhase(ctx, 'orchestration', () =>
-      this.runOrchestration(triggerCtx.messageText, orchOpts)
+    const { orchResult, audioKey } = await this.orchestrateWithAudio(
+      ctx,
+      triggerCtx.messageText,
+      orchOpts,
+      {
+        context: audioContext,
+        body,
+        emitStatus: loaded.emitStatus,
+      }
     );
-    const ttsResponses = this.extractTtsResponses(orchResult, logger);
-
-    const voiceAudio = await this.tracedPhase(ctx, 'audio_generation', () =>
-      this.maybeGenerateAudio(body, audioContext, ttsResponses, logger, loaded.emitStatus)
-    );
-    const audioKey = voiceAudio?.audioKey ?? null;
 
     // On SSE/final the welcome rides ahead of the model answer as its own
     // `responses` entry (that transport returns the whole array, so no delta
@@ -1912,12 +1989,72 @@ export class UserDO {
     // `deferInBandWelcomeRecord`; `/chat/final` (no such hook) records inline.
     // FIX 2: an emitted admin preview also persists `first_interaction:false`.
     await this.finalizeEmittedWelcome(welcome, welcomeDelivery.handledOutOfBand, callbacks);
+    // #311 FIX B: in-band recording ran (or was deferred to the SSE caller) — the
+    // wrapper's finally guard must NOT also arm pending. Set only after a clean
+    // finalize.
+    welcomeTracker.finalized = true;
 
     // prettier-ignore
     this.logChatTurn(body, effectivePreferences.response_language, logger, { turnId, activeModeName: triggerCtx.activeModeName, activeLanguageName: triggerCtx.activeLanguageName, languageSource: triggerCtx.languageSource, orchestration: orchResult.telemetry, durationMs: Date.now() - ctx.startTime, hadInboundVoice: !!loaded.inboundVoiceKey, hadOutboundVoice: audioKey !== null, inputLanguage, text: chatTurnText(triggerCtx.messageText, responses) });
 
     // prettier-ignore
     return this.assembleChatResponse({ responses, audioKey, workerOrigin, attachmentsContext, effectivePreferences, inputLanguage, logger, startTime: ctx.startTime });
+  }
+
+  /**
+   * Run orchestration then (optionally) synthesize the voice reply, timing both
+   * phases. Extracted from `runChatTurn` to keep it within the lint complexity
+   * limits. Returns the orchestration result and the stored audio key (null when
+   * no audio was produced).
+   */
+  private async orchestrateWithAudio(
+    ctx: { timing: TimingContext; logger: RequestLogger; startTime: number },
+    messageText: string,
+    orchOpts: Parameters<UserDO['runOrchestration']>[1],
+    audio: { context: AudioContext; body: ChatRequest; emitStatus: StatusEmitter | undefined }
+  ): Promise<{ orchResult: OrchestrationResult; audioKey: string | null }> {
+    const { logger } = ctx;
+    const orchResult = await this.tracedPhase(ctx, 'orchestration', () =>
+      this.runOrchestration(messageText, orchOpts)
+    );
+    const ttsResponses = this.extractTtsResponses(orchResult, logger);
+    const voiceAudio = await this.tracedPhase(ctx, 'audio_generation', () =>
+      this.maybeGenerateAudio(audio.body, audio.context, ttsResponses, logger, audio.emitStatus)
+    );
+    return { orchResult, audioKey: voiceAudio?.audioKey ?? null };
+  }
+
+  /**
+   * #311 FIX B: arm the in-band pending re-emit from `processChat`'s finally.
+   *
+   * Fires ONLY when a welcome was DUE this turn, it was NOT delivered out of band
+   * (webhook already records/pends before orchestration), it carries keys (admin
+   * previews do not), and in-band recording never ran (`finalizeEmittedWelcome`
+   * did not complete because orchestration or `saveConversation` threw after the
+   * mode was persisted). Without this, a follow-up plain same-mode turn — which
+   * carries no `#` token, so `classified.modeName` is unset — would never
+   * welcome, silently swallowing the authored copy.
+   *
+   * Idempotent: re-`put`ting an already-set pending bit is harmless. Runs in a
+   * `finally`, so a storage failure here must NOT mask the original turn error —
+   * it is logged (never silently) and the original throw is left to propagate.
+   */
+  private async armInBandWelcomePendingOnThrow(
+    welcome: ModeWelcome | undefined,
+    handledOutOfBand: boolean,
+    finalized: boolean,
+    logger: RequestLogger
+  ): Promise<void> {
+    if (!welcome?.keys || handledOutOfBand || finalized) return;
+    try {
+      await this.state.storage.put(welcome.keys.pending, true);
+      logger.warn('mode_welcome_pending_armed_on_throw', { pending_key: welcome.keys.pending });
+    } catch (error) {
+      // The turn already failed and that error is propagating from the try;
+      // rethrowing here would mask it. Log at error (a storage write failed
+      // during recovery) and let the original throw win.
+      logger.error('mode_welcome_pending_arm_failed', error, { pending_key: welcome.keys.pending });
+    }
   }
 
   /**
@@ -2398,28 +2535,88 @@ export class UserDO {
     if (!activeModeName || loaded.isAdmin) return undefined;
 
     const keys = this.modeWelcomeKeys(body, activeModeName);
-    const pending = await this.state.storage.get<boolean>(keys.pending);
-    if (pending !== true) return undefined;
-
     const mode = loaded.orgModes.modes.find((m) => m.name === activeModeName);
+
+    // FIX C (#311): alias-aware pending lookup — mirror `isAnyCurrentSlugWelcomed`.
+    // After a reslug (#284) the old slug becomes an alias, so a pending bit set
+    // under the FORMER slug is stranded off the current canonical key. Resolve it
+    // across the mode's current slugs and copy it onto the canonical key on read
+    // (deleting the alias key), so the re-emit fires and future reads are keyed
+    // canonically. When the mode is gone we can only check the canonical key.
+    const pending = mode
+      ? await this.resolveAnyCurrentSlugPending(body, mode, keys.pending)
+      : (await this.state.storage.get<boolean>(keys.pending)) === true;
+    if (!pending) return undefined;
+
     const welcomeCopy = mode?.welcome_message?.trim();
     // FIX 4 (#311): the authored copy was removed (empty/absent, or the mode is
-    // gone) AFTER a failed delivery left this pending bit. Clear the stale bit so
-    // re-authoring the copy later does not surprise-welcome the user on a plain
-    // same-mode turn.
+    // gone) AFTER a failed delivery left this pending bit. Clear the stale bit(s)
+    // across the mode's current slugs so re-authoring the copy later does not
+    // surprise-welcome the user on a plain same-mode turn.
     if (!mode || !welcomeCopy) {
-      await this.state.storage.delete(keys.pending);
+      await this.clearPendingAcrossCurrentSlugs(body, mode, keys.pending);
       logger.log('mode_welcome_pending_cleared', { mode: activeModeName, reason: 'copy_removed' });
       return undefined;
     }
 
-    // FIX 3 (#311): alias-aware welcomed check (see `maybeBuildModeWelcome`) — a
+    // FIX 3/C (#311): alias-aware welcomed check (see `maybeBuildModeWelcome`) — a
     // rename must not re-emit for a user already welcomed under a former slug.
-    if (await this.isAnyCurrentSlugWelcomed(body, mode)) return undefined;
+    // When it fires, ALSO clear any stale pending bit across the mode's current
+    // slugs so a stranded pending never lingers after the user is welcomed.
+    if (await this.isAnyCurrentSlugWelcomed(body, mode)) {
+      await this.clearPendingAcrossCurrentSlugs(body, mode, keys.pending);
+      return undefined;
+    }
 
     const text = buildModeWelcomeText(welcomeCopy, activeModeName, this.env.WHATSAPP_NUMBER);
     this.logModeWelcomePrepared(logger, activeModeName, text, { reason: 'pending_reemit' });
     return { text, keys };
+  }
+
+  /**
+   * FIX C (#311): true when a `mode_welcome_pending` bit exists under ANY of this
+   * mode's CURRENT slugs — canonical `name` first, then any `aliases` (former
+   * slugs after a reslug, #284). Mirrors `isAnyCurrentSlugWelcomed`: when the bit
+   * is found only under an alias it is COPIED onto the canonical pending key and
+   * the alias key is DELETED (copy-on-read), so the re-emit keys canonically and
+   * the stranded alias bit does not linger. `canonicalPendingKey` is the caller's
+   * already-computed canonical key (equals `modeWelcomePendingKey(body, mode.name)`).
+   */
+  private async resolveAnyCurrentSlugPending(
+    body: ChatRequest,
+    mode: PromptMode,
+    canonicalPendingKey: string
+  ): Promise<boolean> {
+    if ((await this.state.storage.get<boolean>(canonicalPendingKey)) === true) return true;
+    for (const alias of mode.aliases ?? []) {
+      const aliasKey = this.modeWelcomePendingKey(body, alias);
+      if ((await this.state.storage.get<boolean>(aliasKey)) === true) {
+        // Copy-on-read: migrate the former-slug pending bit onto the canonical
+        // key so the re-emit and all future reads key off the current name.
+        await this.state.storage.put(canonicalPendingKey, true);
+        await this.state.storage.delete(aliasKey);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * FIX C (#311): delete the `mode_welcome_pending` bit under ALL of the mode's
+   * current slugs — the canonical key plus every alias. Used when the welcomed
+   * short-circuit fires or the authored copy was removed, so a stale pending bit
+   * never lingers under the canonical key or a former slug. `mode` may be
+   * undefined (mode deleted), in which case only the canonical key is cleared.
+   */
+  private async clearPendingAcrossCurrentSlugs(
+    body: ChatRequest,
+    mode: PromptMode | undefined,
+    canonicalPendingKey: string
+  ): Promise<void> {
+    await this.state.storage.delete(canonicalPendingKey);
+    for (const alias of mode?.aliases ?? []) {
+      await this.state.storage.delete(this.modeWelcomePendingKey(body, alias));
+    }
   }
 
   /** Structured `mode_welcome_prepared` log shared by the emit paths (#311). */

@@ -14,12 +14,14 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import Anthropic from '@anthropic-ai/sdk';
 import {
   buildChatBody,
+  postChatFinal,
   postChatFinalJson,
   readMockRequestBody,
   renderSystem,
   setupAnthropicFetchCapture,
 } from '../helpers/anthropic-capture.js';
 import type { ChatRequest, ChatResponse, StreamCallbacks } from '../../src/types/engine.js';
+import type { InternalQueueEntry } from '../../src/types/queue.js';
 import type { OrgModes, PromptMode } from '../../src/types/prompt-overrides.js';
 import type { UserPreferencesInternal } from '../../src/types/engine.js';
 import { createRequestLogger, type RequestLogger } from '../../src/utils/logger.js';
@@ -34,6 +36,11 @@ interface ProcessChatInstance {
     timing: TimingContext,
     callbacks?: StreamCallbacks
   ): Promise<ChatResponse>;
+}
+
+/** White-box handle to the DO's real queued-SSE caller (#311 FIX A). */
+interface ProcessSSEEntryInstance {
+  processSSEEntry(entry: InternalQueueEntry, logger: RequestLogger): Promise<void>;
 }
 
 /**
@@ -130,6 +137,22 @@ function runProcessChat(
       createRequestLogger('test-turn'),
       createTimingContext(),
       callbacks
+    )
+  );
+}
+
+/**
+ * Drive the DO's REAL queued-SSE caller (`processSSEEntry`) with `entry`.
+ * `processSSEEntry` looks the writer up in `queuedWriters` by `message_id`; when
+ * none is registered (the FIX A case — a disconnected/never-registered writer),
+ * `buildSSESender` gets `writer === undefined` and must treat the welcome as
+ * NOT delivered.
+ */
+function runProcessSSEEntry(stub: DurableObjectStub, entry: InternalQueueEntry): Promise<void> {
+  return runInDurableObject(stub, (instance) =>
+    (instance as unknown as ProcessSSEEntryInstance).processSSEEntry(
+      entry,
+      createRequestLogger('test-sse-entry')
     )
   );
 }
@@ -1117,5 +1140,167 @@ describe('per-mode welcome — clears stale pending when copy removed (#311 FIX 
     // surprise-welcome the user.
     expect(await readPendingFlag(stub, 'spoken')).toBeUndefined();
     expect(await readWelcomedFlag(stub, 'spoken')).toBeUndefined();
+  });
+});
+
+// FIX A (#311): on the queued-SSE path the sender is built from
+// `queuedWriters.get(message_id)`, which is `undefined` when the writer was
+// deleted on a client disconnect (`createQueuedSSEStream`) or never registered
+// (a retry). A missing writer means the `complete` (and its in-band welcome)
+// never went out, so `finalizeSseWelcomeRecord` must record a `mode_welcome_pending`
+// re-emit — NOT burn the one-time `mode_welcomed` flag. Driven through the REAL
+// queued-SSE caller (`processSSEEntry`), not a synthetic `record(false)`.
+describe('per-mode welcome — queued SSE with no writer arms pending (#311 FIX A)', () => {
+  let stub: DurableObjectStub;
+
+  beforeEach(() => {
+    stub = env.USER_DO.get(env.USER_DO.newUniqueId());
+    setupAnthropicSSE();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('records pending (NOT the one-time flag) when the queued writer is missing', async () => {
+    // No writer is registered for this message_id — `processSSEEntry` builds its
+    // sender from `queuedWriters.get(...)` ⇒ `undefined` (the disconnected case).
+    const entry: InternalQueueEntry = {
+      message_id: 'msg-no-writer',
+      body: { ...triggerBody('#spoken hi'), _worker_origin: '' },
+      enqueued_at: Date.now(),
+      retry_count: 0,
+    };
+
+    await runProcessSSEEntry(stub, entry);
+
+    // The welcome never reached the client (no writer) ⇒ the one-time flag stays
+    // UNSET and a pending re-emit is queued for a later same-mode turn.
+    expect(await readWelcomedFlag(stub, 'spoken')).toBeUndefined();
+    expect(await readPendingFlag(stub, 'spoken')).toBe(true);
+  });
+});
+
+// FIX B (#311): an in-band (SSE / `/chat/final`) welcome's flag/pending write runs
+// only AFTER orchestration + save. If either throws once the mode is already
+// persisted (`applyTriggerOverrides` writes `selected_mode` before delivery), no
+// pending is armed — so a later plain same-mode turn (no `#`) never welcomes.
+// `processChat`'s finally arms pending when a welcome was due in-band and
+// recording never ran. The webhook path is unaffected (records/pends before
+// orchestration).
+describe('per-mode welcome — in-band throw arms pending (#311 FIX B)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('(SSE) orchestration throw after mode persisted arms pending (flag unset)', async () => {
+    setupAnthropicSSEModelThrows();
+    const stub = env.USER_DO.get(env.USER_DO.newUniqueId());
+
+    // SSE-shaped callbacks (deferInBandWelcomeRecord present, no onWelcome). The
+    // model 400s AFTER `#spoken` persisted the mode ⇒ processChat throws before
+    // `finalizeEmittedWelcome` ran.
+    await expect(
+      runProcessChat(
+        stub,
+        triggerBody('#spoken hi'),
+        callbackStreamCallbacks({ deferInBandWelcomeRecord: () => {} })
+      )
+    ).rejects.toThrow();
+
+    expect(await readWelcomedFlag(stub, 'spoken')).toBeUndefined();
+    expect(await readPendingFlag(stub, 'spoken')).toBe(true);
+  });
+
+  it('(/chat/final) throw arms pending; a following plain same-mode turn delivers the copy once', async () => {
+    const stub = env.USER_DO.get(env.USER_DO.newUniqueId());
+
+    // Turn 1: `/chat/final` with `#spoken`; the model 400s after the mode is
+    // persisted ⇒ the request errors, but pending is armed by the finally.
+    setupAnthropicSSEModelThrows();
+    const failing = await postChatFinal(stub, triggerBody('#spoken hi'));
+    expect(failing.status).not.toBe(200);
+    expect(await readWelcomedFlag(stub, 'spoken')).toBeUndefined();
+    expect(await readPendingFlag(stub, 'spoken')).toBe(true);
+
+    vi.restoreAllMocks();
+
+    // Turn 2: a PLAIN same-mode turn (no `#`) re-emits the authored copy exactly
+    // once and records it (spoken was persisted by turn 1).
+    setupAnthropicFetchCapture();
+    const result = await postChatFinalJson(
+      stub,
+      buildChatBody({ message: 'hello again', _org_modes: ORG_MODES })
+    );
+
+    expect(result.responses).toHaveLength(2);
+    expect(result.responses[0]).toContain('Welcome to Spoken mode!');
+    expect(result.responses[1]).toBe('ok');
+    expect(await readWelcomedFlag(stub, 'spoken')).toBe(true);
+    expect(await readPendingFlag(stub, 'spoken')).toBeUndefined();
+  });
+});
+
+// FIX C (#311): the pending lookup must be alias-aware, mirroring the welcomed
+// check. After a reslug (#284) the old slug becomes an alias, so a pending bit
+// set under the FORMER slug is stranded off the current canonical key. Resolve
+// pending across the mode's current slugs (copy-on-read to canonical, delete the
+// alias key); and when the welcomed short-circuit fires, clear any stale pending
+// across those slugs.
+describe('per-mode welcome — alias-aware pending after reslug (#311 FIX C)', () => {
+  const SPOKEN_V2: PromptMode = {
+    name: 'spoken-v2',
+    label: 'Spoken',
+    published: true,
+    welcome_message: 'Welcome to Spoken mode!',
+    aliases: ['spoken'],
+    overrides: {},
+  };
+  const ORG_MODES_RESLUGGED: OrgModes = { modes: [SPOKEN_V2] };
+
+  let stub: DurableObjectStub;
+
+  beforeEach(() => {
+    stub = env.USER_DO.get(env.USER_DO.newUniqueId());
+    setupAnthropicFetchCapture();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const resluggedBody = (message: string): ChatRequest =>
+    buildChatBody({ message, _org_modes: ORG_MODES_RESLUGGED });
+
+  it('re-emits a pending welcome stranded under the OLD slug, and clears that stale key', async () => {
+    await seedSelectedMode(stub, 'spoken-v2'); // canonical is active
+    await seedPendingFlag(stub, 'spoken'); // pending stranded under the former slug
+
+    const result = await postChatFinalJson(stub, resluggedBody('hello')); // plain turn, no `#`
+
+    // The re-emit fires under the canonical slug (alias-aware lookup).
+    expect(result.responses).toHaveLength(2);
+    expect(result.responses[0]).toContain('Welcome to Spoken mode!');
+    expect(result.responses[1]).toBe('ok');
+    // Success records the canonical flag and clears pending on BOTH slugs.
+    expect(await readWelcomedFlag(stub, 'spoken-v2')).toBe(true);
+    expect(await readPendingFlag(stub, 'spoken-v2')).toBeUndefined();
+    expect(await readPendingFlag(stub, 'spoken')).toBeUndefined();
+  });
+
+  it('cleans a stale pending across slugs when already welcomed under any current slug', async () => {
+    await seedWelcomedFlag(stub, 'spoken'); // welcomed under the former slug (now an alias)
+    await seedPendingFlag(stub, 'spoken-v2'); // stale pending lingering under canonical
+    await seedSelectedMode(stub, 'spoken-v2');
+
+    const result = await postChatFinalJson(stub, resluggedBody('hello')); // plain turn
+
+    // Already welcomed ⇒ no re-emit, just the model answer.
+    expect(result.responses).toEqual(['ok']);
+    // The welcomed short-circuit clears the stale pending across current slugs.
+    expect(await readPendingFlag(stub, 'spoken-v2')).toBeUndefined();
+    expect(await readPendingFlag(stub, 'spoken')).toBeUndefined();
+    // Copy-on-read migrated the welcomed flag onto the canonical slug.
+    expect(await readWelcomedFlag(stub, 'spoken-v2')).toBe(true);
   });
 });
