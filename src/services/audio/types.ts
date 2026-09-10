@@ -15,7 +15,7 @@ export interface SpeechSynthesisResult {
   input_chars: number;
 }
 
-export const SUPPORTED_AUDIO_FORMATS = ['ogg', 'mp3', 'wav', 'webm', 'flac', 'm4a'] as const;
+export const SUPPORTED_AUDIO_FORMATS = ['ogg', 'mp3', 'wav', 'webm', 'flac', 'm4a', 'aac'] as const;
 export type AudioFormat = (typeof SUPPORTED_AUDIO_FORMATS)[number];
 
 /**
@@ -36,6 +36,7 @@ const MIME_TO_BARE_EXTENSION: ReadonlyMap<string, AudioFormat> = new Map([
   ['audio/x-flac', 'flac'],
   ['audio/mp4', 'm4a'],
   ['audio/x-m4a', 'm4a'],
+  ['audio/aac', 'aac'],
 ]);
 
 const SUPPORTED_AUDIO_FORMATS_SET: ReadonlySet<string> = new Set(SUPPORTED_AUDIO_FORMATS);
