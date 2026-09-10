@@ -191,6 +191,7 @@ const AUDIO_FORMAT_MIME_MAP: Readonly<Record<string, string>> = Object.freeze({
   webm: 'audio/webm',
   flac: 'audio/flac',
   m4a: 'audio/mp4',
+  aac: 'audio/aac',
 });
 
 export type ModePersistenceAction =

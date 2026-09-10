@@ -78,7 +78,7 @@ describe('transcribeAudio - happy path', () => {
   });
 
   it('accepts all supported formats', async () => {
-    for (const format of ['ogg', 'mp3', 'wav', 'webm', 'flac', 'm4a']) {
+    for (const format of ['ogg', 'mp3', 'wav', 'webm', 'flac', 'm4a', 'aac']) {
       const mockAi = createMockAi({ text: 'test' });
       const result = await transcribeAudio(mockAi, makeBase64(50), format, logger);
       expect(result.text).toBe('test');
@@ -106,9 +106,18 @@ describe('transcribeAudio - validation and errors', () => {
 
   it('rejects unsupported audio format', async () => {
     const audio = makeBase64(100);
-    await expect(transcribeAudio(createMockAi(), audio, 'aac', logger)).rejects.toThrow(
+    await expect(transcribeAudio(createMockAi(), audio, '3gp', logger)).rejects.toThrow(
       /Unsupported audio format/
     );
+  });
+
+  it('accepts bare `aac` (Signal gateway sends this)', async () => {
+    // Issue #424: Signal voice notes are AAC; the original allowlist rejected
+    // them before STT, breaking every Signal voice message.
+    const audio = makeBase64(100);
+    await expect(
+      transcribeAudio(createMockAi({ text: 'hi' }), audio, 'aac', logger)
+    ).resolves.toEqual(expect.objectContaining({ text: 'hi' }));
   });
 
   it('accepts MIME-form audio_format like `audio/ogg` (gateway sends this)', async () => {
@@ -123,7 +132,7 @@ describe('transcribeAudio - validation and errors', () => {
 
   it('rejects MIME-form with an unsupported subtype', async () => {
     const audio = makeBase64(100);
-    await expect(transcribeAudio(createMockAi(), audio, 'audio/aac', logger)).rejects.toThrow(
+    await expect(transcribeAudio(createMockAi(), audio, 'audio/3gpp', logger)).rejects.toThrow(
       /Unsupported audio format/
     );
   });
@@ -192,7 +201,7 @@ describe('AudioContext', () => {
 // ─── normalizeAudioFormat ──────────────────────────────────────────────────
 
 describe('normalizeAudioFormat', () => {
-  it.each(['ogg', 'mp3', 'wav', 'webm', 'flac', 'm4a'])(
+  it.each(['ogg', 'mp3', 'wav', 'webm', 'flac', 'm4a', 'aac'])(
     'passes bare-extension `%s` through unchanged',
     (fmt) => {
       expect(normalizeAudioFormat(fmt)).toBe(fmt);
@@ -207,6 +216,7 @@ describe('normalizeAudioFormat', () => {
     ['audio/wav', 'wav'],
     ['audio/webm', 'webm'],
     ['audio/flac', 'flac'],
+    ['audio/aac', 'aac'],
   ])('maps canonical IANA MIME `%s` → `%s`', (mime, bare) => {
     expect(normalizeAudioFormat(mime)).toBe(bare);
   });
@@ -229,12 +239,12 @@ describe('normalizeAudioFormat', () => {
   });
 
   it('returns null for unsupported bare extensions', () => {
-    expect(normalizeAudioFormat('aac')).toBeNull();
+    expect(normalizeAudioFormat('3gp')).toBeNull();
     expect(normalizeAudioFormat('opus')).toBeNull();
   });
 
   it('returns null for unsupported MIME types', () => {
-    expect(normalizeAudioFormat('audio/aac')).toBeNull();
+    expect(normalizeAudioFormat('audio/3gpp')).toBeNull();
     expect(normalizeAudioFormat('audio/opus')).toBeNull();
   });
 
