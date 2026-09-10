@@ -31,4 +31,14 @@ describe('buildModeWelcomeText', () => {
     expect(text).toBe('Welcome!');
     expect(text).not.toContain(SHARE_LINE_PREFIX);
   });
+
+  // #311 FIX 5: a reserved clear-token slug drops the (self-defeating) share
+  // line but STILL emits the authored copy.
+  it('omits the share line but keeps the copy for a reserved clear-token slug', () => {
+    for (const slug of ['default', 'none', 'clear']) {
+      const text = buildModeWelcomeText('Welcome!', slug, '15558196461');
+      expect(text).toBe('Welcome!');
+      expect(text).not.toContain('wa.me');
+    }
+  });
 });

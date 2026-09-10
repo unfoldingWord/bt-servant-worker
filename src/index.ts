@@ -1761,6 +1761,31 @@ function mergeContentFields(
 }
 
 /**
+ * Resolve a nullable, clearable authored scalar on mode upsert (#311, FIX 4).
+ * `welcome_message` is the one field an author must be able to turn OFF, so it
+ * departs from the plain `incoming ?? existing` rule with three cases:
+ *
+ *  - OMITTED (`undefined`) ⇒ UNCHANGED — the existing value carries through
+ *    (the portal editor's normal save omits the field).
+ *  - explicit `null` OR empty string `''` ⇒ CLEARED — returns `undefined` so
+ *    `compactOptional` drops the key and the stored mode loses the field.
+ *  - a non-empty string ⇒ SET to that value.
+ *
+ * `null` reaches here because `validateOptionalString` accepts it (JSON has no
+ * `undefined`, so a portal "clear" sends `null`); a plain `?? existing` would
+ * treat it as a no-op. `''` already opted out via `compactOptional` dropping
+ * empty strings — this makes both explicit. Mirrors the prompt-slot tombstone
+ * convention (`mergePromptOverrides`: `null` deletes a slot).
+ */
+function resolveClearableModeField(
+  incoming: string | null | undefined,
+  existing: string | undefined
+): string | undefined {
+  if (incoming === undefined) return existing;
+  return incoming === null || incoming === '' ? undefined : incoming;
+}
+
+/**
  * Merge an incoming mode with an existing one (Phase 1 of #200).
  *
  * Scalar fields (label/description/published) follow the prior "incoming
@@ -1777,10 +1802,14 @@ function mergeExistingMode(existing: PromptMode, incoming: PromptMode): PromptMo
       aliases: normalizeAliases(incoming.aliases ?? existing.aliases),
       label: incoming.label ?? existing.label,
       description: incoming.description ?? existing.description,
-      // #311: same "incoming wins if present, else existing carries through"
-      // rule as description. Without this line every PUT that omits
-      // welcome_message (the portal editor's normal save) would drop it.
-      welcome_message: incoming.welcome_message ?? existing.welcome_message,
+      // #311 FIX 4: omit ⇒ unchanged, explicit null/'' ⇒ cleared, string ⇒ set.
+      // (A plain `?? existing` made null a no-op, so a welcome could never be
+      // turned off.) The cast reflects that JSON can deliver null even though
+      // the PromptMode type declares `welcome_message?: string`.
+      welcome_message: resolveClearableModeField(
+        incoming.welcome_message as string | null | undefined,
+        existing.welcome_message
+      ),
       published: incoming.published ?? existing.published,
       requires_group: incoming.requires_group ?? existing.requires_group,
     }),

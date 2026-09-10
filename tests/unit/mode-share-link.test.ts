@@ -63,4 +63,20 @@ describe('buildModeShareLink', () => {
     expect(buildModeShareLink('', 'spoken-mode')).toBeNull();
     expect(buildModeShareLink('012', 'spoken-mode')).toBeNull();
   });
+
+  // #311 FIX 5: a mode whose canonical slug is a reserved clear-token would
+  // build wa.me/…?text=%23default — which the recipient's classifier reads as
+  // "clear the active mode", so the QR would deactivate rather than select.
+  // Mirror the portal builder's `RESERVED_TRIGGERS` and drop the link instead.
+  it('returns null for a reserved clear-token slug even with a valid number', () => {
+    expect(buildModeShareLink('15558196461', 'default')).toBeNull();
+    expect(buildModeShareLink('15558196461', 'none')).toBeNull();
+    expect(buildModeShareLink('15558196461', 'clear')).toBeNull();
+  });
+
+  it('still builds the link for a non-reserved slug', () => {
+    expect(buildModeShareLink('15558196461', 'defaults')).toBe(
+      'https://wa.me/15558196461?text=%23defaults'
+    );
+  });
 });

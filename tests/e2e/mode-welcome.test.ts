@@ -15,6 +15,8 @@ import Anthropic from '@anthropic-ai/sdk';
 import {
   buildChatBody,
   postChatFinalJson,
+  readMockRequestBody,
+  renderSystem,
   setupAnthropicFetchCapture,
 } from '../helpers/anthropic-capture.js';
 import type { ChatRequest, ChatResponse, StreamCallbacks } from '../../src/types/engine.js';
@@ -61,8 +63,13 @@ function anthropicSSEResponse(text: string): Response {
   });
 }
 
-/** Stub the Anthropic SDK ctor + a streaming `globalThis.fetch` (answer: 'ok'). */
-function setupAnthropicSSE(): void {
+/**
+ * Stub the Anthropic SDK ctor + a streaming `globalThis.fetch` (answer: 'ok').
+ * Captures each request's flattened `system` prompt so a test can assert on the
+ * per-turn `first_interaction`-driven "Briefly welcome them." note (FIX 1).
+ */
+function setupAnthropicSSE(): { calls: Array<{ system: string }> } {
+  const calls: Array<{ system: string }> = [];
   (Anthropic as unknown as ReturnType<typeof vi.fn>).mockImplementation(function MockAnthropic(
     this: object
   ) {
@@ -72,11 +79,31 @@ function setupAnthropicSSE(): void {
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
     const url =
       typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
-    if (url.includes('api.anthropic.com')) return anthropicSSEResponse('ok');
+    if (url.includes('api.anthropic.com')) {
+      const rawBody = await readMockRequestBody(input, init);
+      const parsed = rawBody ? (JSON.parse(rawBody) as Record<string, unknown>) : {};
+      calls.push({ system: renderSystem(parsed.system) });
+      return anthropicSSEResponse('ok');
+    }
     return realFetch(input, init);
   });
   vi.spyOn(console, 'log').mockImplementation(() => {});
   vi.spyOn(console, 'warn').mockImplementation(() => {});
+  return { calls };
+}
+
+/** Collect the parsed `data:` events from an SSE Response body (skips keepalives). */
+async function readSSEEvents(response: Response): Promise<Array<Record<string, unknown>>> {
+  const body = await response.text();
+  const events: Array<Record<string, unknown>> = [];
+  for (const line of body.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) continue;
+    const json = trimmed.slice('data:'.length).trim();
+    if (!json) continue;
+    events.push(JSON.parse(json) as Record<string, unknown>);
+  }
+  return events;
 }
 
 /** Minimal webhook-flavored callbacks (onWelcome present ⇒ the callback path). */
@@ -578,10 +605,12 @@ describe('per-mode welcome — suppresses the model welcome (#311 FIX A)', () =>
   });
 });
 
-// FIX B: admins re-preview freely. On an explicit #mode an admin ALWAYS gets
-// the welcome and no one-time flag is written, so an author iterating on
-// welcome_message sees every save.
-describe('per-mode welcome — admin re-preview (#311 FIX B)', () => {
+// FIX B/3: admins re-preview freely, but only on a mode CHANGE — the real
+// re-preview flow (edit copy → switch away → switch back). No one-time flag is
+// written, so an author iterating on welcome_message sees every (re-)entry. FIX
+// 3: the portal prefixes `#<mode>` on EVERY test-chat turn, so an admin must
+// NOT re-emit on an already-active `#<same-mode>` (that was per-turn spam).
+describe('per-mode welcome — admin re-preview (#311 FIX B/3)', () => {
   let stub: DurableObjectStub;
 
   beforeEach(() => {
@@ -596,15 +625,148 @@ describe('per-mode welcome — admin re-preview (#311 FIX B)', () => {
   const adminBody = (message: string): ChatRequest =>
     buildChatBody({ message, _org_modes: ORG_MODES, client_id: 'admin-portal' });
 
-  it('re-emits the welcome on every #mode scan and never writes the flag', async () => {
+  it('emits on the mode CHANGE but not on a subsequent already-active #<same-mode> turn', async () => {
+    // Entry into spoken (a change from no mode) ⇒ welcome.
     const first = await postChatFinalJson(stub, adminBody('#spoken hi'));
+    // Already-active spoken (no change), the portal's per-turn `#` prefix ⇒ no
+    // welcome, just the model answer. This is the FIX 3 anti-spam behavior.
     const second = await postChatFinalJson(stub, adminBody('#spoken again'));
 
     expect(first.responses[0]).toContain('Welcome to Spoken mode!');
-    expect(second.responses[0]).toContain('Welcome to Spoken mode!');
+    expect(second.responses).toEqual(['ok']);
 
     // No one-time flag (or pending bit) is written for admins.
     expect(await readWelcomedFlag(stub, 'spoken')).toBeUndefined();
     expect(await readPendingFlag(stub, 'spoken')).toBeUndefined();
+  });
+
+  it('re-emits when the admin switches away and back (edit → switch away → switch back)', async () => {
+    await postChatFinalJson(stub, adminBody('#spoken hi')); // enter spoken
+    const away = await postChatFinalJson(stub, adminBody('#fia-coach hello')); // switch away
+    const back = await postChatFinalJson(stub, adminBody('#spoken again')); // switch back
+
+    expect(away.responses[0]).toContain('FIA coaching starts here.');
+    expect(back.responses[0]).toContain('Welcome to Spoken mode!');
+
+    // Still no flags for admins.
+    expect(await readWelcomedFlag(stub, 'spoken')).toBeUndefined();
+    expect(await readWelcomedFlag(stub, 'fia-coach')).toBeUndefined();
+  });
+});
+
+// FIX 1: the out-of-band welcome is delivered BEFORE orchestration, so its
+// outcome is known first. The per-turn `first_interaction: false` suppression
+// (FIX A) is applied ONLY when the welcome actually DELIVERED. If delivery
+// THREW (a visible failure), `first_interaction` stays at its real value so the
+// model still welcomes this turn as the fallback — a brand-new user whose
+// welcome send fails still gets exactly one welcome (the model's).
+describe('per-mode welcome — first_interaction gated on delivery (#311 FIX 1)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const WELCOME_NOTE = 'Briefly welcome them.';
+
+  it('KEEPS the model welcome note when the out-of-band welcome send THROWS', async () => {
+    const capture = setupAnthropicSSE();
+    // A brand-new DO ⇒ first_interaction: true.
+    const stub = env.USER_DO.get(env.USER_DO.newUniqueId());
+
+    const response = await runProcessChat(
+      stub,
+      triggerBody('#spoken hi'),
+      callbackStreamCallbacks({
+        onWelcome: async () => {
+          throw new Error('webhook down');
+        },
+      })
+    );
+
+    // Turn still completes with the model answer (delivery is non-fatal).
+    expect(response.responses).toEqual(['ok']);
+    // Delivery FAILED ⇒ first_interaction stayed true ⇒ the note IS present, so
+    // the model welcomes this turn as the fallback.
+    expect(capture.calls).toHaveLength(1);
+    expect(capture.calls[0]?.system).toContain(WELCOME_NOTE);
+    // Failed delivery ⇒ one-time flag unset, pending bit set.
+    expect(await readWelcomedFlag(stub, 'spoken')).toBeUndefined();
+    expect(await readPendingFlag(stub, 'spoken')).toBe(true);
+  });
+
+  it('OMITS the model welcome note when the out-of-band welcome DELIVERS', async () => {
+    const capture = setupAnthropicSSE();
+    const stub = env.USER_DO.get(env.USER_DO.newUniqueId());
+
+    const delivered: string[] = [];
+    const response = await runProcessChat(
+      stub,
+      triggerBody('#spoken hi'),
+      callbackStreamCallbacks({
+        onWelcome: async (text) => {
+          delivered.push(text);
+        },
+      })
+    );
+
+    expect(delivered).toHaveLength(1);
+    expect(response.responses).toEqual(['ok']);
+    // Delivery SUCCEEDED ⇒ first_interaction: false this turn ⇒ note ABSENT
+    // (exactly one welcome — ours).
+    expect(capture.calls).toHaveLength(1);
+    expect(capture.calls[0]?.system).not.toContain(WELCOME_NOTE);
+    expect(await readWelcomedFlag(stub, 'spoken')).toBe(true);
+  });
+});
+
+// FIX 2: `/chat/stream` (web client AND portal test chat) now wires `onWelcome`
+// to a `progress` SSE event, so the welcome ships as its own message ahead of
+// the model tokens and is kept OUT of the final `responses`. The one-time flag
+// is recorded only after that SSE write succeeds.
+describe('per-mode welcome — SSE path onWelcome (#311 FIX 2)', () => {
+  let stub: DurableObjectStub;
+
+  beforeEach(() => {
+    stub = env.USER_DO.get(env.USER_DO.newUniqueId());
+    setupAnthropicSSE();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('emits the welcome as a progress event before model tokens, keeps it out of responses, and records the flag', async () => {
+    const response = await stub.fetch('http://fake-host/chat/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(triggerBody('#spoken hi')),
+    });
+    expect(response.headers.get('Content-Type')).toBe('text/event-stream');
+
+    const events = await readSSEEvents(response);
+
+    // The welcome rides ahead of the completion as its OWN progress event.
+    const welcomeEventIdx = events.findIndex(
+      (e) => e.type === 'progress' && String(e.text).includes('Welcome to Spoken mode!')
+    );
+    const completeEventIdx = events.findIndex((e) => e.type === 'complete');
+    expect(welcomeEventIdx).toBeGreaterThanOrEqual(0);
+    expect(completeEventIdx).toBeGreaterThanOrEqual(0);
+    expect(welcomeEventIdx).toBeLessThan(completeEventIdx);
+
+    // It carries the deterministic wa.me share line…
+    expect(String(events[welcomeEventIdx]?.text)).toContain(
+      'https://wa.me/15558196461?text=%23spoken'
+    );
+
+    // …and it lands BEFORE the model tokens ('ok' streamed as progress).
+    const modelTokenIdx = events.findIndex((e) => e.type === 'progress' && e.text === 'ok');
+    if (modelTokenIdx >= 0) expect(welcomeEventIdx).toBeLessThan(modelTokenIdx);
+
+    // The completion's responses are model-only — the welcome is NOT prepended.
+    const completeResponse = (events[completeEventIdx] as { response: ChatResponse }).response;
+    expect(completeResponse.responses).toEqual(['ok']);
+
+    // The flag was recorded only after the SSE welcome write landed.
+    expect(await readWelcomedFlag(stub, 'spoken')).toBe(true);
   });
 });

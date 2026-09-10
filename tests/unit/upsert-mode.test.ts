@@ -128,6 +128,46 @@ describe('upsertMode - welcome_message (#311)', () => {
   });
 });
 
+// #311 FIX 4: an author must be able to turn a welcome OFF. Three cases:
+//  - omit (undefined) ⇒ unchanged (covered by the suite above);
+//  - explicit null ⇒ removed (a plain `?? existing` treated null as a no-op);
+//  - explicit '' ⇒ removed (compactOptional drops empty strings; made explicit).
+describe('upsertMode - welcome_message opt-out (#311 FIX 4)', () => {
+  it('removes welcome_message when the caller sends explicit null', () => {
+    const orgModes = makeOrgModes({ name: 't', welcome_message: 'Turn me off', overrides: {} });
+    const result = upsertMode(
+      orgModes,
+      // JSON carries a portal "clear" as null; the PromptMode type says string,
+      // so cast to model the wire reality.
+      { name: 't', welcome_message: null, overrides: {} } as unknown as OrgModes['modes'][number],
+      'o'
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.savedMode.welcome_message).toBeUndefined();
+      // The key is dropped, not merely set to a falsy value.
+      expect('welcome_message' in result.savedMode).toBe(false);
+    }
+  });
+
+  it('removes welcome_message when the caller sends an empty string', () => {
+    const orgModes = makeOrgModes({ name: 't', welcome_message: 'Turn me off', overrides: {} });
+    const result = upsertMode(orgModes, { name: 't', welcome_message: '', overrides: {} }, 'o');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.savedMode.welcome_message).toBeUndefined();
+      expect('welcome_message' in result.savedMode).toBe(false);
+    }
+  });
+
+  it('leaves welcome_message unchanged when the caller omits it', () => {
+    const orgModes = makeOrgModes({ name: 't', welcome_message: 'Keep me', overrides: {} });
+    const result = upsertMode(orgModes, { name: 't', overrides: { identity: 'X' } }, 'o');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.savedMode.welcome_message).toBe('Keep me');
+  });
+});
+
 describe('welcome_message view + clone (#311)', () => {
   it('round-trips welcome_message through GET (view) -> PUT (omit) -> GET (view)', () => {
     // GET: an authored mode surfaces welcome_message in the admin view.

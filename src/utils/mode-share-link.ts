@@ -25,6 +25,15 @@ export const WA_ME_ORIGIN = 'https://wa.me';
 // formal E.164 minimum. Identical to the portal's `E164_DIGITS`.
 const E164_DIGITS = /^[1-9][0-9]{6,14}$/;
 
+// #311 FIX 5: the classifier reads these tokens as "clear the active mode"
+// BEFORE any mode match (worker `CLEAR_TOKENS`, src/services/classifier/index.ts;
+// the portal mirrors them as `RESERVED_TRIGGERS`). A mode whose canonical slug
+// is one of these would produce `wa.me/…?text=%23default`, and scanning that QR
+// would DEACTIVATE the recipient's mode instead of selecting it — a self-
+// defeating link. Kept as a local copy (like the portal builder) so this module
+// stays dependency-free; `CLEAR_TOKENS` is the canonical source if they change.
+const RESERVED_CLEAR_TRIGGERS: ReadonlySet<string> = new Set(['default', 'none', 'clear']);
+
 /**
  * Reduce an operator-entered WhatsApp number to the digit string `wa.me`
  * expects. Accepts the `+`, spaces, hyphens, dots, and parentheses people
@@ -46,17 +55,24 @@ export function modeShareTrigger(slug: string): string {
 }
 
 /**
- * Build the `wa.me` share link for `slug`, or `null` when the number is
- * missing/invalid. Returning `null` (rather than throwing) is deliberate: an
- * unset/typo'd `WHATSAPP_NUMBER` must degrade to "no share line", never crash
- * the turn. `encodeURIComponent` turns the `#` into `%23`; the slug's own
- * alphabet ([a-z0-9-]) is untouched, which keeps the link legible and matches
- * the portal's output character-for-character.
+ * Build the `wa.me` share link for `slug`, or `null` when it cannot be built.
+ * Returning `null` (rather than throwing) is deliberate: the caller degrades to
+ * "no share line, authored copy still emitted", never a crashed turn. `null` is
+ * returned when:
+ *
+ *  - `WHATSAPP_NUMBER` is unset or a typo (not a plausible E.164 number), or
+ *  - the slug is a reserved clear-token (#311 FIX 5) — a QR for it would clear
+ *    the recipient's mode rather than select it.
+ *
+ * `encodeURIComponent` turns the `#` into `%23`; the slug's own alphabet
+ * ([a-z0-9-]) is untouched, which keeps the link legible and matches the
+ * portal's output character-for-character.
  */
 export function buildModeShareLink(
   rawNumber: string | null | undefined,
   slug: string
 ): string | null {
+  if (RESERVED_CLEAR_TRIGGERS.has(slug)) return null;
   const digits = normalizeWhatsAppNumber(rawNumber);
   if (!digits) return null;
   const trigger = modeShareTrigger(slug);
