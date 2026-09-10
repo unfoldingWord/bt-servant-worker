@@ -1818,6 +1818,32 @@ function mergeExistingMode(existing: PromptMode, incoming: PromptMode): PromptMo
 }
 
 /**
+ * Build the stored record for a BRAND-NEW mode. Strips control characters from
+ * `document` (mirroring the language scaffold pattern) and normalizes
+ * `welcome_message` exactly as `mergeExistingMode` does on the update path
+ * (#311 FIX 3): an explicit `null` or `''` means "no welcome", so store NO field
+ * rather than persisting `null` (which violates the `string | undefined` shape
+ * and returns null to clients). A non-empty string is kept; an omitted field is
+ * absent. Returns a fresh object so the caller never mutates `modeInput`.
+ */
+function buildNewMode(modeInput: PromptMode): PromptMode {
+  const newMode: PromptMode = { ...modeInput };
+  if (newMode.document !== undefined) {
+    newMode.document = stripControlChars(newMode.document);
+  }
+  const resolvedWelcome = resolveClearableModeField(
+    newMode.welcome_message as string | null | undefined,
+    undefined
+  );
+  if (resolvedWelcome === undefined) {
+    delete newMode.welcome_message;
+  } else {
+    newMode.welcome_message = resolvedWelcome;
+  }
+  return newMode;
+}
+
+/**
  * Upsert a mode into an OrgModes array, merging with any existing mode.
  * Mutates orgModes.modes in-place (splice/push) and returns the result.
  *
@@ -1863,11 +1889,8 @@ export function upsertMode(
   ]);
   if (collision) return { ok: false, error: collision };
 
-  // New mode: sanitize document field if present.
-  const newMode: PromptMode =
-    modeInput.document !== undefined
-      ? { ...modeInput, document: stripControlChars(modeInput.document) }
-      : modeInput;
+  // New mode: sanitize the document field and normalize welcome_message.
+  const newMode = buildNewMode(modeInput);
 
   logger?.log('admin_action', {
     action: 'upsert_mode_before',

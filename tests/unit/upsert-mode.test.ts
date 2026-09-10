@@ -128,6 +128,40 @@ describe('upsertMode - welcome_message (#311)', () => {
   });
 });
 
+// #311 FIX 3: the CREATE branch previously stored the input object unchanged, so
+// `welcome_message: null` (or '') persisted `null` in KV — violating the
+// `string | undefined` shape and returning null to clients. Normalize on create
+// exactly as mergeExistingMode does on update: null/'' ⇒ store NO field.
+describe('upsertMode - welcome_message create-path normalization (#311 FIX 3)', () => {
+  it('stores NO welcome_message when a brand-new mode sends explicit null', () => {
+    const orgModes = makeOrgModes();
+    const result = upsertMode(
+      orgModes,
+      { name: 't', welcome_message: null, overrides: {} } as unknown as OrgModes['modes'][number],
+      'o'
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.savedMode.welcome_message).toBeUndefined();
+      // The key is absent from the stored record, not merely null.
+      expect('welcome_message' in result.savedMode).toBe(false);
+    }
+    // And the persisted mode in the array carries no field either.
+    expect('welcome_message' in orgModes.modes[0]!).toBe(false);
+  });
+
+  it('stores NO welcome_message when a brand-new mode sends an empty string', () => {
+    const orgModes = makeOrgModes();
+    const result = upsertMode(orgModes, { name: 't', welcome_message: '', overrides: {} }, 'o');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.savedMode.welcome_message).toBeUndefined();
+      expect('welcome_message' in result.savedMode).toBe(false);
+    }
+    expect('welcome_message' in orgModes.modes[0]!).toBe(false);
+  });
+});
+
 // #311 FIX 4: an author must be able to turn a welcome OFF. Three cases:
 //  - omit (undefined) ⇒ unchanged (covered by the suite above);
 //  - explicit null ⇒ removed (a plain `?? existing` treated null as a no-op);

@@ -552,17 +552,18 @@ interface ModeWelcome {
 /**
  * Outcome of the pre-orchestration welcome delivery (#311, FIX 1).
  *
- * `handledOutOfBand` — a transport-level `onWelcome` sink existed (webhook OR
- * the SSE path, per FIX 2), so the welcome was sent as its OWN message and must
- * NOT be prepended into `responses`. Only TRUE `/chat/final` (no streaming
- * callbacks) leaves this false and the caller prepends the welcome in-band.
+ * `handledOutOfBand` — a transport-level `onWelcome` sink existed (the
+ * webhook/WhatsApp path ONLY, per FIX 1), so the welcome was sent as its OWN
+ * message and must NOT be prepended into `responses`. Both the SSE path
+ * (`/chat/stream`) and TRUE `/chat/final` leave this false and the caller
+ * prepends the welcome in-band into `responses`.
  *
  * `delivered` — the welcome actually reached the user THIS turn: the
  * out-of-band send resolved without throwing. On a throw it is false and a
- * `pending` bit was set to re-emit on a later turn. The per-turn
- * `first_interaction: false` suppression (FIX A) is gated on delivery so a
- * VISIBLE delivery failure leaves the model's own "Briefly welcome them."
- * fallback in place — a brand-new user still gets exactly one welcome.
+ * `pending` bit was set to re-emit on a later turn. Model-welcome suppression
+ * (FIX 2) is gated on `emittingWelcome` (a welcome was DUE this turn), NOT on
+ * delivery: a failed out-of-band send falls back to the `pending` re-emit of
+ * the authored copy, never to a second (model) welcome.
  */
 interface WelcomeDelivery {
   handledOutOfBand: boolean;
@@ -1181,12 +1182,18 @@ export class UserDO {
   ): Response {
     const { readable, writable } = new TransformStream<Uint8Array>();
     const writer = writable.getWriter();
-    const { sendEvent, keepaliveInterval, state } = this.buildSSESender(writer, logger, Date.now());
+    const { sendEvent, keepaliveInterval } = this.buildSSESender(writer, logger, Date.now());
 
+    // #311 FIX 1: the SSE path does NOT wire `onWelcome`. Both live SSE consumers
+    // (web client `use-chat-runtime.ts`, portal `sse-stream.ts`) REPLACE the
+    // stream with `complete.responses`, so a progress-only welcome would be
+    // dropped while the flag still got recorded. The welcome is instead prepended
+    // in-band into `complete.responses` (see `processChat`).
+    // TODO(#311 follow-up): a truly-separate SSE welcome bubble would need a new
+    // dedicated SSE event type plus web-client + portal changes to render it.
     const callbacks: StreamCallbacks = {
       onStatus: async (status) => sendEvent({ type: 'status', ...status }),
       onProgress: async (text) => sendEvent({ type: 'progress', text }),
-      onWelcome: async (text) => this.sendSSEWelcome(sendEvent, state, text),
       onComplete: async (response) => sendEvent({ type: 'complete', response }),
       onError: async (error) => sendEvent({ type: 'error', error }),
       onToolUse: async (tool, input) => sendEvent({ type: 'tool_use', tool, input }),
@@ -1428,40 +1435,22 @@ export class UserDO {
     return { sendEvent, keepaliveInterval, state };
   }
 
-  /**
-   * #311 FIX 2: deliver the first-contact welcome on the SSE path as its own
-   * `progress` event, ahead of the model's tokens (mirrors `onProgress`) and
-   * kept OUT of the final `responses`. `sendEvent` swallows a client disconnect
-   * (it flips `state.clientDisconnected` and logs, but resolves), so re-check it
-   * and THROW when the write did not land: `deliverWelcomeOutOfBand` then sets
-   * the pending bit and withholds the `mode_welcomed` flag, so a disconnect can
-   * never record a welcome the client never received.
-   */
-  private async sendSSEWelcome(
-    sendEvent: (event: SSEEvent) => Promise<void>,
-    state: { clientDisconnected: boolean },
-    text: string
-  ): Promise<void> {
-    await sendEvent({ type: 'progress', text });
-    if (state.clientDisconnected) {
-      throw new Error('SSE client disconnected before welcome delivered');
-    }
-  }
-
   /** Process an SSE-mode queue entry (web client). */
   private async processSSEEntry(entry: InternalQueueEntry, logger: RequestLogger): Promise<void> {
     const body = entry.body;
     const writer = this.queuedWriters.get(entry.message_id);
-    const { sendEvent, keepaliveInterval, state } = this.buildSSESender(writer, logger, Date.now());
+    const { sendEvent, keepaliveInterval } = this.buildSSESender(writer, logger, Date.now());
     // Resolved inside the try so the finally (writer close) always runs.
     let locale = DEFAULT_PREFERENCES.response_language;
 
     try {
       locale = await this.readStatusLocale(body, logger);
+      // #311 FIX 1: no `onWelcome` on the SSE path — the welcome is prepended
+      // in-band into `complete.responses` (both SSE consumers replace the stream
+      // with that array, so an out-of-band progress welcome would be dropped).
       const callbacks: StreamCallbacks = {
         onStatus: async (status) => sendEvent({ type: 'status', ...status }),
         onProgress: async (text) => sendEvent({ type: 'progress', text }),
-        onWelcome: async (text) => this.sendSSEWelcome(sendEvent, state, text),
         // onComplete is sent explicitly after processChat returns (not by the orchestrator)
         onComplete: async (response) => sendEvent({ type: 'complete', response }),
         onError: async (error) => sendEvent({ type: 'error', error }),
@@ -1831,40 +1820,35 @@ export class UserDO {
     const inputLanguage = detectWrittenLanguage(triggerCtx.messageText, logger);
 
     // ── Deliver the welcome BEFORE building orchestrator options ──────────────
-    // #311: the welcome is its OWN message on any transport with an `onWelcome`
-    // sink — the webhook/WhatsApp path AND the SSE path (FIX 2) — delivered
-    // BEFORE the model runs and kept OUT of `responses` so the model's streamed
-    // iteration deltas keep their prefix invariant. Only TRUE `/chat/final` (no
-    // streaming callbacks) has no `onWelcome`; there it is prepended to
-    // `responses` below instead.
+    // #311: the welcome is its OWN message ONLY on the webhook/WhatsApp path,
+    // which has an `onWelcome` sink and renders each send discretely (FIX 1). On
+    // the SSE path (`/chat/stream`) and TRUE `/chat/final` there is no
+    // `onWelcome`; the welcome is prepended in-band into `responses` below,
+    // because both SSE consumers replace the stream with `complete.responses`.
     //
-    // FIX 1: delivery runs FIRST so its outcome is known before `buildOrchOpts`
-    // reads the preferences. `handledOutOfBand` decides the prepend; `delivered`
-    // gates the FIX A suppression below.
+    // Delivery runs FIRST so its outcome is known before `buildOrchOpts` reads
+    // the preferences. `handledOutOfBand` decides the in-band prepend.
     const welcome = triggerCtx.welcome;
+    // `emittingWelcome` — an authored welcome is DUE this turn (first-contact or
+    // a pending re-emit). It drives model-welcome suppression regardless of
+    // out-of-band delivery success (FIX 2).
+    const emittingWelcome = !!welcome;
     const welcomeDelivery = await this.deliverWelcomeOutOfBand(welcome, callbacks, logger);
-    // A welcome that was NOT handled out of band (`/chat/final`) is delivered by
-    // the in-band prepend below, so it counts as delivered. Out of band it
-    // counts only when the send resolved (a throw sets `delivered: false`).
-    const welcomeDelivered = welcome
-      ? welcomeDelivery.handledOutOfBand
-        ? welcomeDelivery.delivered
-        : true
-      : false;
 
     // ── Build orchestrator options ────────────────────────────────────────────
-    // FIX A (#311): when our OWN mode welcome actually reached the user this
-    // turn, suppress the model's "This is the user's first interaction. Briefly
-    // welcome them." injection (system-prompt.ts) so a brand-new user isn't
-    // welcomed twice. FIX 1: gate on ACTUAL delivery — if the out-of-band send
-    // THREW (a VISIBLE failure, pending bit set), leave `first_interaction` at
-    // its real value so the model still welcomes this turn as the fallback.
-    // Per-turn ONLY — the persisted record is untouched, so `saveConversation`
-    // still flips `first_interaction` from `loaded.preferences` at turn end.
+    // FIX 2 (#311): suppress the model's "This is the user's first interaction.
+    // Briefly welcome them." injection (system-prompt.ts) whenever an authored
+    // welcome is DUE this turn — even if the out-of-band send THREW — so a
+    // brand-new user is never welcomed twice. On a failed webhook delivery the
+    // `mode_welcome_pending` re-emit is the SOLE fallback (it re-delivers the
+    // authored copy + wa.me link next same-mode turn); the model never doubles
+    // up. Per-turn ONLY — the durable `first_interaction:false` is written by
+    // `recordWelcomeDelivered` (on actual delivery), and `saveConversation`
+    // skips its flip on emitting turns so a failed delivery stays re-welcomable.
     const effectivePreferences = {
       ...loaded.preferences,
       response_language: loaded.locale,
-      ...(welcomeDelivered ? { first_interaction: false } : {}),
+      ...(emittingWelcome ? { first_interaction: false } : {}),
     };
     const groupContext = this.maybeBuildGroupContext(body);
 
@@ -1893,9 +1877,12 @@ export class UserDO {
 
     // #311 FIX 5: persist history as MODEL text only. The welcome + wa.me link
     // must not become the assistant's prior turn, or the model may mimic it.
+    // FIX 2: `emittingWelcome` defers the `first_interaction` flip to
+    // `recordWelcomeDelivered` — the flip persists only when the authored
+    // welcome actually delivered, so a failed delivery stays re-welcomable.
     // prettier-ignore
     await this.tracedPhase(ctx, 'save_conversation', () =>
-      this.saveConversation(triggerCtx.messageText, orchResult.responses, loaded.preferences, body._org_config ?? {}, { logger, audioKey, inboundVoiceKey: loaded.inboundVoiceKey, speaker: body.speaker, attachments: attachmentsContext.list() })
+      this.saveConversation(triggerCtx.messageText, orchResult.responses, loaded.preferences, body._org_config ?? {}, { logger, audioKey, inboundVoiceKey: loaded.inboundVoiceKey, speaker: body.speaker, attachments: attachmentsContext.list(), emittingWelcome })
     );
 
     // #311: on SSE/final the welcome ships inside `responses`; record it as
@@ -2115,22 +2102,21 @@ export class UserDO {
   }
 
   /**
-   * #311: deliver the welcome as its own message before the model runs, on
-   * transports that render each send discretely — webhook/WhatsApp AND the SSE
-   * path (FIX 2), i.e. any transport with `onWelcome` present.
+   * #311: deliver the welcome as its own message before the model runs, ONLY on
+   * the webhook/WhatsApp transport, which renders each send discretely and is the
+   * only path with `onWelcome` present (FIX 1). The SSE path and `/chat/final`
+   * have no `onWelcome`, so this returns `handledOutOfBand: false` for them and
+   * the caller prepends the welcome in-band into `responses`.
    *
    * FIX C: delivery is NON-FATAL. On success it records the one-time flag and
    * clears any pending bit; on failure it LOGS (structured, per the no-silent-
    * catch policy), sets the durable pending bit so a later turn re-emits, and
    * RETURNS WITHOUT RETHROWING so `processChat` still returns the model answer.
-   * Either outcome reports `handledOutOfBand: true` so the caller does NOT also
-   * prepend the welcome into `responses`; `delivered` distinguishes a resolved
-   * send (records the flag, suppresses the model welcome) from a throw (pending
-   * set, model welcome kept as the fallback — FIX 1).
-   *
-   * On the SSE path `onWelcome` is `sendEvent` guarded to THROW when the client
-   * has disconnected, so a disconnect lands here (pending set, flag withheld)
-   * rather than silently recording a welcome the client never received.
+   * On success `handledOutOfBand: true` tells the caller NOT to also prepend the
+   * welcome into `responses`; `delivered` distinguishes a resolved send (records
+   * the flag) from a throw (pending set, re-emitted next same-mode turn). The
+   * model welcome is suppressed on both outcomes because a welcome was DUE this
+   * turn (`emittingWelcome`, FIX 2) — a failed send never doubles up.
    *
    * A residual failure this worker cannot observe — the gateway returns 200 but
    * Meta then rejects the send — is tracked in bt-servant-whatsapp-gateway#45.
@@ -2173,11 +2159,21 @@ export class UserDO {
    * #311: mark a welcome as successfully delivered — set the one-time
    * `mode_welcomed` flag and clear any `mode_welcome_pending` bit. No-op for
    * admin re-previews (FIX B), which carry no keys.
+   *
+   * FIX 2: also persist `first_interaction:false` durably here — the authored
+   * welcome ACTUALLY went out (webhook success, or in-band SSE/`/chat/final`), so
+   * a later turn whose orchestration throws before `saveConversation` can never
+   * re-welcome the user via the model. This is NOT reached on a failed delivery
+   * (pending re-emit, or a later model welcome, handles that case instead).
    */
   private async recordWelcomeDelivered(welcome: ModeWelcome): Promise<void> {
     if (!welcome.keys) return;
     await this.state.storage.put(welcome.keys.welcomed, true);
     await this.state.storage.delete(welcome.keys.pending);
+    const preferences = await this.getPreferences();
+    if (preferences.first_interaction) {
+      await this.updatePreferences({ ...preferences, first_interaction: false });
+    }
   }
 
   /**
@@ -2733,9 +2729,10 @@ export class UserDO {
       inboundVoiceKey?: string | undefined;
       speaker?: string | undefined;
       attachments?: Attachment[];
+      emittingWelcome?: boolean;
     }
   ) {
-    const { logger, audioKey, inboundVoiceKey, speaker, attachments } = opts;
+    const { logger, audioKey, inboundVoiceKey, speaker, attachments, emittingWelcome } = opts;
     const startTime = Date.now();
     const storageMax = orgConfig.max_history_storage ?? DEFAULT_ORG_CONFIG.max_history_storage;
     const hasAttachments = !!attachments && attachments.length > 0;
@@ -2751,9 +2748,7 @@ export class UserDO {
       },
       storageMax
     );
-    if (preferences.first_interaction) {
-      await this.updatePreferences({ ...preferences, first_interaction: false });
-    }
+    await this.maybeFlipFirstInteraction(preferences, emittingWelcome);
     logger.log('phase_save_complete', {
       duration_ms: Date.now() - startTime,
       storageMax,
@@ -3315,6 +3310,20 @@ export class UserDO {
     history.push(entry);
     const trimmed = history.slice(-maxStorage);
     await this.state.storage.put(HISTORY_KEY, trimmed);
+  }
+
+  /**
+   * #311 FIX 2: the normal end-of-turn `first_interaction` flip. Skipped on a
+   * welcome-emitting turn — there `recordWelcomeDelivered` owns the durable
+   * `first_interaction:false` and writes it ONLY when the authored welcome
+   * actually delivered, so a failed-then-pending welcome stays re-welcomable.
+   */
+  private async maybeFlipFirstInteraction(
+    preferences: UserPreferencesInternal,
+    emittingWelcome: boolean | undefined
+  ): Promise<void> {
+    if (emittingWelcome || !preferences.first_interaction) return;
+    await this.updatePreferences({ ...preferences, first_interaction: false });
   }
 
   private async getPreferences(): Promise<UserPreferencesInternal> {
