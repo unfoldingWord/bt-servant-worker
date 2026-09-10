@@ -44,6 +44,10 @@ CODE_EXEC_TIMEOUT_MS = "30000"
 MAX_MCP_CALLS_PER_EXECUTION = "10"
 MAX_MCP_CALLS_PER_REQUEST = "100"
 DEFAULT_ORG = "unfoldingWord"
+# WhatsApp business number (E.164 digits, no `+`) for the per-mode wa.me share
+# link in first-contact welcomes (#311). Non-secret, so it lives in [vars], not
+# a wrangler secret. Same var/value the portal reads for its share panel.
+WHATSAPP_NUMBER = "15558196461"
 
 # KV Namespaces
 [[kv_namespaces]]
@@ -116,6 +120,8 @@ CODE_EXEC_TIMEOUT_MS = "30000"
 MAX_MCP_CALLS_PER_EXECUTION = "10"
 MAX_MCP_CALLS_PER_REQUEST = "100"
 DEFAULT_ORG = "unfoldingWord"
+# See top-level [vars] note. Same wa.me share number as prod/portal (#311).
+WHATSAPP_NUMBER = "15558196461"
 
 [[env.staging.kv_namespaces]]
 binding = "ORG_ADMIN_KEYS"

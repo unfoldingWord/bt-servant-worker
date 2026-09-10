@@ -60,6 +60,15 @@ export const MAX_MODE_LABEL_LENGTH = 100;
 export const MAX_MODE_DESCRIPTION_LENGTH = 500;
 
 /**
+ * Maximum length for a mode's authored first-contact welcome message (#311).
+ * Larger than a description because this is end-user-facing copy shown on the
+ * first scan of the mode's QR, not admin metadata — but kept well under
+ * WhatsApp's 1600-char single-message limit so the copy plus the deterministic
+ * `wa.me` share line the worker appends still fit inside one message.
+ */
+export const MAX_MODE_WELCOME_MESSAGE_LENGTH = 1000;
+
+/**
  * Maximum length for a mode markdown document (Phase 1 of #200).
  * Comfortably above the worst case of 7 × MAX_OVERRIDE_LENGTH plus heading
  * overhead.
@@ -102,6 +111,14 @@ export interface PromptMode {
   label?: string;
   /** Description of what this mode does */
   description?: string;
+  /**
+   * One-time, per-user-per-mode welcome copy shown the first time a user
+   * reaches this mode via its `#`-trigger / WhatsApp QR deep link (#311).
+   * Authored and opt-in: absent/empty ⇒ no welcome is emitted. The worker
+   * appends a deterministic `wa.me` share line to this text at emit time, so
+   * the authored copy itself should NOT include the link.
+   */
+  welcome_message?: string;
   /**
    * Whether this mode is visible to end users via list_modes/switch_mode.
    * `true` => user-visible. Anything else (`false`, `undefined`, missing) => draft.
@@ -421,6 +438,7 @@ export function validatePromptMode(mode: unknown): string | null {
     ('name' in obj ? validateModeName(obj.name) : null) ??
     validateOptionalString(obj, 'label', MAX_MODE_LABEL_LENGTH) ??
     validateOptionalString(obj, 'description', MAX_MODE_DESCRIPTION_LENGTH) ??
+    validateOptionalString(obj, 'welcome_message', MAX_MODE_WELCOME_MESSAGE_LENGTH) ??
     validateOptionalBoolean(obj, 'published') ??
     validateOptionalBoolean(obj, 'requires_group') ??
     validateModeAliases(obj.aliases);

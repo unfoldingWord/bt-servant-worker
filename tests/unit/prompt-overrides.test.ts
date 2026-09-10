@@ -14,6 +14,7 @@ import {
   MAX_MODE_NAME_LENGTH,
   MAX_MODE_LABEL_LENGTH,
   MAX_MODE_DESCRIPTION_LENGTH,
+  MAX_MODE_WELCOME_MESSAGE_LENGTH,
 } from '../../src/types/prompt-overrides.js';
 import { resolveEffectiveMode } from '../../src/types/mode-markdown.js';
 
@@ -393,6 +394,43 @@ describe('validatePromptMode — accepts', () => {
   it('rejects a non-boolean requires_group', () => {
     expect(validatePromptMode({ requires_group: 'yes', overrides: {} })).toContain(
       'requires_group must be a boolean'
+    );
+  });
+});
+
+// #311: authored per-mode welcome copy.
+describe('validatePromptMode — welcome_message (#311)', () => {
+  it('accepts a mode with a welcome_message', () => {
+    expect(
+      validatePromptMode({ welcome_message: 'Welcome to FIA mode!', overrides: {} })
+    ).toBeNull();
+  });
+
+  it('accepts a welcome_message at the maximum length', () => {
+    expect(
+      validatePromptMode({
+        welcome_message: 'a'.repeat(MAX_MODE_WELCOME_MESSAGE_LENGTH),
+        overrides: {},
+      })
+    ).toBeNull();
+  });
+
+  it('accepts an absent welcome_message (opt-in)', () => {
+    expect(validatePromptMode({ overrides: {} })).toBeNull();
+  });
+
+  it('rejects an over-length welcome_message', () => {
+    expect(
+      validatePromptMode({
+        welcome_message: 'a'.repeat(MAX_MODE_WELCOME_MESSAGE_LENGTH + 1),
+        overrides: {},
+      })
+    ).toContain('welcome_message exceeds maximum length');
+  });
+
+  it('rejects a non-string welcome_message', () => {
+    expect(validatePromptMode({ welcome_message: 42, overrides: {} })).toContain(
+      'welcome_message must be a string'
     );
   });
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { upsertMode } from '../../src/index.js';
+import { upsertMode, cloneMode, toMarkdownView } from '../../src/index.js';
 import { OrgModes, MAX_MODES_PER_ORG } from '../../src/types/prompt-overrides.js';
 
 function makeOrgModes(...modes: OrgModes['modes']): OrgModes {
@@ -86,6 +86,150 @@ describe('upsertMode - scalar field preservation', () => {
     const result = upsertMode(orgModes, { name: 't', label: 'New', overrides: {} }, 'o');
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.savedMode.label).toBe('New');
+  });
+});
+
+// #311: welcome_message is an authored scalar that must survive admin CRUD.
+// Before the fix, mergeExistingMode rebuilt the record field-by-field and
+// dropped it on every PUT, and toMarkdownView never surfaced it, so the portal
+// editor lost the copy on the next save.
+describe('upsertMode - welcome_message (#311)', () => {
+  it('preserves existing welcome_message when caller omits it', () => {
+    const orgModes = makeOrgModes({
+      name: 't',
+      welcome_message: 'Hi there',
+      overrides: {},
+    });
+    const result = upsertMode(orgModes, { name: 't', overrides: { identity: 'X' } }, 'o');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.savedMode.welcome_message).toBe('Hi there');
+  });
+
+  it('updates welcome_message when caller provides one', () => {
+    const orgModes = makeOrgModes({ name: 't', welcome_message: 'Old copy', overrides: {} });
+    const result = upsertMode(
+      orgModes,
+      { name: 't', welcome_message: 'New copy', overrides: {} },
+      'o'
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.savedMode.welcome_message).toBe('New copy');
+  });
+
+  it('persists welcome_message on a brand-new mode', () => {
+    const orgModes = makeOrgModes();
+    const result = upsertMode(
+      orgModes,
+      { name: 't', welcome_message: 'Fresh', overrides: {} },
+      'o'
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.savedMode.welcome_message).toBe('Fresh');
+  });
+});
+
+// #311 FIX 3: the CREATE branch previously stored the input object unchanged, so
+// `welcome_message: null` (or '') persisted `null` in KV — violating the
+// `string | undefined` shape and returning null to clients. Normalize on create
+// exactly as mergeExistingMode does on update: null/'' ⇒ store NO field.
+describe('upsertMode - welcome_message create-path normalization (#311 FIX 3)', () => {
+  it('stores NO welcome_message when a brand-new mode sends explicit null', () => {
+    const orgModes = makeOrgModes();
+    const result = upsertMode(
+      orgModes,
+      { name: 't', welcome_message: null, overrides: {} } as unknown as OrgModes['modes'][number],
+      'o'
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.savedMode.welcome_message).toBeUndefined();
+      // The key is absent from the stored record, not merely null.
+      expect('welcome_message' in result.savedMode).toBe(false);
+    }
+    // And the persisted mode in the array carries no field either.
+    expect('welcome_message' in orgModes.modes[0]!).toBe(false);
+  });
+
+  it('stores NO welcome_message when a brand-new mode sends an empty string', () => {
+    const orgModes = makeOrgModes();
+    const result = upsertMode(orgModes, { name: 't', welcome_message: '', overrides: {} }, 'o');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.savedMode.welcome_message).toBeUndefined();
+      expect('welcome_message' in result.savedMode).toBe(false);
+    }
+    expect('welcome_message' in orgModes.modes[0]!).toBe(false);
+  });
+});
+
+// #311 FIX 4: an author must be able to turn a welcome OFF. Three cases:
+//  - omit (undefined) ⇒ unchanged (covered by the suite above);
+//  - explicit null ⇒ removed (a plain `?? existing` treated null as a no-op);
+//  - explicit '' ⇒ removed (compactOptional drops empty strings; made explicit).
+describe('upsertMode - welcome_message opt-out (#311 FIX 4)', () => {
+  it('removes welcome_message when the caller sends explicit null', () => {
+    const orgModes = makeOrgModes({ name: 't', welcome_message: 'Turn me off', overrides: {} });
+    const result = upsertMode(
+      orgModes,
+      // JSON carries a portal "clear" as null; the PromptMode type says string,
+      // so cast to model the wire reality.
+      { name: 't', welcome_message: null, overrides: {} } as unknown as OrgModes['modes'][number],
+      'o'
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.savedMode.welcome_message).toBeUndefined();
+      // The key is dropped, not merely set to a falsy value.
+      expect('welcome_message' in result.savedMode).toBe(false);
+    }
+  });
+
+  it('removes welcome_message when the caller sends an empty string', () => {
+    const orgModes = makeOrgModes({ name: 't', welcome_message: 'Turn me off', overrides: {} });
+    const result = upsertMode(orgModes, { name: 't', welcome_message: '', overrides: {} }, 'o');
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.savedMode.welcome_message).toBeUndefined();
+      expect('welcome_message' in result.savedMode).toBe(false);
+    }
+  });
+
+  it('leaves welcome_message unchanged when the caller omits it', () => {
+    const orgModes = makeOrgModes({ name: 't', welcome_message: 'Keep me', overrides: {} });
+    const result = upsertMode(orgModes, { name: 't', overrides: { identity: 'X' } }, 'o');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.savedMode.welcome_message).toBe('Keep me');
+  });
+});
+
+describe('welcome_message view + clone (#311)', () => {
+  it('round-trips welcome_message through GET (view) -> PUT (omit) -> GET (view)', () => {
+    // GET: an authored mode surfaces welcome_message in the admin view.
+    const stored: OrgModes['modes'][number] = {
+      name: 't',
+      welcome_message: 'Round trip',
+      overrides: {},
+    };
+    expect(toMarkdownView(stored).welcome_message).toBe('Round trip');
+
+    // PUT that omits welcome_message (the portal editor's normal save).
+    const orgModes = makeOrgModes(stored);
+    const result = upsertMode(orgModes, { name: 't', overrides: { identity: 'X' } }, 'o');
+    expect(result.ok).toBe(true);
+
+    // GET again: the copy is still present in the view, not silently dropped.
+    if (result.ok) expect(toMarkdownView(result.savedMode).welcome_message).toBe('Round trip');
+  });
+
+  it('cloneMode copies welcome_message onto the clone', () => {
+    const orgModes = makeOrgModes({
+      name: 'src',
+      welcome_message: 'Clone me',
+      overrides: {},
+    });
+    const result = cloneMode(orgModes, 'src', 'dst');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.savedMode.welcome_message).toBe('Clone me');
   });
 });
 

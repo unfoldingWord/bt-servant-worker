@@ -365,6 +365,30 @@ export interface StreamCallbacks {
   onToolUse?: (toolName: string, input: unknown) => void;
   onToolResult?: (toolName: string, result: unknown) => void;
   onIterationComplete?: (text: string) => void;
+  /**
+   * Deliver a one-time mode first-contact welcome (#311) as its OWN message
+   * ahead of the model's answer. Present only on transports that render each
+   * send as a discrete message (the webhook/WhatsApp path); absent on SSE and
+   * `/chat/final`, where the welcome is carried as a `responses[]` entry
+   * instead. MUST reject on a delivery failure. The DO caller treats that
+   * rejection as NON-FATAL (#311, FIX C): it logs, withholds the `mode_welcomed`
+   * flag, sets a durable `mode_welcome_pending` bit so a later turn re-emits,
+   * and still returns the model's answer — the failed welcome never aborts the
+   * turn.
+   */
+  onWelcome?: (text: string) => Promise<void>;
+  /**
+   * SSE transports ONLY (#311 FIX 1). On the SSE path the in-band welcome ships
+   * inside `complete.responses`, which the client only receives if it is still
+   * connected when the `complete` event is written. The DO hands the one-time
+   * flag recording to the caller through this hook; the caller runs the handed
+   * `record` AFTER the `complete` write, passing `delivered = !clientDisconnected`
+   * so a mid-turn disconnect records a `mode_welcome_pending` re-emit instead of
+   * burning the flag on a welcome the user never saw. Absent on the webhook path
+   * (welcome sent out of band via `onWelcome`) and on `/chat/final` (no stream to
+   * drop — recorded inline as the turn is saved).
+   */
+  deferInBandWelcomeRecord?: (record: (delivered: boolean) => Promise<void>) => void;
 }
 
 /**

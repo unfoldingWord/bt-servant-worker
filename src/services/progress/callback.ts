@@ -103,6 +103,48 @@ export class ProgressCallbackSender {
     await this.post({ type: 'error', error });
   }
 
+  /**
+   * Deliver a one-time mode first-contact welcome (#311) as its own webhook
+   * message, ahead of the model's answer. Sent as a `progress` payload so the
+   * gateway renders it as a standalone message — exactly how iteration deltas
+   * arrive — with zero gateway changes.
+   *
+   * Unlike every other send here this does NOT swallow failures: it awaits the
+   * POST and THROWS on a network error or non-2xx status. The caller writes the
+   * `mode_welcomed` flag only after this resolves, so a failed delivery leaves
+   * the flag unset and the welcome re-emits on the retry. A rare double-send
+   * beats a permanent skip. It deliberately does not touch the progress
+   * accumulator or the iteration/complete delta cursor, so the model's own
+   * streamed deltas keep their prefix invariant.
+   */
+  async sendWelcome(text: string): Promise<void> {
+    if (!text) return;
+    const payload = this.buildPayload({ type: 'progress', text });
+    const ctx = { type: 'welcome', user_id: this.config.user_id };
+    this.logger?.log('webhook_send', {
+      ...ctx,
+      has_text: true,
+      text_length: text.length,
+      has_audio: false,
+      attachment_count: 0,
+    });
+    const response = await this.fetchWithTimeout(payload);
+    this.logger?.log('webhook_response', { ...ctx, status: response.status });
+    countMetric('progress_webhook_total', {
+      type: 'welcome',
+      status: response.ok ? 'success' : 'http_error',
+      status_code: response.status,
+    });
+    if (!response.ok) {
+      this.logger?.warn('webhook_failure', {
+        url: this.config.url,
+        status: response.status,
+        ...ctx,
+      });
+      throw new Error(`welcome webhook returned HTTP ${response.status}`);
+    }
+  }
+
   getAccumulatedText(): string {
     return this.accumulatedText;
   }
@@ -386,6 +428,10 @@ export function createWebhookCallbacks(
       incrementalSender?.complete();
       runSafe(logger, 'webhook_error_failed', () => sender.sendError(error));
     },
+    // #311: the welcome is its own message, sent before the model runs. It
+    // rejects on failure (unlike the other callbacks, which log-and-continue)
+    // so the DO withholds the mode_welcomed flag and re-emits on retry.
+    onWelcome: (text) => sender.sendWelcome(text),
   };
 
   if (mode === 'iteration') {

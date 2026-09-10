@@ -74,7 +74,10 @@ export interface ClassifierResult {
  * they cannot be shadowed by a published mode or language named
  * `default`/`none`/`clear`.
  */
-const CLEAR_TOKENS: ReadonlySet<string> = new Set(['default', 'none', 'clear']);
+// Exported so callers that must mirror this set (e.g. the mode-share-link
+// builder's reserved-slug guard) can assert parity in tests and never silently
+// drift from the canonical source.
+export const CLEAR_TOKENS: ReadonlySet<string> = new Set(['default', 'none', 'clear']);
 
 export interface ClassifierContext {
   availableModes: AvailableOption[];

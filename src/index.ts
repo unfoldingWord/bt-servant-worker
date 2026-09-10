@@ -1702,11 +1702,12 @@ function compactOptional<T extends Record<string, unknown>>(
  * Modes already stored as markdown pass their `document` through unchanged
  * and omit `originalSlots`.
  */
-function toMarkdownView(mode: PromptMode): {
+export function toMarkdownView(mode: PromptMode): {
   name: string;
   aliases?: string[];
   label?: string;
   description?: string;
+  welcome_message?: string;
   published?: boolean;
   requires_group?: boolean;
   document: string;
@@ -1721,6 +1722,10 @@ function toMarkdownView(mode: PromptMode): {
       aliases: normalizeAliases(mode.aliases),
       label: mode.label,
       description: mode.description,
+      // #311: first-contact welcome copy is an authored scalar that must
+      // survive the round-trip to the portal editor, or a re-save silently
+      // drops it (mergeExistingMode reads it back off this view's PUT).
+      welcome_message: mode.welcome_message,
       published: mode.published,
       requires_group: mode.requires_group,
       originalSlots: isLegacy ? (mode.overrides ?? {}) : undefined,
@@ -1756,6 +1761,31 @@ function mergeContentFields(
 }
 
 /**
+ * Resolve a nullable, clearable authored scalar on mode upsert (#311, FIX 4).
+ * `welcome_message` is the one field an author must be able to turn OFF, so it
+ * departs from the plain `incoming ?? existing` rule with three cases:
+ *
+ *  - OMITTED (`undefined`) ⇒ UNCHANGED — the existing value carries through
+ *    (the portal editor's normal save omits the field).
+ *  - explicit `null` OR empty string `''` ⇒ CLEARED — returns `undefined` so
+ *    `compactOptional` drops the key and the stored mode loses the field.
+ *  - a non-empty string ⇒ SET to that value.
+ *
+ * `null` reaches here because `validateOptionalString` accepts it (JSON has no
+ * `undefined`, so a portal "clear" sends `null`); a plain `?? existing` would
+ * treat it as a no-op. `''` already opted out via `compactOptional` dropping
+ * empty strings — this makes both explicit. Mirrors the prompt-slot tombstone
+ * convention (`mergePromptOverrides`: `null` deletes a slot).
+ */
+function resolveClearableModeField(
+  incoming: string | null | undefined,
+  existing: string | undefined
+): string | undefined {
+  if (incoming === undefined) return existing;
+  return incoming === null || incoming === '' ? undefined : incoming;
+}
+
+/**
  * Merge an incoming mode with an existing one (Phase 1 of #200).
  *
  * Scalar fields (label/description/published) follow the prior "incoming
@@ -1772,11 +1802,45 @@ function mergeExistingMode(existing: PromptMode, incoming: PromptMode): PromptMo
       aliases: normalizeAliases(incoming.aliases ?? existing.aliases),
       label: incoming.label ?? existing.label,
       description: incoming.description ?? existing.description,
+      // #311 FIX 4: omit ⇒ unchanged, explicit null/'' ⇒ cleared, string ⇒ set.
+      // (A plain `?? existing` made null a no-op, so a welcome could never be
+      // turned off.) The cast reflects that JSON can deliver null even though
+      // the PromptMode type declares `welcome_message?: string`.
+      welcome_message: resolveClearableModeField(
+        incoming.welcome_message as string | null | undefined,
+        existing.welcome_message
+      ),
       published: incoming.published ?? existing.published,
       requires_group: incoming.requires_group ?? existing.requires_group,
     }),
     ...mergeContentFields(existing, incoming),
   };
+}
+
+/**
+ * Build the stored record for a BRAND-NEW mode. Strips control characters from
+ * `document` (mirroring the language scaffold pattern) and normalizes
+ * `welcome_message` exactly as `mergeExistingMode` does on the update path
+ * (#311 FIX 3): an explicit `null` or `''` means "no welcome", so store NO field
+ * rather than persisting `null` (which violates the `string | undefined` shape
+ * and returns null to clients). A non-empty string is kept; an omitted field is
+ * absent. Returns a fresh object so the caller never mutates `modeInput`.
+ */
+function buildNewMode(modeInput: PromptMode): PromptMode {
+  const newMode: PromptMode = { ...modeInput };
+  if (newMode.document !== undefined) {
+    newMode.document = stripControlChars(newMode.document);
+  }
+  const resolvedWelcome = resolveClearableModeField(
+    newMode.welcome_message as string | null | undefined,
+    undefined
+  );
+  if (resolvedWelcome === undefined) {
+    delete newMode.welcome_message;
+  } else {
+    newMode.welcome_message = resolvedWelcome;
+  }
+  return newMode;
 }
 
 /**
@@ -1825,11 +1889,8 @@ export function upsertMode(
   ]);
   if (collision) return { ok: false, error: collision };
 
-  // New mode: sanitize document field if present.
-  const newMode: PromptMode =
-    modeInput.document !== undefined
-      ? { ...modeInput, document: stripControlChars(modeInput.document) }
-      : modeInput;
+  // New mode: sanitize the document field and normalize welcome_message.
+  const newMode = buildNewMode(modeInput);
 
   logger?.log('admin_action', {
     action: 'upsert_mode_before',
@@ -1930,6 +1991,9 @@ export function cloneMode(
     ...compactOptional({
       label: newLabel ?? source.label,
       description: source.description,
+      // #311: welcome copy is content the author wrote, so a clone carries it
+      // (aliases are the deliberate exception — a clone is a new identity).
+      welcome_message: source.welcome_message,
       requires_group: source.requires_group,
     }),
     published: false,

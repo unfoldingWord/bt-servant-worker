@@ -50,6 +50,8 @@ export default defineConfig({
           // Pass API keys for real chat tests
           ENGINE_API_KEY: 'test-api-key',
           ANTHROPIC_API_KEY: anthropicKey,
+          // #311: wa.me share number for first-contact welcome tests.
+          WHATSAPP_NUMBER: '15558196461',
         },
         kvNamespaces: ['ORG_ADMIN_KEYS', 'MCP_SERVERS', 'ORG_CONFIG', 'PROMPT_OVERRIDES'],
         r2Buckets: ['AUDIO_BUCKET', 'PTXPRINT_BUCKET'],
