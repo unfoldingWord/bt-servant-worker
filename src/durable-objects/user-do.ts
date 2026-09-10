@@ -61,6 +61,8 @@ import {
   validatePromptOverrides,
 } from '../types/prompt-overrides.js';
 import { resolveEffectiveMode } from '../types/mode-markdown.js';
+import { buildModeWelcomeText } from '../utils/mode-welcome.js';
+import { WA_ME_ORIGIN } from '../utils/mode-share-link.js';
 import {
   transcribeAudio,
   synthesizeSpeech,
@@ -111,6 +113,14 @@ const PREFERENCES_KEY = 'preferences';
 const PROMPT_OVERRIDES_KEY = 'prompt_overrides';
 const SELECTED_MODE_KEY = 'selected_mode';
 const SELECTED_LANGUAGE_KEY = 'selected_language';
+/**
+ * Prefix for the one-time per-user-per-mode welcome flag (#311). Full key is
+ * `mode_welcomed:<canonical-slug>`. Deliberately NOT the `first_interaction`
+ * preference: an existing user scanning a NEW mode's QR must still get that
+ * mode's welcome (decided with Elsy), which a global first-interaction flag
+ * would suppress.
+ */
+const MODE_WELCOMED_PREFIX = 'mode_welcomed:';
 const PROCESSING_LOCK_KEY = '_processing_lock';
 const QUEUE_KEY = 'queue';
 const QUEUE_PROCESSING_KEY = 'queue_processing';
@@ -1776,16 +1786,26 @@ export class UserDO {
     );
     const audioKey = voiceAudio?.audioKey ?? null;
 
+    // #311: a one-time per-mode welcome rides ahead of the model's answer as
+    // its own `responses` entry, so on the WhatsApp/matrix path it arrives as a
+    // separate message before the answer. Prepended AFTER TTS extraction on
+    // purpose: the welcome is text-only for V1, and leaving `orchResult`
+    // untouched keeps `finalIterationStartIndex` pointing at the model's own
+    // responses so voice output is unaffected.
+    const responses = triggerCtx.welcomeMessage
+      ? [triggerCtx.welcomeMessage, ...orchResult.responses]
+      : orchResult.responses;
+
     // prettier-ignore
     await this.tracedPhase(ctx, 'save_conversation', () =>
-      this.saveConversation(triggerCtx.messageText, orchResult.responses, loaded.preferences, body._org_config ?? {}, { logger, audioKey, inboundVoiceKey: loaded.inboundVoiceKey, speaker: body.speaker, attachments: attachmentsContext.list() })
+      this.saveConversation(triggerCtx.messageText, responses, loaded.preferences, body._org_config ?? {}, { logger, audioKey, inboundVoiceKey: loaded.inboundVoiceKey, speaker: body.speaker, attachments: attachmentsContext.list() })
     );
 
     // prettier-ignore
-    this.logChatTurn(body, effectivePreferences.response_language, logger, { turnId, activeModeName: triggerCtx.activeModeName, activeLanguageName: triggerCtx.activeLanguageName, languageSource: triggerCtx.languageSource, orchestration: orchResult.telemetry, durationMs: Date.now() - ctx.startTime, hadInboundVoice: !!loaded.inboundVoiceKey, hadOutboundVoice: audioKey !== null, inputLanguage, text: chatTurnText(triggerCtx.messageText, orchResult.responses) });
+    this.logChatTurn(body, effectivePreferences.response_language, logger, { turnId, activeModeName: triggerCtx.activeModeName, activeLanguageName: triggerCtx.activeLanguageName, languageSource: triggerCtx.languageSource, orchestration: orchResult.telemetry, durationMs: Date.now() - ctx.startTime, hadInboundVoice: !!loaded.inboundVoiceKey, hadOutboundVoice: audioKey !== null, inputLanguage, text: chatTurnText(triggerCtx.messageText, responses) });
 
     // prettier-ignore
-    return this.assembleChatResponse({ responses: orchResult.responses, audioKey, workerOrigin, attachmentsContext, effectivePreferences, inputLanguage, logger, startTime: ctx.startTime });
+    return this.assembleChatResponse({ responses, audioKey, workerOrigin, attachmentsContext, effectivePreferences, inputLanguage, logger, startTime: ctx.startTime });
   }
 
   /**
@@ -1980,6 +2000,14 @@ export class UserDO {
     );
     await this.dispatchSelectionPersistence(SELECTED_LANGUAGE_KEY, languagePersistence);
 
+    // #311: a `#`-trigger that resolved to a NEW mode this turn is the only
+    // path that can emit a first-contact welcome. `newEffectiveModeName` is set
+    // exactly there (canonical slug), so gating on it keeps the welcome off the
+    // clear-intent path and off persisted-fallback re-entries into a mode.
+    const welcomeMessage = newEffectiveModeName
+      ? await this.maybeBuildModeWelcome(loaded, newEffectiveModeName, logger)
+      : undefined;
+
     return {
       resolved,
       activeModeName,
@@ -1988,7 +2016,52 @@ export class UserDO {
       languageSource: language.languageSource,
       modePersistence,
       languagePersistence,
+      welcomeMessage,
     };
+  }
+
+  /**
+   * Build the one-time per-user-per-mode first-contact welcome (#311), or
+   * `undefined` when none should be emitted this turn.
+   *
+   * Emits only when ALL hold:
+   *   1. the mode carries authored `welcome_message` copy (V1 is opt-in by
+   *      authoring — a mode with no copy emits nothing, a deliberate decision
+   *      so the welcome never surprises modes that did not opt in), and
+   *   2. DO storage has no `mode_welcomed:<slug>` flag for this user+mode yet.
+   *
+   * `effectiveModeName` is the mode's canonical slug (from
+   * `resolveEffectiveMode`), so the storage key and the `wa.me` trigger both
+   * key off the canonical name even when the user scanned an alias.
+   *
+   * The welcome is text-only for V1. The `wa.me` share line is assembled by
+   * `buildModeWelcomeText`; when `WHATSAPP_NUMBER` is unset the line is omitted
+   * (logged below) rather than crashing the turn.
+   */
+  private async maybeBuildModeWelcome(
+    loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
+    effectiveModeName: string,
+    logger: RequestLogger
+  ): Promise<string | undefined> {
+    const mode = loaded.orgModes.modes.find((m) => m.name === effectiveModeName);
+    const welcomeCopy = mode?.welcome_message?.trim();
+    if (!welcomeCopy) return undefined;
+
+    const storageKey = MODE_WELCOMED_PREFIX + effectiveModeName;
+    const alreadyWelcomed = await this.state.storage.get<boolean>(storageKey);
+    if (alreadyWelcomed === true) return undefined;
+
+    const welcome = buildModeWelcomeText(welcomeCopy, effectiveModeName, this.env.WHATSAPP_NUMBER);
+    await this.state.storage.put(storageKey, true);
+    logger.log('mode_welcome_emitted', {
+      mode: effectiveModeName,
+      // Greppable: a missing/typo'd WHATSAPP_NUMBER drops the forwarding link
+      // silently to the user, so surface it in logs rather than swallowing it.
+      whatsapp_number_configured: !!this.env.WHATSAPP_NUMBER,
+      has_share_link: welcome.includes(WA_ME_ORIGIN),
+      welcome_length: welcome.length,
+    });
+    return welcome;
   }
 
   /** Apply a mode/language selection persistence decision to DO storage. */

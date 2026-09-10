@@ -12,6 +12,15 @@ export interface Env {
   ADMIN_RATE_LIMIT_MAX?: string;
   ADMIN_RATE_LIMIT_WINDOW_MS?: string;
 
+  /**
+   * WhatsApp business number (E.164 digits, no `+`) used to build the per-mode
+   * `wa.me` share link embedded in a mode's first-contact welcome (#311). Same
+   * var/value the portal reads to render its share panel. Optional: when unset
+   * the welcome still goes out but without the share line (see
+   * src/utils/mode-welcome.ts).
+   */
+  WHATSAPP_NUMBER?: string;
+
   // Claude configuration (optional - has defaults)
   CLAUDE_MODEL?: string;
   CLAUDE_MAX_TOKENS?: string;
