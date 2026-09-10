@@ -917,3 +917,205 @@ describe('per-mode welcome — SSE path in-band prepend (#311 FIX 1)', () => {
     expect(await readWelcomedFlag(stub, 'spoken')).toBe(true);
   });
 });
+
+// FIX 1 (5th round): on the SSE path the welcome ships inside `complete.responses`,
+// which the client receives ONLY if still connected when `complete` is written.
+// Recording the one-time flag is therefore DEFERRED to the SSE caller, which runs
+// it AFTER the complete write with the live connection state — a mid-turn
+// disconnect records a `mode_welcome_pending` re-emit instead of burning the flag
+// on a welcome the user never saw. These drive the DO pipeline directly and invoke
+// the deferred recorder the caller would run.
+describe('per-mode welcome — SSE deferred flag recording (#311 FIX 1)', () => {
+  let stub: DurableObjectStub;
+
+  beforeEach(() => {
+    stub = env.USER_DO.get(env.USER_DO.newUniqueId());
+    setupAnthropicSSE();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('defers recording: processChat writes NEITHER the flag NOR pending inline', async () => {
+    // The caller hands off `record` but this test never invokes it — simulating
+    // the window between `processChat` returning and the caller writing `complete`.
+    const response = await runProcessChat(
+      stub,
+      triggerBody('#spoken hi'),
+      callbackStreamCallbacks({ deferInBandWelcomeRecord: () => {} })
+    );
+
+    // Welcome rode in-band ahead of the model answer.
+    expect(response.responses).toHaveLength(2);
+    expect(response.responses[0]).toContain('Welcome to Spoken mode!');
+
+    // FIX 1: nothing was recorded during processChat — the flag write is deferred
+    // to the caller, gated on the client still being connected at the complete
+    // write. (The connected case — flag set after `complete` — is covered by the
+    // `/chat/stream` in-band test above, which exercises the real SSE caller.)
+    expect(await readWelcomedFlag(stub, 'spoken')).toBeUndefined();
+    expect(await readPendingFlag(stub, 'spoken')).toBeUndefined();
+  });
+
+  it('a disconnect at the complete write records pending, NOT the one-time flag', async () => {
+    // The caller runs the handed recorder with delivered=false (client dropped
+    // before `complete` reached it). Invoke it synchronously inside the deferral
+    // so the single pending-put runs within the live DO invocation context.
+    let recordPromise: Promise<void> | undefined;
+    const response = await runProcessChat(
+      stub,
+      triggerBody('#spoken hi'),
+      callbackStreamCallbacks({
+        deferInBandWelcomeRecord: (record) => {
+          recordPromise = record(false);
+        },
+      })
+    );
+    await recordPromise;
+
+    expect(response.responses).toHaveLength(2);
+    // Disconnect ⇒ pending re-emit queued; the one-time flag stays UNSET so a
+    // later same-mode turn re-emits the welcome the user never saw.
+    expect(await readWelcomedFlag(stub, 'spoken')).toBeUndefined();
+    expect(await readPendingFlag(stub, 'spoken')).toBe(true);
+  });
+});
+
+// FIX 2 (5th round): an admin preview carries no keys (admins re-preview freely,
+// never `mode_welcomed`), so `recordWelcomeDelivered` no-ops and the end-of-turn
+// flip is skipped on the emitting turn — leaving `first_interaction:true`. The
+// preview DID go out, so it must persist `first_interaction:false` durably (and
+// ONLY that). Without it the next already-active `#<mode>` turn triggers the
+// model's own "Briefly welcome them." injection.
+describe('per-mode welcome — admin preview persists first_interaction:false (#311 FIX 2)', () => {
+  const WELCOME_NOTE = 'Briefly welcome them.';
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const adminBody = (message: string): ChatRequest =>
+    buildChatBody({ message, _org_modes: ORG_MODES, client_id: 'admin-portal' });
+
+  it('admin emit persists first_interaction:false (no flag) so the next #<mode> turn omits the model note', async () => {
+    const capture = setupAnthropicFetchCapture();
+    const stub = env.USER_DO.get(env.USER_DO.newUniqueId()); // fresh ⇒ first_interaction: true
+
+    // Turn 1: admin enters spoken ⇒ authored preview emits.
+    const first = await postChatFinalJson(stub, adminBody('#spoken hi'));
+    expect(first.responses[0]).toContain('Welcome to Spoken mode!');
+
+    // first_interaction is durably false now — but NO one-time flag (re-preview
+    // must still work) and NO pending bit were written.
+    expect((await readStoredPreferences(stub))?.first_interaction).toBe(false);
+    expect(await readWelcomedFlag(stub, 'spoken')).toBeUndefined();
+    expect(await readPendingFlag(stub, 'spoken')).toBeUndefined();
+
+    // Turn 2: already-active #spoken (the portal prefixes it every turn). The
+    // authored copy is correctly withheld AND the model's own welcome note is
+    // ABSENT — because first_interaction is already durably false.
+    const second = await postChatFinalJson(stub, adminBody('#spoken again'));
+    expect(second.responses).toEqual(['ok']);
+    expect(capture.calls).toHaveLength(2);
+    expect(capture.calls[1]?.system).not.toContain(WELCOME_NOTE);
+    // Still no one-time flag for the admin — re-preview stays available.
+    expect(await readWelcomedFlag(stub, 'spoken')).toBeUndefined();
+  });
+});
+
+// FIX 3 (5th round): the one-time flag is keyed on the CURRENT canonical slug.
+// After a reslug (`spoken` → `spoken-v2`, old slug kept as an alias, #284) a user
+// already welcomed under `mode_welcomed:spoken` must NOT be re-welcomed under the
+// new canonical `spoken-v2`. The check treats the user as welcomed if ANY current
+// slug (canonical + aliases) carries the flag, and copies it onto the canonical
+// key (copy-on-read).
+describe('per-mode welcome — reslug/alias does not re-welcome (#311 FIX 3)', () => {
+  const SPOKEN_V2: PromptMode = {
+    name: 'spoken-v2',
+    label: 'Spoken',
+    published: true,
+    welcome_message: 'Welcome to Spoken mode!',
+    aliases: ['spoken'],
+    overrides: {},
+  };
+  const ORG_MODES_RESLUGGED: OrgModes = { modes: [SPOKEN_V2] };
+
+  let stub: DurableObjectStub;
+
+  beforeEach(() => {
+    stub = env.USER_DO.get(env.USER_DO.newUniqueId());
+    setupAnthropicFetchCapture();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const resluggedBody = (message: string): ChatRequest =>
+    buildChatBody({ message, _org_modes: ORG_MODES_RESLUGGED });
+
+  it('does NOT re-welcome when scanning the former slug (now an alias); copies the flag to canonical', async () => {
+    await seedWelcomedFlag(stub, 'spoken'); // welcomed under the OLD canonical slug
+
+    const result = await postChatFinalJson(stub, resluggedBody('#spoken hi'));
+
+    // No re-welcome — just the model answer.
+    expect(result.responses).toEqual(['ok']);
+    // Copy-on-read: the canonical key is now present.
+    expect(await readWelcomedFlag(stub, 'spoken-v2')).toBe(true);
+  });
+
+  it('does NOT re-welcome when scanning the new canonical slug', async () => {
+    await seedWelcomedFlag(stub, 'spoken'); // welcomed under the OLD slug (alias now)
+
+    const result = await postChatFinalJson(stub, resluggedBody('#spoken-v2 hi'));
+
+    expect(result.responses).toEqual(['ok']);
+    expect(await readWelcomedFlag(stub, 'spoken-v2')).toBe(true);
+  });
+});
+
+// FIX 4 (5th round): `maybePendingWelcome` returned undefined when a mode had no
+// `welcome_message` but left a stale `mode_welcome_pending:<key>` bit. So: delivery
+// fails (pending set) → admin clears the copy → later re-authors it → next PLAIN
+// same-mode turn surprise-welcomes the user. The pending bit must be cleared when
+// the copy is (empty/)absent.
+describe('per-mode welcome — clears stale pending when copy removed (#311 FIX 4)', () => {
+  // `spoken` with NO welcome_message (the copy was cleared).
+  const SPOKEN_NO_COPY: PromptMode = {
+    name: 'spoken',
+    label: 'Spoken',
+    published: true,
+    overrides: {},
+  };
+  const ORG_MODES_NO_COPY: OrgModes = { modes: [SPOKEN_NO_COPY] };
+
+  let stub: DurableObjectStub;
+
+  beforeEach(() => {
+    stub = env.USER_DO.get(env.USER_DO.newUniqueId());
+    setupAnthropicFetchCapture();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('deletes the pending bit and does not surprise-welcome on the next plain same-mode turn', async () => {
+    await seedSelectedMode(stub, 'spoken');
+    await seedPendingFlag(stub, 'spoken'); // left by an earlier failed delivery
+
+    const result = await postChatFinalJson(
+      stub,
+      buildChatBody({ message: 'hello', _org_modes: ORG_MODES_NO_COPY })
+    );
+
+    // No welcome (the copy is gone) — just the model answer.
+    expect(result.responses).toEqual(['ok']);
+    // The stale pending bit is cleared, so re-authoring the copy later cannot
+    // surprise-welcome the user.
+    expect(await readPendingFlag(stub, 'spoken')).toBeUndefined();
+    expect(await readWelcomedFlag(stub, 'spoken')).toBeUndefined();
+  });
+});

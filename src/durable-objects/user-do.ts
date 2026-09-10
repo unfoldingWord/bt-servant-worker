@@ -1182,7 +1182,7 @@ export class UserDO {
   ): Response {
     const { readable, writable } = new TransformStream<Uint8Array>();
     const writer = writable.getWriter();
-    const { sendEvent, keepaliveInterval } = this.buildSSESender(writer, logger, Date.now());
+    const { sendEvent, keepaliveInterval, state } = this.buildSSESender(writer, logger, Date.now());
 
     // #311 FIX 1: the SSE path does NOT wire `onWelcome`. Both live SSE consumers
     // (web client `use-chat-runtime.ts`, portal `sse-stream.ts`) REPLACE the
@@ -1191,6 +1191,10 @@ export class UserDO {
     // in-band into `complete.responses` (see `processChat`).
     // TODO(#311 follow-up): a truly-separate SSE welcome bubble would need a new
     // dedicated SSE event type plus web-client + portal changes to render it.
+    // FIX 1: `deferInBandWelcomeRecord` captures the DO's flag-recording closure
+    // so it runs AFTER the `complete` write, gated on the client still being
+    // connected (a disconnect records a pending re-emit instead of the flag).
+    let recordWelcome: ((delivered: boolean) => Promise<void>) | undefined;
     const callbacks: StreamCallbacks = {
       onStatus: async (status) => sendEvent({ type: 'status', ...status }),
       onProgress: async (text) => sendEvent({ type: 'progress', text }),
@@ -1198,6 +1202,9 @@ export class UserDO {
       onError: async (error) => sendEvent({ type: 'error', error }),
       onToolUse: async (tool, input) => sendEvent({ type: 'tool_use', tool, input }),
       onToolResult: async (tool, result) => sendEvent({ type: 'tool_result', tool, result }),
+      deferInBandWelcomeRecord: (record) => {
+        recordWelcome = record;
+      },
     };
 
     // Process in background — the Response is returned immediately with the SSE stream
@@ -1206,6 +1213,10 @@ export class UserDO {
         const timing = createTimingContext();
         const response = await this.processChat(body, workerOrigin, logger, timing, callbacks);
         await sendEvent({ type: 'complete', response });
+        // #311 FIX 1: record the one-time welcome flag ONLY after the `complete`
+        // write, with the live connection state — a mid-turn disconnect leaves a
+        // pending re-emit instead of burning the flag on an unseen welcome.
+        await this.finalizeSseWelcomeRecord(recordWelcome, state, logger);
       } catch (error) {
         this.logFailedChatTurn(body, error, logger);
         logger.error('immediate_sse_error', error, { message_id: messageId });
@@ -1439,7 +1450,7 @@ export class UserDO {
   private async processSSEEntry(entry: InternalQueueEntry, logger: RequestLogger): Promise<void> {
     const body = entry.body;
     const writer = this.queuedWriters.get(entry.message_id);
-    const { sendEvent, keepaliveInterval } = this.buildSSESender(writer, logger, Date.now());
+    const { sendEvent, keepaliveInterval, state } = this.buildSSESender(writer, logger, Date.now());
     // Resolved inside the try so the finally (writer close) always runs.
     let locale = DEFAULT_PREFERENCES.response_language;
 
@@ -1448,6 +1459,9 @@ export class UserDO {
       // #311 FIX 1: no `onWelcome` on the SSE path — the welcome is prepended
       // in-band into `complete.responses` (both SSE consumers replace the stream
       // with that array, so an out-of-band progress welcome would be dropped).
+      // `deferInBandWelcomeRecord` defers the one-time flag write to after the
+      // `complete` send so a mid-turn disconnect re-emits instead of skipping.
+      let recordWelcome: ((delivered: boolean) => Promise<void>) | undefined;
       const callbacks: StreamCallbacks = {
         onStatus: async (status) => sendEvent({ type: 'status', ...status }),
         onProgress: async (text) => sendEvent({ type: 'progress', text }),
@@ -1456,6 +1470,9 @@ export class UserDO {
         onError: async (error) => sendEvent({ type: 'error', error }),
         onToolUse: async (tool, input) => sendEvent({ type: 'tool_use', tool, input }),
         onToolResult: async (tool, result) => sendEvent({ type: 'tool_result', tool, result }),
+        deferInBandWelcomeRecord: (record) => {
+          recordWelcome = record;
+        },
       };
 
       const timing = createTimingContext();
@@ -1467,6 +1484,9 @@ export class UserDO {
         callbacks
       );
       await sendEvent({ type: 'complete', response });
+      // #311 FIX 1: record the one-time welcome flag only after the `complete`
+      // write, gated on the client still being connected (else pending re-emit).
+      await this.finalizeSseWelcomeRecord(recordWelcome, state, logger);
     } catch (error) {
       // Send error to SSE client BEFORE closing the writer — if we let this propagate
       // to processQueueEntry's handleProcessingError, the writer is already closed.
@@ -1887,7 +1907,11 @@ export class UserDO {
 
     // #311: on SSE/final the welcome ships inside `responses`; record it as
     // delivered only after the turn is saved, so a throw before here re-emits.
-    await this.recordInBandWelcome(welcome, welcomeDelivery.handledOutOfBand);
+    // FIX 1: on the SSE path recording is DEFERRED to the caller (run after the
+    // `complete` write, gated on the client still being connected) via
+    // `deferInBandWelcomeRecord`; `/chat/final` (no such hook) records inline.
+    // FIX 2: an emitted admin preview also persists `first_interaction:false`.
+    await this.finalizeEmittedWelcome(welcome, welcomeDelivery.handledOutOfBand, callbacks);
 
     // prettier-ignore
     this.logChatTurn(body, effectivePreferences.response_language, logger, { turnId, activeModeName: triggerCtx.activeModeName, activeLanguageName: triggerCtx.activeLanguageName, languageSource: triggerCtx.languageSource, orchestration: orchResult.telemetry, durationMs: Date.now() - ctx.startTime, hadInboundVoice: !!loaded.inboundVoiceKey, hadOutboundVoice: audioKey !== null, inputLanguage, text: chatTurnText(triggerCtx.messageText, responses) });
@@ -2144,15 +2168,103 @@ export class UserDO {
   }
 
   /**
-   * #311: on SSE/final the welcome ships inside `responses`; record it as
-   * delivered only after the turn is saved, so a throw before that point
-   * re-emits. Out-of-band delivery already recorded itself.
+   * #311: finalize the emitted welcome's durable state after the turn is saved.
+   * Covers the in-band (SSE/`/chat/final`) one-time flag AND the admin-preview
+   * `first_interaction:false` write (FIX 2). Out-of-band (webhook) delivery
+   * already recorded its own flag, so the flag half no-ops there.
+   *
+   * FIX 1: on the SSE path the welcome only reaches the client inside the
+   * `complete` event, which is written by the caller AFTER `processChat` returns
+   * — and a mid-turn client disconnect makes that write a no-op. So when the
+   * caller supplies `deferInBandWelcomeRecord`, DEFER flag recording to it: the
+   * caller runs the handed recorder after the `complete` write with `delivered =
+   * !clientDisconnected`. On `/chat/final` there is no stream to drop, so record
+   * inline right here (as before). A throw before this point re-emits on retry.
    */
-  private async recordInBandWelcome(
+  private async finalizeEmittedWelcome(
     welcome: ModeWelcome | undefined,
-    sentOutOfBand: boolean
+    sentOutOfBand: boolean,
+    callbacks: StreamCallbacks | undefined
   ): Promise<void> {
-    if (welcome && !sentOutOfBand) await this.recordWelcomeDelivered(welcome);
+    if (!welcome) return;
+    // FIX 2: an admin preview carries no keys, so the flag paths below no-op for
+    // it — persist `first_interaction:false` here (and ONLY that) so a later
+    // already-active `#<mode>` turn does not trigger the model's own welcome.
+    await this.recordAdminWelcomeEmitted(welcome);
+    if (sentOutOfBand) return;
+    if (callbacks?.deferInBandWelcomeRecord) {
+      // SSE: the caller runs this after the `complete` write (see the SSE
+      // handlers), passing whether the client was still connected.
+      callbacks.deferInBandWelcomeRecord((delivered) =>
+        this.recordInBandWelcomeOutcome(welcome, delivered)
+      );
+      return;
+    }
+    // `/chat/final`: no stream to disconnect — the welcome is in the JSON body.
+    await this.recordWelcomeDelivered(welcome);
+  }
+
+  /**
+   * #311 FIX 1: apply the deferred SSE welcome outcome. `delivered` (the client
+   * was still connected when `complete` was written) records the one-time flag;
+   * a disconnect leaves a `mode_welcome_pending` bit instead so a later
+   * same-mode turn re-emits the welcome the user never saw. Admin previews carry
+   * no keys, so both branches no-op for them (re-preview stays intact).
+   */
+  private async recordInBandWelcomeOutcome(
+    welcome: ModeWelcome,
+    delivered: boolean
+  ): Promise<void> {
+    if (delivered) {
+      await this.recordWelcomeDelivered(welcome);
+    } else if (welcome.keys) {
+      await this.state.storage.put(welcome.keys.pending, true);
+    }
+  }
+
+  /**
+   * #311 FIX 2: an admin welcome carries NO keys (admins re-preview freely and
+   * are never `mode_welcomed`), so `recordWelcomeDelivered` no-ops and the
+   * end-of-turn `first_interaction` flip is skipped on an emitting turn —
+   * leaving `first_interaction:true`. The preview DID go out, so persist
+   * `first_interaction:false` durably here (and ONLY that — no `mode_welcomed`,
+   * no pending). Without it the next already-active `#<mode>` turn (the portal
+   * prefixes `#<mode>` every turn, and the authored copy is correctly withheld)
+   * would trigger the model's own "This is the user's first interaction. Briefly
+   * welcome them." injection. No-op for non-admin welcomes (they carry keys).
+   */
+  private async recordAdminWelcomeEmitted(welcome: ModeWelcome | undefined): Promise<void> {
+    if (!welcome || welcome.keys) return;
+    const preferences = await this.getPreferences();
+    if (preferences.first_interaction) {
+      await this.updatePreferences({ ...preferences, first_interaction: false });
+    }
+  }
+
+  /**
+   * #311 FIX 1: run the deferred SSE welcome recorder after the `complete` event
+   * was written. `delivered = !clientDisconnected` — the client received the
+   * welcome only if it was still connected. A storage failure here is NON-FATAL:
+   * the turn already completed and `complete` already shipped, so log it (never
+   * silently) and continue — worst case the one-time flag is not recorded and the
+   * user is re-welcomed on a later same-mode turn, which the logs make visible.
+   */
+  private async finalizeSseWelcomeRecord(
+    record: ((delivered: boolean) => Promise<void>) | undefined,
+    state: { clientDisconnected: boolean },
+    logger: RequestLogger
+  ): Promise<void> {
+    if (!record) return;
+    try {
+      await record(!state.clientDisconnected);
+    } catch (error) {
+      logger.warn('mode_welcome_record_failed', {
+        client_disconnected: state.clientDisconnected,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // Explicitly continue — recording the one-time flag is a post-turn side
+      // effect; failing it must not tear down an already-completed SSE turn.
+    }
   }
 
   /**
@@ -2239,7 +2351,7 @@ export class UserDO {
   ): Promise<ModeWelcome | undefined> {
     const mode = loaded.orgModes.modes.find((m) => m.name === effectiveModeName);
     const welcomeCopy = mode?.welcome_message?.trim();
-    if (!welcomeCopy) return undefined;
+    if (!mode || !welcomeCopy) return undefined;
 
     const text = buildModeWelcomeText(welcomeCopy, effectiveModeName, this.env.WHATSAPP_NUMBER);
 
@@ -2258,9 +2370,13 @@ export class UserDO {
       return { text };
     }
 
-    const welcomedKey = this.modeWelcomedKey(body, effectiveModeName);
-    const alreadyWelcomed = await this.state.storage.get<boolean>(welcomedKey);
-    if (alreadyWelcomed === true) return undefined;
+    // FIX 3 (#311): alias-aware — a user welcomed under ANY of the mode's CURRENT
+    // slugs (canonical `name` + `aliases`) is already welcomed, so a rename/reslug
+    // (#284) that turns the old slug into an alias never re-welcomes them. Flags
+    // live per user DO and cannot be migrated from org KV, so this is a
+    // copy-on-read check: the delivered flag is still WRITTEN on the CANONICAL key
+    // via `modeWelcomeKeys(effectiveModeName)` below.
+    if (await this.isAnyCurrentSlugWelcomed(body, mode)) return undefined;
 
     this.logModeWelcomePrepared(logger, effectiveModeName, text, { reason: 'first_contact' });
     return { text, keys: this.modeWelcomeKeys(body, effectiveModeName) };
@@ -2284,12 +2400,22 @@ export class UserDO {
     const keys = this.modeWelcomeKeys(body, activeModeName);
     const pending = await this.state.storage.get<boolean>(keys.pending);
     if (pending !== true) return undefined;
-    const alreadyWelcomed = await this.state.storage.get<boolean>(keys.welcomed);
-    if (alreadyWelcomed === true) return undefined;
 
     const mode = loaded.orgModes.modes.find((m) => m.name === activeModeName);
     const welcomeCopy = mode?.welcome_message?.trim();
-    if (!welcomeCopy) return undefined;
+    // FIX 4 (#311): the authored copy was removed (empty/absent, or the mode is
+    // gone) AFTER a failed delivery left this pending bit. Clear the stale bit so
+    // re-authoring the copy later does not surprise-welcome the user on a plain
+    // same-mode turn.
+    if (!mode || !welcomeCopy) {
+      await this.state.storage.delete(keys.pending);
+      logger.log('mode_welcome_pending_cleared', { mode: activeModeName, reason: 'copy_removed' });
+      return undefined;
+    }
+
+    // FIX 3 (#311): alias-aware welcomed check (see `maybeBuildModeWelcome`) — a
+    // rename must not re-emit for a user already welcomed under a former slug.
+    if (await this.isAnyCurrentSlugWelcomed(body, mode)) return undefined;
 
     const text = buildModeWelcomeText(welcomeCopy, activeModeName, this.env.WHATSAPP_NUMBER);
     this.logModeWelcomePrepared(logger, activeModeName, text, { reason: 'pending_reemit' });
@@ -2335,6 +2461,30 @@ export class UserDO {
     return this.isGroupChatType(body)
       ? `${MODE_WELCOME_PENDING_PREFIX}${body.user_id}:${slug}`
       : `${MODE_WELCOME_PENDING_PREFIX}${slug}`;
+  }
+
+  /**
+   * FIX 3 (#311): true when the user carries a `mode_welcomed` flag under ANY of
+   * this mode's CURRENT slugs — its canonical `name` or any `aliases` (#284). A
+   * reslug turns the former canonical slug into an alias, so a user welcomed
+   * under the old name must not be re-welcomed under the new one. Flags live in
+   * each user DO and cannot be migrated from org KV, so when the flag is found
+   * only under an alias we COPY it onto the current canonical key (copy-on-read),
+   * leaving future lookups keyed canonically. In group DOs the alias set applies
+   * to the `<slug>` portion of the per-sender key (`modeWelcomedKey`).
+   */
+  private async isAnyCurrentSlugWelcomed(body: ChatRequest, mode: PromptMode): Promise<boolean> {
+    const canonicalKey = this.modeWelcomedKey(body, mode.name);
+    if ((await this.state.storage.get<boolean>(canonicalKey)) === true) return true;
+    for (const alias of mode.aliases ?? []) {
+      if ((await this.state.storage.get<boolean>(this.modeWelcomedKey(body, alias))) === true) {
+        // Copy-on-read: migrate the former-slug flag onto the canonical key so
+        // the user reads as welcomed under the new name from here on.
+        await this.state.storage.put(canonicalKey, true);
+        return true;
+      }
+    }
+    return false;
   }
 
   /** The paired `mode_welcomed` / `mode_welcome_pending` keys for a mode (#311). */

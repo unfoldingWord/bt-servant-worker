@@ -377,6 +377,18 @@ export interface StreamCallbacks {
    * turn.
    */
   onWelcome?: (text: string) => Promise<void>;
+  /**
+   * SSE transports ONLY (#311 FIX 1). On the SSE path the in-band welcome ships
+   * inside `complete.responses`, which the client only receives if it is still
+   * connected when the `complete` event is written. The DO hands the one-time
+   * flag recording to the caller through this hook; the caller runs the handed
+   * `record` AFTER the `complete` write, passing `delivered = !clientDisconnected`
+   * so a mid-turn disconnect records a `mode_welcome_pending` re-emit instead of
+   * burning the flag on a welcome the user never saw. Absent on the webhook path
+   * (welcome sent out of band via `onWelcome`) and on `/chat/final` (no stream to
+   * drop — recorded inline as the turn is saved).
+   */
+  deferInBandWelcomeRecord?: (record: (delivered: boolean) => Promise<void>) => void;
 }
 
 /**
