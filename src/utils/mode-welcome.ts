@@ -2,8 +2,7 @@
  * Deterministic first-contact welcome text for a mode (#311).
  *
  * The worker — not the model — assembles this so the `wa.me` share link is
- * always present and correct ("keeps the forwarding path alive", per Elsy).
- * The shape is:
+ * always present and correct. The shape is:
  *
  *   <authored welcome_message>
  *
@@ -18,11 +17,10 @@
 import { buildModeShareLink } from './mode-share-link.js';
 
 /**
- * Label that precedes the share link. Kept as a single module-level constant
- * (English, minimal) rather than an authored/i18n string for V1: the link
- * itself is the payload, the prefix is a thin affordance. Easy to localize
- * later without touching call sites.
+ * Label that precedes the share link. A single English constant for now — the
+ * link is the payload, the prefix a thin affordance.
  */
+// TODO(#311 follow-up): localize SHARE_LINE_PREFIX from the user's response_language.
 export const SHARE_LINE_PREFIX = 'Share this mode: ';
 
 /**

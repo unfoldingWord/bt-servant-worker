@@ -114,11 +114,10 @@ const PROMPT_OVERRIDES_KEY = 'prompt_overrides';
 const SELECTED_MODE_KEY = 'selected_mode';
 const SELECTED_LANGUAGE_KEY = 'selected_language';
 /**
- * Prefix for the one-time per-user-per-mode welcome flag (#311). Full key is
- * `mode_welcomed:<canonical-slug>`. Deliberately NOT the `first_interaction`
- * preference: an existing user scanning a NEW mode's QR must still get that
- * mode's welcome (decided with Elsy), which a global first-interaction flag
- * would suppress.
+ * Prefix for the one-time welcome flag (#311). Keyed per-mode (`mode_welcomed:<slug>`)
+ * and per-user in group chats (see `modeWelcomedKey`) — NOT the global
+ * `first_interaction` preference, so an existing user still gets a mode's
+ * welcome the first time they scan its QR.
  */
 const MODE_WELCOMED_PREFIX = 'mode_welcomed:';
 const PROCESSING_LOCK_KEY = '_processing_lock';
@@ -1776,6 +1775,14 @@ export class UserDO {
     // prettier-ignore
     const orchOpts = { ...this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, triggerCtx.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, triggerCtx.activeModeName, audioContext, attachmentsContext, workerOrigin, logger, callbacks, groupContext, triggerCtx.languageDocument, triggerCtx.unmatchedTriggers, loaded.inboundVoiceKey, { triggerOnly: triggerCtx.triggerOnly }), turnId };
 
+    // #311: on the webhook/WhatsApp path the welcome is its OWN message,
+    // delivered BEFORE the model runs and kept OUT of `responses` so the
+    // model's streamed iteration deltas keep their prefix invariant. On
+    // SSE/`/chat/final` there is no onWelcome and it is prepended to `responses`
+    // below instead. Returns true only when it was delivered here.
+    const welcome = triggerCtx.welcome;
+    const welcomeSentOutOfBand = await this.deliverWelcomeOutOfBand(welcome, callbacks);
+
     const orchResult = await this.tracedPhase(ctx, 'orchestration', () =>
       this.runOrchestration(triggerCtx.messageText, orchOpts)
     );
@@ -1786,20 +1793,24 @@ export class UserDO {
     );
     const audioKey = voiceAudio?.audioKey ?? null;
 
-    // #311: a one-time per-mode welcome rides ahead of the model's answer as
-    // its own `responses` entry, so on the WhatsApp/matrix path it arrives as a
-    // separate message before the answer. Prepended AFTER TTS extraction on
-    // purpose: the welcome is text-only for V1, and leaving `orchResult`
-    // untouched keeps `finalIterationStartIndex` pointing at the model's own
-    // responses so voice output is unaffected.
-    const responses = triggerCtx.welcomeMessage
-      ? [triggerCtx.welcomeMessage, ...orchResult.responses]
-      : orchResult.responses;
+    // On SSE/final the welcome rides ahead of the model answer as its own
+    // `responses` entry (that transport returns the whole array, so no delta
+    // slicing garbles it). The webhook path already sent it out of band.
+    const responses =
+      welcome && !welcomeSentOutOfBand
+        ? [welcome.text, ...orchResult.responses]
+        : orchResult.responses;
 
+    // #311 FIX 5: persist history as MODEL text only. The welcome + wa.me link
+    // must not become the assistant's prior turn, or the model may mimic it.
     // prettier-ignore
     await this.tracedPhase(ctx, 'save_conversation', () =>
-      this.saveConversation(triggerCtx.messageText, responses, loaded.preferences, body._org_config ?? {}, { logger, audioKey, inboundVoiceKey: loaded.inboundVoiceKey, speaker: body.speaker, attachments: attachmentsContext.list() })
+      this.saveConversation(triggerCtx.messageText, orchResult.responses, loaded.preferences, body._org_config ?? {}, { logger, audioKey, inboundVoiceKey: loaded.inboundVoiceKey, speaker: body.speaker, attachments: attachmentsContext.list() })
     );
+
+    // #311: on SSE/final the welcome ships inside `responses`; record it as
+    // delivered only after the turn is saved, so a throw before here re-emits.
+    await this.recordInBandWelcome(welcome, welcomeSentOutOfBand);
 
     // prettier-ignore
     this.logChatTurn(body, effectivePreferences.response_language, logger, { turnId, activeModeName: triggerCtx.activeModeName, activeLanguageName: triggerCtx.activeLanguageName, languageSource: triggerCtx.languageSource, orchestration: orchResult.telemetry, durationMs: Date.now() - ctx.startTime, hadInboundVoice: !!loaded.inboundVoiceKey, hadOutboundVoice: audioKey !== null, inputLanguage, text: chatTurnText(triggerCtx.messageText, responses) });
@@ -1999,14 +2010,7 @@ export class UserDO {
       language.newEffectiveLanguageName
     );
     await this.dispatchSelectionPersistence(SELECTED_LANGUAGE_KEY, languagePersistence);
-
-    // #311: a `#`-trigger that resolved to a NEW mode this turn is the only
-    // path that can emit a first-contact welcome. `newEffectiveModeName` is set
-    // exactly there (canonical slug), so gating on it keeps the welcome off the
-    // clear-intent path and off persisted-fallback re-entries into a mode.
-    const welcomeMessage = newEffectiveModeName
-      ? await this.maybeBuildModeWelcome(loaded, newEffectiveModeName, logger)
-      : undefined;
+    const welcome = await this.resolveTurnWelcome(body, loaded, classified, newEffectiveModeName, logger); // prettier-ignore
 
     return {
       resolved,
@@ -2016,52 +2020,128 @@ export class UserDO {
       languageSource: language.languageSource,
       modePersistence,
       languagePersistence,
-      welcomeMessage,
+      welcome,
     };
   }
 
   /**
-   * Build the one-time per-user-per-mode first-contact welcome (#311), or
-   * `undefined` when none should be emitted this turn.
+   * #311: deliver the welcome as its own message before the model runs, on
+   * transports that render each send discretely (webhook/WhatsApp, i.e.
+   * `onWelcome` present). Writes the one-time flag only after the send resolves;
+   * a failed send throws (so the flag stays unset and the welcome re-emits on
+   * retry — a rare double-send beats a permanent skip). Returns true when the
+   * welcome was delivered here, so the caller does NOT also prepend it.
+   */
+  private async deliverWelcomeOutOfBand(
+    welcome: { text: string; flagKey: string } | undefined,
+    callbacks: StreamCallbacks | undefined
+  ): Promise<boolean> {
+    if (!welcome || !callbacks?.onWelcome) return false;
+    await callbacks.onWelcome(welcome.text);
+    await this.state.storage.put(welcome.flagKey, true);
+    return true;
+  }
+
+  /**
+   * #311: on SSE/final the welcome ships inside `responses`; write the one-time
+   * flag only after the turn is saved, so a throw before that point re-emits.
+   */
+  private async recordInBandWelcome(
+    welcome: { text: string; flagKey: string } | undefined,
+    sentOutOfBand: boolean
+  ): Promise<void> {
+    if (welcome && !sentOutOfBand) await this.state.storage.put(welcome.flagKey, true);
+  }
+
+  /**
+   * Decide this turn's first-contact welcome (#311). Fires whenever an explicit
+   * `#mode` trigger resolves to a visible canonical mode and the one-time flag
+   * is unset — even when that mode is already active (existing user rescanning
+   * its QR, or switch_mode-then-QR). NOT on clear-intent (`#default`/`#none`/
+   * `#clear`) and NOT on persisted-fallback re-entry (no `#` token ⇒
+   * classified.modeName unset). Reuses the canonical slug from the mode-change
+   * branch when set; otherwise resolves it (already-active re-trigger).
+   */
+  private async resolveTurnWelcome(
+    body: ChatRequest,
+    loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
+    classified: ClassifierResult,
+    newEffectiveModeName: string | undefined,
+    logger: RequestLogger
+  ): Promise<{ text: string; flagKey: string } | undefined> {
+    const triggeredMode =
+      classified.clearMode || !classified.modeName
+        ? undefined
+        : (newEffectiveModeName ?? this.resolveTriggeredMode(body, loaded, classified.modeName));
+    return triggeredMode
+      ? this.maybeBuildModeWelcome(body, loaded, triggeredMode, logger)
+      : undefined;
+  }
+
+  /**
+   * Build the one-time first-contact welcome for `effectiveModeName` (#311), or
+   * `undefined` when none is due (mode has no authored copy, or the one-time
+   * flag is already set). Opt-in by authoring: a mode with no `welcome_message`
+   * emits nothing.
    *
-   * Emits only when ALL hold:
-   *   1. the mode carries authored `welcome_message` copy (V1 is opt-in by
-   *      authoring — a mode with no copy emits nothing, a deliberate decision
-   *      so the welcome never surprises modes that did not opt in), and
-   *   2. DO storage has no `mode_welcomed:<slug>` flag for this user+mode yet.
-   *
-   * `effectiveModeName` is the mode's canonical slug (from
-   * `resolveEffectiveMode`), so the storage key and the `wa.me` trigger both
-   * key off the canonical name even when the user scanned an alias.
-   *
-   * The welcome is text-only for V1. The `wa.me` share line is assembled by
-   * `buildModeWelcomeText`; when `WHATSAPP_NUMBER` is unset the line is omitted
-   * (logged below) rather than crashing the turn.
+   * Does NOT write the flag — it returns the flag key so the caller can write
+   * it only AFTER the welcome is actually delivered, leaving a failed delivery
+   * to re-emit on retry. `effectiveModeName` is the canonical slug, so the flag
+   * and the `wa.me` trigger key off the canonical name even for an alias scan.
    */
   private async maybeBuildModeWelcome(
+    body: ChatRequest,
     loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
     effectiveModeName: string,
     logger: RequestLogger
-  ): Promise<string | undefined> {
+  ): Promise<{ text: string; flagKey: string } | undefined> {
     const mode = loaded.orgModes.modes.find((m) => m.name === effectiveModeName);
     const welcomeCopy = mode?.welcome_message?.trim();
     if (!welcomeCopy) return undefined;
 
-    const storageKey = MODE_WELCOMED_PREFIX + effectiveModeName;
-    const alreadyWelcomed = await this.state.storage.get<boolean>(storageKey);
+    const flagKey = this.modeWelcomedKey(body, effectiveModeName);
+    const alreadyWelcomed = await this.state.storage.get<boolean>(flagKey);
     if (alreadyWelcomed === true) return undefined;
 
-    const welcome = buildModeWelcomeText(welcomeCopy, effectiveModeName, this.env.WHATSAPP_NUMBER);
-    await this.state.storage.put(storageKey, true);
-    logger.log('mode_welcome_emitted', {
+    const text = buildModeWelcomeText(welcomeCopy, effectiveModeName, this.env.WHATSAPP_NUMBER);
+    logger.log('mode_welcome_prepared', {
       mode: effectiveModeName,
-      // Greppable: a missing/typo'd WHATSAPP_NUMBER drops the forwarding link
-      // silently to the user, so surface it in logs rather than swallowing it.
+      // A missing/typo'd WHATSAPP_NUMBER silently drops the forwarding link;
+      // surface it in logs rather than swallowing it.
       whatsapp_number_configured: !!this.env.WHATSAPP_NUMBER,
-      has_share_link: welcome.includes(WA_ME_ORIGIN),
-      welcome_length: welcome.length,
+      has_share_link: text.includes(WA_ME_ORIGIN),
+      welcome_length: text.length,
     });
-    return welcome;
+    return { text, flagKey };
+  }
+
+  /**
+   * Storage key for the one-time welcome flag. Group-chat DOs are shared across
+   * members (`group:{org}:{chat_id}`), so a bare `mode_welcomed:<slug>` would
+   * let one member's scan suppress everyone else's — key per sender there. 1:1
+   * DOs are already per-user, so they keep the slug-only key.
+   */
+  private modeWelcomedKey(body: ChatRequest, slug: string): string {
+    return this.isGroupChatType(body)
+      ? `${MODE_WELCOMED_PREFIX}${body.user_id}:${slug}`
+      : `${MODE_WELCOMED_PREFIX}${slug}`;
+  }
+
+  /**
+   * Canonical slug an explicit `#mode` trigger resolves to, or `undefined` when
+   * it is not visible to this caller/context (unpublished, or `requires_group`
+   * for a non-admin outside a group). Used by the welcome gate to key off the
+   * canonical name even when the mode is already active this turn.
+   */
+  private resolveTriggeredMode(
+    body: ChatRequest,
+    loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
+    modeName: string
+  ): string | undefined {
+    return resolveEffectiveMode(loaded.orgModes, modeName, {
+      includeUnpublished: loaded.isAdmin,
+      isGroupChat: this.isGroupChatType(body),
+    }).effectiveModeName;
   }
 
   /** Apply a mode/language selection persistence decision to DO storage. */

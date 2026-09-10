@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { upsertMode } from '../../src/index.js';
+import { upsertMode, cloneMode, toMarkdownView } from '../../src/index.js';
 import { OrgModes, MAX_MODES_PER_ORG } from '../../src/types/prompt-overrides.js';
 
 function makeOrgModes(...modes: OrgModes['modes']): OrgModes {
@@ -86,6 +86,76 @@ describe('upsertMode - scalar field preservation', () => {
     const result = upsertMode(orgModes, { name: 't', label: 'New', overrides: {} }, 'o');
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.savedMode.label).toBe('New');
+  });
+});
+
+// #311: welcome_message is an authored scalar that must survive admin CRUD.
+// Before the fix, mergeExistingMode rebuilt the record field-by-field and
+// dropped it on every PUT, and toMarkdownView never surfaced it, so the portal
+// editor lost the copy on the next save.
+describe('upsertMode - welcome_message (#311)', () => {
+  it('preserves existing welcome_message when caller omits it', () => {
+    const orgModes = makeOrgModes({
+      name: 't',
+      welcome_message: 'Hi there',
+      overrides: {},
+    });
+    const result = upsertMode(orgModes, { name: 't', overrides: { identity: 'X' } }, 'o');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.savedMode.welcome_message).toBe('Hi there');
+  });
+
+  it('updates welcome_message when caller provides one', () => {
+    const orgModes = makeOrgModes({ name: 't', welcome_message: 'Old copy', overrides: {} });
+    const result = upsertMode(
+      orgModes,
+      { name: 't', welcome_message: 'New copy', overrides: {} },
+      'o'
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.savedMode.welcome_message).toBe('New copy');
+  });
+
+  it('persists welcome_message on a brand-new mode', () => {
+    const orgModes = makeOrgModes();
+    const result = upsertMode(
+      orgModes,
+      { name: 't', welcome_message: 'Fresh', overrides: {} },
+      'o'
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.savedMode.welcome_message).toBe('Fresh');
+  });
+});
+
+describe('welcome_message view + clone (#311)', () => {
+  it('round-trips welcome_message through GET (view) -> PUT (omit) -> GET (view)', () => {
+    // GET: an authored mode surfaces welcome_message in the admin view.
+    const stored: OrgModes['modes'][number] = {
+      name: 't',
+      welcome_message: 'Round trip',
+      overrides: {},
+    };
+    expect(toMarkdownView(stored).welcome_message).toBe('Round trip');
+
+    // PUT that omits welcome_message (the portal editor's normal save).
+    const orgModes = makeOrgModes(stored);
+    const result = upsertMode(orgModes, { name: 't', overrides: { identity: 'X' } }, 'o');
+    expect(result.ok).toBe(true);
+
+    // GET again: the copy is still present in the view, not silently dropped.
+    if (result.ok) expect(toMarkdownView(result.savedMode).welcome_message).toBe('Round trip');
+  });
+
+  it('cloneMode copies welcome_message onto the clone', () => {
+    const orgModes = makeOrgModes({
+      name: 'src',
+      welcome_message: 'Clone me',
+      overrides: {},
+    });
+    const result = cloneMode(orgModes, 'src', 'dst');
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.savedMode.welcome_message).toBe('Clone me');
   });
 });
 

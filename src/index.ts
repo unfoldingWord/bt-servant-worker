@@ -1702,11 +1702,12 @@ function compactOptional<T extends Record<string, unknown>>(
  * Modes already stored as markdown pass their `document` through unchanged
  * and omit `originalSlots`.
  */
-function toMarkdownView(mode: PromptMode): {
+export function toMarkdownView(mode: PromptMode): {
   name: string;
   aliases?: string[];
   label?: string;
   description?: string;
+  welcome_message?: string;
   published?: boolean;
   requires_group?: boolean;
   document: string;
@@ -1721,6 +1722,10 @@ function toMarkdownView(mode: PromptMode): {
       aliases: normalizeAliases(mode.aliases),
       label: mode.label,
       description: mode.description,
+      // #311: first-contact welcome copy is an authored scalar that must
+      // survive the round-trip to the portal editor, or a re-save silently
+      // drops it (mergeExistingMode reads it back off this view's PUT).
+      welcome_message: mode.welcome_message,
       published: mode.published,
       requires_group: mode.requires_group,
       originalSlots: isLegacy ? (mode.overrides ?? {}) : undefined,
@@ -1772,6 +1777,10 @@ function mergeExistingMode(existing: PromptMode, incoming: PromptMode): PromptMo
       aliases: normalizeAliases(incoming.aliases ?? existing.aliases),
       label: incoming.label ?? existing.label,
       description: incoming.description ?? existing.description,
+      // #311: same "incoming wins if present, else existing carries through"
+      // rule as description. Without this line every PUT that omits
+      // welcome_message (the portal editor's normal save) would drop it.
+      welcome_message: incoming.welcome_message ?? existing.welcome_message,
       published: incoming.published ?? existing.published,
       requires_group: incoming.requires_group ?? existing.requires_group,
     }),
@@ -1930,6 +1939,9 @@ export function cloneMode(
     ...compactOptional({
       label: newLabel ?? source.label,
       description: source.description,
+      // #311: welcome copy is content the author wrote, so a clone carries it
+      // (aliases are the deliberate exception — a clone is a new identity).
+      welcome_message: source.welcome_message,
       requires_group: source.requires_group,
     }),
     published: false,

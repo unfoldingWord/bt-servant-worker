@@ -365,6 +365,15 @@ export interface StreamCallbacks {
   onToolUse?: (toolName: string, input: unknown) => void;
   onToolResult?: (toolName: string, result: unknown) => void;
   onIterationComplete?: (text: string) => void;
+  /**
+   * Deliver a one-time mode first-contact welcome (#311) as its OWN message
+   * ahead of the model's answer. Present only on transports that render each
+   * send as a discrete message (the webhook/WhatsApp path); absent on SSE and
+   * `/chat/final`, where the welcome is carried as a `responses[]` entry
+   * instead. MUST reject on a delivery failure so the caller can withhold the
+   * `mode_welcomed` flag and re-emit on retry.
+   */
+  onWelcome?: (text: string) => Promise<void>;
 }
 
 /**
