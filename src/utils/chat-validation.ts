@@ -114,8 +114,14 @@ function validateTransportFields(body: ChatRequest, transport: ChatTransport): s
  */
 function validateVoiceFormat(format: unknown): string | null {
   if (format === undefined || format === null) return null;
-  if (typeof format !== 'string' || !VALID_VOICE_FORMATS.has(format)) {
-    return `Invalid voice_format: ${String(format)}. Must be one of: opus, aac`;
+  // Fixed message for non-strings — coercing arbitrary JSON values into the
+  // error can itself throw (e.g. { toString: null } shadows the conversion
+  // method), turning the promised 400 into a 500.
+  if (typeof format !== 'string') {
+    return 'Invalid voice_format: expected a string. Must be one of: opus, aac';
+  }
+  if (!VALID_VOICE_FORMATS.has(format)) {
+    return `Invalid voice_format: ${format}. Must be one of: opus, aac`;
   }
   return null;
 }

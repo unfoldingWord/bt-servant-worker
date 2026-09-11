@@ -74,21 +74,27 @@ describe('validateChatBody — voice_format', () => {
     expect(validateChatBody(body, 'final')).toBeNull();
   });
 
-  it.each([
-    ['', "''"],
-    [false, 'false'],
-    [0, '0'],
-  ])('rejects falsey non-allowlisted voice_format %j', (value) => {
-    const body = { ...baseBody, voice_format: value } as unknown as ChatRequest;
+  it("rejects an empty-string voice_format ''", () => {
+    const body = { ...baseBody, voice_format: '' } as unknown as ChatRequest;
     expect(validateChatBody(body, 'final')).toBe(
-      `Invalid voice_format: ${String(value)}. Must be one of: opus, aac`
+      'Invalid voice_format: . Must be one of: opus, aac'
     );
   });
 
-  it('rejects a non-string voice_format (object)', () => {
-    const body = { ...baseBody, voice_format: { fmt: 'aac' } } as unknown as ChatRequest;
+  it.each([[false], [0], [{ fmt: 'aac' }]])(
+    'rejects a non-string voice_format %j with a fixed message',
+    (value) => {
+      const body = { ...baseBody, voice_format: value } as unknown as ChatRequest;
+      expect(validateChatBody(body, 'final')).toBe(
+        'Invalid voice_format: expected a string. Must be one of: opus, aac'
+      );
+    }
+  );
+
+  it('rejects { toString: null } without throwing (coercion would raise a TypeError)', () => {
+    const body = { ...baseBody, voice_format: { toString: null } } as unknown as ChatRequest;
     expect(validateChatBody(body, 'final')).toBe(
-      'Invalid voice_format: [object Object]. Must be one of: opus, aac'
+      'Invalid voice_format: expected a string. Must be one of: opus, aac'
     );
   });
 });
