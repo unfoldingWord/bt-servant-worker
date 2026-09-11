@@ -34,7 +34,7 @@ interface CapturedPost {
   text?: string;
 }
 
-function setup(status = 200) {
+function setup(status = 200, suppressProgressText = false) {
   const posts: CapturedPost[] = [];
   vi.stubGlobal(
     'fetch',
@@ -51,6 +51,7 @@ function setup(status = 200) {
   const callbacks = createWebhookCallbacks(sender, logger, {
     mode: 'iteration',
     throttleSeconds: 5,
+    suppressProgressText,
   });
   return { posts, callbacks };
 }
@@ -116,5 +117,21 @@ describe('#311 callback wiring — welcome as its own message', () => {
   it('onWelcome rejects on a webhook failure so the caller can withhold the flag', async () => {
     const { callbacks } = setup(503);
     await expect(callbacks.onWelcome!(WELCOME)).rejects.toThrow(/503/);
+  });
+
+  it('#428: welcome still delivers when intermediate text progress is suppressed (voice turn)', async () => {
+    const { posts, callbacks } = setup(200, true);
+
+    // Voice turns suppress the iteration-narration channel entirely...
+    expect(callbacks.onIterationComplete).toBeUndefined();
+
+    // ...but a first-contact voice message must still get its welcome.
+    await callbacks.onWelcome!(WELCOME);
+    callbacks.onComplete(completion(['The answer.']));
+
+    await vi.waitFor(() => expect(posts.length).toBe(2));
+    expect(posts[0]?.text).toBe(WELCOME);
+    expect(posts[1]?.type).toBe('complete');
+    expect(posts[1]?.text).toBe('The answer.');
   });
 });

@@ -1760,6 +1760,12 @@ export class UserDO {
     return createWebhookCallbacks(sender, logger, {
       mode: body.progress_mode ?? DEFAULT_PROGRESS_MODE,
       throttleSeconds,
+      // #428: voice turns get a voice reply whose TTS already strips
+      // intermediate narration (extractTtsResponses); suppress the text
+      // side too or gateways interleave narration bubbles before the voice
+      // note. Gated on message_type only — tool-requested audio on a text
+      // turn (audioContext.audioRequested) is unknowable this early.
+      suppressProgressText: body.message_type === 'audio',
     });
   }
 
