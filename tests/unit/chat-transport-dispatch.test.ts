@@ -47,7 +47,9 @@ describe('validateChatBody — shared rules', () => {
       'is_admin is not a valid field; admin origin is derived from client_id'
     );
   });
+});
 
+describe('validateChatBody — voice_format', () => {
   it('accepts voice_format: opus', () => {
     expect(validateChatBody({ ...baseBody, voice_format: 'opus' }, 'final')).toBeNull();
   });
@@ -64,6 +66,29 @@ describe('validateChatBody — shared rules', () => {
     const body = { ...baseBody, voice_format: 'mp3' } as unknown as ChatRequest;
     expect(validateChatBody(body, 'final')).toBe(
       'Invalid voice_format: mp3. Must be one of: opus, aac'
+    );
+  });
+
+  it('treats voice_format: null as absent (matches the ?? default downstream)', () => {
+    const body = { ...baseBody, voice_format: null } as unknown as ChatRequest;
+    expect(validateChatBody(body, 'final')).toBeNull();
+  });
+
+  it.each([
+    ['', "''"],
+    [false, 'false'],
+    [0, '0'],
+  ])('rejects falsey non-allowlisted voice_format %j', (value) => {
+    const body = { ...baseBody, voice_format: value } as unknown as ChatRequest;
+    expect(validateChatBody(body, 'final')).toBe(
+      `Invalid voice_format: ${String(value)}. Must be one of: opus, aac`
+    );
+  });
+
+  it('rejects a non-string voice_format (object)', () => {
+    const body = { ...baseBody, voice_format: { fmt: 'aac' } } as unknown as ChatRequest;
+    expect(validateChatBody(body, 'final')).toBe(
+      'Invalid voice_format: [object Object]. Must be one of: opus, aac'
     );
   });
 });

@@ -103,15 +103,29 @@ function validateTransportFields(body: ChatRequest, transport: ChatTransport): s
   return null;
 }
 
+/**
+ * Validate the optional `voice_format` field.
+ *
+ * Presence is checked with `!== undefined`/`!== null` (not truthiness) so
+ * falsey junk (`""`, `false`, `0`) is rejected rather than silently surviving
+ * to synthesis with an unsupported format. `null` is deliberately treated as
+ * absent to match the `body.voice_format ?? 'opus'` default at the point of
+ * use in UserDO — both mean "use the default".
+ */
+function validateVoiceFormat(format: unknown): string | null {
+  if (format === undefined || format === null) return null;
+  if (typeof format !== 'string' || !VALID_VOICE_FORMATS.has(format)) {
+    return `Invalid voice_format: ${String(format)}. Must be one of: opus, aac`;
+  }
+  return null;
+}
+
 /** Validate the optional enum-valued fields shared by all transports. */
 function validateEnumFields(body: ChatRequest): string | null {
   if (body.chat_type && !VALID_CHAT_TYPES.has(body.chat_type)) {
     return `Invalid chat_type: ${body.chat_type}. Must be one of: private, group, supergroup`;
   }
-  if (body.voice_format && !VALID_VOICE_FORMATS.has(body.voice_format)) {
-    return `Invalid voice_format: ${body.voice_format}. Must be one of: opus, aac`;
-  }
-  return null;
+  return validateVoiceFormat(body.voice_format);
 }
 
 function validateCoreFields(body: ChatRequest): string | null {
