@@ -56,6 +56,10 @@ interface CallbackPayload {
 export class ProgressCallbackSender {
   private accumulatedText = '';
   private logger: RequestLogger | undefined;
+  // #428: non-terminal POSTs in flight. Terminal sends (`complete`/`error`)
+  // await these so a slow progress/status POST can never reach the gateway
+  // after the final message — gateways deliver callbacks in arrival order.
+  private pending = new Set<Promise<void>>();
 
   constructor(
     private config: ProgressCallbackConfig,
@@ -64,8 +68,30 @@ export class ProgressCallbackSender {
     this.logger = logger;
   }
 
+  private track(promise: Promise<void>): Promise<void> {
+    this.pending.add(promise);
+    const remove = () => this.pending.delete(promise);
+    promise.then(remove, remove);
+    return promise;
+  }
+
+  private async awaitPendingSends(terminalType: 'complete' | 'error'): Promise<void> {
+    if (this.pending.size === 0) return;
+    const waitStart = Date.now();
+    const waitedCount = this.pending.size;
+    // allSettled, never all: pending failures are already logged in post()
+    // and must not block the terminal event.
+    await Promise.allSettled([...this.pending]);
+    this.logger?.log('webhook_complete_waited', {
+      terminal_type: terminalType,
+      waited_count: waitedCount,
+      wait_ms: Date.now() - waitStart,
+      user_id: this.config.user_id,
+    });
+  }
+
   async sendStatus(status: StatusUpdate): Promise<void> {
-    await this.post({ type: 'status', ...status });
+    await this.track(this.post({ type: 'status', ...status }));
   }
 
   accumulateProgress(text: string): void {
@@ -74,13 +100,13 @@ export class ProgressCallbackSender {
 
   async sendProgress(): Promise<void> {
     if (this.accumulatedText) {
-      await this.post({ type: 'progress', text: this.accumulatedText });
+      await this.track(this.post({ type: 'progress', text: this.accumulatedText }));
     }
   }
 
   async sendProgressDirect(text: string): Promise<void> {
     if (text) {
-      await this.post({ type: 'progress', text });
+      await this.track(this.post({ type: 'progress', text }));
     }
   }
 
@@ -90,6 +116,7 @@ export class ProgressCallbackSender {
     voiceAudioBase64?: string | null,
     attachments?: Attachment[] | null
   ): Promise<void> {
+    await this.awaitPendingSends('complete');
     await this.post({
       type: 'complete',
       ...(text ? { text } : {}),
@@ -100,6 +127,7 @@ export class ProgressCallbackSender {
   }
 
   async sendError(error: string): Promise<void> {
+    await this.awaitPendingSends('error');
     await this.post({ type: 'error', error });
   }
 
@@ -249,6 +277,15 @@ export const MIN_THROTTLE_SECONDS = 1;
 export interface IncrementalProgressConfig {
   mode: ProgressMode;
   throttleSeconds: number;
+  /**
+   * #428: suppress every intermediate `progress` text send (iteration
+   * narration, periodic/sentence deltas) while keeping `status`, `welcome`,
+   * and the terminal `complete`/`error` events. Set for voice turns, whose
+   * TTS already strips intermediate narration (`extractTtsResponses`) —
+   * without this the same narration reaches the user as interleaved text
+   * bubbles before the voice note.
+   */
+  suppressProgressText?: boolean;
 }
 
 /**
@@ -399,8 +436,9 @@ export function createWebhookCallbacks(
   config?: Partial<IncrementalProgressConfig>
 ): StreamCallbacks {
   const mode = config?.mode ?? DEFAULT_PROGRESS_MODE;
+  const suppressProgressText = config?.suppressProgressText === true;
   const incrementalSender =
-    mode === 'periodic' || mode === 'sentence'
+    (mode === 'periodic' || mode === 'sentence') && !suppressProgressText
       ? new IncrementalProgressSender(sender, logger, config)
       : null;
 
@@ -434,7 +472,7 @@ export function createWebhookCallbacks(
     onWelcome: (text) => sender.sendWelcome(text),
   };
 
-  if (mode === 'iteration') {
+  if (mode === 'iteration' && !suppressProgressText) {
     callbacks.onIterationComplete = (text) => {
       const delta = text.slice(lastSentText.length);
       if (delta) {

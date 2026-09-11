@@ -6,8 +6,9 @@ import {
   IncrementalProgressSender,
   MIN_THROTTLE_SECONDS,
   ProgressCallbackSender,
+  type IncrementalProgressConfig,
 } from '../../src/services/progress/callback.js';
-import { createRequestLogger } from '../../src/utils/logger.js';
+import { createRequestLogger, type RequestLogger } from '../../src/utils/logger.js';
 
 const testLogger = createRequestLogger('test-request-id');
 
@@ -851,5 +852,188 @@ describe('Progress mode constants', () => {
     expect(DEFAULT_PROGRESS_MODE).toBe('iteration');
     expect(DEFAULT_THROTTLE_SECONDS).toBe(5);
     expect(MIN_THROTTLE_SECONDS).toBe(1);
+  });
+});
+
+function suppressedCallbacks(config: Partial<IncrementalProgressConfig>) {
+  const sender = new ProgressCallbackSender(mockConfig);
+  return createWebhookCallbacks(sender, testLogger, { suppressProgressText: true, ...config });
+}
+
+function lastFetchBody(): Record<string, unknown> {
+  return JSON.parse((fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].body as string) as Record<
+    string,
+    unknown
+  >;
+}
+
+describe('createWebhookCallbacks suppressProgressText wiring (#428 voice turns)', () => {
+  beforeEach(setupMocks);
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('iteration mode: onIterationComplete is not wired when suppressed', () => {
+    const callbacks = suppressedCallbacks({ mode: 'iteration' });
+    expect(callbacks.onIterationComplete).toBeUndefined();
+  });
+
+  it('iteration mode without the flag keeps onIterationComplete (text-turn regression guard)', () => {
+    const sender = new ProgressCallbackSender(mockConfig);
+    const callbacks = createWebhookCallbacks(sender, testLogger, { mode: 'iteration' });
+    expect(callbacks.onIterationComplete).toBeDefined();
+  });
+
+  it('status events still flow when suppressed', async () => {
+    const callbacks = suppressedCallbacks({ mode: 'iteration' });
+    callbacks.onStatus({ key: 'status_transcribing', message: 'Transcribing...' });
+    await vi.runAllTimersAsync();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(lastFetchBody().type).toBe('status');
+  });
+});
+
+describe('createWebhookCallbacks suppressProgressText behavior (#428 voice turns)', () => {
+  beforeEach(setupMocks);
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('periodic mode: no intermediate sends when suppressed', async () => {
+    const callbacks = suppressedCallbacks({ mode: 'periodic', throttleSeconds: 1 });
+    callbacks.onProgress('chunk1');
+    callbacks.onProgress('chunk2');
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('sentence mode: no boundary sends when suppressed', async () => {
+    const callbacks = suppressedCallbacks({ mode: 'sentence' });
+    callbacks.onProgress('A full sentence. ');
+    await vi.runAllTimersAsync();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('complete still fires and carries the full text (cursor never advanced)', async () => {
+    const callbacks = suppressedCallbacks({ mode: 'iteration' });
+    callbacks.onProgress('Let me look that up.');
+    callbacks.onComplete({
+      responses: ['Let me look that up.', 'The answer.'],
+      response_language: 'en',
+      voice_audio_base64: null,
+      voice_audio_url: 'https://example.com/api/v1/audio/audio/org/user/id.mp3',
+    });
+    await vi.runAllTimersAsync();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    const body = lastFetchBody();
+    expect(body.type).toBe('complete');
+    expect(body.text).toBe('Let me look that up.\nThe answer.');
+    expect(body.voice_audio_url).toBe('https://example.com/api/v1/audio/audio/org/user/id.mp3');
+  });
+});
+
+// #428 terminal-ordering helpers — real timers, raw promise settlement order.
+function spyLogger(): RequestLogger {
+  return { log: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as RequestLogger;
+}
+
+/** Stub fetch so the FIRST call stays in flight until the test settles it. */
+function deferredFetch() {
+  const calls: string[] = [];
+  let settleFirst!: { resolve: (r: Response) => void; reject: (e: Error) => void };
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((_url: unknown, init: { body: string }) => {
+      const body = JSON.parse(init.body) as { type: string };
+      calls.push(body.type);
+      if (calls.length === 1) {
+        return new Promise<Response>((resolve, reject) => {
+          settleFirst = { resolve, reject };
+        });
+      }
+      return Promise.resolve(new Response());
+    })
+  );
+  return { calls, settleFirst: () => settleFirst };
+}
+
+const settle = () => new Promise((r) => setTimeout(r, 0));
+
+describe('ProgressCallbackSender terminal ordering (#428)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('sendComplete does not POST until an in-flight status send settles', async () => {
+    const { calls, settleFirst } = deferredFetch();
+    const logger = spyLogger();
+    const sender = new ProgressCallbackSender(mockConfig, logger);
+
+    const statusPromise = sender.sendStatus({ key: 'status_processing', message: 'working' });
+    const completePromise = sender.sendComplete('done');
+    await settle();
+
+    expect(calls).toEqual(['status']);
+
+    settleFirst().resolve(new Response());
+    await statusPromise;
+    await completePromise;
+    expect(calls).toEqual(['status', 'complete']);
+    expect(logger.log).toHaveBeenCalledWith(
+      'webhook_complete_waited',
+      expect.objectContaining({ waited_count: 1, terminal_type: 'complete' })
+    );
+  });
+
+  it('sendComplete proceeds even when the in-flight send fails', async () => {
+    const { calls, settleFirst } = deferredFetch();
+    const logger = spyLogger();
+    const sender = new ProgressCallbackSender(mockConfig, logger);
+
+    const progressPromise = sender.sendProgressDirect('intermediate');
+    const completePromise = sender.sendComplete('done');
+    await settle();
+    expect(calls).toEqual(['progress']);
+
+    settleFirst().reject(new Error('Network error'));
+    await progressPromise;
+    await completePromise;
+    expect(calls).toEqual(['progress', 'complete']);
+    // The failed send is still observable (post() logs it).
+    expect(logger.error).toHaveBeenCalledWith(
+      'webhook_failure',
+      expect.any(Error),
+      expect.objectContaining({ type: 'progress' })
+    );
+  });
+});
+
+describe('ProgressCallbackSender terminal ordering — error path and no-wait (#428)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('sendError also waits for in-flight sends', async () => {
+    const { calls, settleFirst } = deferredFetch();
+    const sender = new ProgressCallbackSender(mockConfig, spyLogger());
+
+    const statusPromise = sender.sendStatus({ key: 'status_processing', message: 'working' });
+    const errorPromise = sender.sendError('boom');
+    await settle();
+    expect(calls).toEqual(['status']);
+
+    settleFirst().resolve(new Response());
+    await statusPromise;
+    await errorPromise;
+    expect(calls).toEqual(['status', 'error']);
+  });
+
+  it('sendComplete with nothing in flight does not log a wait', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response()));
+    const logger = spyLogger();
+    const sender = new ProgressCallbackSender(mockConfig, logger);
+    await sender.sendComplete('done');
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(logger.log).not.toHaveBeenCalledWith('webhook_complete_waited', expect.anything());
   });
 });
