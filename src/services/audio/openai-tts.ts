@@ -6,11 +6,12 @@ import OpenAI from 'openai';
 import { AudioSynthesisError } from '../../utils/errors.js';
 import { RequestLogger } from '../../utils/logger.js';
 import { MAX_TTS_INPUT_CHARS, SpeechSynthesisResult } from './types.js';
+import type { VoiceFormat } from '../../types/engine.js';
 import { countMetric, recordMetric } from '../telemetry/index.js';
 
 const TTS_MODEL = 'gpt-4o-mini-tts';
 const TTS_VOICE = 'ash';
-const TTS_FORMAT = 'opus';
+const DEFAULT_TTS_FORMAT: VoiceFormat = 'opus';
 /** Abort TTS calls that hang longer than 5 minutes. */
 const TTS_TIMEOUT_MS = 5 * 60 * 1000;
 
@@ -110,7 +111,8 @@ async function callTtsApi(
   client: OpenAI,
   text: string,
   logger: RequestLogger,
-  attempt: number
+  attempt: number,
+  format: VoiceFormat
 ): Promise<TtsResponseData> {
   const apiCallStart = Date.now();
   const controller = new AbortController();
@@ -120,7 +122,7 @@ async function callTtsApi(
     attempt,
     model: TTS_MODEL,
     voice: TTS_VOICE,
-    format: TTS_FORMAT,
+    format,
     input_chars: text.length,
     instructions_chars: VOICE_INSTRUCTIONS.length,
     timeout_ms: TTS_TIMEOUT_MS,
@@ -133,7 +135,7 @@ async function callTtsApi(
         model: TTS_MODEL,
         voice: TTS_VOICE,
         input: text,
-        response_format: TTS_FORMAT,
+        response_format: format,
         instructions: VOICE_INSTRUCTIONS,
       },
       { signal: controller.signal }
@@ -229,14 +231,15 @@ function logAttemptFailure(
 
 /**
  * Synthesize text to speech using OpenAI gpt-4o-mini-tts.
- * Returns base64-encoded MP3 audio.
+ * Returns the audio in the requested voice format (default opus).
  *
  * Retries once on 5xx/network errors; fails immediately on 4xx.
  */
 export async function synthesizeSpeech(
   apiKey: string,
   text: string,
-  logger: RequestLogger
+  logger: RequestLogger,
+  format: VoiceFormat = DEFAULT_TTS_FORMAT
 ): Promise<SpeechSynthesisResult> {
   const startTime = Date.now();
   const truncatedText = prepareInput(text, logger);
@@ -251,9 +254,16 @@ export async function synthesizeSpeech(
     });
 
     try {
-      const { audioBytes, audioBase64 } = await callTtsApi(client, truncatedText, logger, attempt);
+      const { audioBytes, audioBase64 } = await callTtsApi(
+        client,
+        truncatedText,
+        logger,
+        attempt,
+        format
+      );
       logger.log('tts_complete', {
         attempt,
+        format,
         output_size_bytes: audioBytes.byteLength,
         output_base64_length: audioBase64.length,
         attempt_ms: Date.now() - attemptStart,
@@ -262,22 +272,33 @@ export async function synthesizeSpeech(
         original_input_chars: text.length,
         was_truncated: text.length > MAX_TTS_INPUT_CHARS,
       });
-      recordMetric('tts_duration_ms', Date.now() - startTime, { status: 'success' });
-      countMetric('tts_total', { status: 'success' });
-      return {
-        audio_base64: audioBase64,
-        audio_bytes: audioBytes,
-        audio_format: 'opus',
-        duration_ms: Date.now() - startTime,
-        input_chars: text.length,
-      };
+      return buildTtsSuccess(audioBytes, audioBase64, format, startTime, text.length);
     } catch (error) {
       lastError = error;
       if (logAttemptFailure(error, attempt, attemptStart, startTime, logger)) break;
     }
   }
 
-  return throwTtsExhausted(lastError, startTime, truncatedText.length, logger);
+  return throwTtsExhausted(lastError, startTime, truncatedText.length, logger, format);
+}
+
+/** Record success metrics and build the synthesis result. */
+function buildTtsSuccess(
+  audioBytes: Uint8Array,
+  audioBase64: string,
+  format: VoiceFormat,
+  startTime: number,
+  inputChars: number
+): SpeechSynthesisResult {
+  recordMetric('tts_duration_ms', Date.now() - startTime, { status: 'success', format });
+  countMetric('tts_total', { status: 'success', format });
+  return {
+    audio_base64: audioBase64,
+    audio_bytes: audioBytes,
+    audio_format: format,
+    duration_ms: Date.now() - startTime,
+    input_chars: inputChars,
+  };
 }
 
 /** Emit the failure metric + log for exhausted TTS retries, then throw. */
@@ -285,11 +306,13 @@ function throwTtsExhausted(
   lastError: unknown,
   startTime: number,
   inputChars: number,
-  logger: RequestLogger
+  logger: RequestLogger,
+  format: VoiceFormat
 ): never {
-  recordMetric('tts_duration_ms', Date.now() - startTime, { status: 'error' });
+  recordMetric('tts_duration_ms', Date.now() - startTime, { status: 'error', format });
   countMetric('tts_total', {
     status: 'error',
+    format,
     error_name: lastError instanceof Error ? lastError.name : 'Error',
   });
   logger.error('tts_all_attempts_exhausted', lastError, {

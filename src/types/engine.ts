@@ -21,6 +21,13 @@ export type ProgressMode = 'complete' | 'iteration' | 'periodic' | 'sentence';
 export type ChatType = 'private' | 'group' | 'supergroup';
 
 /**
+ * Outbound TTS voice-note format. Defaults to 'opus' when absent (backward
+ * compat). Controls the OpenAI TTS response_format, the R2 key extension
+ * (.opus/.aac), and the stored content type (audio/ogg / audio/aac).
+ */
+export type VoiceFormat = 'opus' | 'aac';
+
+/**
  * Chat transport selected by the worker route.
  *
  * - 'final'    → POST /api/v1/chat. Synchronous final-only JSON response.
@@ -50,6 +57,14 @@ export interface ChatRequest {
 
   /** Chat type. Defaults to 'private' when absent (backward compat). */
   chat_type?: ChatType;
+
+  /**
+   * Outbound TTS voice-note format. Defaults to 'opus' when absent, so
+   * WhatsApp/Telegram gateways are unaffected. Gateways whose clients cannot
+   * inline-render Opus voice notes (Signal renders AAC natively) declare
+   * their preferred format here; OpenAI TTS synthesizes it directly.
+   */
+  voice_format?: VoiceFormat;
 
   /** Group/supergroup chat ID. Required when chat_type is 'group' or 'supergroup'. */
   chat_id?: string;
@@ -228,8 +243,9 @@ export interface ChatHistoryEntry {
   created_at?: string | null;
   /**
    * R2 object key for the TTS-synthesized audio of `assistant_response`
-   * (assistant → user). Stored under the `audio/{org}/{user_id}/{uuid}.opus`
-   * prefix. Present only when TTS ran for this turn.
+   * (assistant → user). Stored under the
+   * `audio/{org}/{user_id}/{uuid}.{opus|aac}` prefix. Present only when TTS
+   * ran for this turn.
    */
   voice_audio_key?: string | null;
   /**

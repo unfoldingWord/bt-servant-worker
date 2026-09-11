@@ -47,6 +47,25 @@ describe('validateChatBody — shared rules', () => {
       'is_admin is not a valid field; admin origin is derived from client_id'
     );
   });
+
+  it('accepts voice_format: opus', () => {
+    expect(validateChatBody({ ...baseBody, voice_format: 'opus' }, 'final')).toBeNull();
+  });
+
+  it('accepts voice_format: aac', () => {
+    expect(validateChatBody({ ...baseBody, voice_format: 'aac' }, 'final')).toBeNull();
+  });
+
+  it('accepts an absent voice_format (defaults to opus downstream)', () => {
+    expect(validateChatBody(baseBody, 'final')).toBeNull();
+  });
+
+  it('rejects an unknown voice_format', () => {
+    const body = { ...baseBody, voice_format: 'mp3' } as unknown as ChatRequest;
+    expect(validateChatBody(body, 'final')).toBe(
+      'Invalid voice_format: mp3. Must be one of: opus, aac'
+    );
+  });
 });
 
 describe('isAdminClient', () => {

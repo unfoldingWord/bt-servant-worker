@@ -12,6 +12,8 @@ import type { ChatRequest, ChatTransport } from '../types/engine.js';
 
 const VALID_CHAT_TYPES: ReadonlySet<string> = new Set(['private', 'group', 'supergroup']);
 
+const VALID_VOICE_FORMATS: ReadonlySet<string> = new Set(['opus', 'aac']);
+
 /** ISO 639-1 language code shape: exactly two lowercase letters. */
 const ISO_639_1_PATTERN = /^[a-z]{2}$/;
 
@@ -101,6 +103,17 @@ function validateTransportFields(body: ChatRequest, transport: ChatTransport): s
   return null;
 }
 
+/** Validate the optional enum-valued fields shared by all transports. */
+function validateEnumFields(body: ChatRequest): string | null {
+  if (body.chat_type && !VALID_CHAT_TYPES.has(body.chat_type)) {
+    return `Invalid chat_type: ${body.chat_type}. Must be one of: private, group, supergroup`;
+  }
+  if (body.voice_format && !VALID_VOICE_FORMATS.has(body.voice_format)) {
+    return `Invalid voice_format: ${body.voice_format}. Must be one of: opus, aac`;
+  }
+  return null;
+}
+
 function validateCoreFields(body: ChatRequest): string | null {
   if (!body.user_id) return 'user_id is required';
   if (!body.client_id) return 'client_id is required';
@@ -110,9 +123,8 @@ function validateCoreFields(body: ChatRequest): string | null {
   if ((body as unknown as Record<string, unknown>).is_admin !== undefined) {
     return 'is_admin is not a valid field; admin origin is derived from client_id';
   }
-  if (body.chat_type && !VALID_CHAT_TYPES.has(body.chat_type)) {
-    return `Invalid chat_type: ${body.chat_type}. Must be one of: private, group, supergroup`;
-  }
+  const enumError = validateEnumFields(body);
+  if (enumError) return enumError;
   const isGroup = body.chat_type === 'group' || body.chat_type === 'supergroup';
   if (isGroup && !body.chat_id) return 'chat_id is required for group/supergroup chats';
   return null;

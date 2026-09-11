@@ -4,8 +4,9 @@
  * Two key families share the `AUDIO_BUCKET` namespace, distinguished by
  * prefix:
  *
- * - **`audio/{org}/{user_id}/{uuid}.opus`** — TTS output (assistant → user).
- *   Synthesized after every voice-out turn; served via
+ * - **`audio/{org}/{user_id}/{uuid}.{opus|aac}`** — TTS output
+ *   (assistant → user). Synthesized after every voice-out turn in the
+ *   request's `voice_format` (default opus); served via
  *   `GET /api/v1/audio/:key`.
  *
  * - **`voice-submissions/{org}/{chatId|user_id}/{speaker|user_id}/{uuid}.ogg`** —
@@ -22,11 +23,17 @@
 
 import { RequestLogger } from '../../utils/logger.js';
 import { withSpan, countMetric } from '../telemetry/index.js';
+import { voiceFormatSpec } from './types.js';
+import type { VoiceFormat } from '../../types/engine.js';
 
 /** Generate a unique R2 key for a TTS audio object. */
-export function generateAudioKey(org: string, userId: string): string {
+export function generateAudioKey(
+  org: string,
+  userId: string,
+  format: VoiceFormat = 'opus'
+): string {
   const id = crypto.randomUUID();
-  return `audio/${org}/${userId}/${id}.opus`;
+  return `audio/${org}/${userId}/${id}.${voiceFormatSpec(format).extension}`;
 }
 
 /** Build the public-facing URL path for an audio key. */
@@ -35,18 +42,19 @@ export function audioKeyToUrl(audioKey: string, baseUrl: string): string {
   return `${base}/api/v1/audio/${audioKey}`;
 }
 
-/** Upload raw audio bytes to R2. */
+/** Upload raw audio bytes to R2 with the given content type. */
 export async function uploadAudio(
   bucket: R2Bucket,
   key: string,
   audioBytes: Uint8Array,
+  contentType: string,
   logger: RequestLogger
 ): Promise<void> {
   const start = Date.now();
   try {
     // Span carries only the bounded size; the key embeds org/user ids and never egresses.
     await withSpan('r2.put', { size_bytes: audioBytes.byteLength }, () =>
-      bucket.put(key, audioBytes, { httpMetadata: { contentType: 'audio/ogg' } })
+      bucket.put(key, audioBytes, { httpMetadata: { contentType } })
     );
   } catch (error) {
     countMetric('r2_operations_total', {
