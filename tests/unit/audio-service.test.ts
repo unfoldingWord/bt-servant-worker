@@ -293,6 +293,17 @@ describe('synthesizeSpeech - happy path', () => {
     );
   });
 
+  it('synthesizes aac when voice format is aac', async () => {
+    mockSpeechCreate.mockResolvedValue(mockSpeechResponse('fake-audio'));
+    const result = await synthesizeSpeech('test-key', 'Hello', logger, 'aac');
+
+    expect(result.audio_format).toBe('aac');
+    expect(mockSpeechCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ response_format: 'aac' }),
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
+  });
+
   it('truncates text exceeding MAX_TTS_INPUT_CHARS', async () => {
     const longText = 'a'.repeat(MAX_TTS_INPUT_CHARS + 500);
     mockSpeechCreate.mockResolvedValue(mockSpeechResponse('audio'));

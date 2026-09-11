@@ -37,6 +37,7 @@ import {
   ChatHistoryEntry,
   ChatHistoryResponse,
   ChatRequest,
+  VoiceFormat,
   ChatResponse,
   ChatTransport,
   SSEEvent,
@@ -67,6 +68,7 @@ import {
   transcribeAudio,
   synthesizeSpeech,
   AudioContext,
+  SpeechSynthesisResult,
   generateAudioKey,
   audioKeyToUrl,
   uploadAudio,
@@ -74,6 +76,7 @@ import {
   uploadVoiceSubmission,
   voiceSubmissionKeyToUrl,
   normalizeAudioFormat,
+  voiceFormatSpec,
 } from '../services/audio/index.js';
 import { AttachmentsContext, createAttachmentsContext } from '../services/ptxprint/index.js';
 import { AppError, AudioTranscriptionError, ValidationError } from '../utils/errors.js';
@@ -3161,10 +3164,12 @@ export class UserDO {
     const combinedText = responses.join('\n\n');
     const org = body.org ?? this.env.DEFAULT_ORG;
     const userId = body.user_id;
+    const voiceFormat: VoiceFormat = body.voice_format ?? 'opus';
     logger.log('audio_flow_tts_decision', {
       message_type: body.message_type,
       audio_requested_by_tool: audioContext.audioRequested,
       should_generate: shouldGenerate,
+      voice_format: voiceFormat,
       response_count: responses.length,
       combined_text_chars: combinedText.length,
       individual_response_lengths: responses.map((r) => r.length),
@@ -3176,7 +3181,11 @@ export class UserDO {
       });
       return null;
     }
-    const audio = await this.generateVoiceResponse(org, userId, responses, logger, emit);
+    const audio = await this.generateVoiceResponse(
+      { org, userId, responses, format: voiceFormat },
+      logger,
+      emit
+    );
     logger.log('audio_flow_tts_result', {
       has_audio: audio !== null,
       audio_key: audio?.audioKey ?? null,
@@ -3210,36 +3219,58 @@ export class UserDO {
     return { interval, getCount: () => count };
   }
 
+  /** Synthesize the combined text in the requested format and upload it to R2. */
+  private async synthesizeAndUploadVoice(
+    voice: { org: string; userId: string; format: VoiceFormat },
+    combinedText: string,
+    logger: RequestLogger
+  ): Promise<{ audioKey: string; synthesis: SpeechSynthesisResult; r2UploadMs: number }> {
+    const synthesis = await synthesizeSpeech(
+      this.env.OPENAI_API_KEY,
+      combinedText,
+      logger,
+      voice.format
+    );
+    const synthesisDoneAt = Date.now();
+    const audioKey = generateAudioKey(voice.org, voice.userId, voice.format);
+    await uploadAudio(
+      this.env.AUDIO_BUCKET,
+      audioKey,
+      synthesis.audio_bytes,
+      voiceFormatSpec(voice.format).contentType,
+      logger
+    );
+    return { audioKey, synthesis, r2UploadMs: Date.now() - synthesisDoneAt };
+  }
+
   private async generateVoiceResponse(
-    org: string,
-    userId: string,
-    responses: string[],
+    voice: { org: string; userId: string; responses: string[]; format: VoiceFormat },
     logger: RequestLogger,
     emit?: StatusEmitter
   ): Promise<{ audioKey: string } | null> {
     const genStart = Date.now();
-    const combinedText = responses.join('\n\n');
+    const combinedText = voice.responses.join('\n\n');
     logger.log('audio_flow_generate_voice_start', {
-      response_count: responses.length,
+      response_count: voice.responses.length,
       combined_text_chars: combinedText.length,
+      voice_format: voice.format,
       has_callbacks: !!emit,
     });
 
     const keepalive = emit ? this.startTtsKeepalive(emit, genStart, logger) : null;
     try {
       await emit?.('status_tts_generating');
-      const synthesis = await synthesizeSpeech(this.env.OPENAI_API_KEY, combinedText, logger);
-      const synthesisDoneAt = Date.now();
-
-      const audioKey = generateAudioKey(org, userId);
-      await uploadAudio(this.env.AUDIO_BUCKET, audioKey, synthesis.audio_bytes, logger);
-      const uploadDoneAt = Date.now();
+      const { audioKey, synthesis, r2UploadMs } = await this.synthesizeAndUploadVoice(
+        voice,
+        combinedText,
+        logger
+      );
 
       logger.log('audio_flow_generate_voice_complete', {
         input_chars: synthesis.input_chars,
         synthesis_ms: synthesis.duration_ms,
-        r2_upload_ms: uploadDoneAt - synthesisDoneAt,
-        generate_voice_total_ms: uploadDoneAt - genStart,
+        r2_upload_ms: r2UploadMs,
+        generate_voice_total_ms: Date.now() - genStart,
         audio_bytes: synthesis.audio_bytes.byteLength,
         audio_key: audioKey,
         keepalives_sent: keepalive?.getCount() ?? 0,

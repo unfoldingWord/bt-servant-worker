@@ -214,7 +214,8 @@ const OTHER_LABEL_VALUE = 'other';
  */
 const BOUNDED_LABEL_VALUES: Record<string, ReadonlySet<string>> = {
   chat_type: new Set(['private', 'group', 'supergroup']),
-  format: new Set(['ogg', 'mp3', 'wav', 'webm', 'flac', 'm4a', 'aac']),
+  // Inbound STT formats (SUPPORTED_AUDIO_FORMATS) + outbound TTS VoiceFormat ('opus', 'aac').
+  format: new Set(['ogg', 'mp3', 'wav', 'webm', 'flac', 'm4a', 'aac', 'opus']),
   error_name: new Set([
     // AppError hierarchy (src/utils/errors.ts)
     'AppError',

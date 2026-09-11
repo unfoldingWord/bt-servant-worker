@@ -105,9 +105,7 @@ interface UserDOInternals {
     emit?: StatusEmitter
   ): Promise<{ text: string; inboundVoiceKey?: string }>;
   generateVoiceResponse(
-    org: string,
-    userId: string,
-    responses: string[],
+    voice: { org: string; userId: string; responses: string[]; format: 'opus' | 'aac' },
     logger: RequestLogger,
     emit?: StatusEmitter
   ): Promise<{ audioKey: string } | null>;
@@ -573,9 +571,7 @@ describe('UserDO TTS status (#405)', () => {
     const statuses: StatusUpdate[] = [];
     const emit = createStatusEmitter(createCallbacks(statuses), 'pt', createMockLogger());
     const result = await createDO().generateVoiceResponse(
-      'unfoldingWord',
-      'u1',
-      ['Olá!'],
+      { org: 'unfoldingWord', userId: 'u1', responses: ['Olá!'], format: 'opus' },
       createMockLogger(),
       emit
     );
@@ -662,7 +658,11 @@ describe('SSE status contract (#405)', () => {
         const emit = createStatusEmitter(callbacks, 'pt', turnLogger);
         await emit?.('status_processing');
         await userDo.transcribeAudioMessage(audioBody, turnLogger, emit);
-        await userDo.generateVoiceResponse('unfoldingWord', 'u1', ['x'], turnLogger, emit);
+        await userDo.generateVoiceResponse(
+          { org: 'unfoldingWord', userId: 'u1', responses: ['x'], format: 'opus' },
+          turnLogger,
+          emit
+        );
         return FAKE_RESPONSE;
       }
     );

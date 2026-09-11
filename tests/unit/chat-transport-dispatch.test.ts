@@ -49,6 +49,56 @@ describe('validateChatBody — shared rules', () => {
   });
 });
 
+describe('validateChatBody — voice_format', () => {
+  it('accepts voice_format: opus', () => {
+    expect(validateChatBody({ ...baseBody, voice_format: 'opus' }, 'final')).toBeNull();
+  });
+
+  it('accepts voice_format: aac', () => {
+    expect(validateChatBody({ ...baseBody, voice_format: 'aac' }, 'final')).toBeNull();
+  });
+
+  it('accepts an absent voice_format (defaults to opus downstream)', () => {
+    expect(validateChatBody(baseBody, 'final')).toBeNull();
+  });
+
+  it('rejects an unknown voice_format', () => {
+    const body = { ...baseBody, voice_format: 'mp3' } as unknown as ChatRequest;
+    expect(validateChatBody(body, 'final')).toBe(
+      'Invalid voice_format: mp3. Must be one of: opus, aac'
+    );
+  });
+
+  it('treats voice_format: null as absent (matches the ?? default downstream)', () => {
+    const body = { ...baseBody, voice_format: null } as unknown as ChatRequest;
+    expect(validateChatBody(body, 'final')).toBeNull();
+  });
+
+  it("rejects an empty-string voice_format ''", () => {
+    const body = { ...baseBody, voice_format: '' } as unknown as ChatRequest;
+    expect(validateChatBody(body, 'final')).toBe(
+      'Invalid voice_format: . Must be one of: opus, aac'
+    );
+  });
+
+  it.each([[false], [0], [{ fmt: 'aac' }]])(
+    'rejects a non-string voice_format %j with a fixed message',
+    (value) => {
+      const body = { ...baseBody, voice_format: value } as unknown as ChatRequest;
+      expect(validateChatBody(body, 'final')).toBe(
+        'Invalid voice_format: expected a string. Must be one of: opus, aac'
+      );
+    }
+  );
+
+  it('rejects { toString: null } without throwing (coercion would raise a TypeError)', () => {
+    const body = { ...baseBody, voice_format: { toString: null } } as unknown as ChatRequest;
+    expect(validateChatBody(body, 'final')).toBe(
+      'Invalid voice_format: expected a string. Must be one of: opus, aac'
+    );
+  });
+});
+
 describe('isAdminClient', () => {
   it('treats "admin-portal" as admin', () => {
     expect(isAdminClient('admin-portal')).toBe(true);

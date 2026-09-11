@@ -21,4 +21,5 @@ export {
   MAX_AUDIO_SIZE_BYTES,
   MAX_TTS_INPUT_CHARS,
   normalizeAudioFormat,
+  voiceFormatSpec,
 } from './types.js';

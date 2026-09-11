@@ -2,6 +2,8 @@
  * Audio service type definitions for STT (Speech-to-Text) and TTS (Text-to-Speech)
  */
 
+import type { VoiceFormat } from '../../types/engine.js';
+
 export interface TranscriptionResult {
   text: string;
   duration_ms: number;
@@ -10,9 +12,27 @@ export interface TranscriptionResult {
 export interface SpeechSynthesisResult {
   audio_base64: string;
   audio_bytes: Uint8Array;
-  audio_format: 'opus';
+  audio_format: VoiceFormat;
   duration_ms: number;
   input_chars: number;
+}
+
+/**
+ * Per-format R2 key extension and content type for outbound TTS audio.
+ * Distinct from the inbound-STT format machinery below — the outbound set is
+ * what OpenAI TTS can synthesize and gateways can render, not what STT accepts.
+ *
+ * OpenAI's 'opus' output is Ogg-encapsulated (hence `audio/ogg`); its 'aac'
+ * output is a raw ADTS stream (`audio/aac`), which Signal clients render as a
+ * native inline voice bubble.
+ */
+export function voiceFormatSpec(format: VoiceFormat): { extension: string; contentType: string } {
+  switch (format) {
+    case 'opus':
+      return { extension: 'opus', contentType: 'audio/ogg' };
+    case 'aac':
+      return { extension: 'aac', contentType: 'audio/aac' };
+  }
 }
 
 export const SUPPORTED_AUDIO_FORMATS = ['ogg', 'mp3', 'wav', 'webm', 'flac', 'm4a', 'aac'] as const;

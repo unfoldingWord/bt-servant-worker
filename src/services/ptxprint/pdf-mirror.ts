@@ -42,7 +42,7 @@ export function buildPdfPublicUrl(baseUrl: string, key: string): string {
 
 /**
  * Build the R2 key under which a PDF gets stored. Org/user-scoped + job-id
- * suffix mirrors the audio key shape (`audio/{org}/{user}/{uuid}.opus`) but
+ * suffix mirrors the audio key shape (`audio/{org}/{user}/{uuid}.{opus|aac}`) but
  * with the job_id from ptxprint-mcp standing in for the random UUID — we
  * already get a unique-per-payload identifier and re-using it makes
  * ptxprint-side and bt-servant-side logs trivially correlatable.

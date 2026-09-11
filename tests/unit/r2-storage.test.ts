@@ -22,6 +22,11 @@ describe('generateAudioKey', () => {
     expect(key).toMatch(/^audio\/myOrg\/user-42\/[0-9a-f-]+\.opus$/);
   });
 
+  it('uses the aac extension when the format is aac', () => {
+    const key = generateAudioKey('myOrg', 'user-42', 'aac');
+    expect(key).toMatch(/^audio\/myOrg\/user-42\/[0-9a-f-]+\.aac$/);
+  });
+
   it('generates unique keys on successive calls', () => {
     const a = generateAudioKey('org', 'user');
     const b = generateAudioKey('org', 'user');
@@ -41,14 +46,36 @@ describe('audioKeyToUrl', () => {
   });
 });
 
-describe('uploadAudio error path', () => {
+describe('uploadAudio', () => {
+  it('stores the passed content type on the R2 object (opus → audio/ogg)', async () => {
+    const logger = fakeLogger();
+    const put = vi.fn().mockResolvedValue(undefined);
+    const bucket = { put } as unknown as R2Bucket;
+
+    await uploadAudio(bucket, 'audio/o/u/x.opus', new Uint8Array([1, 2, 3]), 'audio/ogg', logger);
+    expect(put).toHaveBeenCalledWith('audio/o/u/x.opus', expect.any(Uint8Array), {
+      httpMetadata: { contentType: 'audio/ogg' },
+    });
+  });
+
+  it('stores the passed content type on the R2 object (aac → audio/aac)', async () => {
+    const logger = fakeLogger();
+    const put = vi.fn().mockResolvedValue(undefined);
+    const bucket = { put } as unknown as R2Bucket;
+
+    await uploadAudio(bucket, 'audio/o/u/x.aac', new Uint8Array([1, 2, 3]), 'audio/aac', logger);
+    expect(put).toHaveBeenCalledWith('audio/o/u/x.aac', expect.any(Uint8Array), {
+      httpMetadata: { contentType: 'audio/aac' },
+    });
+  });
+
   it('logs and rethrows when the R2 put fails (no silent swallow)', async () => {
     const logger = fakeLogger();
     const boom = new Error('r2 unavailable');
     const bucket = { put: vi.fn().mockRejectedValue(boom) } as unknown as R2Bucket;
 
     await expect(
-      uploadAudio(bucket, 'audio/o/u/x.opus', new Uint8Array([1, 2, 3]), logger)
+      uploadAudio(bucket, 'audio/o/u/x.opus', new Uint8Array([1, 2, 3]), 'audio/ogg', logger)
     ).rejects.toBe(boom);
     expect(logger.error).toHaveBeenCalledWith(
       'r2_audio_upload_failed',

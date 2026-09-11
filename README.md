@@ -105,16 +105,16 @@ Lifecycle operations (`_rename`, `_clone`, `_retire`) manage modes without break
 
 **Trigger Classifier** — Messages may begin with `#<mode>` and/or `@<language>` tokens. A deterministic cascade matches exact slugs first; fuzzy input falls back to a Haiku-powered LLM classifier for disambiguation.
 
-**Audio Pipeline** — When a user sends an audio message (`message_type: 'audio'`), the worker archives the inbound voice recording to R2 (`voice-submissions/…`), transcribes it using Whisper (`@cf/openai/whisper-large-v3-turbo` via Workers AI), processes the transcribed text through the normal Claude orchestration, then generates a spoken response using OpenAI's `gpt-4o-mini-tts` (with exponential-backoff retry on 429/5xx). TTS audio is stored in R2 and served via `/api/v1/audio/*`. TTS failure is non-fatal — the text response is always returned. `audio_format` accepts both bare extensions (`ogg`) and MIME forms (`audio/ogg`).
+**Audio Pipeline** — When a user sends an audio message (`message_type: 'audio'`), the worker archives the inbound voice recording to R2 (`voice-submissions/…`), transcribes it using Whisper (`@cf/openai/whisper-large-v3-turbo` via Workers AI), processes the transcribed text through the normal Claude orchestration, then generates a spoken response using OpenAI's `gpt-4o-mini-tts` (with exponential-backoff retry on 429/5xx). TTS audio is stored in R2 and served via `/api/v1/audio/*`. TTS failure is non-fatal — the text response is always returned. `audio_format` accepts both bare extensions (`ogg`) and MIME forms (`audio/ogg`). The outbound TTS format is selectable per request via `voice_format` (`'opus'` default, or `'aac'` for clients like Signal that only inline-render AAC voice notes); it controls the OpenAI `response_format`, the R2 key extension, and the stored content type.
 
-| Constraint              | Value                                |
-| ----------------------- | ------------------------------------ |
-| Max audio input size    | 25 MB                                |
-| Supported audio formats | ogg, mp3, wav, webm, flac, m4a       |
-| Max TTS input           | 10,000 characters (truncated beyond) |
-| TTS output format       | OGG/Opus                             |
-| TTS model               | gpt-4o-mini-tts                      |
-| TTS voice               | ash                                  |
+| Constraint              | Value                                        |
+| ----------------------- | -------------------------------------------- |
+| Max audio input size    | 25 MB                                        |
+| Supported audio formats | ogg, mp3, wav, webm, flac, m4a               |
+| Max TTS input           | 10,000 characters (truncated beyond)         |
+| TTS output format       | OGG/Opus (default) or AAC via `voice_format` |
+| TTS model               | gpt-4o-mini-tts                              |
+| TTS voice               | ash                                          |
 
 **Spoken Mode / Ambient Group Voice** — Group messages may carry `addressed_to_bot: false` (e.g., ambient voice in a group where the bot listens but wasn't mentioned). Ambient turns are archived and attributed but short-circuit full orchestration. Claude can later retrieve and replay archived recordings via the `read_r2_object` and `attach_audio` tools. See [docs/spoken-mode-document.md](docs/spoken-mode-document.md).
 
@@ -222,6 +222,7 @@ interface ChatRequest {
   message_type: 'text' | 'audio';
   audio_base64?: string; // base64-encoded audio (required when message_type is 'audio')
   audio_format?: string; // 'ogg' | 'mp3' | 'wav' | 'webm' | 'flac' | 'm4a' — bare or MIME form ('audio/ogg')
+  voice_format?: 'opus' | 'aac'; // outbound TTS voice-note format — defaults to 'opus'
   org?: string; // defaults to DEFAULT_ORG env var
   org_id?: string; // legacy alias for org (backward compat with whatsapp gateway)
   message_key?: string; // correlation ID for webhook callbacks — REQUIRED on /chat/callback, REJECTED elsewhere
