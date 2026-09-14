@@ -141,6 +141,96 @@ curl -X POST "http://localhost:$PORT/api/v1/chat" \
 { "error": "Message is required" }
 ```
 
+### Send a Message With a Client-Supplied Thread
+
+Replaces the stored history with the supplied turns before the turn runs (issue #392, full spec in [client-supplied-history.md](client-supplied-history.md)). `"history": []` starts blank.
+
+```bash
+curl -X POST "http://localhost:$PORT/api/v1/chat" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "client_id": "curl-test",
+    "user_id": "my-user-id",
+    "message_type": "text",
+    "history": [
+      { "user_message": "Give me an overview of Mark 1.", "assistant_response": "## Mark 1 — Overview\n..." }
+    ],
+    "message": "What does \"immediately\" signal in verse 12?"
+  }'
+```
+
+**Response (200)** — includes the appended turn and the stored thread length (only when `history` was sent):
+
+```json
+{
+  "message_id": "…",
+  "responses": ["…"],
+  "response_language": "en",
+  "input_language": "en",
+  "voice_audio_base64": null,
+  "voice_audio_url": null,
+  "history_entry": {
+    "user_message": "What does \"immediately\" signal in verse 12?",
+    "assistant_response": "…",
+    "timestamp": 1757800000000
+  },
+  "history_length": 2
+}
+```
+
+Verify what was stored:
+
+```bash
+curl "http://localhost:$PORT/api/v1/orgs/$ORG/users/my-user-id/history?user_id=my-user-id" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+### Send a Message With a Client-Supplied Thread (INVALID: empty turn)
+
+```bash
+curl -X POST "http://localhost:$PORT/api/v1/chat" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "client_id": "curl-test",
+    "user_id": "my-user-id",
+    "message_type": "text",
+    "history": [{ "user_message": "q", "assistant_response": "" }],
+    "message": "hi"
+  }'
+```
+
+**Response (400):**
+
+```json
+{ "error": "history[0].assistant_response is required and must be non-empty" }
+```
+
+### Suppress the Welcome and Memory
+
+Both flags are independent of `history` and of each other. `suppress_welcome` skips the mode's first-contact welcome without writing any flag; `suppress_memory` removes the memory prompt slot, TOC and tools for the turn.
+
+```bash
+curl -X POST "http://localhost:$PORT/api/v1/chat" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "client_id": "curl-test",
+    "user_id": "my-user-id",
+    "message_type": "text",
+    "suppress_welcome": true,
+    "suppress_memory": true,
+    "message": "#spoken hello"
+  }'
+```
+
+**Response (400)** for a non-boolean flag:
+
+```json
+{ "error": "suppress_welcome must be a boolean" }
+```
+
 ---
 
 ## Streaming Chat (SSE)

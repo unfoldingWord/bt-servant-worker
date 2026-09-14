@@ -175,10 +175,10 @@ Authorization: Bearer <ENGINE_API_KEY or org-specific admin key>
 
 ### User Endpoints
 
-| Endpoint                                      | Method  | Description                             |
-| --------------------------------------------- | ------- | --------------------------------------- |
-| `/api/v1/orgs/:org/users/:userId/preferences` | GET/PUT | User preferences                        |
-| `/api/v1/orgs/:org/users/:userId/history`     | GET     | Chat history (`?limit=` and `?offset=`) |
+| Endpoint                                      | Method  | Description                                                                                                                                                        |
+| --------------------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `/api/v1/orgs/:org/users/:userId/preferences` | GET/PUT | User preferences                                                                                                                                                   |
+| `/api/v1/orgs/:org/users/:userId/history`     | GET     | Chat history (`?limit=` and `?offset=`). Write via `history` on a chat request — see [Client-supplied conversation history](#client-supplied-conversation-history) |
 
 ### Admin Endpoints
 
@@ -237,6 +237,18 @@ interface ChatRequest {
   thread_id?: string; // topic/thread ID within a supergroup
   addressed_to_bot?: boolean; // false = ambient message the bot overheard but wasn't asked (defaults true)
   response_language_hint?: string; // ISO 639-1 code — overrides stored preference for this request
+
+  // Client-owned conversation fields (all optional — see docs/client-supplied-history.md)
+  history?: ClientHistoryEntry[]; // REPLACES the stored thread before this turn; [] starts blank; private chats only
+  suppress_welcome?: boolean; // skip the first-contact welcome (authored copy, share link, model self-greet) this turn
+  suppress_memory?: boolean; // turn persistent memory off this turn (no prompt slot, no TOC, no memory tools)
+}
+
+interface ClientHistoryEntry {
+  user_message: string; // required, non-empty, ≤ 16,000 chars
+  assistant_response: string; // required, non-empty, ≤ 16,000 chars
+  timestamp?: number; // ms since epoch (optional; wins over created_at)
+  created_at?: string; // ISO 8601 (optional; a GET /history payload round-trips unchanged)
 }
 
 // Response
@@ -247,6 +259,8 @@ interface ChatResponse {
   voice_audio_base64: string | null; // deprecated — always null (legacy compat)
   voice_audio_url?: string | null; // URL to fetch TTS audio from R2 (e.g., /api/v1/audio/...)
   attachments?: Attachment[]; // tool-produced artifacts (PDFs, archived audio)
+  history_entry?: { user_message: string; assistant_response: string; timestamp: number }; // ONLY when the request sent `history`: the turn just appended
+  history_length?: number; // ONLY when the request sent `history`: stored thread length after the append
 }
 
 type Attachment =
@@ -345,6 +359,53 @@ curl -X POST https://api.btservant.ai/api/v1/chat/callback \
 Immediate response: `202 Accepted` with `{"message_id": "uuid"}`. The worker then POSTs callback events (`status`, `progress`, `complete`, `error`) to the `progress_callback_url` asynchronously. Set `progress_mode: "complete"` to receive only the final completion event (zero intermediate status/progress POSTs).
 
 More examples in [docs/curl-examples.md](docs/curl-examples.md).
+
+### Client-Supplied Conversation History
+
+A client can own its conversation instead of relying on the thread the worker stores per user (issue #392). Three optional, independent fields work on every chat transport. Full spec, semantics table, and more examples: [docs/client-supplied-history.md](docs/client-supplied-history.md).
+
+| Field              | Effect                                                                                                            |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------- |
+| `history`          | Replaces the stored thread before the turn runs; the turn appends; `[]` starts blank. Private chats only.         |
+| `suppress_welcome` | Skips the first-contact welcome (authored mode copy, share link, and the model's own greeting). No flags written. |
+| `suppress_memory`  | Turns persistent memory off for the turn: no memory prompt slot, no TOC, no `read_memory`/`update_memory` tools.  |
+
+Start a conversation from a client-authored opening page, with no welcome and no memory:
+
+```bash
+curl -X POST https://api.btservant.ai/api/v1/chat \
+  -H "Authorization: Bearer $ENGINE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "client_id": "fluent",
+    "user_id": "user-42",
+    "org": "unfoldingword",
+    "message_type": "text",
+    "suppress_welcome": true,
+    "suppress_memory": true,
+    "history": [
+      { "user_message": "Give me an overview of Mark 1.", "assistant_response": "## Mark 1 — Overview\n..." }
+    ],
+    "message": "What does \"immediately\" signal in verse 12?"
+  }'
+```
+
+The response carries the appended turn and the stored length, so the client can append locally and send the whole thread next time:
+
+```json
+{
+  "responses": ["In Mark, \"immediately\" ..."],
+  "response_language": "en",
+  "history_entry": {
+    "user_message": "What does \"immediately\" signal in verse 12?",
+    "assistant_response": "In Mark, ...",
+    "timestamp": 1757800000000
+  },
+  "history_length": 2
+}
+```
+
+Threads longer than the org's `max_history_storage` are trimmed from the oldest end, never rejected; `history_length` reports what was kept. Uploaded entries are rebuilt from a whitelist (`user_message`, `assistant_response`, `timestamp`/`created_at`), so a client can never write R2 audio keys, `speaker`, or `attachments` into stored history.
 
 ### SSE Event Types
 

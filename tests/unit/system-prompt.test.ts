@@ -185,6 +185,37 @@ describe('buildSystemPrompt - memory TOC', () => {
   });
 });
 
+describe('buildSystemPrompt - memory suppression (#392)', () => {
+  it('drops memory_instructions AND the TOC when memoryEnabled is false', () => {
+    const toc = '- **Progress** (1.2 KB) [pinned]\n\nTotal: 1.2 KB / 128.0 KB';
+    const prompt = buildSystemPrompt(
+      createEmptyCatalog(),
+      defaultPrefs,
+      [],
+      DEFAULT_PROMPT_VALUES,
+      { memoryTOC: toc, memoryEnabled: false }
+    );
+    expect(prompt).not.toContain(DEFAULT_PROMPT_VALUES.memory_instructions);
+    expect(prompt).not.toContain('- **Progress**');
+    // Everything around the memory slot is untouched.
+    expect(prompt).toContain(DEFAULT_PROMPT_VALUES.client_instructions);
+    expect(prompt).toContain(DEFAULT_PROMPT_VALUES.closing);
+  });
+
+  it('keeps memory_instructions when memoryEnabled is true or omitted', () => {
+    for (const options of [undefined, { memoryEnabled: true }]) {
+      const prompt = buildSystemPrompt(
+        createEmptyCatalog(),
+        defaultPrefs,
+        [],
+        DEFAULT_PROMPT_VALUES,
+        options
+      );
+      expect(prompt).toContain(DEFAULT_PROMPT_VALUES.memory_instructions);
+    }
+  });
+});
+
 describe('buildSystemPrompt - audio tool guidance', () => {
   it('includes audio response guidance in system prompt', () => {
     const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);

@@ -81,6 +81,35 @@ describe('buildAllTools', () => {
   });
 });
 
+describe('buildAllTools — memory gating (#392)', () => {
+  const catalog = buildToolCatalog([], []);
+
+  it('omits both memory tools and stops naming them when hasMemory is false', () => {
+    const tools = buildAllTools(catalog, { hasMemory: false });
+    const names = tools.map((t) => t.name);
+
+    expect(tools.length).toBe(7);
+    expect(names).not.toContain('read_memory');
+    expect(names).not.toContain('update_memory');
+    expect(names).toContain('execute_code');
+    expect(names).toContain('request_audio');
+    const executeCode = tools.find((t) => t.name === 'execute_code');
+    expect(executeCode?.description).not.toContain('update_memory');
+    expect(executeCode?.description).not.toContain('read_memory');
+    expect(executeCode?.description).toContain('attach_audio, request_audio, read_r2_object');
+  });
+
+  it('keeps the memory tools by default and when hasMemory is true', () => {
+    for (const tools of [buildAllTools(catalog), buildAllTools(catalog, { hasMemory: true })]) {
+      const names = tools.map((t) => t.name);
+      expect(names).toContain('read_memory');
+      expect(names).toContain('update_memory');
+      const executeCode = tools.find((t) => t.name === 'execute_code');
+      expect(executeCode?.description).toContain('update_memory, read_memory, attach_audio');
+    }
+  });
+});
+
 describe('isBuiltInTool', () => {
   it('should identify built-in tools', () => {
     expect(isBuiltInTool('execute_code')).toBe(true);

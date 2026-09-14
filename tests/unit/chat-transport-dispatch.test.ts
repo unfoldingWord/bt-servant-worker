@@ -253,3 +253,75 @@ describe('validateChatBody — group chat rules (transport-agnostic)', () => {
     expect(result).toBe('chat_id is required for group/supergroup chats');
   });
 });
+
+describe('validateChatBody — client-owned conversation fields (#392)', () => {
+  const thread = [{ user_message: 'q', assistant_response: 'a' }];
+  const callbackFields = { progress_callback_url: 'https://example.com/hook', message_key: 'm1' };
+
+  it('accepts history, suppress_welcome and suppress_memory on every transport', () => {
+    const fields = { history: thread, suppress_welcome: true, suppress_memory: true };
+    expect(validateChatBody({ ...baseBody, ...fields }, 'final')).toBeNull();
+    expect(validateChatBody({ ...baseBody, ...fields }, 'stream')).toBeNull();
+    expect(validateChatBody({ ...baseBody, ...fields, ...callbackFields }, 'callback')).toBeNull();
+  });
+
+  it('accepts an empty history (start blank) and explicit false flags', () => {
+    const body = { ...baseBody, history: [], suppress_welcome: false, suppress_memory: false };
+    expect(validateChatBody(body, 'final')).toBeNull();
+  });
+
+  it('treats null flags and null history as absent', () => {
+    const body = {
+      ...baseBody,
+      history: null,
+      suppress_welcome: null,
+      suppress_memory: null,
+    } as unknown as ChatRequest;
+    expect(validateChatBody(body, 'final')).toBeNull();
+  });
+
+  it('still allows suppress flags on group chats (they are not history)', () => {
+    const body = { ...baseBody, chat_type: 'group' as const, chat_id: 'g1', suppress_memory: true };
+    expect(validateChatBody(body, 'final')).toBeNull();
+  });
+});
+
+describe('validateChatBody — client-owned conversation fields, rejections (#392)', () => {
+  const thread = [{ user_message: 'q', assistant_response: 'a' }];
+
+  it('rejects a non-boolean suppress_welcome', () => {
+    const body = { ...baseBody, suppress_welcome: 'yes' } as unknown as ChatRequest;
+    expect(validateChatBody(body, 'final')).toBe('suppress_welcome must be a boolean');
+  });
+
+  it('rejects a non-boolean suppress_memory', () => {
+    const body = { ...baseBody, suppress_memory: 1 } as unknown as ChatRequest;
+    expect(validateChatBody(body, 'final')).toBe('suppress_memory must be a boolean');
+  });
+
+  it('surfaces the history validator message verbatim', () => {
+    const body = {
+      ...baseBody,
+      history: [{ user_message: 'q', assistant_response: '' }],
+    } as unknown as ChatRequest;
+    expect(validateChatBody(body, 'final')).toBe(
+      'history[0].assistant_response is required and must be non-empty'
+    );
+  });
+
+  it('rejects history on group and supergroup chats, even when empty', () => {
+    const group = { ...baseBody, chat_type: 'group' as const, chat_id: 'g1', history: [] };
+    expect(validateChatBody(group, 'final')).toBe(
+      'history is not supported on group/supergroup chats'
+    );
+    const supergroup = {
+      ...baseBody,
+      chat_type: 'supergroup' as const,
+      chat_id: 'g1',
+      history: thread,
+    };
+    expect(validateChatBody(supergroup, 'stream')).toBe(
+      'history is not supported on group/supergroup chats'
+    );
+  });
+});

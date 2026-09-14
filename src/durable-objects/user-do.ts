@@ -104,6 +104,7 @@ import {
   UNDETERMINED_LANGUAGE,
 } from '../services/language/index.js';
 import { isAdminClient, isValidLanguageCode, validateChatBody } from '../utils/chat-validation.js';
+import { hasClientHistory, sanitizeClientHistory } from '../utils/history-validation.js';
 import { OrgLanguages, resolveEffectiveLanguage } from '../types/languages.js';
 import { InternalQueueEntry } from '../types/queue.js';
 import { statusUpdate, uiString } from '../i18n/ui-strings.js';
@@ -387,6 +388,70 @@ function isCountryCode(value: string | undefined): value is string {
  * misattribute every WhatsApp/Telegram user to wherever the gateway runs.
  */
 /**
+ * #392: the response fields a client that owns its thread reads back. Only the
+ * client-writable subset of the entry is echoed — never R2 keys, speaker or
+ * attachments — so the receipt is exactly what the client may upload again.
+ */
+export function historyReceiptFields(receipt: {
+  entry: ChatHistoryEntry;
+  historyLength: number;
+}): Pick<ChatResponse, 'history_entry' | 'history_length'> {
+  const { user_message, assistant_response, timestamp } = receipt.entry;
+  return {
+    history_entry: { user_message, assistant_response, timestamp },
+    history_length: receipt.historyLength,
+  };
+}
+
+/**
+ * #392: the receipt is echoed ONLY to a request that supplied `history`, so
+ * gateway payloads stay byte-identical.
+ */
+export function clientHistoryReceipt(
+  body: ChatRequest,
+  saved: { entry: ChatHistoryEntry; historyLength: number }
+): { entry: ChatHistoryEntry; historyLength: number } | undefined {
+  return hasClientHistory(body) ? saved : undefined;
+}
+
+/**
+ * #392: drop the model's own "briefly welcome them" line for this turn when an
+ * authored welcome is due (#311) OR the client asked to suppress the welcome.
+ * Per-turn only — the durable `first_interaction` flip is decided elsewhere.
+ */
+export function neutralizeModelWelcome(body: ChatRequest, emittingWelcome: boolean): boolean {
+  return emittingWelcome || body.suppress_welcome === true;
+}
+
+/**
+ * The orchestrator's memory inputs for a turn. `memoryEnabled` is explicit,
+ * from the request (#392 `suppress_memory`) — never inferred from whether a
+ * store happens to be present.
+ */
+export function memoryOrchOpts(
+  body: ChatRequest,
+  memoryStore: JsonMemoryStore | undefined,
+  formattedTOC: string | undefined
+): Pick<Parameters<typeof orchestrate>[1], 'memoryStore' | 'memoryTOC' | 'memoryEnabled'> {
+  return {
+    memoryStore,
+    memoryTOC: formattedTOC || undefined,
+    memoryEnabled: body.suppress_memory !== true,
+  };
+}
+
+/** #392: the client-owned-conversation facts recorded on every `chat_turn`. */
+export function clientOwnedTurnFacts(
+  body: ChatRequest
+): Pick<ChatTurnContext, 'suppliedHistoryCount' | 'welcomeSuppressed' | 'memorySuppressed'> {
+  return {
+    suppliedHistoryCount: hasClientHistory(body) ? (body.history?.length ?? 0) : null,
+    welcomeSuppressed: body.suppress_welcome === true,
+    memorySuppressed: body.suppress_memory === true,
+  };
+}
+
+/**
  * Everything `logChatTurn` needs that is NOT derivable from the ChatRequest.
  *
  * Passed as one object rather than as positional parameters: the repo caps
@@ -395,6 +460,15 @@ function isCountryCode(value: string | undefined): value is string {
 interface ChatTurnContext {
   /** Per-turn id. Joins `chat_turn` to the generation-level orchestrator logs. */
   turnId: string;
+  /**
+   * #392: number of turns the client supplied in `history`, or null when the
+   * request did not carry the field. Log payload only — never a metric label.
+   */
+  suppliedHistoryCount: number | null;
+  /** #392: the request asked to skip the first-contact welcome. */
+  welcomeSuppressed: boolean;
+  /** #392: the request turned persistent memory off for the turn. */
+  memorySuppressed: boolean;
   /** Mode that GOVERNED this turn (mode at turn start). The attribution key. */
   activeModeName: string | undefined;
   /** Resolved language name for this turn, if any. */
@@ -472,6 +546,10 @@ function buildChatTurnPayload(
     duration_ms: turn.durationMs,
     had_inbound_voice: turn.hadInboundVoice,
     had_outbound_voice: turn.hadOutboundVoice,
+    // #392: client-owned-conversation flags. Payload only (see ChatTurnContext).
+    supplied_history_count: turn.suppliedHistoryCount,
+    welcome_suppressed: turn.welcomeSuppressed,
+    memory_suppressed: turn.memorySuppressed,
     // The conversation itself: user_message / assistant_reply (chat-turn-text.ts).
     ...turn.text,
     ...turnProvenance(turn),
@@ -1953,10 +2031,13 @@ export class UserDO {
     // up. Per-turn ONLY — the durable `first_interaction:false` is written by
     // `recordWelcomeDelivered` (on actual delivery), and `saveConversation`
     // skips its flip on emitting turns so a failed delivery stays re-welcomable.
+    // #392: `suppress_welcome` reuses the same per-turn neutralization, so the
+    // model's own "briefly welcome them" line is dropped too. The DURABLE flip
+    // still happens at end of turn (the flag is not `emittingWelcome`).
     const effectivePreferences = {
       ...loaded.preferences,
       response_language: loaded.locale,
-      ...(emittingWelcome ? { first_interaction: false } : {}),
+      ...(neutralizeModelWelcome(body, emittingWelcome) ? { first_interaction: false } : {}),
     };
     const audioContext = this.buildAudioContext();
     const attachmentsContext = createAttachmentsContext();
@@ -1988,7 +2069,7 @@ export class UserDO {
     // `recordWelcomeDelivered` — the flip persists only when the authored
     // welcome actually delivered, so a failed delivery stays re-welcomable.
     // prettier-ignore
-    await this.tracedPhase(ctx, 'save_conversation', () =>
+    const saved = await this.tracedPhase(ctx, 'save_conversation', () =>
       this.saveConversation(triggerCtx.messageText, orchResult.responses, loaded.preferences, body._org_config ?? {}, { logger, audioKey, inboundVoiceKey: loaded.inboundVoiceKey, speaker: body.speaker, attachments: attachmentsContext.list(), emittingWelcome })
     );
 
@@ -2005,10 +2086,10 @@ export class UserDO {
     welcomeTracker.finalized = true;
 
     // prettier-ignore
-    this.logChatTurn(body, effectivePreferences.response_language, logger, { turnId, activeModeName: triggerCtx.activeModeName, activeLanguageName: triggerCtx.activeLanguageName, languageSource: triggerCtx.languageSource, orchestration: orchResult.telemetry, durationMs: Date.now() - ctx.startTime, hadInboundVoice: !!loaded.inboundVoiceKey, hadOutboundVoice: audioKey !== null, inputLanguage, text: chatTurnText(triggerCtx.messageText, responses) });
+    this.logChatTurn(body, effectivePreferences.response_language, logger, { turnId, activeModeName: triggerCtx.activeModeName, activeLanguageName: triggerCtx.activeLanguageName, languageSource: triggerCtx.languageSource, orchestration: orchResult.telemetry, durationMs: Date.now() - ctx.startTime, hadInboundVoice: !!loaded.inboundVoiceKey, hadOutboundVoice: audioKey !== null, inputLanguage, text: chatTurnText(triggerCtx.messageText, responses), ...clientOwnedTurnFacts(body) });
 
     // prettier-ignore
-    return this.assembleChatResponse({ responses, audioKey, workerOrigin, attachmentsContext, effectivePreferences, inputLanguage, logger, startTime: ctx.startTime });
+    return this.assembleChatResponse({ responses, audioKey, workerOrigin, attachmentsContext, effectivePreferences, inputLanguage, logger, startTime: ctx.startTime, historyReceipt: clientHistoryReceipt(body, saved) });
   }
 
   /**
@@ -2476,6 +2557,14 @@ export class UserDO {
     modes: { newEffective: string | undefined; active: string | undefined },
     logger: RequestLogger
   ): Promise<ModeWelcome | undefined> {
+    // #392 `suppress_welcome`: the client owns the opening of the conversation.
+    // Nothing is emitted and NO flag is read or written — neither `mode_welcomed`
+    // nor a `mode_welcome_pending` re-emit — so a later turn without the flag
+    // (or the same user on another channel) still gets the welcome.
+    if (body.suppress_welcome === true) {
+      logger.log('welcome_suppressed_by_client', { client_id: body.client_id, user_id: body.user_id, mode: modes.active ?? null }); // prettier-ignore
+      return undefined;
+    }
     // Explicit `#mode` path: first-time emit (or admin re-preview, FIX B, or an
     // already-active re-trigger) still REQUIRES a `#` token this turn.
     const triggeredMode =
@@ -2839,7 +2928,7 @@ export class UserDO {
       this.tracedPhase(ctx, 'resolve_message', () =>
         this.resolveMessageText(body, logger, emitStatus)
       ),
-      this.tracedPhase(ctx, 'load_history', () => this.loadHistory(logger)),
+      this.tracedPhase(ctx, 'load_history', () => this.loadOrReplaceHistory(body, logger)),
     ]);
     const catalog = await this.tracedPhase(ctx, 'mcp_discovery', () =>
       this.discoverMCPTools(body._mcp_servers ?? [], logger)
@@ -2850,7 +2939,9 @@ export class UserDO {
       () => this.resolvePrompts(body, logger)
     );
     const { memoryStore, formattedTOC } = await this.tracedPhase(ctx, 'load_memory', () =>
-      this.loadMemoryContext(logger)
+      body.suppress_memory === true
+        ? this.suppressedMemoryContext(body, logger)
+        : this.loadMemoryContext(logger)
     );
     const orgLanguages: OrgLanguages = body._org_languages ?? { languages: [] };
     const selectedLanguageName = await this.getSelectedLanguage();
@@ -3075,11 +3166,27 @@ export class UserDO {
     return { resolved, orgModes, activeModeName: effectiveModeName, isAdmin };
   }
 
-  private async loadMemoryContext(logger: RequestLogger) {
+  private async loadMemoryContext(
+    logger: RequestLogger
+  ): Promise<{ memoryStore: JsonMemoryStore | undefined; formattedTOC: string | undefined }> {
     const memoryStore = new JsonMemoryStore(this.state.storage, logger);
     const memoryTOC = await memoryStore.getTableOfContents();
     const formattedTOC = formatTOCForPrompt(memoryTOC);
     return { memoryStore, formattedTOC: formattedTOC || undefined };
+  }
+
+  /**
+   * #392 `suppress_memory`: memory is OFF for this turn. No store is built (so
+   * nothing can be read or written), and `buildOrchOpts` passes
+   * `memoryEnabled: false` so the orchestrator omits the memory prompt slot,
+   * the TOC and both memory tools. The stored memory document is not touched.
+   */
+  private async suppressedMemoryContext(
+    body: ChatRequest,
+    logger: RequestLogger
+  ): Promise<{ memoryStore: undefined; formattedTOC: undefined }> {
+    logger.log('memory_suppressed_by_client', { client_id: body.client_id, user_id: body.user_id });
+    return { memoryStore: undefined, formattedTOC: undefined };
   }
 
   private async loadHistory(logger: RequestLogger) {
@@ -3087,6 +3194,33 @@ export class UserDO {
     const history = await this.getHistory();
     logger.log('phase_load_complete', {
       history_count: history.length,
+      duration_ms: Date.now() - startTime,
+    });
+    return history;
+  }
+
+  /**
+   * #392: a client-supplied `history` REPLACES the stored thread before the
+   * turn runs. Entries are rebuilt from a whitelist (`sanitizeClientHistory`)
+   * and trimmed from the OLDEST end to the org storage cap — the same slice
+   * rule `addHistoryEntry` applies — so the stored value can never exceed what
+   * a normal turn could produce. Replacement is idempotent: a retry that
+   * resends the same thread lands in the same state.
+   */
+  private async loadOrReplaceHistory(body: ChatRequest, logger: RequestLogger) {
+    if (!hasClientHistory(body)) return this.loadHistory(logger);
+    const startTime = Date.now();
+    const supplied = body.history ?? [];
+    const storageMax =
+      body._org_config?.max_history_storage ?? DEFAULT_ORG_CONFIG.max_history_storage;
+    const history = sanitizeClientHistory(supplied, Date.now()).slice(-storageMax);
+    await this.state.storage.put(HISTORY_KEY, history);
+    logger.log('history_replaced', {
+      client_id: body.client_id,
+      user_id: body.user_id,
+      supplied: supplied.length,
+      stored: history.length,
+      trimmed: supplied.length - history.length,
       duration_ms: Date.now() - startTime,
     });
     return history;
@@ -3123,24 +3257,25 @@ export class UserDO {
     const startTime = Date.now();
     const storageMax = orgConfig.max_history_storage ?? DEFAULT_ORG_CONFIG.max_history_storage;
     const hasAttachments = !!attachments && attachments.length > 0;
-    await this.addHistoryEntry(
-      {
-        user_message: message,
-        assistant_response: responses.join('\n'),
-        timestamp: Date.now(),
-        ...(audioKey ? { voice_audio_key: audioKey } : {}),
-        ...(inboundVoiceKey ? { inbound_voice_audio_key: inboundVoiceKey } : {}),
-        ...(speaker ? { speaker } : {}),
-        ...(hasAttachments ? { attachments } : {}),
-      },
-      storageMax
-    );
+    const entry: ChatHistoryEntry = {
+      user_message: message,
+      assistant_response: responses.join('\n'),
+      timestamp: Date.now(),
+      ...(audioKey ? { voice_audio_key: audioKey } : {}),
+      ...(inboundVoiceKey ? { inbound_voice_audio_key: inboundVoiceKey } : {}),
+      ...(speaker ? { speaker } : {}),
+      ...(hasAttachments ? { attachments } : {}),
+    };
+    const historyLength = await this.addHistoryEntry(entry, storageMax);
     await this.maybeFlipFirstInteraction(preferences, emittingWelcome);
     logger.log('phase_save_complete', {
       duration_ms: Date.now() - startTime,
       storageMax,
+      history_length: historyLength,
       attachment_count: attachments?.length ?? 0,
     });
+    // #392: the receipt a client that owns its thread appends locally.
+    return { entry, historyLength };
   }
 
   // ── Audio ─────────────────────────────────────────────────────────────────────
@@ -3364,7 +3499,7 @@ export class UserDO {
     history: ChatHistoryEntry[],
     preferences: UserPreferencesInternal,
     resolvedPromptValues: ReturnType<typeof resolvePromptOverrides>,
-    memoryStore: JsonMemoryStore,
+    memoryStore: JsonMemoryStore | undefined,
     formattedTOC: string | undefined,
     orgModes: { modes: PromptMode[] },
     activeModeName: string | undefined,
@@ -3389,8 +3524,7 @@ export class UserDO {
         first_interaction: preferences.first_interaction,
       },
       resolvedPromptValues,
-      memoryStore,
-      memoryTOC: formattedTOC || undefined,
+      ...memoryOrchOpts(body, memoryStore, formattedTOC),
       modeContext: this.buildModeContext(orgModes, activeModeName, body),
       audioContext,
       attachmentsContext,
@@ -3432,6 +3566,12 @@ export class UserDO {
     inputLanguage: DetectedLanguage | null;
     logger: RequestLogger;
     startTime: number;
+    /**
+     * #392: present ONLY when the request supplied `history`. Surfaces the
+     * appended entry and the stored length so the client can append locally
+     * and detect server-side trimming.
+     */
+    historyReceipt?: { entry: ChatHistoryEntry; historyLength: number } | undefined;
   }): ChatResponse {
     const {
       responses,
@@ -3442,6 +3582,7 @@ export class UserDO {
       inputLanguage,
       logger,
       startTime,
+      historyReceipt,
     } = opts;
     const voiceAudioUrl = audioKey ? audioKeyToUrl(audioKey, workerOrigin) : null;
     const attachments = attachmentsContext.list();
@@ -3454,6 +3595,7 @@ export class UserDO {
       voice_audio_base64: null,
       voice_audio_url: voiceAudioUrl,
       ...(attachments.length > 0 ? { attachments } : {}),
+      ...(historyReceipt ? historyReceiptFields(historyReceipt) : {}),
     };
   }
 
@@ -3720,11 +3862,13 @@ export class UserDO {
     return history ?? [];
   }
 
-  private async addHistoryEntry(entry: ChatHistoryEntry, maxStorage: number): Promise<void> {
+  /** Append one entry, trim to `maxStorage` from the oldest end, and return the stored length. */
+  private async addHistoryEntry(entry: ChatHistoryEntry, maxStorage: number): Promise<number> {
     const history = await this.getHistory();
     history.push(entry);
     const trimmed = history.slice(-maxStorage);
     await this.state.storage.put(HISTORY_KEY, trimmed);
+    return trimmed.length;
   }
 
   /**
