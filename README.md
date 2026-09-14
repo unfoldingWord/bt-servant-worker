@@ -736,4 +736,4 @@ These projects depend on bt-servant-worker's API (see the [C4 ecosystem diagrams
 
 ## License
 
-Private
+MIT — see the [LICENSE](LICENSE) file.
