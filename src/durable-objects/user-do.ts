@@ -135,6 +135,21 @@ const MODE_WELCOME_PENDING_PREFIX = 'mode_welcome_pending:';
 const PROCESSING_LOCK_KEY = '_processing_lock';
 const QUEUE_KEY = 'queue';
 const QUEUE_PROCESSING_KEY = 'queue_processing';
+/**
+ * Reservation for the entry currently being processed off the queue. The
+ * queue is one storage value with a byte budget (`MAX_QUEUE_BYTES`); a
+ * dequeued entry leaves that value but may come BACK via `reEnqueue` on a
+ * transient failure, so its bytes stay counted against the budget until the
+ * turn ends. Expires like the processing lock (`LOCK_STALE_THRESHOLD_MS`) so
+ * an eviction mid-turn can never shrink the budget for good.
+ */
+const QUEUE_INFLIGHT_KEY = 'queue_inflight';
+
+/** What `QUEUE_INFLIGHT_KEY` stores: the entry's serialized size and when it was dequeued. */
+interface QueueInFlightReservation {
+  bytes: number;
+  at: number;
+}
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 const LOCK_STALE_THRESHOLD_MS = 90_000; // 90 seconds
@@ -155,6 +170,19 @@ export const QUEUE_REJECT_BYTES = -2;
 /** UTF-8 size of `value` as JSON — the same yardstick `history-validation.ts` uses for its cap. */
 function serializedBytes(value: unknown): number {
   return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+}
+
+/**
+ * Bytes still reserved by an in-flight queue entry, or 0 when there is none
+ * or the reservation is older than the lock staleness threshold (the turn is
+ * assumed dead, exactly as `tryAcquireLock` assumes for a stale lock).
+ */
+export function liveInFlightBytes(
+  reservation: QueueInFlightReservation | undefined,
+  now: number
+): number {
+  if (!reservation) return 0;
+  return now - reservation.at < LOCK_STALE_THRESHOLD_MS ? reservation.bytes : 0;
 }
 const DEFAULT_MAX_RETRIES = 3;
 const ENQUEUE_RATE_WINDOW_MS = 60_000; // 1 minute
@@ -1473,6 +1501,9 @@ export class UserDO {
       await this.handleProcessingError(entry, error, logger);
     } finally {
       await this.releaseLock();
+      // Success or permanent failure: the entry is gone. (On a retry,
+      // `reEnqueue` already cleared it — the delete is idempotent.)
+      await this.clearInFlightReservation();
       this.queuedWriters.delete(entry.message_id);
     }
   }
@@ -1686,7 +1717,11 @@ export class UserDO {
         // (a near-cap #392 `history`, a large audio_base64) can add up past the
         // 2 MiB SQLite value limit and make this put throw AFTER validation
         // passed. Reject before writing instead, so the client gets a 429.
-        if (serializedBytes(queue) > MAX_QUEUE_BYTES) return QUEUE_REJECT_BYTES;
+        // The in-flight entry's bytes count too: it may `reEnqueue` on a
+        // transient failure, and that re-insert must always fit.
+        const inFlight = await this.state.storage.get<QueueInFlightReservation>(QUEUE_INFLIGHT_KEY);
+        const reserved = liveInFlightBytes(inFlight, Date.now());
+        if (serializedBytes(queue) + reserved > MAX_QUEUE_BYTES) return QUEUE_REJECT_BYTES;
         await this.state.storage.put(QUEUE_KEY, queue);
 
         const isProcessing = (await this.state.storage.get<boolean>(QUEUE_PROCESSING_KEY)) ?? false;
@@ -1699,7 +1734,11 @@ export class UserDO {
     );
   }
 
-  /** Atomically dequeue the next entry, or return null if queue is empty. */
+  /**
+   * Atomically dequeue the next entry, or return null if queue is empty.
+   * Reserves the dequeued entry's bytes (`QUEUE_INFLIGHT_KEY`) in the same
+   * atomic step, so no enqueue can observe the queue without the reservation.
+   */
   private async dequeueNext(): Promise<InternalQueueEntry | null> {
     return this.state.blockConcurrencyWhile(async () => {
       const queue = (await this.state.storage.get<InternalQueueEntry[]>(QUEUE_KEY)) ?? [];
@@ -1709,8 +1748,18 @@ export class UserDO {
       }
       const next = queue.shift()!;
       await this.state.storage.put(QUEUE_KEY, queue);
+      const reservation: QueueInFlightReservation = {
+        bytes: serializedBytes(next),
+        at: Date.now(),
+      };
+      await this.state.storage.put(QUEUE_INFLIGHT_KEY, reservation);
       return next;
     });
+  }
+
+  /** The in-flight entry finished (or was re-queued): its bytes are no longer reserved. */
+  private async clearInFlightReservation(): Promise<void> {
+    await this.state.storage.delete(QUEUE_INFLIGHT_KEY);
   }
 
   /** Schedule the next alarm if there are items remaining in the queue. */
@@ -1729,12 +1778,23 @@ export class UserDO {
     }
   }
 
-  /** Re-enqueue a failed entry at the front of the queue for retry. */
-  private async reEnqueue(entry: InternalQueueEntry): Promise<void> {
-    await this.state.blockConcurrencyWhile(async () => {
+  /**
+   * Re-enqueue a failed entry at the front of the queue for retry. Bounded by
+   * the same `MAX_QUEUE_BYTES` as `enqueueEntry`: normally the entry's bytes
+   * are still reserved, so it always fits; if the reservation expired (a turn
+   * longer than the lock staleness threshold) and the queue refilled, the
+   * entry is NOT written and `false` is returned so the caller can fail it
+   * permanently instead of blowing the storage value limit.
+   */
+  private async reEnqueue(entry: InternalQueueEntry): Promise<boolean> {
+    return this.state.blockConcurrencyWhile(async () => {
       const queue = (await this.state.storage.get<InternalQueueEntry[]>(QUEUE_KEY)) ?? [];
       queue.unshift(entry);
+      if (serializedBytes(queue) > MAX_QUEUE_BYTES) return false;
       await this.state.storage.put(QUEUE_KEY, queue);
+      // Back in the queue — counted there now, not as in-flight.
+      await this.state.storage.delete(QUEUE_INFLIGHT_KEY);
+      return true;
     });
   }
 
@@ -1748,13 +1808,24 @@ export class UserDO {
     const maxRetries = this.getMaxRetries();
 
     if (this.isTransientError(errorMessage) && entry.retry_count < maxRetries) {
-      logger.warn('queue_entry_retry', {
+      const reinserted = await this.reEnqueue({ ...entry, retry_count: entry.retry_count + 1 });
+      if (reinserted) {
+        logger.warn('queue_entry_retry', {
+          message_id: entry.message_id,
+          retry_count: entry.retry_count + 1,
+          max_retries: maxRetries,
+        });
+        return;
+      }
+      // Defined terminal behavior: the retry no longer fits the queue's byte
+      // budget (reservation expired + queue refilled). Fall through and fail
+      // the entry permanently rather than exceed the storage value limit.
+      logger.error('queue_retry_dropped_over_budget', error, {
         message_id: entry.message_id,
+        user_id: entry.body.user_id,
         retry_count: entry.retry_count + 1,
-        max_retries: maxRetries,
+        max_bytes: MAX_QUEUE_BYTES,
       });
-      await this.reEnqueue({ ...entry, retry_count: entry.retry_count + 1 });
-      return;
     }
 
     // Permanent failure: count the turn as failed, then notify the SSE client if connected.
