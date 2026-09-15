@@ -44,6 +44,11 @@ export interface TriggerOnlyContext {
 
 interface SystemPromptOptions {
   memoryTOC?: string | undefined;
+  /**
+   * Whether persistent memory is available this turn. Default true. `false`
+   * (#392 `suppress_memory`) drops the `memory_instructions` slot and the TOC.
+   */
+  memoryEnabled?: boolean | undefined;
   clientId?: string | undefined;
   groupContext?: GroupChatContext | undefined;
   isVoiceMessage?: boolean | undefined;
@@ -306,11 +311,16 @@ function pushMiddleSections(
   sections: string[],
   resolvedPromptValues: Required<Record<PromptSlot, string>>,
   catalog: ToolCatalog,
-  memoryTOC: string | undefined,
-  isVoiceMessage: boolean | undefined
+  opts: Pick<SystemPromptOptions, 'memoryTOC' | 'isVoiceMessage' | 'memoryEnabled'>
 ): void {
-  sections.push(resolvedPromptValues.memory_instructions);
-  if (memoryTOC) sections.push(memoryTOC);
+  const { memoryTOC, isVoiceMessage } = opts;
+  // #392: with memory suppressed, the model is told nothing about memory —
+  // no instructions slot, no TOC — because the memory tools are not
+  // registered for the turn either (see buildAllTools).
+  if (opts.memoryEnabled !== false) {
+    sections.push(resolvedPromptValues.memory_instructions);
+    if (memoryTOC) sections.push(memoryTOC);
+  }
   sections.push(AUDIO_GUIDANCE);
   if (catalog.tools.some((t) => t.serverId === 'ptxprint-mcp')) {
     sections.push(PTXPRINT_FLOW_GUIDANCE);
@@ -399,7 +409,7 @@ export function buildSystemPromptBlocks(
   resolvedPromptValues: Required<Record<PromptSlot, string>>,
   options?: SystemPromptOptions
 ): SystemPromptBlocks {
-  const { memoryTOC, clientId, groupContext, isVoiceMessage } = options ?? {};
+  const { memoryTOC, memoryEnabled, clientId, groupContext, isVoiceMessage } = options ?? {};
 
   // ── Cacheable: derived only from org/mode config and the MCP catalog ──
   const stableSections: string[] = [
@@ -428,7 +438,11 @@ export function buildSystemPromptBlocks(
   pushUnmatchedTriggersSection(sections, options?.unmatchedTriggers);
   pushTriggerOnlyMessageSection(sections, options?.triggerOnly);
 
-  pushMiddleSections(sections, resolvedPromptValues, catalog, memoryTOC, isVoiceMessage);
+  pushMiddleSections(sections, resolvedPromptValues, catalog, {
+    memoryTOC,
+    isVoiceMessage,
+    memoryEnabled,
+  });
   sections.push(...buildConditionalSections(preferences, history));
   if (!isVoiceMessage) {
     sections.push(MEDIA_FORMATTING_RULES);

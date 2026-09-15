@@ -9,6 +9,7 @@
  */
 
 import type { ChatRequest, ChatTransport } from '../types/engine.js';
+import { hasClientHistory, validateClientHistory } from './history-validation.js';
 
 const VALID_CHAT_TYPES: ReadonlySet<string> = new Set(['private', 'group', 'supergroup']);
 
@@ -134,6 +135,37 @@ function validateEnumFields(body: ChatRequest): string | null {
   return validateVoiceFormat(body.voice_format);
 }
 
+/**
+ * Validate an optional boolean flag. `null` is treated as absent (the same
+ * convention as `voice_format`), so `undefined`/`null` both mean "default".
+ * Anything else that is not literally `true`/`false` is rejected — a client
+ * sending `"yes"` or `1` must get a 400, not a silently-ignored flag.
+ */
+function validateOptionalBoolean(value: unknown, field: string): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'boolean') return `${field} must be a boolean`;
+  return null;
+}
+
+/**
+ * The client-owned-conversation fields (#392): `history`, `suppress_welcome`,
+ * `suppress_memory`. `history` is private-chat only in phase 1 — group DOs
+ * share memory/preferences per chat and the ownership story there is
+ * unspecified, so the field is rejected rather than half-supported.
+ */
+function validateClientOwnedFields(body: ChatRequest, isGroup: boolean): string | null {
+  const welcomeError = validateOptionalBoolean(body.suppress_welcome, 'suppress_welcome');
+  if (welcomeError) return welcomeError;
+  const memoryError = validateOptionalBoolean(body.suppress_memory, 'suppress_memory');
+  if (memoryError) return memoryError;
+  const historyError = validateClientHistory(body.history);
+  if (historyError) return historyError;
+  if (isGroup && hasClientHistory(body)) {
+    return 'history is not supported on group/supergroup chats';
+  }
+  return null;
+}
+
 function validateCoreFields(body: ChatRequest): string | null {
   if (!body.user_id) return 'user_id is required';
   if (!body.client_id) return 'client_id is required';
@@ -147,7 +179,7 @@ function validateCoreFields(body: ChatRequest): string | null {
   if (enumError) return enumError;
   const isGroup = body.chat_type === 'group' || body.chat_type === 'supergroup';
   if (isGroup && !body.chat_id) return 'chat_id is required for group/supergroup chats';
-  return null;
+  return validateClientOwnedFields(body, isGroup);
 }
 
 /** Validate chat request fields, returning an error string or null if valid. */

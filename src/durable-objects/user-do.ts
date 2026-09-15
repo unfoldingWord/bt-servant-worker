@@ -104,6 +104,7 @@ import {
   UNDETERMINED_LANGUAGE,
 } from '../services/language/index.js';
 import { isAdminClient, isValidLanguageCode, validateChatBody } from '../utils/chat-validation.js';
+import { hasClientHistory, sanitizeClientHistory } from '../utils/history-validation.js';
 import { OrgLanguages, resolveEffectiveLanguage } from '../types/languages.js';
 import { InternalQueueEntry } from '../types/queue.js';
 import { statusUpdate, uiString } from '../i18n/ui-strings.js';
@@ -134,10 +135,55 @@ const MODE_WELCOME_PENDING_PREFIX = 'mode_welcome_pending:';
 const PROCESSING_LOCK_KEY = '_processing_lock';
 const QUEUE_KEY = 'queue';
 const QUEUE_PROCESSING_KEY = 'queue_processing';
+/**
+ * Reservation for the entry currently being processed off the queue. The
+ * queue is one storage value with a byte budget (`MAX_QUEUE_BYTES`); a
+ * dequeued entry leaves that value but may come BACK via `reEnqueue` on a
+ * transient failure, so its bytes stay counted against the budget until the
+ * turn ends. Expires like the processing lock (`LOCK_STALE_THRESHOLD_MS`) so
+ * an eviction mid-turn can never shrink the budget for good.
+ */
+const QUEUE_INFLIGHT_KEY = 'queue_inflight';
+
+/** What `QUEUE_INFLIGHT_KEY` stores: the entry's serialized size and when it was dequeued. */
+interface QueueInFlightReservation {
+  bytes: number;
+  at: number;
+}
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 const LOCK_STALE_THRESHOLD_MS = 90_000; // 90 seconds
 const DEFAULT_MAX_QUEUE_DEPTH = 50;
+/**
+ * Byte budget for the serialized callback/SSE queue. The queue is persisted as
+ * ONE SQLite-backed storage value (2 MiB hard limit), and each queued entry
+ * carries a whole request body — a #392 `history` up to 512 KiB, or a large
+ * `audio_base64`. Enforced on enqueue so a request that passed validation is
+ * turned away with a 429 instead of failing the storage put.
+ */
+export const MAX_QUEUE_BYTES = 1.5 * 1024 * 1024;
+/** `enqueueEntry` rejection: the queue already holds `maxDepth` entries. */
+export const QUEUE_REJECT_DEPTH = -1;
+/** `enqueueEntry` rejection: accepting the entry would push the serialized queue past `MAX_QUEUE_BYTES`. */
+export const QUEUE_REJECT_BYTES = -2;
+
+/** UTF-8 size of `value` as JSON — the same yardstick `history-validation.ts` uses for its cap. */
+function serializedBytes(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+}
+
+/**
+ * Bytes still reserved by an in-flight queue entry, or 0 when there is none
+ * or the reservation is older than the lock staleness threshold (the turn is
+ * assumed dead, exactly as `tryAcquireLock` assumes for a stale lock).
+ */
+export function liveInFlightBytes(
+  reservation: QueueInFlightReservation | undefined,
+  now: number
+): number {
+  if (!reservation) return 0;
+  return now - reservation.at < LOCK_STALE_THRESHOLD_MS ? reservation.bytes : 0;
+}
 const DEFAULT_MAX_RETRIES = 3;
 const ENQUEUE_RATE_WINDOW_MS = 60_000; // 1 minute
 const ENQUEUE_RATE_LIMIT = 300;
@@ -387,6 +433,70 @@ function isCountryCode(value: string | undefined): value is string {
  * misattribute every WhatsApp/Telegram user to wherever the gateway runs.
  */
 /**
+ * #392: the response fields a client that owns its thread reads back. Only the
+ * client-writable subset of the entry is echoed — never R2 keys, speaker or
+ * attachments — so the receipt is exactly what the client may upload again.
+ */
+export function historyReceiptFields(receipt: {
+  entry: ChatHistoryEntry;
+  historyLength: number;
+}): Pick<ChatResponse, 'history_entry' | 'history_length'> {
+  const { user_message, assistant_response, timestamp } = receipt.entry;
+  return {
+    history_entry: { user_message, assistant_response, timestamp },
+    history_length: receipt.historyLength,
+  };
+}
+
+/**
+ * #392: the receipt is echoed ONLY to a request that supplied `history`, so
+ * gateway payloads stay byte-identical.
+ */
+export function clientHistoryReceipt(
+  body: ChatRequest,
+  saved: { entry: ChatHistoryEntry; historyLength: number }
+): { entry: ChatHistoryEntry; historyLength: number } | undefined {
+  return hasClientHistory(body) ? saved : undefined;
+}
+
+/**
+ * #392: drop the model's own "briefly welcome them" line for this turn when an
+ * authored welcome is due (#311) OR the client asked to suppress the welcome.
+ * Per-turn only — the durable `first_interaction` flip is decided elsewhere.
+ */
+export function neutralizeModelWelcome(body: ChatRequest, emittingWelcome: boolean): boolean {
+  return emittingWelcome || body.suppress_welcome === true;
+}
+
+/**
+ * The orchestrator's memory inputs for a turn. `memoryEnabled` is explicit,
+ * from the request (#392 `suppress_memory`) — never inferred from whether a
+ * store happens to be present.
+ */
+export function memoryOrchOpts(
+  body: ChatRequest,
+  memoryStore: JsonMemoryStore | undefined,
+  formattedTOC: string | undefined
+): Pick<Parameters<typeof orchestrate>[1], 'memoryStore' | 'memoryTOC' | 'memoryEnabled'> {
+  return {
+    memoryStore,
+    memoryTOC: formattedTOC || undefined,
+    memoryEnabled: body.suppress_memory !== true,
+  };
+}
+
+/** #392: the client-owned-conversation facts recorded on every `chat_turn`. */
+export function clientOwnedTurnFacts(
+  body: ChatRequest
+): Pick<ChatTurnContext, 'suppliedHistoryCount' | 'welcomeSuppressed' | 'memorySuppressed'> {
+  return {
+    suppliedHistoryCount: hasClientHistory(body) ? (body.history?.length ?? 0) : null,
+    welcomeSuppressed: body.suppress_welcome === true,
+    memorySuppressed: body.suppress_memory === true,
+  };
+}
+
+/**
  * Everything `logChatTurn` needs that is NOT derivable from the ChatRequest.
  *
  * Passed as one object rather than as positional parameters: the repo caps
@@ -395,6 +505,15 @@ function isCountryCode(value: string | undefined): value is string {
 interface ChatTurnContext {
   /** Per-turn id. Joins `chat_turn` to the generation-level orchestrator logs. */
   turnId: string;
+  /**
+   * #392: number of turns the client supplied in `history`, or null when the
+   * request did not carry the field. Log payload only — never a metric label.
+   */
+  suppliedHistoryCount: number | null;
+  /** #392: the request asked to skip the first-contact welcome. */
+  welcomeSuppressed: boolean;
+  /** #392: the request turned persistent memory off for the turn. */
+  memorySuppressed: boolean;
   /** Mode that GOVERNED this turn (mode at turn start). The attribution key. */
   activeModeName: string | undefined;
   /** Resolved language name for this turn, if any. */
@@ -472,6 +591,10 @@ function buildChatTurnPayload(
     duration_ms: turn.durationMs,
     had_inbound_voice: turn.hadInboundVoice,
     had_outbound_voice: turn.hadOutboundVoice,
+    // #392: client-owned-conversation flags. Payload only (see ChatTurnContext).
+    supplied_history_count: turn.suppliedHistoryCount,
+    welcome_suppressed: turn.welcomeSuppressed,
+    memory_suppressed: turn.memorySuppressed,
     // The conversation itself: user_message / assistant_reply (chat-turn-text.ts).
     ...turn.text,
     ...turnProvenance(turn),
@@ -1025,22 +1148,8 @@ export class UserDO {
     const maxDepth = this.getMaxQueueDepth();
     const position = await this.enqueueEntry(entry, maxDepth);
 
-    if (position === -1) {
-      logger.warn('chat_queue_full', {
-        message_id: messageId,
-        user_id: body.user_id,
-        max_depth: maxDepth,
-        status: 429,
-      });
-      countMetric('queue_entries_total', { status: 'rejected', reason: 'queue_full' });
-      return Response.json(
-        {
-          error: 'Queue full',
-          code: 'QUEUE_DEPTH_EXCEEDED',
-          message: `Queue depth limit (${maxDepth}) exceeded.`,
-        },
-        { status: 429, headers: { 'Retry-After': '5' } }
-      );
+    if (position < 0) {
+      return this.rejectEnqueue(position, { messageId, userId: body.user_id, maxDepth, logger });
     }
 
     logger.log('chat_enqueued', {
@@ -1392,6 +1501,9 @@ export class UserDO {
       await this.handleProcessingError(entry, error, logger);
     } finally {
       await this.releaseLock();
+      // Success or permanent failure: the entry is gone. (On a retry,
+      // `reEnqueue` already cleared it — the delete is idempotent.)
+      await this.clearInFlightReservation();
       this.queuedWriters.delete(entry.message_id);
     }
   }
@@ -1552,7 +1664,45 @@ export class UserDO {
 
   // ── Queue infrastructure ──────────────────────────────────────────────────────
 
-  /** Atomically append entry to queue and schedule alarm if idle. Returns -1 if full. */
+  /**
+   * The 429 for a rejected enqueue. Both rejections are transient — the queue
+   * drains — so both carry `Retry-After: 5`; the `code` tells the client which
+   * limit it hit. Logged and counted under distinct reasons.
+   */
+  private rejectEnqueue(
+    code: number,
+    ctx: { messageId: string; userId: string; maxDepth: number; logger: RequestLogger }
+  ): Response {
+    const byBytes = code === QUEUE_REJECT_BYTES;
+    ctx.logger.warn(byBytes ? 'chat_queue_bytes_exceeded' : 'chat_queue_full', {
+      message_id: ctx.messageId,
+      user_id: ctx.userId,
+      max_depth: ctx.maxDepth,
+      max_bytes: MAX_QUEUE_BYTES,
+      status: 429,
+    });
+    countMetric('queue_entries_total', {
+      status: 'rejected',
+      reason: byBytes ? 'queue_bytes' : 'queue_full',
+    });
+    return Response.json(
+      {
+        error: 'Queue full',
+        code: byBytes ? 'QUEUE_BYTES_EXCEEDED' : 'QUEUE_DEPTH_EXCEEDED',
+        message: byBytes
+          ? `Queued request bytes limit (${MAX_QUEUE_BYTES}) exceeded.`
+          : `Queue depth limit (${ctx.maxDepth}) exceeded.`,
+      },
+      { status: 429, headers: { 'Retry-After': '5' } }
+    );
+  }
+
+  /**
+   * Atomically append entry to queue and schedule alarm if idle. Returns the
+   * 1-based queue position, or a negative rejection code: `QUEUE_REJECT_DEPTH`
+   * when the queue already holds `maxDepth` entries, `QUEUE_REJECT_BYTES` when
+   * the serialized queue (one storage value) would exceed `MAX_QUEUE_BYTES`.
+   */
   private async enqueueEntry(entry: InternalQueueEntry, maxDepth: number): Promise<number> {
     // Runs in the DO fetch context (unlike the alarm-drained dequeue path, which
     // cannot export spans — CF error 1003), so this span reaches the collector.
@@ -1560,9 +1710,18 @@ export class UserDO {
       this.state.blockConcurrencyWhile(async () => {
         const queue = (await this.state.storage.get<InternalQueueEntry[]>(QUEUE_KEY)) ?? [];
 
-        if (queue.length >= maxDepth) return -1;
+        if (queue.length >= maxDepth) return QUEUE_REJECT_DEPTH;
 
         queue.push(entry);
+        // The whole queue is ONE storage value, so individually valid bodies
+        // (a near-cap #392 `history`, a large audio_base64) can add up past the
+        // 2 MiB SQLite value limit and make this put throw AFTER validation
+        // passed. Reject before writing instead, so the client gets a 429.
+        // The in-flight entry's bytes count too: it may `reEnqueue` on a
+        // transient failure, and that re-insert must always fit.
+        const inFlight = await this.state.storage.get<QueueInFlightReservation>(QUEUE_INFLIGHT_KEY);
+        const reserved = liveInFlightBytes(inFlight, Date.now());
+        if (serializedBytes(queue) + reserved > MAX_QUEUE_BYTES) return QUEUE_REJECT_BYTES;
         await this.state.storage.put(QUEUE_KEY, queue);
 
         const isProcessing = (await this.state.storage.get<boolean>(QUEUE_PROCESSING_KEY)) ?? false;
@@ -1575,7 +1734,11 @@ export class UserDO {
     );
   }
 
-  /** Atomically dequeue the next entry, or return null if queue is empty. */
+  /**
+   * Atomically dequeue the next entry, or return null if queue is empty.
+   * Reserves the dequeued entry's bytes (`QUEUE_INFLIGHT_KEY`) in the same
+   * atomic step, so no enqueue can observe the queue without the reservation.
+   */
   private async dequeueNext(): Promise<InternalQueueEntry | null> {
     return this.state.blockConcurrencyWhile(async () => {
       const queue = (await this.state.storage.get<InternalQueueEntry[]>(QUEUE_KEY)) ?? [];
@@ -1585,8 +1748,18 @@ export class UserDO {
       }
       const next = queue.shift()!;
       await this.state.storage.put(QUEUE_KEY, queue);
+      const reservation: QueueInFlightReservation = {
+        bytes: serializedBytes(next),
+        at: Date.now(),
+      };
+      await this.state.storage.put(QUEUE_INFLIGHT_KEY, reservation);
       return next;
     });
+  }
+
+  /** The in-flight entry finished (or was re-queued): its bytes are no longer reserved. */
+  private async clearInFlightReservation(): Promise<void> {
+    await this.state.storage.delete(QUEUE_INFLIGHT_KEY);
   }
 
   /** Schedule the next alarm if there are items remaining in the queue. */
@@ -1605,12 +1778,23 @@ export class UserDO {
     }
   }
 
-  /** Re-enqueue a failed entry at the front of the queue for retry. */
-  private async reEnqueue(entry: InternalQueueEntry): Promise<void> {
-    await this.state.blockConcurrencyWhile(async () => {
+  /**
+   * Re-enqueue a failed entry at the front of the queue for retry. Bounded by
+   * the same `MAX_QUEUE_BYTES` as `enqueueEntry`: normally the entry's bytes
+   * are still reserved, so it always fits; if the reservation expired (a turn
+   * longer than the lock staleness threshold) and the queue refilled, the
+   * entry is NOT written and `false` is returned so the caller can fail it
+   * permanently instead of blowing the storage value limit.
+   */
+  private async reEnqueue(entry: InternalQueueEntry): Promise<boolean> {
+    return this.state.blockConcurrencyWhile(async () => {
       const queue = (await this.state.storage.get<InternalQueueEntry[]>(QUEUE_KEY)) ?? [];
       queue.unshift(entry);
+      if (serializedBytes(queue) > MAX_QUEUE_BYTES) return false;
       await this.state.storage.put(QUEUE_KEY, queue);
+      // Back in the queue — counted there now, not as in-flight.
+      await this.state.storage.delete(QUEUE_INFLIGHT_KEY);
+      return true;
     });
   }
 
@@ -1624,13 +1808,24 @@ export class UserDO {
     const maxRetries = this.getMaxRetries();
 
     if (this.isTransientError(errorMessage) && entry.retry_count < maxRetries) {
-      logger.warn('queue_entry_retry', {
+      const reinserted = await this.reEnqueue({ ...entry, retry_count: entry.retry_count + 1 });
+      if (reinserted) {
+        logger.warn('queue_entry_retry', {
+          message_id: entry.message_id,
+          retry_count: entry.retry_count + 1,
+          max_retries: maxRetries,
+        });
+        return;
+      }
+      // Defined terminal behavior: the retry no longer fits the queue's byte
+      // budget (reservation expired + queue refilled). Fall through and fail
+      // the entry permanently rather than exceed the storage value limit.
+      logger.error('queue_retry_dropped_over_budget', error, {
         message_id: entry.message_id,
+        user_id: entry.body.user_id,
         retry_count: entry.retry_count + 1,
-        max_retries: maxRetries,
+        max_bytes: MAX_QUEUE_BYTES,
       });
-      await this.reEnqueue({ ...entry, retry_count: entry.retry_count + 1 });
-      return;
     }
 
     // Permanent failure: count the turn as failed, then notify the SSE client if connected.
@@ -1953,10 +2148,13 @@ export class UserDO {
     // up. Per-turn ONLY — the durable `first_interaction:false` is written by
     // `recordWelcomeDelivered` (on actual delivery), and `saveConversation`
     // skips its flip on emitting turns so a failed delivery stays re-welcomable.
+    // #392: `suppress_welcome` reuses the same per-turn neutralization, so the
+    // model's own "briefly welcome them" line is dropped too. The DURABLE flip
+    // still happens at end of turn (the flag is not `emittingWelcome`).
     const effectivePreferences = {
       ...loaded.preferences,
       response_language: loaded.locale,
-      ...(emittingWelcome ? { first_interaction: false } : {}),
+      ...(neutralizeModelWelcome(body, emittingWelcome) ? { first_interaction: false } : {}),
     };
     const audioContext = this.buildAudioContext();
     const attachmentsContext = createAttachmentsContext();
@@ -1988,7 +2186,7 @@ export class UserDO {
     // `recordWelcomeDelivered` — the flip persists only when the authored
     // welcome actually delivered, so a failed delivery stays re-welcomable.
     // prettier-ignore
-    await this.tracedPhase(ctx, 'save_conversation', () =>
+    const saved = await this.tracedPhase(ctx, 'save_conversation', () =>
       this.saveConversation(triggerCtx.messageText, orchResult.responses, loaded.preferences, body._org_config ?? {}, { logger, audioKey, inboundVoiceKey: loaded.inboundVoiceKey, speaker: body.speaker, attachments: attachmentsContext.list(), emittingWelcome })
     );
 
@@ -2005,10 +2203,10 @@ export class UserDO {
     welcomeTracker.finalized = true;
 
     // prettier-ignore
-    this.logChatTurn(body, effectivePreferences.response_language, logger, { turnId, activeModeName: triggerCtx.activeModeName, activeLanguageName: triggerCtx.activeLanguageName, languageSource: triggerCtx.languageSource, orchestration: orchResult.telemetry, durationMs: Date.now() - ctx.startTime, hadInboundVoice: !!loaded.inboundVoiceKey, hadOutboundVoice: audioKey !== null, inputLanguage, text: chatTurnText(triggerCtx.messageText, responses) });
+    this.logChatTurn(body, effectivePreferences.response_language, logger, { turnId, activeModeName: triggerCtx.activeModeName, activeLanguageName: triggerCtx.activeLanguageName, languageSource: triggerCtx.languageSource, orchestration: orchResult.telemetry, durationMs: Date.now() - ctx.startTime, hadInboundVoice: !!loaded.inboundVoiceKey, hadOutboundVoice: audioKey !== null, inputLanguage, text: chatTurnText(triggerCtx.messageText, responses), ...clientOwnedTurnFacts(body) });
 
     // prettier-ignore
-    return this.assembleChatResponse({ responses, audioKey, workerOrigin, attachmentsContext, effectivePreferences, inputLanguage, logger, startTime: ctx.startTime });
+    return this.assembleChatResponse({ responses, audioKey, workerOrigin, attachmentsContext, effectivePreferences, inputLanguage, logger, startTime: ctx.startTime, historyReceipt: clientHistoryReceipt(body, saved) });
   }
 
   /**
@@ -2476,6 +2674,14 @@ export class UserDO {
     modes: { newEffective: string | undefined; active: string | undefined },
     logger: RequestLogger
   ): Promise<ModeWelcome | undefined> {
+    // #392 `suppress_welcome`: the client owns the opening of the conversation.
+    // Nothing is emitted and NO flag is read or written — neither `mode_welcomed`
+    // nor a `mode_welcome_pending` re-emit — so a later turn without the flag
+    // (or the same user on another channel) still gets the welcome.
+    if (body.suppress_welcome === true) {
+      logger.log('welcome_suppressed_by_client', { client_id: body.client_id, user_id: body.user_id, mode: modes.active ?? null }); // prettier-ignore
+      return undefined;
+    }
     // Explicit `#mode` path: first-time emit (or admin re-preview, FIX B, or an
     // already-active re-trigger) still REQUIRES a `#` token this turn.
     const triggeredMode =
@@ -2839,7 +3045,7 @@ export class UserDO {
       this.tracedPhase(ctx, 'resolve_message', () =>
         this.resolveMessageText(body, logger, emitStatus)
       ),
-      this.tracedPhase(ctx, 'load_history', () => this.loadHistory(logger)),
+      this.tracedPhase(ctx, 'load_history', () => this.loadOrReplaceHistory(body, logger)),
     ]);
     const catalog = await this.tracedPhase(ctx, 'mcp_discovery', () =>
       this.discoverMCPTools(body._mcp_servers ?? [], logger)
@@ -2850,7 +3056,9 @@ export class UserDO {
       () => this.resolvePrompts(body, logger)
     );
     const { memoryStore, formattedTOC } = await this.tracedPhase(ctx, 'load_memory', () =>
-      this.loadMemoryContext(logger)
+      body.suppress_memory === true
+        ? this.suppressedMemoryContext(body, logger)
+        : this.loadMemoryContext(logger)
     );
     const orgLanguages: OrgLanguages = body._org_languages ?? { languages: [] };
     const selectedLanguageName = await this.getSelectedLanguage();
@@ -3075,11 +3283,27 @@ export class UserDO {
     return { resolved, orgModes, activeModeName: effectiveModeName, isAdmin };
   }
 
-  private async loadMemoryContext(logger: RequestLogger) {
+  private async loadMemoryContext(
+    logger: RequestLogger
+  ): Promise<{ memoryStore: JsonMemoryStore | undefined; formattedTOC: string | undefined }> {
     const memoryStore = new JsonMemoryStore(this.state.storage, logger);
     const memoryTOC = await memoryStore.getTableOfContents();
     const formattedTOC = formatTOCForPrompt(memoryTOC);
     return { memoryStore, formattedTOC: formattedTOC || undefined };
+  }
+
+  /**
+   * #392 `suppress_memory`: memory is OFF for this turn. No store is built (so
+   * nothing can be read or written), and `buildOrchOpts` passes
+   * `memoryEnabled: false` so the orchestrator omits the memory prompt slot,
+   * the TOC and both memory tools. The stored memory document is not touched.
+   */
+  private async suppressedMemoryContext(
+    body: ChatRequest,
+    logger: RequestLogger
+  ): Promise<{ memoryStore: undefined; formattedTOC: undefined }> {
+    logger.log('memory_suppressed_by_client', { client_id: body.client_id, user_id: body.user_id });
+    return { memoryStore: undefined, formattedTOC: undefined };
   }
 
   private async loadHistory(logger: RequestLogger) {
@@ -3087,6 +3311,33 @@ export class UserDO {
     const history = await this.getHistory();
     logger.log('phase_load_complete', {
       history_count: history.length,
+      duration_ms: Date.now() - startTime,
+    });
+    return history;
+  }
+
+  /**
+   * #392: a client-supplied `history` REPLACES the stored thread before the
+   * turn runs. Entries are rebuilt from a whitelist (`sanitizeClientHistory`)
+   * and trimmed from the OLDEST end to the org storage cap — the same slice
+   * rule `addHistoryEntry` applies — so the stored value can never exceed what
+   * a normal turn could produce. Replacement is idempotent: a retry that
+   * resends the same thread lands in the same state.
+   */
+  private async loadOrReplaceHistory(body: ChatRequest, logger: RequestLogger) {
+    if (!hasClientHistory(body)) return this.loadHistory(logger);
+    const startTime = Date.now();
+    const supplied = body.history ?? [];
+    const storageMax =
+      body._org_config?.max_history_storage ?? DEFAULT_ORG_CONFIG.max_history_storage;
+    const history = sanitizeClientHistory(supplied, Date.now()).slice(-storageMax);
+    await this.state.storage.put(HISTORY_KEY, history);
+    logger.log('history_replaced', {
+      client_id: body.client_id,
+      user_id: body.user_id,
+      supplied: supplied.length,
+      stored: history.length,
+      trimmed: supplied.length - history.length,
       duration_ms: Date.now() - startTime,
     });
     return history;
@@ -3123,24 +3374,25 @@ export class UserDO {
     const startTime = Date.now();
     const storageMax = orgConfig.max_history_storage ?? DEFAULT_ORG_CONFIG.max_history_storage;
     const hasAttachments = !!attachments && attachments.length > 0;
-    await this.addHistoryEntry(
-      {
-        user_message: message,
-        assistant_response: responses.join('\n'),
-        timestamp: Date.now(),
-        ...(audioKey ? { voice_audio_key: audioKey } : {}),
-        ...(inboundVoiceKey ? { inbound_voice_audio_key: inboundVoiceKey } : {}),
-        ...(speaker ? { speaker } : {}),
-        ...(hasAttachments ? { attachments } : {}),
-      },
-      storageMax
-    );
+    const entry: ChatHistoryEntry = {
+      user_message: message,
+      assistant_response: responses.join('\n'),
+      timestamp: Date.now(),
+      ...(audioKey ? { voice_audio_key: audioKey } : {}),
+      ...(inboundVoiceKey ? { inbound_voice_audio_key: inboundVoiceKey } : {}),
+      ...(speaker ? { speaker } : {}),
+      ...(hasAttachments ? { attachments } : {}),
+    };
+    const historyLength = await this.addHistoryEntry(entry, storageMax);
     await this.maybeFlipFirstInteraction(preferences, emittingWelcome);
     logger.log('phase_save_complete', {
       duration_ms: Date.now() - startTime,
       storageMax,
+      history_length: historyLength,
       attachment_count: attachments?.length ?? 0,
     });
+    // #392: the receipt a client that owns its thread appends locally.
+    return { entry, historyLength };
   }
 
   // ── Audio ─────────────────────────────────────────────────────────────────────
@@ -3364,7 +3616,7 @@ export class UserDO {
     history: ChatHistoryEntry[],
     preferences: UserPreferencesInternal,
     resolvedPromptValues: ReturnType<typeof resolvePromptOverrides>,
-    memoryStore: JsonMemoryStore,
+    memoryStore: JsonMemoryStore | undefined,
     formattedTOC: string | undefined,
     orgModes: { modes: PromptMode[] },
     activeModeName: string | undefined,
@@ -3389,8 +3641,7 @@ export class UserDO {
         first_interaction: preferences.first_interaction,
       },
       resolvedPromptValues,
-      memoryStore,
-      memoryTOC: formattedTOC || undefined,
+      ...memoryOrchOpts(body, memoryStore, formattedTOC),
       modeContext: this.buildModeContext(orgModes, activeModeName, body),
       audioContext,
       attachmentsContext,
@@ -3432,6 +3683,12 @@ export class UserDO {
     inputLanguage: DetectedLanguage | null;
     logger: RequestLogger;
     startTime: number;
+    /**
+     * #392: present ONLY when the request supplied `history`. Surfaces the
+     * appended entry and the stored length so the client can append locally
+     * and detect server-side trimming.
+     */
+    historyReceipt?: { entry: ChatHistoryEntry; historyLength: number } | undefined;
   }): ChatResponse {
     const {
       responses,
@@ -3442,6 +3699,7 @@ export class UserDO {
       inputLanguage,
       logger,
       startTime,
+      historyReceipt,
     } = opts;
     const voiceAudioUrl = audioKey ? audioKeyToUrl(audioKey, workerOrigin) : null;
     const attachments = attachmentsContext.list();
@@ -3454,6 +3712,7 @@ export class UserDO {
       voice_audio_base64: null,
       voice_audio_url: voiceAudioUrl,
       ...(attachments.length > 0 ? { attachments } : {}),
+      ...(historyReceipt ? historyReceiptFields(historyReceipt) : {}),
     };
   }
 
@@ -3720,11 +3979,13 @@ export class UserDO {
     return history ?? [];
   }
 
-  private async addHistoryEntry(entry: ChatHistoryEntry, maxStorage: number): Promise<void> {
+  /** Append one entry, trim to `maxStorage` from the oldest end, and return the stored length. */
+  private async addHistoryEntry(entry: ChatHistoryEntry, maxStorage: number): Promise<number> {
     const history = await this.getHistory();
     history.push(entry);
     const trimmed = history.slice(-maxStorage);
     await this.state.storage.put(HISTORY_KEY, trimmed);
+    return trimmed.length;
   }
 
   /**

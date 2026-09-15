@@ -182,6 +182,12 @@ interface OrchestratorOptions {
   resolvedPromptValues?: Required<Record<PromptSlot, string>>;
   memoryStore?: UserMemoryStore | undefined;
   memoryTOC?: string | undefined;
+  /**
+   * Whether persistent memory is available this turn. Default true. `false`
+   * (#392 `suppress_memory`) drops the memory prompt slot, the TOC and both
+   * memory tools together, so the model is never told memory exists.
+   */
+  memoryEnabled?: boolean | undefined;
   modeContext?: ModeContext | undefined;
   audioContext?: AudioContext | undefined;
   attachmentsContext?: AttachmentsContext | undefined;
@@ -1634,6 +1640,24 @@ function executionLimits(
   };
 }
 
+/**
+ * #392: the prompt slot, the TOC and the two memory tools all key off this ONE
+ * explicit signal so they can never disagree. Explicit rather than inferred
+ * from `memoryStore` so a caller that omits the store (test fixtures) keeps
+ * today's behavior.
+ */
+function hasMemoryForTurn(options: OrchestratorOptions): boolean {
+  return options.memoryEnabled !== false;
+}
+
+/** The tool list for this turn: mode tools only when modes exist, memory tools only when memory is enabled. */
+function turnTools(catalog: ToolCatalog, options: OrchestratorOptions): Anthropic.Tool[] {
+  return buildAllTools(catalog, {
+    hasModes: (options.modeContext?.availableModes.length ?? 0) > 0,
+    hasMemory: hasMemoryForTurn(options),
+  });
+}
+
 function createOrchestrationContext(
   userMessage: string,
   options: OrchestratorOptions,
@@ -1651,7 +1675,7 @@ function createOrchestrationContext(
   const llmMax = orgConfig?.max_history_llm ?? DEFAULT_ORG_CONFIG.max_history_llm;
 
   // prettier-ignore
-  const systemBlocks = buildSystemPromptBlocks(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument, triggerOnly: options.triggerOnly, unmatchedTriggers: options.unmatchedTriggers, addressedToBot: options.addressedToBot, inboundVoiceKey: options.inboundVoiceKey });
+  const systemBlocks = buildSystemPromptBlocks(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, memoryEnabled: hasMemoryForTurn(options), clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument, triggerOnly: options.triggerOnly, unmatchedTriggers: options.unmatchedTriggers, addressedToBot: options.addressedToBot, inboundVoiceKey: options.inboundVoiceKey });
 
   return {
     client: new Anthropic({ apiKey: env.ANTHROPIC_API_KEY }),
@@ -1662,9 +1686,7 @@ function createOrchestrationContext(
     systemVolatile: systemBlocks.volatile,
     systemStableHash: fingerprint(systemBlocks.stable),
     activeMode: options.modeContext?.activeModeName,
-    tools: buildAllTools(catalog, {
-      hasModes: (options.modeContext?.availableModes.length ?? 0) > 0,
-    }),
+    tools: turnTools(catalog, options),
     messages: buildSeedMessages(userMessage, options, llmMax),
     responses: [],
     lastIterationStartIndex: 0,

@@ -308,6 +308,89 @@ describe('createWebhookCallbacks onComplete forwards audio', () => {
   });
 });
 
+const SAMPLE_RECEIPT = {
+  history_entry: { user_message: 'next', assistant_response: 'ok', timestamp: 1757800000000 },
+  history_length: 2,
+};
+
+describe('ProgressCallbackSender.sendComplete with history receipt (#392)', () => {
+  beforeEach(setupMocks);
+
+  it('includes history_entry and history_length when passed', async () => {
+    const sender = new ProgressCallbackSender(mockConfig);
+    await sender.sendComplete('Response text', null, null, null, SAMPLE_RECEIPT);
+    const body = JSON.parse((fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].body as string);
+    expect(body.type).toBe('complete');
+    expect(body.history_entry).toEqual(SAMPLE_RECEIPT.history_entry);
+    expect(body.history_length).toBe(2);
+  });
+
+  it('omits both fields when the receipt is null or not passed', async () => {
+    const sender = new ProgressCallbackSender(mockConfig);
+    await sender.sendComplete('Response text', null, null, null, null);
+    await sender.sendComplete('Response text');
+    for (const call of (fetch as ReturnType<typeof vi.fn>).mock.calls) {
+      const body = JSON.parse((call as [string, { body: string }])[1].body);
+      expect(body).not.toHaveProperty('history_entry');
+      expect(body).not.toHaveProperty('history_length');
+    }
+  });
+});
+
+describe('createWebhookCallbacks onComplete forwards the history receipt (#392)', () => {
+  beforeEach(setupMocks);
+
+  it('forwards history_entry and history_length from ChatResponse', async () => {
+    const sender = new ProgressCallbackSender(mockConfig);
+    const callbacks = createWebhookCallbacks(sender, testLogger);
+    callbacks.onComplete({
+      responses: ['ok'],
+      response_language: 'en',
+      voice_audio_base64: null,
+      ...SAMPLE_RECEIPT,
+    });
+    await vi.runAllTimersAsync();
+    const body = JSON.parse((fetch as ReturnType<typeof vi.fn>).mock.calls[0][1].body as string);
+    expect(body.type).toBe('complete');
+    expect(body.text).toBe('ok');
+    expect(body.history_entry).toEqual(SAMPLE_RECEIPT.history_entry);
+    expect(body.history_length).toBe(2);
+  });
+
+  it('sends complete when only the receipt is new (text already streamed as progress)', async () => {
+    const sender = new ProgressCallbackSender(mockConfig);
+    const callbacks = createWebhookCallbacks(sender, testLogger);
+    callbacks.onProgress('ok');
+    callbacks.onIterationComplete?.('ok');
+    callbacks.onComplete({
+      responses: ['ok'],
+      response_language: 'en',
+      voice_audio_base64: null,
+      ...SAMPLE_RECEIPT,
+    });
+    await vi.runAllTimersAsync();
+    const completes = (fetch as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => JSON.parse((call as [string, { body: string }])[1].body))
+      .filter((body) => body.type === 'complete');
+    expect(completes).toHaveLength(1);
+    expect(completes[0]).not.toHaveProperty('text');
+    expect(completes[0].history_length).toBe(2);
+  });
+
+  it('still skips the complete when there is no delta, no audio, no attachments and no receipt', async () => {
+    const sender = new ProgressCallbackSender(mockConfig);
+    const callbacks = createWebhookCallbacks(sender, testLogger);
+    callbacks.onProgress('ok');
+    callbacks.onIterationComplete?.('ok');
+    callbacks.onComplete({ responses: ['ok'], response_language: 'en', voice_audio_base64: null });
+    await vi.runAllTimersAsync();
+    const completes = (fetch as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => JSON.parse((call as [string, { body: string }])[1].body))
+      .filter((body) => body.type === 'complete');
+    expect(completes).toHaveLength(0);
+  });
+});
+
 describe('ProgressCallbackSender.sendError', () => {
   beforeEach(setupMocks);
 

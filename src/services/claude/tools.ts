@@ -15,9 +15,28 @@ import Anthropic from '@anthropic-ai/sdk';
 import { JSONSchema, ToolCatalog } from '../mcp/types.js';
 
 /**
+ * Options shared by the tool builders.
+ *
+ * `hasMemory` (default true) — when false (#392 `suppress_memory`) the memory
+ * tools are not registered AND `execute_code`'s guidance stops naming them,
+ * so the model is never told those tools exist for this turn.
+ */
+export interface BuildToolsOptions {
+  hasModes?: boolean;
+  hasMemory?: boolean;
+}
+
+/** Internal tool names `execute_code` must never be asked to call from inside the sandbox. */
+function internalToolNamesForGuidance(hasMemory: boolean): string {
+  const memory = hasMemory ? ['update_memory', 'read_memory'] : [];
+  return [...memory, 'attach_audio', 'request_audio', 'read_r2_object'].join(', ');
+}
+
+/**
  * Build execute_code tool definition
  */
-export function buildExecuteCodeTool(): Anthropic.Tool {
+export function buildExecuteCodeTool(opts?: Pick<BuildToolsOptions, 'hasMemory'>): Anthropic.Tool {
+  const internalTools = internalToolNamesForGuidance(opts?.hasMemory ?? true);
   return {
     name: 'execute_code',
     description: `Execute JavaScript code in a sandboxed QuickJS environment.
@@ -29,7 +48,7 @@ const result = await tool_name({ param: "value" });
 __result__ = result;
 
 AVAILABLE: console.log/info/warn/error, JSON, all MCP tool functions (e.g. fetch_scripture, search_resources)
-NOT AVAILABLE: fetch, require, import, process, eval, Function constructor, internal tools (update_memory, read_memory, attach_audio, request_audio, read_r2_object — call these directly as tool calls, never from inside execute_code)
+NOT AVAILABLE: fetch, require, import, process, eval, Function constructor, internal tools (${internalTools} — call these directly as tool calls, never from inside execute_code)
 
 RESOURCE LIMITS:
 - Maximum 10 MCP tool calls per execute_code invocation (hard limit - execution fails if exceeded)
@@ -336,15 +355,15 @@ export function buildSwitchModeTool(): Anthropic.Tool {
  * - Forces Claude to be intentional about which tools to use
  * - Full schemas are loaded on-demand, not upfront
  */
-export function buildAllTools(
-  _catalog: ToolCatalog,
-  opts?: { hasModes?: boolean }
-): Anthropic.Tool[] {
+export function buildAllTools(_catalog: ToolCatalog, opts?: BuildToolsOptions): Anthropic.Tool[] {
+  const hasMemory = opts?.hasMemory ?? true;
   const tools: Anthropic.Tool[] = [
-    buildExecuteCodeTool(),
+    buildExecuteCodeTool({ hasMemory }),
     buildGetToolDefinitionsTool(),
-    buildReadMemoryTool(),
-    buildUpdateMemoryTool(),
+    // #392: omitted entirely when the request suppressed memory — the handlers
+    // would only answer "Memory is not available", so exposing them wastes an
+    // iteration and contradicts the (also omitted) memory_instructions slot.
+    ...(hasMemory ? [buildReadMemoryTool(), buildUpdateMemoryTool()] : []),
     buildRequestAudioTool(), // Always available — TTS is a platform capability, not org-gated
     buildGenerateScripturePdfTool(), // Always available — short-circuits to error if ptxprint-mcp not registered for the org
     buildPrepareUsfmSourceTool(),

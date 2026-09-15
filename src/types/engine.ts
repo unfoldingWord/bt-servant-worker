@@ -93,6 +93,31 @@ export interface ChatRequest {
   /** Gateway-provided language hint. Overrides stored preference for this request. */
   response_language_hint?: string;
 
+  /**
+   * Client-supplied conversation thread (#392). When present, it REPLACES the
+   * stored history before this turn runs; the turn then appends to it and the
+   * result is persisted as usual. Omit to continue the stored thread (today's
+   * behavior). `[]` starts blank. Private chats only — rejected with 400 on
+   * group/supergroup. See docs/client-supplied-history.md.
+   */
+  history?: ClientHistoryEntry[];
+
+  /**
+   * Skip the first-contact welcome for this turn (#392): the mode's authored
+   * `welcome_message` + share link AND the model's own "briefly welcome them"
+   * instruction. Writes no welcome flags, so a later turn without the flag
+   * (or the same user on another channel) still gets the welcome. Default false.
+   */
+  suppress_welcome?: boolean;
+
+  /**
+   * Turn persistent memory OFF for this turn (#392): the memory instructions
+   * slot, the memory TOC, and the `read_memory` / `update_memory` tools are
+   * all omitted, and no memory store is loaded. Nothing is read from or
+   * written to the user's memory. Default false.
+   */
+  suppress_memory?: boolean;
+
   /** Internal: MCP servers injected by worker (not from client) */
   _mcp_servers?: MCPServerConfig[];
 
@@ -231,6 +256,38 @@ export interface ChatResponse {
    * should ignore the field — never present a raw URL string in chat.
    */
   attachments?: Attachment[];
+
+  /**
+   * The entry this turn appended to the stored thread (#392). Present ONLY
+   * when the request supplied `history`, so a client that owns its thread can
+   * append it locally without re-deriving the joined response text.
+   */
+  history_entry?: Pick<ChatHistoryEntry, 'user_message' | 'assistant_response' | 'timestamp'>;
+
+  /**
+   * Stored thread length after this turn's append (#392). Present ONLY when
+   * the request supplied `history`. Lets the client detect server-side
+   * trimming at `max_history_storage`.
+   */
+  history_length?: number;
+}
+
+/**
+ * One turn of a client-supplied conversation thread (#392): the subset of
+ * `ChatHistoryEntry` a client may write. Anything else on an uploaded entry
+ * (R2 audio keys, speaker, attachments, the read endpoint's derived URLs) is
+ * dropped by the sanitizer — a client must never be able to point stored
+ * history at arbitrary R2 objects.
+ */
+export interface ClientHistoryEntry {
+  /** Required, non-empty after trim. */
+  user_message: string;
+  /** Required, non-empty after trim. */
+  assistant_response: string;
+  /** Milliseconds since epoch. Optional; wins over `created_at` when both are present. */
+  timestamp?: number;
+  /** ISO 8601. Optional; used when `timestamp` is absent. Lets a GET /history payload round-trip. */
+  created_at?: string | null;
 }
 
 /**
@@ -437,6 +494,13 @@ export interface ProgressCallback {
   voice_audio_url?: string | null;
   /** Tool-produced artifacts (e.g. generated PDFs) — present on `complete` when tools registered them. */
   attachments?: Attachment[];
+  /**
+   * The turn just appended to the stored thread (#392) — present on `complete`
+   * ONLY when the request supplied `history`. Same shape as `ChatResponse.history_entry`.
+   */
+  history_entry?: ChatResponse['history_entry'];
+  /** Stored thread length after the append (#392) — present on `complete` ONLY when the request supplied `history`. */
+  history_length?: number;
   /** Group/supergroup chat ID (present only for group chats). */
   chat_id?: string;
   /** Thread ID within a supergroup (present only for threaded chats). */
