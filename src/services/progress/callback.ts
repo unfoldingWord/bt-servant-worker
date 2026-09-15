@@ -47,10 +47,30 @@ interface CallbackPayload {
    * the same final event that delivers the text.
    */
   attachments?: Attachment[];
+  /**
+   * #392: the turn just appended to the stored thread and the resulting
+   * length — `type: 'complete'` only, and ONLY when the request supplied
+   * `history`. Forwarded verbatim from ChatResponse so a callback client can
+   * append the server-produced turn to its own copy.
+   */
+  history_entry?: ChatResponse['history_entry'];
+  history_length?: number;
   /** Group/supergroup chat ID (present only for group chats). */
   chat_id?: string;
   /** Thread ID within a supergroup (present only for threaded chats). */
   thread_id?: string;
+}
+
+/** The #392 receipt fields of a ChatResponse, as a unit. */
+export type HistoryReceipt = Pick<ChatResponse, 'history_entry' | 'history_length'>;
+
+/**
+ * Extract the #392 receipt from a response, or null when the request did not
+ * supply `history` (both fields are absent together by construction).
+ */
+export function historyReceiptOf(response: ChatResponse): HistoryReceipt | null {
+  if (response.history_length === undefined || response.history_entry === undefined) return null;
+  return { history_entry: response.history_entry, history_length: response.history_length };
 }
 
 export class ProgressCallbackSender {
@@ -114,7 +134,8 @@ export class ProgressCallbackSender {
     text: string,
     voiceAudioUrl?: string | null,
     voiceAudioBase64?: string | null,
-    attachments?: Attachment[] | null
+    attachments?: Attachment[] | null,
+    historyReceipt?: HistoryReceipt | null
   ): Promise<void> {
     await this.awaitPendingSends('complete');
     await this.post({
@@ -123,6 +144,8 @@ export class ProgressCallbackSender {
       ...(voiceAudioUrl ? { voice_audio_url: voiceAudioUrl } : {}),
       ...(voiceAudioBase64 ? { voice_audio_base64: voiceAudioBase64 } : {}),
       ...(attachments && attachments.length > 0 ? { attachments } : {}),
+      // #392: present only when the request supplied `history`.
+      ...(historyReceipt ?? {}),
     });
   }
 
@@ -416,7 +439,16 @@ function buildOnComplete(
     const fullText = response.responses.join('\n');
     const delta = fullText.slice(getLastSentText().length);
     const hasAttachments = !!response.attachments && response.attachments.length > 0;
-    if (!delta && !response.voice_audio_url && !response.voice_audio_base64 && !hasAttachments) {
+    // #392: a client that supplied `history` needs the receipt even when the
+    // text already streamed as progress and the complete carries no delta.
+    const receipt = historyReceiptOf(response);
+    if (
+      !delta &&
+      !response.voice_audio_url &&
+      !response.voice_audio_base64 &&
+      !hasAttachments &&
+      !receipt
+    ) {
       return;
     }
     runSafe(logger, 'webhook_complete_failed', () =>
@@ -424,7 +456,8 @@ function buildOnComplete(
         delta,
         response.voice_audio_url,
         response.voice_audio_base64,
-        response.attachments
+        response.attachments,
+        receipt
       )
     );
   };

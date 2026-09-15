@@ -494,6 +494,13 @@ export interface ProgressCallback {
   voice_audio_url?: string | null;
   /** Tool-produced artifacts (e.g. generated PDFs) — present on `complete` when tools registered them. */
   attachments?: Attachment[];
+  /**
+   * The turn just appended to the stored thread (#392) — present on `complete`
+   * ONLY when the request supplied `history`. Same shape as `ChatResponse.history_entry`.
+   */
+  history_entry?: ChatResponse['history_entry'];
+  /** Stored thread length after the append (#392) — present on `complete` ONLY when the request supplied `history`. */
+  history_length?: number;
   /** Group/supergroup chat ID (present only for group chats). */
   chat_id?: string;
   /** Thread ID within a supergroup (present only for threaded chats). */

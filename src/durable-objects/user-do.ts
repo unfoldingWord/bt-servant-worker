@@ -139,6 +139,23 @@ const QUEUE_PROCESSING_KEY = 'queue_processing';
 // ── Constants ──────────────────────────────────────────────────────────────────
 const LOCK_STALE_THRESHOLD_MS = 90_000; // 90 seconds
 const DEFAULT_MAX_QUEUE_DEPTH = 50;
+/**
+ * Byte budget for the serialized callback/SSE queue. The queue is persisted as
+ * ONE SQLite-backed storage value (2 MiB hard limit), and each queued entry
+ * carries a whole request body — a #392 `history` up to 512 KiB, or a large
+ * `audio_base64`. Enforced on enqueue so a request that passed validation is
+ * turned away with a 429 instead of failing the storage put.
+ */
+export const MAX_QUEUE_BYTES = 1.5 * 1024 * 1024;
+/** `enqueueEntry` rejection: the queue already holds `maxDepth` entries. */
+export const QUEUE_REJECT_DEPTH = -1;
+/** `enqueueEntry` rejection: accepting the entry would push the serialized queue past `MAX_QUEUE_BYTES`. */
+export const QUEUE_REJECT_BYTES = -2;
+
+/** UTF-8 size of `value` as JSON — the same yardstick `history-validation.ts` uses for its cap. */
+function serializedBytes(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+}
 const DEFAULT_MAX_RETRIES = 3;
 const ENQUEUE_RATE_WINDOW_MS = 60_000; // 1 minute
 const ENQUEUE_RATE_LIMIT = 300;
@@ -1103,22 +1120,8 @@ export class UserDO {
     const maxDepth = this.getMaxQueueDepth();
     const position = await this.enqueueEntry(entry, maxDepth);
 
-    if (position === -1) {
-      logger.warn('chat_queue_full', {
-        message_id: messageId,
-        user_id: body.user_id,
-        max_depth: maxDepth,
-        status: 429,
-      });
-      countMetric('queue_entries_total', { status: 'rejected', reason: 'queue_full' });
-      return Response.json(
-        {
-          error: 'Queue full',
-          code: 'QUEUE_DEPTH_EXCEEDED',
-          message: `Queue depth limit (${maxDepth}) exceeded.`,
-        },
-        { status: 429, headers: { 'Retry-After': '5' } }
-      );
+    if (position < 0) {
+      return this.rejectEnqueue(position, { messageId, userId: body.user_id, maxDepth, logger });
     }
 
     logger.log('chat_enqueued', {
@@ -1630,7 +1633,45 @@ export class UserDO {
 
   // ── Queue infrastructure ──────────────────────────────────────────────────────
 
-  /** Atomically append entry to queue and schedule alarm if idle. Returns -1 if full. */
+  /**
+   * The 429 for a rejected enqueue. Both rejections are transient — the queue
+   * drains — so both carry `Retry-After: 5`; the `code` tells the client which
+   * limit it hit. Logged and counted under distinct reasons.
+   */
+  private rejectEnqueue(
+    code: number,
+    ctx: { messageId: string; userId: string; maxDepth: number; logger: RequestLogger }
+  ): Response {
+    const byBytes = code === QUEUE_REJECT_BYTES;
+    ctx.logger.warn(byBytes ? 'chat_queue_bytes_exceeded' : 'chat_queue_full', {
+      message_id: ctx.messageId,
+      user_id: ctx.userId,
+      max_depth: ctx.maxDepth,
+      max_bytes: MAX_QUEUE_BYTES,
+      status: 429,
+    });
+    countMetric('queue_entries_total', {
+      status: 'rejected',
+      reason: byBytes ? 'queue_bytes' : 'queue_full',
+    });
+    return Response.json(
+      {
+        error: 'Queue full',
+        code: byBytes ? 'QUEUE_BYTES_EXCEEDED' : 'QUEUE_DEPTH_EXCEEDED',
+        message: byBytes
+          ? `Queued request bytes limit (${MAX_QUEUE_BYTES}) exceeded.`
+          : `Queue depth limit (${ctx.maxDepth}) exceeded.`,
+      },
+      { status: 429, headers: { 'Retry-After': '5' } }
+    );
+  }
+
+  /**
+   * Atomically append entry to queue and schedule alarm if idle. Returns the
+   * 1-based queue position, or a negative rejection code: `QUEUE_REJECT_DEPTH`
+   * when the queue already holds `maxDepth` entries, `QUEUE_REJECT_BYTES` when
+   * the serialized queue (one storage value) would exceed `MAX_QUEUE_BYTES`.
+   */
   private async enqueueEntry(entry: InternalQueueEntry, maxDepth: number): Promise<number> {
     // Runs in the DO fetch context (unlike the alarm-drained dequeue path, which
     // cannot export spans — CF error 1003), so this span reaches the collector.
@@ -1638,9 +1679,14 @@ export class UserDO {
       this.state.blockConcurrencyWhile(async () => {
         const queue = (await this.state.storage.get<InternalQueueEntry[]>(QUEUE_KEY)) ?? [];
 
-        if (queue.length >= maxDepth) return -1;
+        if (queue.length >= maxDepth) return QUEUE_REJECT_DEPTH;
 
         queue.push(entry);
+        // The whole queue is ONE storage value, so individually valid bodies
+        // (a near-cap #392 `history`, a large audio_base64) can add up past the
+        // 2 MiB SQLite value limit and make this put throw AFTER validation
+        // passed. Reject before writing instead, so the client gets a 429.
+        if (serializedBytes(queue) > MAX_QUEUE_BYTES) return QUEUE_REJECT_BYTES;
         await this.state.storage.put(QUEUE_KEY, queue);
 
         const isProcessing = (await this.state.storage.get<boolean>(QUEUE_PROCESSING_KEY)) ?? false;

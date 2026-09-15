@@ -478,6 +478,7 @@ All error responses follow a standard format:
 | `MCP_REQUEST_CALL_LIMIT_EXCEEDED` | 429  | Too many MCP calls across the whole request        |
 | `RATE_LIMIT_EXCEEDED`             | 429  | Rate limit hit on queue endpoints                  |
 | `QUEUE_DEPTH_EXCEEDED`            | 429  | Conversation's queue is full                       |
+| `QUEUE_BYTES_EXCEEDED`            | 429  | Conversation's queued request bytes over budget    |
 | `AUDIO_TRANSCRIPTION_ERROR`       | 400  | STT failed (bad format, oversized, invalid base64) |
 | `MCP_RESPONSE_TOO_LARGE`          | 413  | MCP server response exceeds size limit             |
 | `CODE_EXECUTION_ERROR`            | 500  | QuickJS sandbox error                              |
