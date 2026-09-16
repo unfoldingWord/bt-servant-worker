@@ -71,9 +71,20 @@ interface LegacyKeyListing {
 /** Once-per-isolate latch so the chat hot path does not log on every turn. */
 let chatFallbackWarned = false;
 
-/** Test seam: reset the once-per-isolate chat warning latch. */
+/**
+ * Once-per-isolate latch for the empty-pool check on the chat path (worker#432).
+ * Separate from `chatFallbackWarned` on purpose: that latch is cleared on every
+ * successful `__global__` read, which is exactly the path this check runs on,
+ * so sharing it would re-probe and re-warn on every turn. This one is re-armed
+ * only by a NON-empty `__global__` read, so emptying the pool again later in the
+ * same isolate is checked again.
+ */
+let chatEmptyPoolChecked = false;
+
+/** Test seam: reset the once-per-isolate chat latches. */
 export function resetChatFallbackWarning(): void {
   chatFallbackWarned = false;
+  chatEmptyPoolChecked = false;
 }
 
 /** Upper bound on `kv.list` pages when enumerating legacy keys for the warn. */
@@ -173,6 +184,39 @@ async function probeLegacyKey(
   }
 }
 
+/**
+ * Chat path, `__global__` is `[]` (worker#432). An empty global pool is a real,
+ * empty pool and disables the legacy fallback, so this read serves zero MCP
+ * servers and says nothing — which is how staging chat ran without MCP from
+ * 2026-09-10 to 09-11 with clean logs. Warn when the legacy DEFAULT_ORG key
+ * still holds servers, because that shape almost always means `[]` was seeded
+ * over live data instead of migrating the raw legacy value.
+ *
+ * Diagnostic only: it never changes what is served, and a failed read is logged
+ * and swallowed so the chat turn proceeds. Self-retiring: once the legacy keys
+ * are deleted the read finds nothing and the warning can never fire.
+ */
+async function warnIfEmptyPoolOverLegacy(
+  kv: KVNamespace,
+  defaultOrg: string,
+  logger: RequestLogger
+): Promise<void> {
+  let legacy: MCPServerConfig[] | null;
+  try {
+    legacy = await readPoolKey(kv, defaultOrg);
+  } catch (error) {
+    logger.error('mcp_legacy_key_probe_failed', error, { key: defaultOrg, source: 'chat' });
+    return;
+  }
+  if (legacy === null || legacy.length === 0) return;
+  logger.warn('mcp_global_pool_empty_over_legacy', {
+    global_key: MCP_GLOBAL_KEY,
+    legacy_key: defaultOrg,
+    legacy_server_count: legacy.length,
+    once_per_isolate: true,
+  });
+}
+
 /** Prepend a key that a direct `get` just found, if the listing did not report it. */
 function withKnownKey(names: string[], key: string, known: boolean): string[] {
   return known && !names.includes(key) ? [key, ...names] : names;
@@ -215,6 +259,12 @@ async function migratedPool(
   // deletes `__global__` is reported again by reused isolates.
   chatFallbackWarned = false;
   if (source !== 'admin') {
+    if (global.length > 0) {
+      chatEmptyPoolChecked = false;
+    } else if (!chatEmptyPoolChecked) {
+      chatEmptyPoolChecked = true;
+      await warnIfEmptyPoolOverLegacy(kv, defaultOrg, logger);
+    }
     return {
       servers: global,
       migrated: true,
