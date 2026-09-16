@@ -510,6 +510,118 @@ describe('readMcpServerPool stale-miss detection', () => {
   });
 });
 
+// ─── worker#432: chat path serving an empty __global__ over a populated legacy key
+
+/** How many times a fake KV was asked for the legacy DEFAULT_ORG key. */
+const legacyGets = (kv: KVNamespace) =>
+  (kv.get as ReturnType<typeof vi.fn>).mock.calls.filter(([key]) => key === 'unfoldingWord').length;
+
+describe('empty-pool-over-legacy warning (worker#432): when it fires', () => {
+  beforeEach(() => resetChatFallbackWarning());
+
+  it('warns with the legacy server count, and still serves the empty pool', async () => {
+    // The 2026-09-10 staging shape: `[]` seeded over live legacy servers.
+    const kv = fakeKv({
+      [MCP_GLOBAL_KEY]: [],
+      unfoldingWord: [stored('a'), stored('b'), stored('c')],
+    });
+    const logger = fakeLogger();
+    const pool = await readMcpServerPool(kv, 'unfoldingWord', logger, 'chat');
+    expect(pool.servers).toEqual([]);
+    expect(pool.migrated).toBe(true);
+    expect(pool.fallbackFound).toBe(false);
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledWith('mcp_global_pool_empty_over_legacy', {
+      global_key: MCP_GLOBAL_KEY,
+      legacy_key: 'unfoldingWord',
+      legacy_server_count: 3,
+      once_per_isolate: true,
+    });
+    // Still a chat read: no key listing on the hot path.
+    expect(kv.list).not.toHaveBeenCalled();
+  });
+
+  it('is silent when the legacy key is absent (a genuinely empty pool)', async () => {
+    const logger = fakeLogger();
+    await readMcpServerPool(fakeKv({ [MCP_GLOBAL_KEY]: [] }), 'unfoldingWord', logger, 'chat');
+    expect(logger.warn).not.toHaveBeenCalled();
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  it('is silent when the legacy key holds an empty list', async () => {
+    const logger = fakeLogger();
+    const kv = fakeKv({ [MCP_GLOBAL_KEY]: [], unfoldingWord: [] });
+    await readMcpServerPool(kv, 'unfoldingWord', logger, 'chat');
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+});
+
+describe('empty-pool-over-legacy warning (worker#432): cost and latching', () => {
+  beforeEach(() => resetChatFallbackWarning());
+
+  it('reads the legacy key and warns at most once per isolate', async () => {
+    const kv = fakeKv({ [MCP_GLOBAL_KEY]: [], unfoldingWord: [stored('a')] });
+    const logger = fakeLogger();
+    await readMcpServerPool(kv, 'unfoldingWord', logger, 'chat');
+    await readMcpServerPool(kv, 'unfoldingWord', logger, 'chat');
+    await readMcpServerPool(kv, 'unfoldingWord', logger, 'chat');
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(legacyGets(kv)).toBe(1);
+  });
+
+  it('checks again after a non-empty __global__ read', async () => {
+    const logger = fakeLogger();
+    const emptied = fakeKv({ [MCP_GLOBAL_KEY]: [], unfoldingWord: [stored('a')] });
+    await readMcpServerPool(emptied, 'unfoldingWord', logger, 'chat');
+    await readMcpServerPool(
+      fakeKv({ [MCP_GLOBAL_KEY]: [stored('g')] }),
+      'unfoldingWord',
+      logger,
+      'chat'
+    );
+    await readMcpServerPool(emptied, 'unfoldingWord', logger, 'chat');
+    expect(logger.warn).toHaveBeenCalledTimes(2);
+  });
+
+  it('never reads the legacy key when __global__ has servers', async () => {
+    const kv = fakeKv({ [MCP_GLOBAL_KEY]: [stored('g')], unfoldingWord: [stored('a')] });
+    const logger = fakeLogger();
+    await readMcpServerPool(kv, 'unfoldingWord', logger, 'chat');
+    expect(legacyGets(kv)).toBe(0);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+});
+
+describe('empty-pool-over-legacy warning (worker#432): failures and scope', () => {
+  beforeEach(() => resetChatFallbackWarning());
+
+  it('logs a failed legacy read and still serves the empty pool', async () => {
+    const kv = fakeKv({ [MCP_GLOBAL_KEY]: [] });
+    (kv.get as ReturnType<typeof vi.fn>).mockImplementation(async (key: string) => {
+      if (key === 'unfoldingWord') throw new Error('kv down');
+      return JSON.stringify([]);
+    });
+    const logger = fakeLogger();
+    const pool = await readMcpServerPool(kv, 'unfoldingWord', logger, 'chat');
+    expect(pool.servers).toEqual([]);
+    expect(logger.error).toHaveBeenCalledWith('mcp_legacy_key_probe_failed', expect.any(Error), {
+      key: 'unfoldingWord',
+      source: 'chat',
+    });
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it('never runs on admin reads, which already report leftovers', async () => {
+    const kv = fakeKv({ [MCP_GLOBAL_KEY]: [], unfoldingWord: [stored('a')] });
+    const logger = fakeLogger();
+    await readMcpServerPool(kv, 'unfoldingWord', logger, 'admin');
+    expect(logger.warn).not.toHaveBeenCalledWith(
+      'mcp_global_pool_empty_over_legacy',
+      expect.anything()
+    );
+  });
+});
+
 describe('readMcpServerPool logging and shape guards', () => {
   beforeEach(() => resetChatFallbackWarning());
 
