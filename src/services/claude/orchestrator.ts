@@ -2298,6 +2298,8 @@ function handleListModes(ctx: OrchestrationContext): unknown {
       name: m.name,
       label: m.label ?? m.name,
       description: m.description ?? null,
+      // Publishing org for a foreign (`<org>/<mode>`) entry; null for this org's own modes (#336).
+      org: m.org ?? null,
     })),
     active_mode: ctx.modeContext.activeModeName ?? null,
   };

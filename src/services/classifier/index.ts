@@ -232,13 +232,19 @@ function tryFuzzyMatch(lower: string, options: AvailableOption[]): string | null
 /**
  * Match a raw token against the configured options using the cascade:
  * exact → unique prefix → unique Levenshtein ≤ 2.
+ *
+ * Org-qualified names (admin-portal#336): a foreign org's published mode is
+ * offered as `<orgslug>/<slug>`, and the token is first partitioned by the
+ * presence of `/` so a bare `#obt` can never prefix- or fuzzy-match
+ * `pbt/obt-coach`, while `#pbt/obt-c` gets the same cascade within the
+ * qualified set. Bare tokens only ever see the request org's own modes.
  */
 function matchToken(raw: string, options: AvailableOption[]): string | null {
-  if (options.length === 0) return null;
+  const qualified = raw.includes('/');
+  const pool = options.filter((opt) => opt.name.includes('/') === qualified);
+  if (pool.length === 0) return null;
   const lower = raw.toLowerCase();
-  return (
-    tryExactMatch(lower, options) ?? tryPrefixMatch(lower, options) ?? tryFuzzyMatch(lower, options)
-  );
+  return tryExactMatch(lower, pool) ?? tryPrefixMatch(lower, pool) ?? tryFuzzyMatch(lower, pool);
 }
 
 // ─── Main classifier ─────────────────────────────────────────────────────────

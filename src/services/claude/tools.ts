@@ -311,7 +311,7 @@ export function buildListModesTool(): Anthropic.Tool {
   return {
     name: 'list_modes',
     description:
-      'List all available assistant modes and which mode is currently active. Modes change how the assistant behaves (e.g., different methodology, instructions, or persona).',
+      "List all available assistant modes and which mode is currently active. Modes change how the assistant behaves (e.g., different methodology, instructions, or persona). Each entry carries its publishing org: modes from this organization have a bare name and org null; modes published by another organization are named '<org>/<mode>' and carry that org's name.",
     input_schema: {
       type: 'object',
       properties: {},
@@ -327,13 +327,14 @@ export function buildSwitchModeTool(): Anthropic.Tool {
   return {
     name: 'switch_mode',
     description:
-      'Switch the assistant to a different mode. The change takes effect on the next message. Pass the mode name to switch to, or null to clear the current mode and return to the default.',
+      "Switch the assistant to a different mode. The change takes effect on the next message. Pass the mode name exactly as list_modes returns it — a bare name for this organization's modes, or the org-qualified '<org>/<mode>' name for a mode published by another organization — or null to clear the current mode and return to the default.",
     input_schema: {
       type: 'object',
       properties: {
         mode: {
           oneOf: [{ type: 'string' }, { type: 'null' }],
-          description: 'The name of the mode to switch to, or null to clear the current mode.',
+          description:
+            "The name of the mode to switch to (bare, or org-qualified as '<org>/<mode>' for another organization's mode), or null to clear the current mode.",
         },
       },
       required: ['mode'],

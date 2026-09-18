@@ -105,9 +105,10 @@ const URL_PATTERN = /(?:https?:\/\/|www\.)\S+/gi;
  * leading trigger tokens that matched a configured mode or language; whatever
  * still starts with `#` or `@` (unmatched tokens the classifier leaves in
  * place, social hashtags, email handles, addressee mentions) carries no
- * signal about the language the user writes in.
+ * signal about the language the user writes in. `/` is part of the word so an
+ * unmatched org-qualified `#org/mode` (#336) is removed whole.
  */
-const HASHTAG_OR_HANDLE_PATTERN = /(?<![\p{L}\p{N}])[#@][\p{L}\p{N}_-]+/gu;
+const HASHTAG_OR_HANDLE_PATTERN = /(?<![\p{L}\p{N}])[#@][\p{L}\p{N}_/-]+/gu;
 
 /** Pictographic emoji plus the variation selector / ZWJ that join sequences. */
 const EMOJI_PATTERN = /[\p{Extended_Pictographic}\p{Emoji_Presentation}\uFE0F\u200D]/gu;

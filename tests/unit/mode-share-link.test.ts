@@ -91,3 +91,11 @@ describe('buildModeShareLink', () => {
     );
   });
 });
+
+describe('buildModeShareLink — org-qualified slugs (#336)', () => {
+  it('percent-encodes the `/` so a foreign mode round-trips through the classifier', () => {
+    expect(buildModeShareLink('15558196461', 'pbt/obt-coach')).toBe(
+      'https://wa.me/15558196461?text=%23pbt%2Fobt-coach'
+    );
+  });
+});
