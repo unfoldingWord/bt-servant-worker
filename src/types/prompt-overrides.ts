@@ -150,11 +150,27 @@ export interface OrgModes {
 }
 
 /**
+ * Chat-side view of a mode (admin-portal#336). The worker merges the request
+ * org's own modes (bare names, exactly as stored) with every other org's
+ * PUBLISHED modes, whose `name` and `aliases` are qualified as
+ * `<orgslug>/<slug>`; those foreign entries also carry the publishing org's
+ * raw name in `org` for display (list_modes). `org` is deliberately NOT on
+ * `PromptMode`: the admin PUT path spreads unknown fields into KV, and this
+ * field must never be persisted.
+ */
+export type ChatMode = PromptMode & { org?: string };
+
+/** The `_org_modes` payload the worker injects into a chat request. */
+export interface ChatOrgModes {
+  modes: ChatMode[];
+}
+
+/**
  * Mode context passed to the orchestrator for list_modes / switch_mode tools.
  */
 export interface ModeContext {
-  /** All modes available for this org */
-  availableModes: PromptMode[];
+  /** All modes available to this user: home org (bare) + foreign published (qualified) */
+  availableModes: ChatMode[];
   /** Currently active mode name (if any) */
   activeModeName: string | undefined;
   /** Callback to persist the user's mode selection */
@@ -284,6 +300,27 @@ export function validateModeName(name: unknown): string | null {
     return 'Mode name must be lowercase alphanumeric with hyphens (e.g., "mast-methodology")';
   }
   return null;
+}
+
+/**
+ * Validate a user's mode SELECTION as accepted by the admin `PUT /mode`
+ * endpoint (admin-portal#336): either a bare mode slug (the request org's own
+ * mode) or `<orgslug>/<modeslug>` (another org's published mode, as the chat
+ * path names it). Both halves must satisfy `MODE_NAME_PATTERN`. Admin mode
+ * CRUD routes keep using `validateModeName`, so `/` can never be STORED as a
+ * mode name — the qualified form exists only in a user's `selected_mode`.
+ *
+ * Returns an error message if invalid, null if valid.
+ */
+export function validateModeSelection(value: unknown): string | null {
+  if (typeof value !== 'string') return 'Mode must be a string';
+  const parts = value.split('/');
+  if (parts.length === 1) return validateModeName(value);
+  const [orgSlug, modeSlug, ...rest] = parts;
+  if (rest.length > 0 || !orgSlug || !modeSlug || !MODE_NAME_PATTERN.test(orgSlug)) {
+    return 'Mode must be a mode slug or "<org-slug>/<mode-slug>" (lowercase alphanumeric with hyphens)';
+  }
+  return validateModeName(modeSlug);
 }
 
 /**
