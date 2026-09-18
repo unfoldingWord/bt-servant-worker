@@ -576,3 +576,86 @@ describe('classifyTriggers — token-only messages (#360)', () => {
     expect(result.strippedMessage).toBe('@nosuchlang');
   });
 });
+
+// ─── Org-qualified mode triggers (#336) ─────────────────────────────────────
+
+// Home (request-org) modes stay bare; foreign published modes are merged in
+// as `<orgslug>/<slug>` by the worker. Bare tokens must never reach the
+// qualified pool, and qualified tokens get the same cascade within it.
+const crossOrgModes: AvailableOption[] = [
+  { name: 'translation-coach', label: 'Translation Coach' },
+  { name: 'obt-coach', label: 'Home OBT Coach' },
+  { name: 'pbt/obt-coach', label: 'OBT Coach', aliases: ['pbt/obt'] },
+  { name: 'pbt/oral-storying', label: 'Oral Storying' },
+  { name: 'test-organization/translation-coach', label: 'TO Translation Coach' },
+];
+
+describe('classifyTriggers — bare tokens never reach org-qualified modes (#336)', () => {
+  const ctx = () => buildCtx({ availableModes: crossOrgModes });
+
+  it('#obt never matches pbt/obt-coach (bare tokens stay in the bare pool)', () => {
+    const bareOnly: AvailableOption[] = crossOrgModes.filter((m) => m.name !== 'obt-coach');
+    const result = classifyTriggers('#obt hi', buildCtx({ availableModes: bareOnly }));
+    expect(result.modeName).toBeUndefined();
+    expect(result.strippedMessage).toBe('#obt hi');
+    expect(result.unmatchedTriggers.map((t) => t.rawToken)).toEqual(['obt']);
+  });
+
+  it('#pbt (a bare token that is a prefix of a qualified name) never selects pbt/obt-coach', () => {
+    const onlyForeign: AvailableOption[] = [{ name: 'pbt/obt-coach', label: 'OBT Coach' }];
+    const result = classifyTriggers('#pbt hi', buildCtx({ availableModes: onlyForeign }));
+    expect(result.modeName).toBeUndefined();
+    expect(result.unmatchedTriggers.map((t) => t.rawToken)).toEqual(['pbt']);
+  });
+
+  it('#obt prefix-matches the HOME obt-coach even though a foreign obt-coach exists', () => {
+    const result = classifyTriggers('#obt hi', ctx());
+    expect(result.modeName).toBe('obt-coach');
+    expect(result.strippedMessage).toBe('hi');
+  });
+
+  it('#translation-coach resolves to the home mode, not the foreign one with the same slug', () => {
+    const result = classifyTriggers('#translation-coach hi', ctx());
+    expect(result.modeName).toBe('translation-coach');
+  });
+});
+
+describe('classifyTriggers — qualified tokens get the cascade within the qualified pool (#336)', () => {
+  const ctx = () => buildCtx({ availableModes: crossOrgModes });
+
+  it('#PBT/obt-coach matches exactly, case-insensitively, returning the canonical name', () => {
+    const result = classifyTriggers('#PBT/obt-coach hi', ctx());
+    expect(result.modeName).toBe('pbt/obt-coach');
+    expect(result.strippedMessage).toBe('hi');
+  });
+
+  it('#pbt/obt exact-matches the qualified alias', () => {
+    expect(classifyTriggers('#pbt/obt hi', ctx()).modeName).toBe('pbt/obt-coach');
+  });
+
+  it('#pbt/obt-c prefix-matches within the qualified pool', () => {
+    expect(classifyTriggers('#pbt/obt-c hi', ctx()).modeName).toBe('pbt/obt-coach');
+  });
+
+  it('#pbt/obt-caoch fuzzy-matches within the qualified pool', () => {
+    expect(classifyTriggers('#pbt/obt-caoch hi', ctx()).modeName).toBe('pbt/obt-coach');
+  });
+
+  it('an ambiguous qualified prefix (#pbt/o) is unmatched, not a guess', () => {
+    const result = classifyTriggers('#pbt/o hi', ctx());
+    expect(result.modeName).toBeUndefined();
+    expect(result.unmatchedTriggers.map((t) => t.rawToken)).toEqual(['pbt/o']);
+  });
+
+  it('a qualified token never falls back to the bare pool (#nowhere/translation-coach)', () => {
+    const result = classifyTriggers('#nowhere/translation-coach hi', ctx());
+    expect(result.modeName).toBeUndefined();
+    expect(result.strippedMessage).toBe('#nowhere/translation-coach hi');
+  });
+
+  it('a qualified language token cannot match a language option', () => {
+    const result = classifyTriggers('@x/english hi', ctx());
+    expect(result.languageName).toBeUndefined();
+    expect(result.unmatchedTriggers.map((t) => t.rawToken)).toEqual(['x/english']);
+  });
+});

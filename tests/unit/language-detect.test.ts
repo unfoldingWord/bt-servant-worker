@@ -387,3 +387,9 @@ describe('detectWrittenLanguage — never throws', () => {
     );
   });
 });
+
+describe('stripNonLinguistic — org-qualified triggers (#336)', () => {
+  it('removes an unmatched `#org/slug` token whole, leaving no `/slug` residue', () => {
+    expect(stripNonLinguistic('#pbt/obt-coach palavras restantes')).toBe('palavras restantes');
+  });
+});

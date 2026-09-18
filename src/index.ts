@@ -46,6 +46,7 @@ import {
 } from './types/language-scaffold.js';
 import { validateResourceLanguage } from './types/resources.js';
 import { synthesizeModeDocument } from './types/mode-markdown.js';
+import { readAllPublishedModes } from './utils/cross-org-modes.js';
 import { stripControlChars } from './types/prompt-overrides.js';
 import { constantTimeCompare } from './utils/crypto.js';
 import { ValidationError } from './utils/errors.js';
@@ -2139,13 +2140,8 @@ async function readAllOrgKV(env: Env, org: string, logger: ReturnType<typeof cre
       'prompt_overrides_kv_read_error',
       logger
     ),
-    readOrgKV<OrgModes>(
-      env.PROMPT_OVERRIDES,
-      `${org}:modes`,
-      { modes: [] },
-      'org_modes_kv_read_error',
-      logger
-    ),
+    // Home org modes plus every other org's published modes (admin-portal#336).
+    readAllPublishedModes(env.PROMPT_OVERRIDES, org, logger),
     readOrgKV<OrgLanguages>(
       env.PROMPT_OVERRIDES,
       `${org}:languages`,
