@@ -12,6 +12,7 @@ import type { OrgModes, PromptMode } from '../../src/types/prompt-overrides.js';
 import { validateModeSelection } from '../../src/types/prompt-overrides.js';
 import {
   MAX_MODES_KEY_PAGES,
+  MAX_FOREIGN_ORGS_PER_TURN,
   mergeCrossOrgModes,
   orgSlug,
   readAllPublishedModes,
@@ -538,6 +539,33 @@ describe('readAllPublishedModes (fake KV) — key filtering and pagination', () 
     expect(logger.warn).toHaveBeenCalledWith(
       'cross_org_modes_list_truncated',
       expect.objectContaining({ pages: MAX_MODES_KEY_PAGES })
+    );
+  });
+});
+
+describe('readAllPublishedModes (fake KV) — per-turn foreign org cap', () => {
+  it('reads at most MAX_FOREIGN_ORGS_PER_TURN foreign orgs, in sorted key order, and logs the cap', async () => {
+    const entries: Record<string, unknown> = { 'home:modes': { modes: [published('h')] } };
+    const total = MAX_FOREIGN_ORGS_PER_TURN + 3;
+    for (let i = 0; i < total; i++) {
+      const org = `org${String(i).padStart(3, '0')}`;
+      entries[`${org}:modes`] = { modes: [published(`m${i}`)] };
+    }
+    const kv = fakeKv(entries);
+    const logger = spyLogger();
+    const merged = await readAllPublishedModes(kv, 'home', logger);
+    const foreignReads = kv.get.mock.calls
+      .map((c) => c[0] as string)
+      .filter((k) => k !== 'home:modes');
+    expect(foreignReads).toHaveLength(MAX_FOREIGN_ORGS_PER_TURN);
+    expect(foreignReads).toEqual([...foreignReads].sort());
+    expect(merged.modes).toHaveLength(1 + MAX_FOREIGN_ORGS_PER_TURN);
+    expect(merged.modes.at(-1)?.name).toBe(
+      `org${String(MAX_FOREIGN_ORGS_PER_TURN - 1).padStart(3, '0')}/m${MAX_FOREIGN_ORGS_PER_TURN - 1}`
+    );
+    expect(logger.warn).toHaveBeenCalledWith(
+      'cross_org_modes_foreign_capped',
+      expect.objectContaining({ total, cap: MAX_FOREIGN_ORGS_PER_TURN })
     );
   });
 });

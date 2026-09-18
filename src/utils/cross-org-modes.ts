@@ -28,6 +28,14 @@ const MODES_KEY_SUFFIX = ':modes';
 /** Upper bound on `kv.list` pages when enumerating `*:modes` keys (mirrors MAX_LEGACY_KEY_PAGES). */
 export const MAX_MODES_KEY_PAGES = 10;
 
+/**
+ * Upper bound on foreign orgs read per chat turn. Every foreign read is one
+ * KV operation inside the request's per-invocation budget, so the fan-out is
+ * capped by org count, not just by list pages. Keys are taken in sorted order
+ * so the cap is deterministic; anything beyond it is logged, never read.
+ */
+export const MAX_FOREIGN_ORGS_PER_TURN = 25;
+
 /** One foreign org's stored modes, keyed by the raw org name from its KV key. */
 export interface ForeignOrgModes {
   org: string;
@@ -178,6 +186,17 @@ export function mergeCrossOrgModes(
  * Enumerate every `*:modes` key other than the home org's. Paged and bounded;
  * a listing failure is logged and yields the empty list (home-only turn).
  */
+/** Sort the foreign keys and keep at most MAX_FOREIGN_ORGS_PER_TURN, logging what was dropped. */
+function capForeignKeys(keys: string[], logger: RequestLogger): string[] {
+  const sorted = [...keys].sort();
+  if (sorted.length <= MAX_FOREIGN_ORGS_PER_TURN) return sorted;
+  logger.warn('cross_org_modes_foreign_capped', {
+    total: sorted.length,
+    cap: MAX_FOREIGN_ORGS_PER_TURN,
+  });
+  return sorted.slice(0, MAX_FOREIGN_ORGS_PER_TURN);
+}
+
 async function listForeignModesKeys(
   kv: KVNamespace,
   homeKey: string,
@@ -271,7 +290,9 @@ export async function readAllPublishedModes(
     readHomeModes(kv, homeKey, logger),
     listForeignModesKeys(kv, homeKey, logger),
   ]);
-  const foreign = await Promise.all(foreignKeys.map((key) => readForeignModes(kv, key, logger)));
+  const foreign = await Promise.all(
+    capForeignKeys(foreignKeys, logger).map((key) => readForeignModes(kv, key, logger))
+  );
   return mergeCrossOrgModes(
     home,
     foreign.filter((entry): entry is ForeignOrgModes => entry !== null),
