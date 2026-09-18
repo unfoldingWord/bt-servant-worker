@@ -169,6 +169,13 @@ export function resourceNameFromId(id: string): string {
 
 const DIRECTIVE_HEADING = '### Applying the resource priority';
 
+/**
+ * Server id → catalog display name. The tool catalog the model sees headings
+ * each server by its display name, never by its id, so the directive carries
+ * the name as the join key and the id in parentheses.
+ */
+export type ServerNames = ReadonlyMap<string, string>;
+
 /** A run of consecutive ranked ids that share one server (`''` when unprefixed). */
 interface ServerRun {
   serverId: string;
@@ -186,7 +193,10 @@ interface ServerRun {
  * than being regrouped by server. Ids with no `server:` prefix are listed
  * plainly. Nothing here names a tool or a resource that is not in `order`.
  */
-export function renderResourcePriorityDirective(order: readonly string[]): string {
+export function renderResourcePriorityDirective(
+  order: readonly string[],
+  serverNames?: ServerNames
+): string {
   const seen = new Set<string>();
   const runs: ServerRun[] = [];
   for (const rawId of order) {
@@ -204,9 +214,10 @@ export function renderResourcePriorityDirective(order: readonly string[]): strin
 
   const ranked = runs.map((run, index) => {
     const names = run.names.join(', then ');
-    return run.serverId.length > 0
-      ? `${index + 1}. server ${run.serverId}: ${names}`
-      : `${index + 1}. ${names}`;
+    if (run.serverId.length === 0) return `${index + 1}. ${names}`;
+    const displayName = serverNames?.get(run.serverId);
+    const label = displayName ? `${displayName} (id ${run.serverId})` : run.serverId;
+    return `${index + 1}. server ${label}: ${names}`;
   });
 
   return [
@@ -216,7 +227,8 @@ export function renderResourcePriorityDirective(order: readonly string[]): strin
     'unranked source only when it does not. When your answer draws on anything other than the',
     'highest-ranked source that covers the question, say so briefly in the same reply.',
     "Each entry names a server and its resource ids in ranked order. Use that server's tools for",
-    'those resources and, where a tool takes a resource selector, pass the id exactly as written.',
+    'those resources. Where a tool takes a resource selector, pass only the resource id after the colon',
+    '(for `server aquifer: WorldEnglishBible` that is `WorldEnglishBible`), never the `server ...:` prefix.',
     "Never pass one server's resource id to another server's tool.",
     'Ranked resources, most preferred first:',
     ...ranked,
@@ -276,7 +288,8 @@ function stripMarkerLines(lines: readonly string[]): string[] {
  */
 function applyValidBlock(
   lines: readonly string[],
-  block: WellFormedBlock
+  block: WellFormedBlock,
+  serverNames?: ServerNames
 ): AppliedResourcePriority {
   const order = parseOrderLine(lines[block.order] ?? '');
   const prose = collapseBlankRuns(
@@ -286,7 +299,7 @@ function applyValidBlock(
   let middle = prose;
   let applied = false;
   if (order !== 'corrupt' && order.length > 0) {
-    const directive = renderResourcePriorityDirective(order);
+    const directive = renderResourcePriorityDirective(order, serverNames);
     if (directive.length > 0) {
       middle = prose.length > 0 ? `${prose}\n\n${directive}` : directive;
       applied = true;
@@ -309,7 +322,10 @@ function applyValidBlock(
  * Pure and non-mutating: returns the original string unchanged when there is no
  * marker syntax at all, so the common case is a cheap identity.
  */
-export function applyResourcePriority(toolGuidance: string): AppliedResourcePriority {
+export function applyResourcePriority(
+  toolGuidance: string,
+  serverNames?: ServerNames
+): AppliedResourcePriority {
   if (typeof toolGuidance !== 'string') {
     return { toolGuidance, order: null, applied: false };
   }
@@ -324,7 +340,7 @@ export function applyResourcePriority(toolGuidance: string): AppliedResourcePrio
   const block =
     markers.begins.length > 0 && markers.ends.length > 0 ? wellFormedBlock(markers) : null;
   if (block) {
-    return applyValidBlock(lines, block);
+    return applyValidBlock(lines, block, serverNames);
   }
 
   // A marker is present but there is no single well-formed block (multiple or

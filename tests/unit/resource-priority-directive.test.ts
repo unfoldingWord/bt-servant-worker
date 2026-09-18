@@ -213,6 +213,40 @@ describe('renderResourcePriorityDirective - wording and de-duplication', () => {
   });
 });
 
+describe('renderResourcePriorityDirective - catalog display names (#341 review)', () => {
+  // The tool catalog the model sees headings each server by its display name
+  // (`### Translation Helps MCP`), never by its id, so the directive must carry
+  // the display name for the model to join a ranked server to its tools.
+  const names = new Map([
+    ['translation-helps', 'Translation Helps MCP'],
+    ['aquifer', 'Aquifer MCP'],
+  ]);
+
+  it('labels each server with its catalog display name and keeps the id as the join key', () => {
+    const directive = renderResourcePriorityDirective(
+      ['translation-helps:ult', 'aquifer:WorldEnglishBible'],
+      names
+    );
+    expect(directive).toContain('1. server Translation Helps MCP (id translation-helps): ult');
+    expect(directive).toContain('2. server Aquifer MCP (id aquifer): WorldEnglishBible');
+  });
+
+  it('falls back to the bare id when the server is not in the catalog', () => {
+    const directive = renderResourcePriorityDirective(['th2:ult'], names);
+    expect(directive).toContain('1. server th2: ult');
+  });
+});
+
+describe('renderResourcePriorityDirective - selector wording (#341 review)', () => {
+  const names = new Map([['aquifer', 'Aquifer MCP']]);
+
+  it('tells the model to pass only the resource id, never the server prefix', () => {
+    const directive = renderResourcePriorityDirective(['aquifer:WorldEnglishBible'], names);
+    expect(directive).toContain('only the resource id after the colon');
+    expect(directive).not.toContain('pass the id exactly as written');
+  });
+});
+
 describe('applyResourcePriority - transform', () => {
   it('leaves guidance with no block untouched (identity)', () => {
     const input = 'Prefer authoritative sources.';
@@ -254,6 +288,15 @@ describe('applyResourcePriority - transform', () => {
     expect(result.toolGuidance).toContain('### Applying the resource priority');
     expect(result.toolGuidance).toContain('1. server translation-helps: ult, then ust');
     expect(result.toolGuidance).not.toContain('fetch_scripture');
+  });
+});
+
+describe('applyResourcePriority - transform with catalog names (#341 review)', () => {
+  it('passes catalog display names through to the rendered directive', () => {
+    const input = slotWithBlock('<!-- order: ["aquifer:WorldEnglishBible"] -->');
+    const result = applyResourcePriority(input, new Map([['aquifer', 'Aquifer MCP']]));
+    expect(result.applied).toBe(true);
+    expect(result.toolGuidance).toContain('1. server Aquifer MCP (id aquifer): WorldEnglishBible');
   });
 
   it('applies an aquifer ranking without naming any translation-helps tool or resource', () => {
