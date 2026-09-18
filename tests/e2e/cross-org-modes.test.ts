@@ -240,6 +240,54 @@ describe('a malformed foreign modes key never fails the turn (#336)', () => {
   });
 });
 
+/**
+ * Review P2 (#336): a foreign element that is an object but would fail the
+ * admin PUT's `validatePromptMode` used to be merged verbatim. Two concrete
+ * failures downstream, both reproduced here through the worker fetch path:
+ * - `overrides: null` → `getEffectiveOverrides` returns null and
+ *   `resolvePromptOverrides` throws, so a user whose persisted
+ *   `selected_mode` names that mode gets a 500 on every turn.
+ * - `welcome_message: 1` → `maybeBuildModeWelcome` calls `.trim()` on it and
+ *   the first-contact `#` turn 500s.
+ */
+describe('a foreign mode that fails storage shape rules never reaches the chat path (#336)', () => {
+  const SHAPE_ORG = 'e2e336-shape';
+  const SHAPE_KEY = `${SHAPE_ORG}:modes`;
+
+  beforeEach(async () => {
+    await seedKV();
+    // Not producible via the admin PUT (validated); a manual KV write can leave these shapes.
+    await env.PROMPT_OVERRIDES.put(
+      SHAPE_KEY,
+      JSON.stringify({
+        modes: [
+          { name: 'null-overrides', label: 'Null', published: true, overrides: null },
+          { name: 'bad-welcome', label: 'Bad', published: true, welcome_message: 1, overrides: {} },
+        ],
+      })
+    );
+    setupAnthropicFetchCapture();
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await Promise.all([...KEYS, SHAPE_KEY].map((k) => env.PROMPT_OVERRIDES.delete(k)));
+  });
+
+  it('a persisted selected_mode naming an overrides:null foreign mode still gets a 200 turn', async () => {
+    const user_id = freshUserId();
+    await seedSelectedMode(user_id, `${SHAPE_ORG}/null-overrides`);
+    await postChat({ user_id, message: 'hello' }); // postChat asserts 200
+  });
+
+  it('a first-contact `#` turn on a welcome_message:1 foreign mode still gets a 200 turn', async () => {
+    const user_id = freshUserId();
+    await postChat({ user_id, message: `#${SHAPE_ORG}/bad-welcome hello` }); // postChat asserts 200
+    // The mode is skipped at read time, so the `#` trigger finds nothing to select.
+    expect(await readSelectedMode(user_id)).toBeUndefined();
+  });
+});
+
 describe('list_modes visibility across orgs (#336)', () => {
   beforeEach(seedKV);
   afterEach(async () => {

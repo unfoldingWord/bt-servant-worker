@@ -265,20 +265,82 @@ describe('mergeCrossOrgModes — malformed foreign elements (never throws)', () 
     });
   });
 
-  it('treats a non-array aliases value as no aliases, with a log, and still merges the mode', () => {
+  it('skips a published mode whose aliases is not an array (the admin PUT rejects it too)', () => {
     const logger = spyLogger();
     const merged = mergeCrossOrgModes(
       { modes: [] },
       [{ org: 'PBT', modes: [{ ...published('x'), aliases: 42 as unknown as string[] }] }],
       logger
     );
-    expect(merged.modes).toHaveLength(1);
-    expect(merged.modes[0]).toMatchObject({ name: 'pbt/x', org: 'PBT', aliases: [] });
+    expect(merged.modes).toHaveLength(0);
     expect(logger.warn).toHaveBeenCalledWith('cross_org_modes_invalid_shape', {
       org: 'PBT',
-      mode: 'x',
-      reason: 'aliases_not_array',
+      index: 0,
+      name: 'x',
+      reason: 'Mode aliases must be an array of strings',
     });
+  });
+});
+
+/**
+ * Review P2 (#336): a foreign element that is a non-null object passed the
+ * old guard and was merged verbatim, so a shape the admin PUT would reject
+ * (`overrides: null`, `welcome_message: 1`) reached the DO. There
+ * `getEffectiveOverrides` returns `null` (it tests `!== undefined`) and
+ * `resolvePromptOverrides` throws on EVERY later turn once the mode is the
+ * user's `selected_mode`; `maybeBuildModeWelcome` calls `.trim()` on the
+ * welcome copy and throws on first contact. The read-time guard must hold a
+ * foreign element to the storage rules (`validatePromptMode`).
+ */
+describe('mergeCrossOrgModes — foreign elements the admin PUT would reject (review P2)', () => {
+  const only = (mode: unknown, logger = spyLogger()) =>
+    mergeCrossOrgModes({ modes: [] }, [{ org: 'PBT', modes: [mode as PromptMode] }], logger);
+
+  it('skips a published mode whose overrides is null, naming org, mode and reason', () => {
+    const logger = spyLogger();
+    const merged = only({ name: 'obt-coach', published: true, overrides: null }, logger);
+    expect(merged.modes).toHaveLength(0);
+    expect(logger.warn).toHaveBeenCalledWith('cross_org_modes_invalid_shape', {
+      org: 'PBT',
+      index: 0,
+      name: 'obt-coach',
+      reason: 'Mode overrides invalid: Prompt overrides must be a JSON object',
+    });
+  });
+
+  it('skips a published mode whose welcome_message is not a string (1, {}, true)', () => {
+    for (const welcome_message of [1, {}, true]) {
+      const logger = spyLogger();
+      const merged = only({ ...published('w'), welcome_message }, logger);
+      expect(merged.modes, `welcome_message=${JSON.stringify(welcome_message)}`).toHaveLength(0);
+      expect(logger.warn).toHaveBeenCalledWith('cross_org_modes_invalid_shape', {
+        org: 'PBT',
+        index: 0,
+        name: 'w',
+        reason: 'Mode welcome_message must be a string',
+      });
+    }
+  });
+
+  it('skips a non-string document, a non-string name and a missing name', () => {
+    expect(only({ name: 'd', published: true, document: 7 }).modes).toHaveLength(0);
+    expect(only({ name: 9, published: true, overrides: {} }).modes).toHaveLength(0);
+    expect(only({ published: true, overrides: {} }).modes).toHaveLength(0);
+  });
+
+  it('still merges a well-formed mode with a null welcome_message or a string document', () => {
+    expect(only({ ...published('n'), welcome_message: null }).modes.map((m) => m.name)).toEqual([
+      'pbt/n',
+    ]);
+    expect(
+      only({ name: 'd', published: true, document: '# Identity\n\nhi' }).modes.map((m) => m.name)
+    ).toEqual(['pbt/d']);
+  });
+
+  it('does not validate (or log) foreign drafts — they are dropped before the shape check', () => {
+    const logger = spyLogger();
+    expect(only({ name: 'draft', overrides: null }, logger).modes).toHaveLength(0);
+    expect(logger.warn).not.toHaveBeenCalled();
   });
 });
 
@@ -404,11 +466,7 @@ describe('readAllPublishedModes (seeded miniflare KV) — malformed foreign elem
     );
     const logger = spyLogger();
     const merged = await readAllPublishedModes(kv, HOME, logger);
-    expect(merged.modes.map((m) => m.name)).toEqual([
-      'home-mode',
-      'u336-elem/bad-aliases',
-      'u336-elem/survivor',
-    ]);
+    expect(merged.modes.map((m) => m.name)).toEqual(['home-mode', 'u336-elem/survivor']);
     expect(logger.warn).toHaveBeenCalledWith('cross_org_modes_invalid_shape', {
       org: 'u336-elem',
       index: 0,
@@ -416,9 +474,39 @@ describe('readAllPublishedModes (seeded miniflare KV) — malformed foreign elem
     });
     expect(logger.warn).toHaveBeenCalledWith('cross_org_modes_invalid_shape', {
       org: 'u336-elem',
-      mode: 'bad-aliases',
-      reason: 'aliases_not_array',
+      index: 1,
+      name: 'bad-aliases',
+      reason: 'Mode aliases must be an array of strings',
     });
+  });
+});
+
+describe('readAllPublishedModes (seeded miniflare KV) — elements the admin PUT would reject', () => {
+  const ELEM_KEYS = [`${HOME}:modes`, 'u336-elem:modes'];
+  afterEach(async () => {
+    await Promise.all(ELEM_KEYS.map((k) => env.PROMPT_OVERRIDES.delete(k)));
+  });
+
+  it('drops a published element with overrides:null or a non-string welcome_message (review P2)', async () => {
+    const kv = env.PROMPT_OVERRIDES;
+    await kv.put(`${HOME}:modes`, JSON.stringify({ modes: [published('home-mode')] }));
+    await kv.put(
+      'u336-elem:modes',
+      JSON.stringify({
+        modes: [
+          { name: 'null-overrides', published: true, overrides: null },
+          { ...published('bad-welcome'), welcome_message: 1 },
+          published('survivor'),
+        ],
+      })
+    );
+    const logger = spyLogger();
+    const merged = await readAllPublishedModes(kv, HOME, logger);
+    expect(merged.modes.map((m) => m.name)).toEqual(['home-mode', 'u336-elem/survivor']);
+    const skipped = logger.warn.mock.calls
+      .filter((c) => c[0] === 'cross_org_modes_invalid_shape')
+      .map((c) => (c[1] as { name?: string; reason: string }).name);
+    expect(skipped).toEqual(['null-overrides', 'bad-welcome']);
   });
 });
 

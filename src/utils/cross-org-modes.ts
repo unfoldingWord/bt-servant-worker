@@ -17,8 +17,13 @@
  *   derived at read time only (portal #144's migration warning).
  * - Reads never fail the turn: a listing failure degrades to home-only and a
  *   bad foreign key is logged and skipped.
+ * - A published foreign ELEMENT is held to the same shape rules the admin PUT
+ *   enforces (`validatePromptMode`); one that fails is logged and skipped,
+ *   never merged, because the DO dereferences it downstream (see
+ *   `foreignModeShapeError`).
  */
 import type { ChatMode, ChatOrgModes, OrgModes, PromptMode } from '../types/prompt-overrides.js';
+import { validatePromptMode } from '../types/prompt-overrides.js';
 import type { RequestLogger } from './logger.js';
 import { MCP_GLOBAL_KEY } from './mcp-validation.js';
 
@@ -89,16 +94,23 @@ function isModeRecord(mode: unknown): mode is PromptMode {
   return mode !== null && typeof mode === 'object';
 }
 
-/** The stored aliases, or `[]` (logged) when the field is present but not an array. */
-function storedAliases(mode: PromptMode, org: string, logger: RequestLogger): string[] {
-  if (mode.aliases === undefined) return [];
-  if (Array.isArray(mode.aliases)) return mode.aliases;
-  logger.warn('cross_org_modes_invalid_shape', {
-    org,
-    mode: mode.name,
-    reason: 'aliases_not_array',
-  });
-  return [];
+/**
+ * Why a published foreign element must not be merged, or null when it is
+ * mergeable. An element that is an object is NOT enough: a manual KV write
+ * can leave a shape the admin PUT (`validatePromptMode`) would have rejected,
+ * and the DO dereferences the merged mode without re-checking it —
+ * `overrides: null` makes `getEffectiveOverrides` return null (it tests
+ * `!== undefined`) so `resolvePromptOverrides` throws on EVERY later turn for
+ * a user whose `selected_mode` names the mode; `welcome_message: 1` makes
+ * `maybeBuildModeWelcome` throw on `.trim()` at first contact. So the guard
+ * reuses the storage validator verbatim (name pattern, optional-string
+ * fields, boolean flags, `aliases` string[], exactly one of a plain-object
+ * `overrides` / string `document`), plus an explicit `name` check because
+ * `validatePromptMode` only validates `name` when the key is present.
+ */
+function foreignModeShapeError(mode: PromptMode): string | null {
+  if (typeof mode.name !== 'string') return 'Mode name must be a string';
+  return validatePromptMode(mode);
 }
 
 /**
@@ -126,7 +138,7 @@ function qualifyForeignMode(
   claimed.set(qualifiedName, entry.org);
 
   const aliases: string[] = [];
-  for (const alias of storedAliases(mode, entry.org, logger)) {
+  for (const alias of mode.aliases ?? []) {
     const qualifiedAlias = `${entry.slug}/${alias}`;
     const aliasWinner = claimed.get(qualifiedAlias);
     if (aliasWinner !== undefined) {
@@ -145,6 +157,40 @@ function qualifyForeignMode(
   const qualified: ChatMode = { ...mode, name: qualifiedName, org: entry.org };
   if (mode.aliases !== undefined) qualified.aliases = aliases;
   return qualified;
+}
+
+/**
+ * Append one foreign org's PUBLISHED, well-shaped modes to `modes`, qualified.
+ * Drafts are dropped before the shape check (they never reach the chat path,
+ * so a malformed draft is not worth a log line); a published element that
+ * fails `foreignModeShapeError` is logged and skipped.
+ */
+function mergeForeignOrg(
+  entry: { org: string; slug: string; modes: PromptMode[] },
+  modes: ChatMode[],
+  claimed: ClaimedNames,
+  logger: RequestLogger
+): void {
+  const { org, slug } = entry;
+  for (const [index, mode] of entry.modes.entries()) {
+    if (!isModeRecord(mode)) {
+      logger.warn('cross_org_modes_invalid_shape', { org, index, reason: 'mode_not_object' });
+      continue;
+    }
+    if (mode.published !== true) continue;
+    const shapeError = foreignModeShapeError(mode);
+    if (shapeError !== null) {
+      logger.warn('cross_org_modes_invalid_shape', {
+        org,
+        index,
+        name: mode.name,
+        reason: shapeError,
+      });
+      continue;
+    }
+    const qualified = qualifyForeignMode(mode, { org, slug }, claimed, logger);
+    if (qualified !== null) modes.push(qualified);
+  }
 }
 
 /**
@@ -169,15 +215,7 @@ export function mergeCrossOrgModes(
       logger.warn('cross_org_modes_org_skipped', { org, reason });
       continue;
     }
-    for (const [index, mode] of orgModes.entries()) {
-      if (!isModeRecord(mode)) {
-        logger.warn('cross_org_modes_invalid_shape', { org, index, reason: 'mode_not_object' });
-        continue;
-      }
-      if (mode.published !== true) continue;
-      const qualified = qualifyForeignMode(mode, { org, slug }, claimed, logger);
-      if (qualified !== null) modes.push(qualified);
-    }
+    mergeForeignOrg({ org, slug, modes: orgModes }, modes, claimed, logger);
   }
   return { modes };
 }
