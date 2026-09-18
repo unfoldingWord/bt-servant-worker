@@ -209,6 +209,37 @@ function setupListModesScript(): { toolResults: unknown[] } {
   return { toolResults };
 }
 
+describe('a malformed foreign modes key never fails the turn (#336)', () => {
+  const CORRUPT_KEY = 'e2e336-corrupt:modes';
+  let capture: AnthropicCapture;
+
+  beforeEach(async () => {
+    await seedKV();
+    // Not producible via the admin PUT (validated); a manual KV write can leave this shape.
+    await env.PROMPT_OVERRIDES.put(
+      CORRUPT_KEY,
+      JSON.stringify({
+        modes: [null, { name: 'bad', label: 'Bad', published: true, overrides: {}, aliases: 42 }],
+      })
+    );
+    capture = setupAnthropicFetchCapture();
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await Promise.all([...KEYS, CORRUPT_KEY].map((k) => env.PROMPT_OVERRIDES.delete(k)));
+  });
+
+  it('still returns 200 for every org and resolves a healthy foreign mode', async () => {
+    const user_id = freshUserId();
+    await postChat({ user_id, message: '#e2e336-pbt/obt-coach hello' }); // postChat asserts 200
+    expect(await readSelectedMode(user_id)).toBe('e2e336-pbt/obt-coach');
+
+    await postChat({ user_id, message: 'and a plain follow-up' });
+    expect(capture.calls[1]?.system ?? '').toContain(PBT_OBT_MARKER);
+  });
+});
+
 describe('list_modes visibility across orgs (#336)', () => {
   beforeEach(seedKV);
   afterEach(async () => {

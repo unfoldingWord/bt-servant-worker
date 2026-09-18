@@ -242,6 +242,45 @@ describe('mergeCrossOrgModes — skips and purity', () => {
   });
 });
 
+describe('mergeCrossOrgModes — malformed foreign elements (never throws)', () => {
+  it('skips a null or non-object element with a log and keeps the rest of that org', () => {
+    const logger = spyLogger();
+    const bad = [null, 'str'] as unknown as PromptMode[];
+    const merged = mergeCrossOrgModes(
+      { modes: [] },
+      [{ org: 'PBT', modes: [...bad, published('ok')] }],
+      logger
+    );
+    expect(merged.modes.map((m) => m.name)).toEqual(['pbt/ok']);
+    expect(logger.warn).toHaveBeenCalledWith('cross_org_modes_invalid_shape', {
+      org: 'PBT',
+      index: 0,
+      reason: 'mode_not_object',
+    });
+    expect(logger.warn).toHaveBeenCalledWith('cross_org_modes_invalid_shape', {
+      org: 'PBT',
+      index: 1,
+      reason: 'mode_not_object',
+    });
+  });
+
+  it('treats a non-array aliases value as no aliases, with a log, and still merges the mode', () => {
+    const logger = spyLogger();
+    const merged = mergeCrossOrgModes(
+      { modes: [] },
+      [{ org: 'PBT', modes: [{ ...published('x'), aliases: 42 as unknown as string[] }] }],
+      logger
+    );
+    expect(merged.modes).toHaveLength(1);
+    expect(merged.modes[0]).toMatchObject({ name: 'pbt/x', org: 'PBT', aliases: [] });
+    expect(logger.warn).toHaveBeenCalledWith('cross_org_modes_invalid_shape', {
+      org: 'PBT',
+      mode: 'x',
+      reason: 'aliases_not_array',
+    });
+  });
+});
+
 // ─── readAllPublishedModes against real (miniflare) KV ────────────────────────
 
 /** Unique key prefix so leftovers from other suites (storage is not isolated) cannot bleed in. */
@@ -345,6 +384,42 @@ function fakeKv(entries: Record<string, unknown>): KVNamespace & {
     delete: vi.fn(),
   } as unknown as KVNamespace & { get: ReturnType<typeof vi.fn>; list: ReturnType<typeof vi.fn> };
 }
+
+describe('readAllPublishedModes (seeded miniflare KV) — malformed foreign elements', () => {
+  const ELEM_KEYS = [`${HOME}:modes`, 'u336-elem:modes'];
+  afterEach(async () => {
+    await Promise.all(ELEM_KEYS.map((k) => env.PROMPT_OVERRIDES.delete(k)));
+  });
+
+  it('resolves (never rejects) when a foreign record holds a null element or non-array aliases', async () => {
+    const kv = env.PROMPT_OVERRIDES;
+    await kv.put(`${HOME}:modes`, JSON.stringify({ modes: [published('home-mode')] }));
+    // Not producible via the admin PUT (validated); a manual KV write can leave this shape.
+    await kv.put(
+      'u336-elem:modes',
+      JSON.stringify({
+        modes: [null, { ...published('bad-aliases'), aliases: 42 }, published('survivor')],
+      })
+    );
+    const logger = spyLogger();
+    const merged = await readAllPublishedModes(kv, HOME, logger);
+    expect(merged.modes.map((m) => m.name)).toEqual([
+      'home-mode',
+      'u336-elem/bad-aliases',
+      'u336-elem/survivor',
+    ]);
+    expect(logger.warn).toHaveBeenCalledWith('cross_org_modes_invalid_shape', {
+      org: 'u336-elem',
+      index: 0,
+      reason: 'mode_not_object',
+    });
+    expect(logger.warn).toHaveBeenCalledWith('cross_org_modes_invalid_shape', {
+      org: 'u336-elem',
+      mode: 'bad-aliases',
+      reason: 'aliases_not_array',
+    });
+  });
+});
 
 describe('readAllPublishedModes (fake KV) — failure handling', () => {
   it('falls back to home-only when the key listing fails, logging the failure', async () => {

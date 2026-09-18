@@ -73,6 +73,27 @@ function orgSkipReason(org: string, slug: string): 'reserved' | 'empty_slug' | n
 type ClaimedNames = Map<string, string>;
 
 /**
+ * A stored `modes[]` element is only typed as PromptMode; `isOrgModes` checks
+ * the container, not its elements, and a manual KV write can leave a null or
+ * primitive there. Such an element must be skipped, never dereferenced.
+ */
+function isModeRecord(mode: unknown): mode is PromptMode {
+  return mode !== null && typeof mode === 'object';
+}
+
+/** The stored aliases, or `[]` (logged) when the field is present but not an array. */
+function storedAliases(mode: PromptMode, org: string, logger: RequestLogger): string[] {
+  if (mode.aliases === undefined) return [];
+  if (Array.isArray(mode.aliases)) return mode.aliases;
+  logger.warn('cross_org_modes_invalid_shape', {
+    org,
+    mode: mode.name,
+    reason: 'aliases_not_array',
+  });
+  return [];
+}
+
+/**
  * Qualify one published foreign mode, or return null when its qualified name
  * is already claimed (first in sorted org order wins; the loser is logged as
  * `cross_org_mode_collision`). A colliding ALIAS drops just that alias.
@@ -97,7 +118,7 @@ function qualifyForeignMode(
   claimed.set(qualifiedName, entry.org);
 
   const aliases: string[] = [];
-  for (const alias of mode.aliases ?? []) {
+  for (const alias of storedAliases(mode, entry.org, logger)) {
     const qualifiedAlias = `${entry.slug}/${alias}`;
     const aliasWinner = claimed.get(qualifiedAlias);
     if (aliasWinner !== undefined) {
@@ -140,7 +161,11 @@ export function mergeCrossOrgModes(
       logger.warn('cross_org_modes_org_skipped', { org, reason });
       continue;
     }
-    for (const mode of orgModes) {
+    for (const [index, mode] of orgModes.entries()) {
+      if (!isModeRecord(mode)) {
+        logger.warn('cross_org_modes_invalid_shape', { org, index, reason: 'mode_not_object' });
+        continue;
+      }
       if (mode.published !== true) continue;
       const qualified = qualifyForeignMode(mode, { org, slug }, claimed, logger);
       if (qualified !== null) modes.push(qualified);
