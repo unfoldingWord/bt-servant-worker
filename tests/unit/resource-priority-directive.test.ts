@@ -246,6 +246,14 @@ describe('renderResourcePriorityDirective - selector wording (#341 review)', () 
     expect(directive).not.toContain('pass the id exactly as written');
   });
 
+  it('describes unprefixed ids as bare resource ids instead of claiming a server for them', () => {
+    const directive = renderResourcePriorityDirective(['noColon'], names);
+    expect(directive).toContain('1. noColon');
+    expect(directive).toContain('An entry without a `server` prefix is a bare resource id');
+    expect(directive).toContain('(for entry 1 that is `noColon`)');
+    expect(directive).not.toContain('Each entry names a server');
+  });
+
   it('draws the selector example from the ranking itself, never from a foreign resource', () => {
     const directive = renderResourcePriorityDirective(['translation-helps:ult'], names);
     expect(directive).toContain('(for entry 1 that is `ult`)');
