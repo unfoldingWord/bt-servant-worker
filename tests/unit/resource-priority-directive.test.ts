@@ -245,6 +245,13 @@ describe('renderResourcePriorityDirective - selector wording (#341 review)', () 
     expect(directive).toContain('only the resource id after the colon');
     expect(directive).not.toContain('pass the id exactly as written');
   });
+
+  it('draws the selector example from the ranking itself, never from a foreign resource', () => {
+    const directive = renderResourcePriorityDirective(['translation-helps:ult'], names);
+    expect(directive).toContain('(for entry 1 that is `ult`)');
+    expect(directive).not.toContain('WorldEnglishBible');
+    expect(directive).not.toContain('aquifer');
+  });
 });
 
 describe('applyResourcePriority - transform', () => {

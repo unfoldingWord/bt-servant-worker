@@ -228,7 +228,7 @@ export function renderResourcePriorityDirective(
     'highest-ranked source that covers the question, say so briefly in the same reply.',
     "Each entry names a server and its resource ids in ranked order. Use that server's tools for",
     'those resources. Where a tool takes a resource selector, pass only the resource id after the colon',
-    '(for `server aquifer: WorldEnglishBible` that is `WorldEnglishBible`), never the `server ...:` prefix.',
+    `(for entry 1 that is \`${runs[0]?.names[0] ?? ''}\`), never the \`server ...:\` prefix.`,
     "Never pass one server's resource id to another server's tool.",
     'Ranked resources, most preferred first:',
     ...ranked,
