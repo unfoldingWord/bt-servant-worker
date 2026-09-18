@@ -658,6 +658,55 @@ describe('readAllPublishedModes (fake KV) — per-turn foreign org cap', () => {
   });
 });
 
+/**
+ * Review P2 (#336): the cap is applied to RAW sorted key names before any key
+ * is read, so draft-only and empty orgs count against it and a publishing
+ * org whose key sorts beyond the window is invisible on the chat path. The
+ * cap stays (it bounds KV operations per invocation); the failure must at
+ * least be observable — the warn names the dropped keys — and less likely
+ * (window of 50). The follow-up for larger tenant counts is an index of
+ * publishing orgs, not a larger cap.
+ */
+describe('readAllPublishedModes (fake KV) — cap observability (review P2)', () => {
+  function seededBeyondCap(extra: number): ReturnType<typeof fakeKv> {
+    const entries: Record<string, unknown> = { 'home:modes': { modes: [published('h')] } };
+    for (let i = 0; i < MAX_FOREIGN_ORGS_PER_TURN + extra; i++) {
+      entries[`org${String(i).padStart(3, '0')}:modes`] = { modes: [] };
+    }
+    return fakeKv(entries);
+  }
+
+  it('holds a window of 50 foreign orgs per turn', () => {
+    expect(MAX_FOREIGN_ORGS_PER_TURN).toBe(50);
+  });
+
+  it('names every dropped key in the capped warn so the invisible org is findable in logs', async () => {
+    const logger = spyLogger();
+    await readAllPublishedModes(seededBeyondCap(3), 'home', logger);
+    const dropped = [0, 1, 2].map(
+      (i) => `org${String(MAX_FOREIGN_ORGS_PER_TURN + i).padStart(3, '0')}:modes`
+    );
+    expect(logger.warn).toHaveBeenCalledWith('cross_org_modes_foreign_capped', {
+      total: MAX_FOREIGN_ORGS_PER_TURN + 3,
+      cap: MAX_FOREIGN_ORGS_PER_TURN,
+      dropped_count: 3,
+      dropped,
+    });
+  });
+
+  it('bounds the named keys at 20 while still reporting the full dropped count', async () => {
+    const logger = spyLogger();
+    await readAllPublishedModes(seededBeyondCap(25), 'home', logger);
+    const call = logger.warn.mock.calls.find((c) => c[0] === 'cross_org_modes_foreign_capped');
+    const payload = call?.[1] as { dropped_count: number; dropped: string[] };
+    expect(payload.dropped_count).toBe(25);
+    expect(payload.dropped).toHaveLength(20);
+    expect(payload.dropped[0]).toBe(
+      `org${String(MAX_FOREIGN_ORGS_PER_TURN).padStart(3, '0')}:modes`
+    );
+  });
+});
+
 // ─── validateModeSelection (admin DO PUT /mode) ───────────────────────────────
 
 describe('validateModeSelection', () => {

@@ -21,6 +21,12 @@
  *   enforces (`validatePromptMode`); one that fails is logged and skipped,
  *   never merged, because the DO dereferences it downstream (see
  *   `foreignModeShapeError`).
+ * - At most `MAX_FOREIGN_ORGS_PER_TURN` foreign keys are read per turn, taken
+ *   in sorted key order BEFORE any key is read. An org whose key sorts beyond
+ *   that window is INVISIBLE on the chat path — its published modes are never
+ *   merged and a `selected_mode` naming one of them resolves to no mode. The
+ *   drop is logged with the key names. For larger tenant counts the follow-up
+ *   is an index of publishing orgs, not a larger cap.
  */
 import type { ChatMode, ChatOrgModes, OrgModes, PromptMode } from '../types/prompt-overrides.js';
 import { validatePromptMode } from '../types/prompt-overrides.js';
@@ -36,10 +42,25 @@ export const MAX_MODES_KEY_PAGES = 10;
 /**
  * Upper bound on foreign orgs read per chat turn. Every foreign read is one
  * KV operation inside the request's per-invocation budget, so the fan-out is
- * capped by org count, not just by list pages. Keys are taken in sorted order
- * so the cap is deterministic; anything beyond it is logged, never read.
+ * capped by org count, not just by list pages.
+ *
+ * The cap is applied to the RAW sorted `*:modes` key list before any key is
+ * read, so it is deterministic — and so draft-only and empty orgs count
+ * against it just like publishing ones. Consequence, stated plainly: an org
+ * whose key sorts beyond the window is invisible on the chat path for every
+ * user. Its published modes are never merged, and a user whose persisted
+ * `selected_mode` names one of them gets no mode (the selection is left in
+ * storage, not cleared). `capForeignKeys` logs the dropped key names as
+ * `cross_org_modes_foreign_capped` so the invisible org can be found in logs.
+ *
+ * When tenant count approaches this number, the follow-up is an index of
+ * PUBLISHING orgs (so only orgs that have something to merge cost a read),
+ * NOT a larger cap — the cap exists to bound KV operations per invocation.
  */
-export const MAX_FOREIGN_ORGS_PER_TURN = 25;
+export const MAX_FOREIGN_ORGS_PER_TURN = 50;
+
+/** How many dropped key names the capped warn carries; enough to name the invisible org, bounded so the log line is. */
+const MAX_DROPPED_KEYS_LOGGED = 20;
 
 /** One foreign org's stored modes, keyed by the raw org name from its KV key. */
 export interface ForeignOrgModes {
@@ -221,20 +242,28 @@ export function mergeCrossOrgModes(
 }
 
 /**
- * Enumerate every `*:modes` key other than the home org's. Paged and bounded;
- * a listing failure is logged and yields the empty list (home-only turn).
+ * Sort the foreign keys and keep at most MAX_FOREIGN_ORGS_PER_TURN. Every key
+ * beyond the window belongs to an org that is invisible this turn (see the
+ * constant's doc), so the warn names them — up to MAX_DROPPED_KEYS_LOGGED —
+ * alongside the full count.
  */
-/** Sort the foreign keys and keep at most MAX_FOREIGN_ORGS_PER_TURN, logging what was dropped. */
 function capForeignKeys(keys: string[], logger: RequestLogger): string[] {
   const sorted = [...keys].sort();
   if (sorted.length <= MAX_FOREIGN_ORGS_PER_TURN) return sorted;
+  const dropped = sorted.slice(MAX_FOREIGN_ORGS_PER_TURN);
   logger.warn('cross_org_modes_foreign_capped', {
     total: sorted.length,
     cap: MAX_FOREIGN_ORGS_PER_TURN,
+    dropped_count: dropped.length,
+    dropped: dropped.slice(0, MAX_DROPPED_KEYS_LOGGED),
   });
   return sorted.slice(0, MAX_FOREIGN_ORGS_PER_TURN);
 }
 
+/**
+ * Enumerate every `*:modes` key other than the home org's. Paged and bounded;
+ * a listing failure is logged and yields the empty list (home-only turn).
+ */
 async function listForeignModesKeys(
   kv: KVNamespace,
   homeKey: string,
