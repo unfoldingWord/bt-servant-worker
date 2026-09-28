@@ -113,7 +113,9 @@ export type RequestLogger = ReturnType<typeof createRequestLogger>;
 // without exposing sensitive values on the happy path.
 //
 // Policy:
-//   - Start/success logs: summarized (keys + value types/lengths)
+//   - MCP tool call start/success logs: raw values with sensitive-key masking +
+//     500-char string truncation (`sanitizeArgsForLog`)
+//   - Other start/success logs: summarized (keys + value types/lengths)
 //   - Error logs: raw values with sensitive-key masking + string truncation
 
 export const SENSITIVE_KEY_PATTERN =
@@ -155,9 +157,20 @@ function truncateString(value: string): string {
   );
 }
 
+/**
+ * Console-log key mask: the shared credential pattern plus phone numbers (WhatsApp /
+ * Signal ids). Kept separate from `SENSITIVE_KEY_PATTERN`, which also drives OTLP
+ * attribute redaction.
+ */
+const PHONE_KEY_PATTERN = /phone|msisdn/i;
+
+function isRedactedLogKey(key: string): boolean {
+  return SENSITIVE_KEY_PATTERN.test(key) || PHONE_KEY_PATTERN.test(key);
+}
+
 /** Redact a single key-value pair: mask sensitive keys, truncate strings, recurse objects. */
 function redactEntry(key: string, value: unknown): unknown {
-  if (SENSITIVE_KEY_PATTERN.test(key)) return '[REDACTED]';
+  if (isRedactedLogKey(key)) return '[REDACTED]';
   return redactArgsForError(value);
 }
 
@@ -175,6 +188,43 @@ export function redactArgsForError(args: unknown): unknown {
     result[key] = redactEntry(key, value);
   }
   return result;
+}
+
+const MAX_LOG_ARG_STRING_LENGTH = 500;
+const MAX_LOG_ARG_DEPTH = 6;
+
+function truncateLogArgString(value: string): string {
+  if (value.length <= MAX_LOG_ARG_STRING_LENGTH) return value;
+  return `${value.slice(0, MAX_LOG_ARG_STRING_LENGTH)} [truncated, ${value.length} chars]`;
+}
+
+function sanitizeLogArgPrimitive(value: unknown): unknown {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string') return truncateLogArgString(value);
+  if (typeof value === 'number' || typeof value === 'boolean') return value;
+  if (typeof value === 'bigint') return value.toString();
+  return `[${typeof value}]`;
+}
+
+function sanitizeLogArgValue(value: unknown, depth: number): unknown {
+  if (typeof value !== 'object' || value === null) return sanitizeLogArgPrimitive(value);
+  if (depth >= MAX_LOG_ARG_DEPTH) return '[max depth]';
+  if (Array.isArray(value)) return value.map((item) => sanitizeLogArgValue(item, depth + 1));
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, entry]) => [
+      key,
+      isRedactedLogKey(key) ? '[REDACTED]' : sanitizeLogArgValue(entry, depth + 1),
+    ])
+  );
+}
+
+/**
+ * JSON-safe copy of MCP tool arguments for start/success logs: real values, with
+ * credential/phone keys masked and strings over 500 chars truncated (noted inline).
+ * Only the console path sees these values; the OTLP sink summarizes nested objects.
+ */
+export function sanitizeArgsForLog(args: unknown): unknown {
+  return sanitizeLogArgValue(args, 0);
 }
 
 /**

@@ -25,7 +25,7 @@
  */
 
 import { MCPError, MCPResponseTooLargeError } from '../../utils/errors.js';
-import { redactArgsForError, RequestLogger, summarizeArgs } from '../../utils/logger.js';
+import { redactArgsForError, RequestLogger, sanitizeArgsForLog } from '../../utils/logger.js';
 import { recordFailure, recordSuccess } from './health.js';
 import { callMCPToolViaSdk, discoverServerToolsViaSdk } from './streamable-http-client.js';
 import { countMetric } from '../telemetry/index.js';
@@ -345,7 +345,7 @@ async function callMCPToolViaJsonRpc(
     server_id: server.id,
     transport: 'json-rpc',
     tool_name: toolName,
-    args: summarizeArgs(args),
+    args: sanitizeArgsForLog(args),
   });
 
   try {
@@ -361,7 +361,7 @@ async function callMCPToolViaJsonRpc(
     const extractedResult = extractToolResult(result);
     logToolCallSuccess(
       logger,
-      { serverId: server.id, toolName, args: summarizeArgs(args), responseTimeMs },
+      { serverId: server.id, toolName, args: sanitizeArgsForLog(args), responseTimeMs },
       metadata,
       extractedResult
     );
