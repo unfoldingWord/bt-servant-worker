@@ -113,8 +113,9 @@ export type RequestLogger = ReturnType<typeof createRequestLogger>;
 // without exposing sensitive values on the happy path.
 //
 // Policy:
-//   - MCP tool call start/success logs: raw values with sensitive-key masking +
-//     500-char string truncation (`sanitizeArgsForLog`)
+//   - MCP tool call start/success logs: allow-listed diagnostic keys (language,
+//     reference, book, ...) shown verbatim, all other strings summarized, sensitive
+//     keys masked (`sanitizeArgsForLog`)
 //   - Other start/success logs: summarized (keys + value types/lengths)
 //   - Error logs: raw values with sensitive-key masking + string truncation
 
@@ -190,41 +191,85 @@ export function redactArgsForError(args: unknown): unknown {
   return result;
 }
 
-const MAX_LOG_ARG_STRING_LENGTH = 500;
+/**
+ * Diagnostic MCP argument keys whose string values are safe to log verbatim.
+ * Compared after lowercasing and stripping `_`/`-`, so `startChapter`, `start_chapter`
+ * and `start-chapter` all match `startchapter`. Anything not listed here is
+ * summarized, because MCP schemas are dynamic and an ordinary-looking key (`query`,
+ * `text`, `payload`, `url`) can carry user content, PII, or a signed URL.
+ */
+const LOG_ARG_VALUE_ALLOWLIST = new Set([
+  'reference',
+  'references',
+  'language',
+  'languages',
+  'lang',
+  'languagecode',
+  'book',
+  'books',
+  'chapter',
+  'verse',
+  'startchapter',
+  'endchapter',
+  'startverse',
+  'endverse',
+  'testament',
+  'resource',
+  'resources',
+  'resourcetype',
+  'format',
+  'translation',
+  'version',
+  'org',
+  'organization',
+  'owner',
+]);
+const MAX_LOG_ARG_STRING_LENGTH = 100;
 const MAX_LOG_ARG_DEPTH = 6;
+
+function isAllowListedLogKey(key: string): boolean {
+  return LOG_ARG_VALUE_ALLOWLIST.has(key.toLowerCase().replace(/[_-]/g, ''));
+}
 
 function truncateLogArgString(value: string): string {
   if (value.length <= MAX_LOG_ARG_STRING_LENGTH) return value;
   return `${value.slice(0, MAX_LOG_ARG_STRING_LENGTH)} [truncated, ${value.length} chars]`;
 }
 
-function sanitizeLogArgPrimitive(value: unknown): unknown {
+function sanitizeLogArgPrimitive(value: unknown, allowed: boolean): unknown {
   if (value === null || value === undefined) return null;
-  if (typeof value === 'string') return truncateLogArgString(value);
+  if (typeof value === 'string')
+    return allowed ? truncateLogArgString(value) : `string(${value.length})`;
   if (typeof value === 'number' || typeof value === 'boolean') return value;
-  if (typeof value === 'bigint') return value.toString();
+  if (typeof value === 'bigint') return allowed ? value.toString() : '[bigint]';
   return `[${typeof value}]`;
 }
 
-function sanitizeLogArgValue(value: unknown, depth: number): unknown {
-  if (typeof value !== 'object' || value === null) return sanitizeLogArgPrimitive(value);
+function sanitizeLogArgValue(value: unknown, depth: number, allowed: boolean): unknown {
+  if (typeof value !== 'object' || value === null) return sanitizeLogArgPrimitive(value, allowed);
   if (depth >= MAX_LOG_ARG_DEPTH) return '[max depth]';
-  if (Array.isArray(value)) return value.map((item) => sanitizeLogArgValue(item, depth + 1));
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeLogArgValue(item, depth + 1, allowed));
+  }
   return Object.fromEntries(
     Object.entries(value as Record<string, unknown>).map(([key, entry]) => [
       key,
-      isRedactedLogKey(key) ? '[REDACTED]' : sanitizeLogArgValue(entry, depth + 1),
+      isRedactedLogKey(key)
+        ? '[REDACTED]'
+        : sanitizeLogArgValue(entry, depth + 1, isAllowListedLogKey(key)),
     ])
   );
 }
 
 /**
- * JSON-safe copy of MCP tool arguments for start/success logs: real values, with
- * credential/phone keys masked and strings over 500 chars truncated (noted inline).
- * Only the console path sees these values; the OTLP sink summarizes nested objects.
+ * JSON-safe copy of MCP tool arguments for start/success logs. Fails closed: only
+ * string values under allow-listed diagnostic keys (`language`, `reference`, `book`,
+ * ...) are shown, truncated to 100 chars. Every other string is summarized as
+ * `string(N)`; numbers and booleans pass through as `summarizeArgs` already does;
+ * credential/phone keys are masked. Nested objects are walked key by key.
  */
 export function sanitizeArgsForLog(args: unknown): unknown {
-  return sanitizeLogArgValue(args, 0);
+  return sanitizeLogArgValue(args, 0, false);
 }
 
 /**
