@@ -1291,6 +1291,9 @@ export class UserDO {
       const callbacks = this.buildWebhookCallbacks(body, logger);
       try {
         const response = await this.processChat(body, workerOrigin, logger, timing, callbacks);
+        // #422: the webhook `onComplete` resolves only after the `complete` POST
+        // was attempted (and any deferred welcome record settled), so the lock
+        // below is held until those durable effects have landed.
         await callbacks?.onComplete?.(response);
         logger.log('immediate_callback_complete', { message_id: messageId });
       } catch (error) {
@@ -1532,6 +1535,8 @@ export class UserDO {
     try {
       locale = await this.readStatusLocale(body, logger);
       const response = await this.processChat(body, workerOrigin, logger, timing, callbacks);
+      // #422: resolves after the `complete` POST was attempted and any deferred
+      // welcome record settled — the queue lock is released only after this.
       await callbacks?.onComplete?.(response);
     } catch (error) {
       await callbacks?.onError?.(processingFailureDetail(error, locale));
@@ -2734,9 +2739,16 @@ export class UserDO {
   private async hasAnyPendingWelcome(logger: RequestLogger): Promise<boolean> {
     const marker = await this.state.storage.get<boolean>(MODE_WELCOME_PENDING_ANY_KEY);
     if (marker !== undefined) return marker;
-    const found = await this.state.storage.list({ prefix: MODE_WELCOME_PENDING_PREFIX, limit: 1 });
-    const anyPending = found.size > 0;
-    await this.state.storage.put(MODE_WELCOME_PENDING_ANY_KEY, anyPending);
+    // One-time init: re-read the marker, list and put INSIDE one transaction so
+    // the derived value can never overwrite a marker armed in between (the
+    // arm is itself an atomic put of bit + marker).
+    const anyPending = await this.state.storage.transaction(async (txn) => {
+      const armed = await txn.get<boolean>(MODE_WELCOME_PENDING_ANY_KEY);
+      if (armed !== undefined) return armed;
+      const found = await txn.list({ prefix: MODE_WELCOME_PENDING_PREFIX, limit: 1 });
+      await txn.put(MODE_WELCOME_PENDING_ANY_KEY, found.size > 0);
+      return found.size > 0;
+    });
     logger.log('mode_welcome_pending_marker_initialized', { any_pending: anyPending });
     return anyPending;
   }

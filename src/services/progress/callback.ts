@@ -442,6 +442,28 @@ function runSafe(logger: RequestLogger, event: string, fn: () => Promise<unknown
 }
 
 /**
+ * Like `runSafe`, but RETURNS the promise so a caller can await the send. The
+ * promise never rejects: a failure is logged under `event` and swallowed, so
+ * awaiting it can never fail the turn. #422: the webhook terminal callbacks
+ * (`onComplete`/`onError`) return this so the DO's existing `await` holds the
+ * per-conversation lock until the terminal POST has been attempted and the
+ * deferred welcome record (complete mode) has settled — otherwise a queued
+ * follow-up turn could start before the one-time flag or pending bit landed.
+ */
+function runLogged(
+  logger: RequestLogger,
+  event: string,
+  fn: () => Promise<unknown>
+): Promise<void> {
+  return fn().then(
+    () => undefined,
+    (error: unknown) => {
+      logger.error(event, error);
+    }
+  );
+}
+
+/**
  * #422: the deferred in-band welcome record handed over by the DO on the
  * complete-mode webhook path (`deferInBandWelcomeRecord`). Settled exactly
  * once with whether the `complete` POST that carried the welcome landed.
@@ -506,7 +528,7 @@ function buildOnComplete(
   getLastSentText: () => string,
   welcomeRecord: DeferredWelcomeRecord
 ) {
-  return (response: ChatResponse) => {
+  return (response: ChatResponse): Promise<void> => {
     incrementalSender?.complete();
     const fullText = response.responses.join('\n');
     const delta = fullText.slice(getLastSentText().length);
@@ -522,10 +544,9 @@ function buildOnComplete(
       !receipt
     ) {
       // Nothing was sent, so a held welcome record was NOT delivered.
-      runSafe(logger, 'webhook_welcome_settle_failed', () => welcomeRecord.settle(false));
-      return;
+      return runLogged(logger, 'webhook_welcome_settle_failed', () => welcomeRecord.settle(false));
     }
-    runSafe(logger, 'webhook_complete_failed', async () => {
+    return runLogged(logger, 'webhook_complete_failed', async () => {
       const delivered = await sender.sendComplete(
         delta,
         response.voice_audio_url,
@@ -579,12 +600,13 @@ export function createWebhookCallbacks(
       () => lastSentText,
       welcomeRecord
     ),
-    onError: (error) => {
+    onError: async (error) => {
       incrementalSender?.complete();
       // #422: a held complete-mode welcome record never got its `complete`
-      // POST — settle as not delivered so the pending re-emit is armed.
-      runSafe(logger, 'webhook_welcome_settle_failed', () => welcomeRecord.settle(false));
-      runSafe(logger, 'webhook_error_failed', () => sender.sendError(error));
+      // POST — settle as not delivered (arms the pending re-emit) BEFORE the
+      // error POST, and return the whole chain so the DO awaits it.
+      await runLogged(logger, 'webhook_welcome_settle_failed', () => welcomeRecord.settle(false));
+      await runLogged(logger, 'webhook_error_failed', () => sender.sendError(error));
     },
     ...welcomeWiring(mode, sender, welcomeRecord),
   };

@@ -355,9 +355,12 @@ describe('#422 item 1 — recordWelcomeDelivered is one storage transaction', ()
 /**
  * Drive the DO's REAL webhook caller (`processCallbackEntry`: builds the
  * `ProgressCallbackSender` + `createWebhookCallbacks` from the body, runs the
- * turn, then fires `onComplete`). Runs inside the DO's instrumented context,
+ * turn, then AWAITS `onComplete`). Runs inside the DO's instrumented context,
  * exactly as the queue does in production, so the deferred welcome record that
  * settles after the `complete` POST executes with the DO's storage context.
+ * The queue releases the per-conversation lock only after this resolves, so
+ * every assertion below reads storage synchronously after it — proving the
+ * record landed BEFORE a queued follow-up turn could start.
  */
 function runCallbackEntry(
   stub: DurableObjectStub,
@@ -384,11 +387,6 @@ function runCallbackEntry(
   );
 }
 
-const welcomedEventually = (stub: DurableObjectStub) =>
-  vi.waitFor(async () => expect(await readWelcomed(stub, 'spoken')).toBe(true));
-const pendingEventually = (stub: DurableObjectStub) =>
-  vi.waitFor(async () => expect(await readPending(stub, 'spoken')).toBe(true));
-
 describe("#422 item 2 — progress_mode 'complete' folds the welcome into the complete POST", () => {
   let stub: DurableObjectStub;
   let posts: CapturedPost[];
@@ -404,8 +402,9 @@ describe("#422 item 2 — progress_mode 'complete' folds the welcome into the co
 
   it("'complete' mode: exactly ONE webhook POST, type complete, carrying welcome + answer", async () => {
     await runCallbackEntry(stub, body('#spoken hi'), 'complete');
-    await welcomedEventually(stub);
 
+    // Recorded by the time the caller resolves (lock still held in production).
+    expect(await readWelcomed(stub, 'spoken')).toBe(true);
     expect(posts).toHaveLength(1);
     expect(posts[0]?.type).toBe('complete');
     expect(posts[0]?.text).toContain('Welcome to Spoken mode!');
@@ -421,9 +420,9 @@ describe("#422 item 2 — progress_mode 'complete' folds the welcome into the co
 
   it("'iteration' mode (control): welcome is still its own progress POST ahead of the answer", async () => {
     await runCallbackEntry(stub, body('#spoken hi'), 'iteration');
-    await welcomedEventually(stub);
 
-    await vi.waitFor(() => expect(posts.length).toBeGreaterThanOrEqual(2));
+    expect(await readWelcomed(stub, 'spoken')).toBe(true);
+    expect(posts.length).toBeGreaterThanOrEqual(2);
     expect(posts[0]?.type).toBe('progress');
     expect(posts[0]?.text).toContain('Welcome to Spoken mode!');
     const completes = posts.filter((p) => p.type === 'complete');
@@ -443,12 +442,12 @@ describe("#422 item 2 — 'complete' mode failed POST arms the re-emit (double-s
     const { posts } = fetchState;
 
     await runCallbackEntry(stub, body('#spoken hi'), 'complete');
-    await pendingEventually(stub);
     expect(posts).toHaveLength(1);
     expect(posts[0]?.text).toContain('Welcome to Spoken mode!');
 
     // The only POST carrying the welcome failed ⇒ NOT welcomed, pending armed
-    // (with its marker), first_interaction untouched.
+    // (with its marker) BEFORE the caller resolved, first_interaction untouched.
+    expect(await readPending(stub, 'spoken')).toBe(true);
     expect(await readWelcomed(stub, 'spoken')).toBeUndefined();
     expect(await readPendingAny(stub)).toBe(true);
     expect((await readPreferences(stub))?.first_interaction ?? true).toBe(true);
@@ -457,7 +456,7 @@ describe("#422 item 2 — 'complete' mode failed POST arms the re-emit (double-s
     // inside that turn's single complete POST, and only then is it recorded.
     fetchState.callbackStatus = 200;
     await runCallbackEntry(stub, body('hello again'), 'complete');
-    await welcomedEventually(stub);
+    expect(await readWelcomed(stub, 'spoken')).toBe(true);
     expect(posts).toHaveLength(2);
     expect(posts[1]?.type).toBe('complete');
     expect(posts[1]?.text).toContain('Welcome to Spoken mode!');

@@ -433,8 +433,16 @@ export interface StreamCallbacks {
   /** Localized status line plus its closed `key` — see `SSEStatusEvent`. */
   onStatus: (status: StatusUpdate) => void;
   onProgress: (text: string) => void;
-  onComplete: (response: ChatResponse) => void;
-  onError: (error: string) => void;
+  /**
+   * Terminal hooks. A transport MAY return a promise; the DO awaits it before
+   * releasing the per-conversation lock, so a transport whose terminal write
+   * carries durable side effects (#422: the complete-mode webhook records or
+   * pends the welcome only after its `complete` POST is acknowledged) can keep
+   * a queued follow-up turn from starting until those have landed. A returned
+   * promise must never reject — delivery failures are logged, never thrown.
+   */
+  onComplete: (response: ChatResponse) => void | Promise<void>;
+  onError: (error: string) => void | Promise<void>;
   onToolUse?: (toolName: string, input: unknown) => void;
   onToolResult?: (toolName: string, result: unknown) => void;
   onIterationComplete?: (text: string) => void;
