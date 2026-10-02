@@ -2561,8 +2561,10 @@ export class UserDO {
    * — and a mid-turn client disconnect makes that write a no-op. So when the
    * caller supplies `deferInBandWelcomeRecord`, DEFER flag recording to it: the
    * caller runs the handed recorder after the `complete` write with `delivered =
-   * !clientDisconnected`. On `/chat/final` there is no stream to drop, so record
-   * inline right here (as before). A throw before this point re-emits on retry.
+   * !clientDisconnected`. #422: a `progress_mode: 'complete'` webhook supplies
+   * the same hook and settles it with whether the `complete` POST got a 2xx. On
+   * `/chat/final` there is no stream to drop, so record inline right here (as
+   * before). A throw before this point re-emits on retry.
    */
   private async finalizeEmittedWelcome(
     welcome: ModeWelcome | undefined,
@@ -2577,8 +2579,8 @@ export class UserDO {
     await this.recordAdminWelcomeEmitted(welcome);
     if (sentOutOfBand) return;
     if (callbacks?.deferInBandWelcomeRecord) {
-      // SSE: the caller runs this after the `complete` write (see the SSE
-      // handlers), passing whether the client was still connected.
+      // SSE / complete-mode webhook: the caller runs this after the terminal
+      // write, passing whether the client actually received it.
       callbacks.deferInBandWelcomeRecord((delivered) =>
         this.recordInBandWelcomeOutcome(welcome, delivered, logger)
       );

@@ -161,4 +161,35 @@ describe("#422 callback wiring — progress_mode 'complete'", () => {
     expect(posts[0]?.type).toBe('complete');
     expect(posts[0]?.text).toBe(`${WELCOME}\nThe answer.`);
   });
+
+  // The welcome only reaches a complete-mode consumer inside that POST, so the
+  // DO's one-time flag record is deferred to the sender and settled on the
+  // POST outcome: 2xx ⇒ delivered, otherwise ⇒ pending re-emit.
+  it("#422: 'complete' mode defers the welcome record and settles it true on a 2xx complete", async () => {
+    const { callbacks } = setup(200, false, 'complete');
+    const record = vi.fn(async (_delivered: boolean) => {});
+
+    expect(callbacks.deferInBandWelcomeRecord).toBeDefined();
+    callbacks.deferInBandWelcomeRecord!(record);
+    callbacks.onComplete(completion([WELCOME, 'The answer.']));
+
+    await vi.waitFor(() => expect(record).toHaveBeenCalledTimes(1));
+    expect(record).toHaveBeenCalledWith(true);
+  });
+
+  it("#422: 'complete' mode settles the welcome record false when the complete POST fails", async () => {
+    const { callbacks } = setup(503, false, 'complete');
+    const record = vi.fn(async (_delivered: boolean) => {});
+
+    callbacks.deferInBandWelcomeRecord!(record);
+    callbacks.onComplete(completion([WELCOME, 'The answer.']));
+
+    await vi.waitFor(() => expect(record).toHaveBeenCalledTimes(1));
+    expect(record).toHaveBeenCalledWith(false);
+  });
+
+  it("#422: 'iteration' mode does not defer (the welcome is acknowledged out of band)", () => {
+    const { callbacks } = setup();
+    expect(callbacks.deferInBandWelcomeRecord).toBeUndefined();
+  });
 });
