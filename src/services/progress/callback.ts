@@ -79,7 +79,7 @@ export class ProgressCallbackSender {
   // #428: non-terminal POSTs in flight. Terminal sends (`complete`/`error`)
   // await these so a slow progress/status POST can never reach the gateway
   // after the final message — gateways deliver callbacks in arrival order.
-  private pending = new Set<Promise<void>>();
+  private pending = new Set<Promise<unknown>>();
 
   constructor(
     private config: ProgressCallbackConfig,
@@ -88,7 +88,7 @@ export class ProgressCallbackSender {
     this.logger = logger;
   }
 
-  private track(promise: Promise<void>): Promise<void> {
+  private track<T>(promise: Promise<T>): Promise<T> {
     this.pending.add(promise);
     const remove = () => this.pending.delete(promise);
     promise.then(remove, remove);
@@ -130,15 +130,20 @@ export class ProgressCallbackSender {
     }
   }
 
+  /**
+   * Send the terminal `complete` event. Resolves `true` when the POST got a
+   * 2xx, `false` when it failed (already logged by `post`). #422: the
+   * complete-mode welcome record is gated on this — see `createWebhookCallbacks`.
+   */
   async sendComplete(
     text: string,
     voiceAudioUrl?: string | null,
     voiceAudioBase64?: string | null,
     attachments?: Attachment[] | null,
     historyReceipt?: HistoryReceipt | null
-  ): Promise<void> {
+  ): Promise<boolean> {
     await this.awaitPendingSends('complete');
-    await this.post({
+    return this.post({
       type: 'complete',
       ...(text ? { text } : {}),
       ...(voiceAudioUrl ? { voice_audio_url: voiceAudioUrl } : {}),
@@ -158,7 +163,8 @@ export class ProgressCallbackSender {
    * Deliver a one-time mode first-contact welcome (#311) as its own webhook
    * message, ahead of the model's answer. Sent as a `progress` payload so the
    * gateway renders it as a standalone message — exactly how iteration deltas
-   * arrive — with zero gateway changes.
+   * arrive — with zero gateway changes. Never wired for `progress_mode:
+   * 'complete'` (#422) — there the welcome rides inside the `complete` payload.
    *
    * Unlike every other send here this does NOT swallow failures: it awaits the
    * POST and THROWS on a network error or non-2xx status. The caller writes the
@@ -200,9 +206,14 @@ export class ProgressCallbackSender {
     return this.accumulatedText;
   }
 
+  /**
+   * POST one payload. Never throws: a non-2xx or network/timeout failure is
+   * logged (and counted) here and reported as `false` so a caller that needs
+   * delivery acknowledgement (#422 complete-mode welcome) can act on it.
+   */
   private async post(
     payload: Omit<CallbackPayload, 'user_id' | 'message_key' | 'timestamp'>
-  ): Promise<void> {
+  ): Promise<boolean> {
     const fullPayload = this.buildPayload(payload);
     const ctx = { type: payload.type, user_id: this.config.user_id };
     this.logOutgoing(payload, ctx);
@@ -222,6 +233,7 @@ export class ProgressCallbackSender {
           ...ctx,
         });
       }
+      return response.ok;
     } catch (error) {
       // Non-blocking: webhook failures shouldn't break main flow
       const isTimeout = error instanceof Error && error.name === 'AbortError';
@@ -235,6 +247,7 @@ export class ProgressCallbackSender {
         is_timeout: isTimeout,
         ...ctx,
       });
+      return false;
     }
   }
 
@@ -428,13 +441,94 @@ function runSafe(logger: RequestLogger, event: string, fn: () => Promise<unknown
   safeAsync(logger, event, fn);
 }
 
+/**
+ * Like `runSafe`, but RETURNS the promise so a caller can await the send. The
+ * promise never rejects: a failure is logged under `event` and swallowed, so
+ * awaiting it can never fail the turn. #422: the webhook terminal callbacks
+ * (`onComplete`/`onError`) return this so the DO's existing `await` holds the
+ * per-conversation lock until the terminal POST has been attempted and the
+ * deferred welcome record (complete mode) has settled — otherwise a queued
+ * follow-up turn could start before the one-time flag or pending bit landed.
+ */
+function runLogged(
+  logger: RequestLogger,
+  event: string,
+  fn: () => Promise<unknown>
+): Promise<void> {
+  return fn().then(
+    () => undefined,
+    (error: unknown) => {
+      logger.error(event, error);
+    }
+  );
+}
+
+/**
+ * #422: the deferred in-band welcome record handed over by the DO on the
+ * complete-mode webhook path (`deferInBandWelcomeRecord`). Settled exactly
+ * once with whether the `complete` POST that carried the welcome landed.
+ */
+class DeferredWelcomeRecord {
+  private record: ((delivered: boolean) => Promise<void>) | undefined;
+
+  constructor(private logger: RequestLogger) {}
+
+  hold(record: (delivered: boolean) => Promise<void>): void {
+    this.record = record;
+  }
+
+  /** Run the held record (if any) with `delivered`; never throws. */
+  async settle(delivered: boolean): Promise<void> {
+    const record = this.record;
+    this.record = undefined;
+    if (!record) return;
+    try {
+      await record(delivered);
+    } catch (error) {
+      this.logger.warn('mode_welcome_record_failed', {
+        transport: 'webhook_complete',
+        delivered,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      // Explicitly continue — recording is a post-turn side effect; a failed
+      // record leaves the flag unset so the welcome re-emits (double-send over skip).
+    }
+  }
+}
+
+/**
+ * #311: the welcome is its own message, sent before the model runs. It rejects
+ * on failure (unlike the other callbacks, which log-and-continue) so the DO
+ * withholds the mode_welcomed flag and re-emits on retry.
+ *
+ * #422: NOT wired in 'complete' mode. That mode's contract (README "Progress
+ * modes") is ONLY the final `complete` event — a `progress`-typed welcome POST
+ * would be dropped by such a consumer while the one-time flag burned unseen.
+ * With no sink the DO prepends the welcome in-band into `responses`, so it
+ * ships inside the single `complete` payload: one message, as the mode
+ * promises. The one-time flag is then recorded ONLY after that POST returns
+ * 2xx (`deferInBandWelcomeRecord`, settled in `onComplete`); a failed POST arms
+ * the pending re-emit instead.
+ */
+function welcomeWiring(
+  mode: ProgressMode,
+  sender: ProgressCallbackSender,
+  welcomeRecord: DeferredWelcomeRecord
+): Pick<StreamCallbacks, 'onWelcome' | 'deferInBandWelcomeRecord'> {
+  if (mode === 'complete') {
+    return { deferInBandWelcomeRecord: (record) => welcomeRecord.hold(record) };
+  }
+  return { onWelcome: (text) => sender.sendWelcome(text) };
+}
+
 function buildOnComplete(
   sender: ProgressCallbackSender,
   logger: RequestLogger,
   incrementalSender: IncrementalProgressSender | null,
-  getLastSentText: () => string
+  getLastSentText: () => string,
+  welcomeRecord: DeferredWelcomeRecord
 ) {
-  return (response: ChatResponse) => {
+  return (response: ChatResponse): Promise<void> => {
     incrementalSender?.complete();
     const fullText = response.responses.join('\n');
     const delta = fullText.slice(getLastSentText().length);
@@ -449,17 +543,21 @@ function buildOnComplete(
       !hasAttachments &&
       !receipt
     ) {
-      return;
+      // Nothing was sent, so a held welcome record was NOT delivered.
+      return runLogged(logger, 'webhook_welcome_settle_failed', () => welcomeRecord.settle(false));
     }
-    runSafe(logger, 'webhook_complete_failed', () =>
-      sender.sendComplete(
+    return runLogged(logger, 'webhook_complete_failed', async () => {
+      const delivered = await sender.sendComplete(
         delta,
         response.voice_audio_url,
         response.voice_audio_base64,
         response.attachments,
         receipt
-      )
-    );
+      );
+      // #422: the complete-mode welcome rides inside this POST — record the
+      // one-time flag only on a 2xx; otherwise arm the pending re-emit.
+      await welcomeRecord.settle(delivered);
+    });
   };
 }
 
@@ -477,6 +575,7 @@ export function createWebhookCallbacks(
 
   // Track text already sent so iteration and complete callbacks only send deltas
   let lastSentText = '';
+  const welcomeRecord = new DeferredWelcomeRecord(logger);
 
   const callbacks: StreamCallbacks = {
     onStatus: (status) => {
@@ -494,15 +593,22 @@ export function createWebhookCallbacks(
         sender.accumulateProgress(text);
       }
     },
-    onComplete: buildOnComplete(sender, logger, incrementalSender, () => lastSentText),
-    onError: (error) => {
+    onComplete: buildOnComplete(
+      sender,
+      logger,
+      incrementalSender,
+      () => lastSentText,
+      welcomeRecord
+    ),
+    onError: async (error) => {
       incrementalSender?.complete();
-      runSafe(logger, 'webhook_error_failed', () => sender.sendError(error));
+      // #422: a held complete-mode welcome record never got its `complete`
+      // POST — settle as not delivered (arms the pending re-emit) BEFORE the
+      // error POST, and return the whole chain so the DO awaits it.
+      await runLogged(logger, 'webhook_welcome_settle_failed', () => welcomeRecord.settle(false));
+      await runLogged(logger, 'webhook_error_failed', () => sender.sendError(error));
     },
-    // #311: the welcome is its own message, sent before the model runs. It
-    // rejects on failure (unlike the other callbacks, which log-and-continue)
-    // so the DO withholds the mode_welcomed flag and re-emits on retry.
-    onWelcome: (text) => sender.sendWelcome(text),
+    ...welcomeWiring(mode, sender, welcomeRecord),
   };
 
   if (mode === 'iteration' && !suppressProgressText) {

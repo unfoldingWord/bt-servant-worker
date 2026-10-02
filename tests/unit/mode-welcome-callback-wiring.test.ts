@@ -34,7 +34,11 @@ interface CapturedPost {
   text?: string;
 }
 
-function setup(status = 200, suppressProgressText = false) {
+function setup(
+  status = 200,
+  suppressProgressText = false,
+  mode: 'iteration' | 'complete' = 'iteration'
+) {
   const posts: CapturedPost[] = [];
   vi.stubGlobal(
     'fetch',
@@ -49,7 +53,7 @@ function setup(status = 200, suppressProgressText = false) {
     logger
   );
   const callbacks = createWebhookCallbacks(sender, logger, {
-    mode: 'iteration',
+    mode,
     throttleSeconds: 5,
     suppressProgressText,
   });
@@ -133,5 +137,101 @@ describe('#311 callback wiring — welcome as its own message', () => {
     expect(posts[0]?.text).toBe(WELCOME);
     expect(posts[1]?.type).toBe('complete');
     expect(posts[1]?.text).toBe('The answer.');
+  });
+});
+
+describe("#422 callback wiring — progress_mode 'complete'", () => {
+  beforeEach(() => vi.restoreAllMocks());
+  afterEach(() => vi.restoreAllMocks());
+
+  // #422 item 2: a `complete`-mode consumer receives ONLY the final `complete`
+  // event (README "Progress modes"), so a `progress`-typed welcome POST would be
+  // ignored and the one-time flag would burn unseen. No `onWelcome` sink is
+  // wired; the DO prepends the welcome in-band and it ships inside the single
+  // `complete` payload — one message, per the mode's contract.
+  it("#422: 'complete' mode wires NO onWelcome sink — the welcome rides inside the complete payload", async () => {
+    const { posts, callbacks } = setup(200, false, 'complete');
+
+    expect(callbacks.onWelcome).toBeUndefined();
+
+    // With no sink the DO prepends the welcome into `responses` (in-band path).
+    callbacks.onComplete(completion([WELCOME, 'The answer.']));
+
+    await vi.waitFor(() => expect(posts.length).toBe(1));
+    expect(posts[0]?.type).toBe('complete');
+    expect(posts[0]?.text).toBe(`${WELCOME}\nThe answer.`);
+  });
+
+  // The welcome only reaches a complete-mode consumer inside that POST, so the
+  // DO's one-time flag record is deferred to the sender and settled on the
+  // POST outcome: 2xx ⇒ delivered, otherwise ⇒ pending re-emit.
+  // `onComplete` RETURNS the send chain (POST then settle) so the DO's await
+  // holds the conversation lock until the record has landed — no polling here.
+  it("#422: 'complete' mode defers the welcome record and settles it true once the 2xx complete resolves", async () => {
+    const { posts, callbacks } = setup(200, false, 'complete');
+    const record = vi.fn(async (_delivered: boolean) => {});
+
+    expect(callbacks.deferInBandWelcomeRecord).toBeDefined();
+    callbacks.deferInBandWelcomeRecord!(record);
+    await callbacks.onComplete(completion([WELCOME, 'The answer.']));
+
+    expect(posts.map((p) => p.type)).toEqual(['complete']);
+    expect(record).toHaveBeenCalledTimes(1);
+    expect(record).toHaveBeenCalledWith(true);
+  });
+
+  it("#422: 'complete' mode settles the welcome record false when the complete POST fails", async () => {
+    const { callbacks } = setup(503, false, 'complete');
+    const record = vi.fn(async (_delivered: boolean) => {});
+
+    callbacks.deferInBandWelcomeRecord!(record);
+    await callbacks.onComplete(completion([WELCOME, 'The answer.']));
+
+    expect(record).toHaveBeenCalledTimes(1);
+    expect(record).toHaveBeenCalledWith(false);
+  });
+});
+
+describe("#422 callback wiring — 'complete' mode settle edge paths", () => {
+  beforeEach(() => vi.restoreAllMocks());
+  afterEach(() => vi.restoreAllMocks());
+
+  it('#422: onError settles a held record false (arms pending) before the error POST, and is awaitable', async () => {
+    const { posts, callbacks } = setup(200, false, 'complete');
+    const order: string[] = [];
+    const record = vi.fn(async (delivered: boolean) => {
+      order.push(`record:${delivered}`);
+    });
+
+    callbacks.deferInBandWelcomeRecord!(record);
+    await callbacks.onError('model exploded');
+
+    expect(order).toEqual(['record:false']);
+    expect(posts.map((p) => p.type)).toEqual(['error']);
+  });
+
+  it('#422: an empty complete (nothing to send) settles a held record false', async () => {
+    const { posts, callbacks } = setup(200, false, 'complete');
+    const record = vi.fn(async (_delivered: boolean) => {});
+
+    callbacks.deferInBandWelcomeRecord!(record);
+    await callbacks.onComplete(completion([]));
+
+    expect(posts).toHaveLength(0);
+    expect(record).toHaveBeenCalledWith(false);
+  });
+
+  it('#422: a throwing record never rejects the awaited onComplete (logged, turn continues)', async () => {
+    const { callbacks } = setup(200, false, 'complete');
+    callbacks.deferInBandWelcomeRecord!(async () => {
+      throw new Error('storage boom');
+    });
+
+    await expect(callbacks.onComplete(completion([WELCOME, 'ok']))).resolves.toBeUndefined();
+  });
+
+  it("#422: 'iteration' mode does not defer (the welcome is acknowledged out of band)", () => {
+    const { callbacks } = setup();
+    expect(callbacks.deferInBandWelcomeRecord).toBeUndefined();
   });
 });

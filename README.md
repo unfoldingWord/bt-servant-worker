@@ -460,6 +460,8 @@ The `progress_mode` field on the request body controls which events the worker s
 | `periodic`  | `status` + accumulated `progress` every N seconds + `complete`        | Rate-limited intermediate updates on a fixed cadence. `progress_throttle_seconds` controls N.                  |
 | `sentence`  | `status` + `progress` per complete sentence + `complete`              | Natural streaming where partial text only surfaces at sentence boundaries.                                     |
 
+A mode's one-time first-contact welcome (`welcome_message`) is delivered as its own `progress` POST ahead of the answer in `iteration`, `periodic` and `sentence` modes. In `complete` mode it is folded into the single `complete` event's `text`, ahead of the answer, so that mode still receives exactly one POST.
+
 ### Error Codes
 
 All error responses follow a standard format:

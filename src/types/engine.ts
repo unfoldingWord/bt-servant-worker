@@ -433,17 +433,26 @@ export interface StreamCallbacks {
   /** Localized status line plus its closed `key` — see `SSEStatusEvent`. */
   onStatus: (status: StatusUpdate) => void;
   onProgress: (text: string) => void;
-  onComplete: (response: ChatResponse) => void;
-  onError: (error: string) => void;
+  /**
+   * Terminal hooks. A transport MAY return a promise; the DO awaits it before
+   * releasing the per-conversation lock, so a transport whose terminal write
+   * carries durable side effects (#422: the complete-mode webhook records or
+   * pends the welcome only after its `complete` POST is acknowledged) can keep
+   * a queued follow-up turn from starting until those have landed. A returned
+   * promise must never reject — delivery failures are logged, never thrown.
+   */
+  onComplete: (response: ChatResponse) => void | Promise<void>;
+  onError: (error: string) => void | Promise<void>;
   onToolUse?: (toolName: string, input: unknown) => void;
   onToolResult?: (toolName: string, result: unknown) => void;
   onIterationComplete?: (text: string) => void;
   /**
    * Deliver a one-time mode first-contact welcome (#311) as its OWN message
    * ahead of the model's answer. Present only on transports that render each
-   * send as a discrete message (the webhook/WhatsApp path); absent on SSE and
-   * `/chat/final`, where the welcome is carried as a `responses[]` entry
-   * instead. MUST reject on a delivery failure. The DO caller treats that
+   * send as a discrete message (the webhook/WhatsApp path in a progress mode
+   * that delivers intermediate POSTs); absent on SSE, `/chat/final` and
+   * `progress_mode: 'complete'` webhooks (#422), where the welcome is carried
+   * as a `responses[]` entry instead. MUST reject on a delivery failure. The DO caller treats that
    * rejection as NON-FATAL (#311, FIX C): it logs, withholds the `mode_welcomed`
    * flag, sets a durable `mode_welcome_pending` bit so a later turn re-emits,
    * and still returns the model's answer — the failed welcome never aborts the
@@ -451,15 +460,18 @@ export interface StreamCallbacks {
    */
   onWelcome?: (text: string) => Promise<void>;
   /**
-   * SSE transports ONLY (#311 FIX 1). On the SSE path the in-band welcome ships
-   * inside `complete.responses`, which the client only receives if it is still
-   * connected when the `complete` event is written. The DO hands the one-time
-   * flag recording to the caller through this hook; the caller runs the handed
-   * `record` AFTER the `complete` write, passing `delivered = !clientDisconnected`
-   * so a mid-turn disconnect records a `mode_welcome_pending` re-emit instead of
-   * burning the flag on a welcome the user never saw. Absent on the webhook path
-   * (welcome sent out of band via `onWelcome`) and on `/chat/final` (no stream to
-   * drop — recorded inline as the turn is saved).
+   * Transports whose in-band welcome is only delivered by the terminal write
+   * (#311 FIX 1, #422). On the SSE path the welcome ships inside
+   * `complete.responses`, which the client only receives if it is still
+   * connected when the `complete` event is written; on a `progress_mode:
+   * 'complete'` webhook it ships inside the single `complete` POST. The DO hands
+   * the one-time flag recording to the caller through this hook; the caller runs
+   * the handed `record` AFTER the terminal write, passing `delivered =
+   * !clientDisconnected` (SSE) or `delivered = POST got 2xx` (webhook), so a
+   * disconnect or a failed POST records a `mode_welcome_pending` re-emit instead
+   * of burning the flag on a welcome the user never saw. Absent on webhooks in
+   * the other progress modes (welcome sent out of band via `onWelcome`) and on
+   * `/chat/final` (no stream to drop — recorded inline as the turn is saved).
    */
   deferInBandWelcomeRecord?: (record: (delivered: boolean) => Promise<void>) => void;
 }
