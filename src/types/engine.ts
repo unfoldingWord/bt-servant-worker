@@ -441,9 +441,10 @@ export interface StreamCallbacks {
   /**
    * Deliver a one-time mode first-contact welcome (#311) as its OWN message
    * ahead of the model's answer. Present only on transports that render each
-   * send as a discrete message (the webhook/WhatsApp path); absent on SSE and
-   * `/chat/final`, where the welcome is carried as a `responses[]` entry
-   * instead. MUST reject on a delivery failure. The DO caller treats that
+   * send as a discrete message (the webhook/WhatsApp path in a progress mode
+   * that delivers intermediate POSTs); absent on SSE, `/chat/final` and
+   * `progress_mode: 'complete'` webhooks (#422), where the welcome is carried
+   * as a `responses[]` entry instead. MUST reject on a delivery failure. The DO caller treats that
    * rejection as NON-FATAL (#311, FIX C): it logs, withholds the `mode_welcomed`
    * flag, sets a durable `mode_welcome_pending` bit so a later turn re-emits,
    * and still returns the model's answer — the failed welcome never aborts the

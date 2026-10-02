@@ -34,7 +34,11 @@ interface CapturedPost {
   text?: string;
 }
 
-function setup(status = 200, suppressProgressText = false) {
+function setup(
+  status = 200,
+  suppressProgressText = false,
+  mode: 'iteration' | 'complete' = 'iteration'
+) {
   const posts: CapturedPost[] = [];
   vi.stubGlobal(
     'fetch',
@@ -49,7 +53,7 @@ function setup(status = 200, suppressProgressText = false) {
     logger
   );
   const callbacks = createWebhookCallbacks(sender, logger, {
-    mode: 'iteration',
+    mode,
     throttleSeconds: 5,
     suppressProgressText,
   });
@@ -133,5 +137,28 @@ describe('#311 callback wiring — welcome as its own message', () => {
     expect(posts[0]?.text).toBe(WELCOME);
     expect(posts[1]?.type).toBe('complete');
     expect(posts[1]?.text).toBe('The answer.');
+  });
+});
+
+describe("#422 callback wiring — progress_mode 'complete'", () => {
+  beforeEach(() => vi.restoreAllMocks());
+  afterEach(() => vi.restoreAllMocks());
+
+  // #422 item 2: a `complete`-mode consumer receives ONLY the final `complete`
+  // event (README "Progress modes"), so a `progress`-typed welcome POST would be
+  // ignored and the one-time flag would burn unseen. No `onWelcome` sink is
+  // wired; the DO prepends the welcome in-band and it ships inside the single
+  // `complete` payload — one message, per the mode's contract.
+  it("#422: 'complete' mode wires NO onWelcome sink — the welcome rides inside the complete payload", async () => {
+    const { posts, callbacks } = setup(200, false, 'complete');
+
+    expect(callbacks.onWelcome).toBeUndefined();
+
+    // With no sink the DO prepends the welcome into `responses` (in-band path).
+    callbacks.onComplete(completion([WELCOME, 'The answer.']));
+
+    await vi.waitFor(() => expect(posts.length).toBe(1));
+    expect(posts[0]?.type).toBe('complete');
+    expect(posts[0]?.text).toBe(`${WELCOME}\nThe answer.`);
   });
 });

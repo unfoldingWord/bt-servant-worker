@@ -132,6 +132,15 @@ const MODE_WELCOMED_PREFIX = 'mode_welcomed:';
  * `mode_welcomed:<key>` (per-user in group chats — see `modeWelcomePendingKey`).
  */
 const MODE_WELCOME_PENDING_PREFIX = 'mode_welcome_pending:';
+/**
+ * #422 (item 3): a single DO-wide marker — `true` when at least one
+ * `mode_welcome_pending:*` bit MAY exist in this DO, `false` when none does,
+ * absent on a DO that predates the marker. `maybePendingWelcome` reads this ONE
+ * key on every plain turn and skips the 1 + |aliases| per-slug reads when it is
+ * `false`. Written alongside every pending arm (same atomic put) and recomputed
+ * (one prefix `list`, limit 1) whenever pending bits are deleted.
+ */
+const MODE_WELCOME_PENDING_ANY_KEY = 'mode_welcome_pending_any';
 const PROCESSING_LOCK_KEY = '_processing_lock';
 const QUEUE_KEY = 'queue';
 const QUEUE_PROCESSING_KEY = 'queue_processing';
@@ -2196,7 +2205,7 @@ export class UserDO {
     // `complete` write, gated on the client still being connected) via
     // `deferInBandWelcomeRecord`; `/chat/final` (no such hook) records inline.
     // FIX 2: an emitted admin preview also persists `first_interaction:false`.
-    await this.finalizeEmittedWelcome(welcome, welcomeDelivery.handledOutOfBand, callbacks);
+    await this.finalizeEmittedWelcome(welcome, welcomeDelivery.handledOutOfBand, callbacks, logger);
     // #311 FIX B: in-band recording ran (or was deferred to the SSE caller) — the
     // wrapper's finally guard must NOT also arm pending. Set only after a clean
     // finalize.
@@ -2255,7 +2264,7 @@ export class UserDO {
   ): Promise<void> {
     if (!welcome?.keys || handledOutOfBand || finalized) return;
     try {
-      await this.state.storage.put(welcome.keys.pending, true);
+      await this.armWelcomePending(welcome.keys.pending);
       logger.warn('mode_welcome_pending_armed_on_throw', { pending_key: welcome.keys.pending });
     } catch (error) {
       // The turn already failed and that error is propagating from the try;
@@ -2475,7 +2484,10 @@ export class UserDO {
    * the webhook/WhatsApp transport, which renders each send discretely and is the
    * only path with `onWelcome` present (FIX 1). The SSE path and `/chat/final`
    * have no `onWelcome`, so this returns `handledOutOfBand: false` for them and
-   * the caller prepends the welcome in-band into `responses`.
+   * the caller prepends the welcome in-band into `responses`. #422: a webhook
+   * consumer in `progress_mode: 'complete'` also has no `onWelcome` (see
+   * `createWebhookCallbacks`), so its welcome rides in-band inside the single
+   * `complete` payload instead of a `progress` POST that mode ignores.
    *
    * FIX C: delivery is NON-FATAL. On success it records the one-time flag and
    * clears any pending bit; on failure it LOGS (structured, per the no-silent-
@@ -2505,7 +2517,7 @@ export class UserDO {
         // Residual (gateway-200-then-Meta-failure) is invisible here — see
         // bt-servant-whatsapp-gateway#45.
       });
-      if (welcome.keys) await this.state.storage.put(welcome.keys.pending, true);
+      if (welcome.keys) await this.armWelcomePending(welcome.keys.pending);
       return { handledOutOfBand: true, delivered: false };
     }
     // The send landed — the user has seen the welcome, so this is handled
@@ -2521,14 +2533,15 @@ export class UserDO {
    * unset in the caller and make processChat's finally arm `mode_welcome_pending`,
    * re-emitting a welcome the user already received. Worst case the flag stays
    * unset and an explicit re-scan re-welcomes once (double-send > pending skip).
-   * Partial-write atomicity of `recordWelcomeDelivered` itself is tracked in #422.
+   * #422: `recordWelcomeDelivered` is one storage transaction, so a throw here
+   * means NOTHING was written — never a half-recorded welcome.
    */
   private async recordWelcomeDeliveredBestEffort(
     welcome: ModeWelcome,
     logger: RequestLogger
   ): Promise<void> {
     try {
-      await this.recordWelcomeDelivered(welcome);
+      await this.recordWelcomeDelivered(welcome, logger);
     } catch (error) {
       logger.warn('mode_welcome_record_failed', {
         error: error instanceof Error ? error.message : String(error),
@@ -2554,7 +2567,8 @@ export class UserDO {
   private async finalizeEmittedWelcome(
     welcome: ModeWelcome | undefined,
     sentOutOfBand: boolean,
-    callbacks: StreamCallbacks | undefined
+    callbacks: StreamCallbacks | undefined,
+    logger: RequestLogger
   ): Promise<void> {
     if (!welcome) return;
     // FIX 2: an admin preview carries no keys, so the flag paths below no-op for
@@ -2566,12 +2580,12 @@ export class UserDO {
       // SSE: the caller runs this after the `complete` write (see the SSE
       // handlers), passing whether the client was still connected.
       callbacks.deferInBandWelcomeRecord((delivered) =>
-        this.recordInBandWelcomeOutcome(welcome, delivered)
+        this.recordInBandWelcomeOutcome(welcome, delivered, logger)
       );
       return;
     }
     // `/chat/final`: no stream to disconnect — the welcome is in the JSON body.
-    await this.recordWelcomeDelivered(welcome);
+    await this.recordWelcomeDelivered(welcome, logger);
   }
 
   /**
@@ -2583,12 +2597,13 @@ export class UserDO {
    */
   private async recordInBandWelcomeOutcome(
     welcome: ModeWelcome,
-    delivered: boolean
+    delivered: boolean,
+    logger: RequestLogger
   ): Promise<void> {
     if (delivered) {
-      await this.recordWelcomeDelivered(welcome);
+      await this.recordWelcomeDelivered(welcome, logger);
     } else if (welcome.keys) {
-      await this.state.storage.put(welcome.keys.pending, true);
+      await this.armWelcomePending(welcome.keys.pending);
     }
   }
 
@@ -2647,15 +2662,81 @@ export class UserDO {
    * a later turn whose orchestration throws before `saveConversation` can never
    * re-welcome the user via the model. This is NOT reached on a failed delivery
    * (pending re-emit, or a later model welcome, handles that case instead).
+   *
+   * #422 (item 1): the flag write, the pending delete, the `first_interaction`
+   * flip and the pending-marker refresh are ONE `storage.transaction()`. Done as
+   * separate ops, an isolate eviction (or a throw in the preferences
+   * read-modify-write) between the flag write and the flip left `mode_welcomed`
+   * set with `first_interaction` still `true` — the authored copy was then
+   * suppressed on the next turn but the model still injected its own "briefly
+   * welcome them" line: a double welcome. Now either everything lands or nothing
+   * does. On a failed transaction nothing is recorded, so the welcome re-emits
+   * (pending / explicit re-scan) — a rare double-send beats a silent skip. The
+   * failure is logged here with the keys and RE-THROWN; each caller already
+   * decides whether it is fatal for its transport.
    */
-  private async recordWelcomeDelivered(welcome: ModeWelcome): Promise<void> {
+  private async recordWelcomeDelivered(welcome: ModeWelcome, logger: RequestLogger): Promise<void> {
     if (!welcome.keys) return;
-    await this.state.storage.put(welcome.keys.welcomed, true);
-    await this.state.storage.delete(welcome.keys.pending);
-    const preferences = await this.getPreferences();
-    if (preferences.first_interaction) {
-      await this.updatePreferences({ ...preferences, first_interaction: false });
+    const { welcomed, pending } = welcome.keys;
+    try {
+      await this.state.storage.transaction(async (txn) => {
+        await txn.put(welcomed, true);
+        await txn.delete(pending);
+        const preferences =
+          (await txn.get<UserPreferencesInternal>(PREFERENCES_KEY)) ?? DEFAULT_PREFERENCES;
+        if (preferences.first_interaction) {
+          await txn.put(PREFERENCES_KEY, { ...preferences, first_interaction: false });
+        }
+        await this.refreshPendingWelcomeMarker(txn);
+      });
+    } catch (error) {
+      logger.warn('mode_welcome_record_txn_failed', {
+        error: error instanceof Error ? error.message : String(error),
+        welcomed_key: welcomed,
+        pending_key: pending,
+      });
+      throw error;
     }
+  }
+
+  /**
+   * #422 (item 3): arm a `mode_welcome_pending` bit AND the DO-wide "any
+   * pending" marker in one atomic multi-key put, so the marker can never read
+   * `false` while a pending bit exists.
+   */
+  private async armWelcomePending(pendingKey: string): Promise<void> {
+    await this.state.storage.put({ [pendingKey]: true, [MODE_WELCOME_PENDING_ANY_KEY]: true });
+  }
+
+  /**
+   * #422 (item 3): recompute the "any pending" marker from the live bits after
+   * pending keys were deleted — one prefix `list` with `limit: 1`. Runs INSIDE
+   * the caller's transaction so the marker and the deletes commit together (a
+   * stale `true` would only cost the full per-slug lookup; a stale `false` would
+   * skip a real re-emit, which this prevents).
+   */
+  private async refreshPendingWelcomeMarker(
+    store: Pick<DurableObjectStorage, 'list' | 'put'>
+  ): Promise<void> {
+    const remaining = await store.list({ prefix: MODE_WELCOME_PENDING_PREFIX, limit: 1 });
+    await store.put(MODE_WELCOME_PENDING_ANY_KEY, remaining.size > 0);
+  }
+
+  /**
+   * #422 (item 3): the cheap gate in front of the per-slug pending lookup. One
+   * durable read on the steady-state path. A DO that predates the marker (bit
+   * armed before this shipped, or never) has no marker: derive it ONCE from the
+   * live bits (prefix `list`, limit 1) and persist it, so a legacy pending bit
+   * still re-emits and every later plain turn pays a single read.
+   */
+  private async hasAnyPendingWelcome(logger: RequestLogger): Promise<boolean> {
+    const marker = await this.state.storage.get<boolean>(MODE_WELCOME_PENDING_ANY_KEY);
+    if (marker !== undefined) return marker;
+    const found = await this.state.storage.list({ prefix: MODE_WELCOME_PENDING_PREFIX, limit: 1 });
+    const anyPending = found.size > 0;
+    await this.state.storage.put(MODE_WELCOME_PENDING_ANY_KEY, anyPending);
+    logger.log('mode_welcome_pending_marker_initialized', { any_pending: anyPending });
+    return anyPending;
   }
 
   /**
@@ -2766,12 +2847,12 @@ export class UserDO {
    * welcome on ANY subsequent turn in that mode — even without a `#` trigger —
    * as long as it is not yet `mode_welcomed`. Non-admins only (admins never
    * write pending). Returns `undefined` when nothing is pending.
+   *
+   * #422 (item 3): this runs on every plain (non-`#`) turn with an active mode,
+   * so it is gated behind the single `mode_welcome_pending_any` marker — the
+   * 1 + |aliases| per-slug reads below only run when some pending bit MAY exist
+   * (rare: a prior delivery failed and has not re-emitted yet).
    */
-  // TODO(review, #422): this runs on every plain (non-#) turn with an active mode
-  // and does 1 + |aliases| durable storage.get calls to detect the rare failed-
-  // delivery re-emit — an N+1 read on the chat hot path. Gate it behind a cheap
-  // signal (e.g. a single cached "has any pending" marker) so steady-state turns
-  // skip the per-alias reads. Tracked with the other welcome hardening in #422.
   private async maybePendingWelcome(
     body: ChatRequest,
     loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
@@ -2779,7 +2860,20 @@ export class UserDO {
     logger: RequestLogger
   ): Promise<ModeWelcome | undefined> {
     if (!activeModeName || loaded.isAdmin) return undefined;
+    if (!(await this.hasAnyPendingWelcome(logger))) return undefined;
+    return this.resolvePendingWelcome(body, loaded, activeModeName, logger);
+  }
 
+  /**
+   * The per-slug half of `maybePendingWelcome` (#311 FIX C), reached only when
+   * the `mode_welcome_pending_any` marker says a pending bit may exist (#422).
+   */
+  private async resolvePendingWelcome(
+    body: ChatRequest,
+    loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
+    activeModeName: string,
+    logger: RequestLogger
+  ): Promise<ModeWelcome | undefined> {
     const keys = this.modeWelcomeKeys(body, activeModeName);
     const mode = loaded.orgModes.modes.find((m) => m.name === activeModeName);
 
@@ -2853,16 +2947,22 @@ export class UserDO {
    * short-circuit fires or the authored copy was removed, so a stale pending bit
    * never lingers under the canonical key or a former slug. `mode` may be
    * undefined (mode deleted), in which case only the canonical key is cleared.
+   * #422: the deletes and the "any pending" marker refresh commit as one
+   * transaction, so the marker tracks the live bits exactly.
    */
   private async clearPendingAcrossCurrentSlugs(
     body: ChatRequest,
     mode: PromptMode | undefined,
     canonicalPendingKey: string
   ): Promise<void> {
-    await this.state.storage.delete(canonicalPendingKey);
-    for (const alias of mode?.aliases ?? []) {
-      await this.state.storage.delete(this.modeWelcomePendingKey(body, alias));
-    }
+    const keys = [
+      canonicalPendingKey,
+      ...(mode?.aliases ?? []).map((alias) => this.modeWelcomePendingKey(body, alias)),
+    ];
+    await this.state.storage.transaction(async (txn) => {
+      await txn.delete(keys);
+      await this.refreshPendingWelcomeMarker(txn);
+    });
   }
 
   /** Structured `mode_welcome_prepared` log shared by the emit paths (#311). */

@@ -158,7 +158,8 @@ export class ProgressCallbackSender {
    * Deliver a one-time mode first-contact welcome (#311) as its own webhook
    * message, ahead of the model's answer. Sent as a `progress` payload so the
    * gateway renders it as a standalone message — exactly how iteration deltas
-   * arrive — with zero gateway changes.
+   * arrive — with zero gateway changes. Never wired for `progress_mode:
+   * 'complete'` (#422) — there the welcome rides inside the `complete` payload.
    *
    * Unlike every other send here this does NOT swallow failures: it awaits the
    * POST and THROWS on a network error or non-2xx status. The caller writes the
@@ -502,7 +503,13 @@ export function createWebhookCallbacks(
     // #311: the welcome is its own message, sent before the model runs. It
     // rejects on failure (unlike the other callbacks, which log-and-continue)
     // so the DO withholds the mode_welcomed flag and re-emits on retry.
-    onWelcome: (text) => sender.sendWelcome(text),
+    // #422: NOT wired in 'complete' mode. That mode's contract (README
+    // "Progress modes") is ONLY the final `complete` event — a `progress`-typed
+    // welcome POST would be dropped by such a consumer while the one-time flag
+    // burned unseen. With no sink the DO prepends the welcome in-band into
+    // `responses`, so it ships inside the single `complete` payload: one
+    // message, as the mode promises.
+    ...(mode === 'complete' ? {} : { onWelcome: (text: string) => sender.sendWelcome(text) }),
   };
 
   if (mode === 'iteration' && !suppressProgressText) {
