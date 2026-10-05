@@ -1589,9 +1589,15 @@ function stripPromptComments(
  */
 function applyResourcePriorityToPrompt(
   values: Required<Record<PromptSlot, string>>,
+  catalog: OrchestratorOptions['catalog'],
   logger: RequestLogger
 ): Required<Record<PromptSlot, string>> {
-  const priority = applyResourcePriority(values.tool_guidance);
+  // The directive labels ranked servers the way the tool catalog does (display
+  // name), so the model can join a ranking entry to the tools under it.
+  const serverNames = new Map(
+    [...catalog.serverMap].map(([id, server]) => [id, server.name] as const)
+  );
+  const priority = applyResourcePriority(values.tool_guidance, serverNames);
   if (priority.order === 'corrupt') {
     logger.warn('resource_priority_corrupt', { source: 'prompt_slot:tool_guidance' });
   } else if (priority.applied && Array.isArray(priority.order)) {
@@ -1671,7 +1677,7 @@ function createOrchestrationContext(
     options.languageDocument,
     logger
   );
-  const promptValues = applyResourcePriorityToPrompt(strippedValues, logger);
+  const promptValues = applyResourcePriorityToPrompt(strippedValues, catalog, logger);
   const llmMax = orgConfig?.max_history_llm ?? DEFAULT_ORG_CONFIG.max_history_llm;
 
   // prettier-ignore

@@ -128,18 +128,61 @@ describe('splitResourceId / resourceNameFromId', () => {
   });
 });
 
-describe('renderResourcePriorityDirective', () => {
-  it('lists ranked resources with their server and cites the scripture lever', () => {
+describe('renderResourcePriorityDirective - server-aware entries (#341)', () => {
+  it('names the ranked server and its resource ids for a translation-helps ranking', () => {
     const directive = renderResourcePriorityDirective([
       'translation-helps:ult',
       'translation-helps:ust',
     ]);
     expect(directive).toContain('### Applying the resource priority');
-    expect(directive).toContain('1. ult — translation-helps');
-    expect(directive).toContain('2. ust — translation-helps');
-    expect(directive).toContain('`fetch_scripture`');
+    expect(directive).toContain('1. server translation-helps: ult, then ust');
+    // #341: no hardcoded tool name — the pool decides which tool serves a server.
+    expect(directive).not.toContain('fetch_scripture');
   });
 
+  it('derives an aquifer-only ranking from the ids, with no foreign tool or resource names', () => {
+    const directive = renderResourcePriorityDirective([
+      'aquifer:WorldEnglishBible',
+      'aquifer:BereanStandardBible',
+    ]);
+    expect(directive).toContain('1. server aquifer: WorldEnglishBible, then BereanStandardBible');
+    expect(directive).not.toContain('2.');
+    // #341 regression: the old directive named `fetch_scripture` and primed
+    // `ult`/`ust`/`t4t`/`ueb` for every ranking, including an Aquifer one.
+    expect(directive).not.toContain('fetch_scripture');
+    expect(directive).not.toContain('`ult`');
+    expect(directive).not.toContain('`ust`');
+    expect(directive).not.toContain('t4t');
+    expect(directive).not.toContain('ueb');
+    expect(directive).not.toContain('translation-helps');
+  });
+
+  it('keeps a mixed-server ranking in ranked order, one entry per consecutive server run', () => {
+    const directive = renderResourcePriorityDirective([
+      'aquifer:WorldEnglishBible',
+      'translation-helps:ult',
+      'aquifer:BereanStandardBible',
+    ]);
+    const first = directive.indexOf('1. server aquifer: WorldEnglishBible');
+    const second = directive.indexOf('2. server translation-helps: ult');
+    const third = directive.indexOf('3. server aquifer: BereanStandardBible');
+    expect(first).toBeGreaterThan(-1);
+    expect(second).toBeGreaterThan(first);
+    expect(third).toBeGreaterThan(second);
+    // The interleaving is NOT collapsed into one aquifer group, which would
+    // silently promote BereanStandardBible above ult.
+    expect(directive).not.toContain('WorldEnglishBible, then BereanStandardBible');
+  });
+
+  it('lists an id with no server prefix plainly', () => {
+    const directive = renderResourcePriorityDirective(['noColon', 'aquifer:WorldEnglishBible']);
+    expect(directive).toContain('1. noColon');
+    expect(directive).not.toContain('1. server');
+    expect(directive).toContain('2. server aquifer: WorldEnglishBible');
+  });
+});
+
+describe('renderResourcePriorityDirective - wording and de-duplication', () => {
   it('keeps the coverage qualifier in the disclosure sentence', () => {
     const directive = renderResourcePriorityDirective(['translation-helps:ult']);
     // Disclosure fires only when bypassing the top source THAT COVERS the
@@ -149,8 +192,8 @@ describe('renderResourcePriorityDirective', () => {
 
   it('keeps the same name under different servers as distinct ranked entries', () => {
     const directive = renderResourcePriorityDirective(['translation-helps:ult', 'aquifer:ult']);
-    expect(directive).toContain('1. ult — translation-helps');
-    expect(directive).toContain('2. ult — aquifer');
+    expect(directive).toContain('1. server translation-helps: ult');
+    expect(directive).toContain('2. server aquifer: ult');
   });
 
   it('de-duplicates by full composite id, preserving first-seen position', () => {
@@ -159,9 +202,9 @@ describe('renderResourcePriorityDirective', () => {
       'translation-helps:ult',
       'translation-helps:ust',
     ]);
-    expect(directive).toContain('1. ult — translation-helps');
-    expect(directive).toContain('2. ust — translation-helps');
-    expect(directive).not.toContain('3.');
+    expect(directive).toContain('1. server translation-helps: ult, then ust');
+    expect(directive).not.toContain('ult, then ult');
+    expect(directive).not.toContain('2.');
   });
 
   it('returns empty string when no usable ids remain', () => {
@@ -170,9 +213,69 @@ describe('renderResourcePriorityDirective', () => {
   });
 });
 
+describe('renderResourcePriorityDirective - catalog display names (#341 review)', () => {
+  // The tool catalog the model sees headings each server by its display name
+  // (`### Translation Helps MCP`), never by its id, so the directive must carry
+  // the display name for the model to join a ranked server to its tools.
+  const names = new Map([
+    ['translation-helps', 'Translation Helps MCP'],
+    ['aquifer', 'Aquifer MCP'],
+  ]);
+
+  it('labels each server with its catalog display name and keeps the id as the join key', () => {
+    const directive = renderResourcePriorityDirective(
+      ['translation-helps:ult', 'aquifer:WorldEnglishBible'],
+      names
+    );
+    expect(directive).toContain('1. server Translation Helps MCP (id translation-helps): ult');
+    expect(directive).toContain('2. server Aquifer MCP (id aquifer): WorldEnglishBible');
+  });
+
+  it('falls back to the bare id when the server is not in the catalog', () => {
+    const directive = renderResourcePriorityDirective(['th2:ult'], names);
+    expect(directive).toContain('1. server th2: ult');
+  });
+});
+
+describe('renderResourcePriorityDirective - selector wording (#341 review)', () => {
+  const names = new Map([['aquifer', 'Aquifer MCP']]);
+
+  it('tells the model to pass only the resource id, never the server prefix', () => {
+    const directive = renderResourcePriorityDirective(['aquifer:WorldEnglishBible'], names);
+    expect(directive).toContain('only the resource id after the colon');
+    expect(directive).not.toContain('pass the id exactly as written');
+  });
+
+  it('describes unprefixed ids as bare resource ids instead of claiming a server for them', () => {
+    const directive = renderResourcePriorityDirective(['noColon'], names);
+    expect(directive).toContain('1. noColon');
+    expect(directive).toContain('An entry without a `server` prefix is a bare resource id');
+    expect(directive).toContain('(for entry 1 that is `noColon`)');
+    expect(directive).not.toContain('Each entry names a server');
+  });
+
+  it('draws the selector example from the ranking itself, never from a foreign resource', () => {
+    const directive = renderResourcePriorityDirective(['translation-helps:ult'], names);
+    expect(directive).toContain('(for entry 1 that is `ult`)');
+    expect(directive).not.toContain('WorldEnglishBible');
+    expect(directive).not.toContain('aquifer');
+  });
+});
+
 describe('applyResourcePriority - transform', () => {
   it('leaves guidance with no block untouched (identity)', () => {
     const input = 'Prefer authoritative sources.';
+    const result = applyResourcePriority(input);
+    expect(result.applied).toBe(false);
+    expect(result.order).toBeNull();
+    expect(result.toolGuidance).toBe(input);
+  });
+
+  it('is byte-identical for multi-line guidance with ordinary comments, blank runs and CRLF (prompt-cache)', () => {
+    // The transformed slot sits in the cacheable stable system block, so any
+    // byte drift when no block is present would bust the prompt cache.
+    const input =
+      'Lead.\r\n\r\n\r\n<!-- author note -->\r\n  indented line\r\nTrailing whitespace   \r\n\r\n';
     const result = applyResourcePriority(input);
     expect(result.applied).toBe(false);
     expect(result.order).toBeNull();
@@ -196,10 +299,33 @@ describe('applyResourcePriority - transform', () => {
     expect(result.toolGuidance).toContain('strongly prefer the sources below');
     expect(result.toolGuidance).toContain('1. Literal Text');
 
-    // The actionable directive is appended, naming the concrete lever + entries.
+    // The actionable directive is appended, derived from the ranked ids.
     expect(result.toolGuidance).toContain('### Applying the resource priority');
-    expect(result.toolGuidance).toContain('ult — translation-helps');
-    expect(result.toolGuidance).toContain('`fetch_scripture`');
+    expect(result.toolGuidance).toContain('1. server translation-helps: ult, then ust');
+    expect(result.toolGuidance).not.toContain('fetch_scripture');
+  });
+});
+
+describe('applyResourcePriority - transform with catalog names (#341 review)', () => {
+  it('passes catalog display names through to the rendered directive', () => {
+    const input = slotWithBlock('<!-- order: ["aquifer:WorldEnglishBible"] -->');
+    const result = applyResourcePriority(input, new Map([['aquifer', 'Aquifer MCP']]));
+    expect(result.applied).toBe(true);
+    expect(result.toolGuidance).toContain('1. server Aquifer MCP (id aquifer): WorldEnglishBible');
+  });
+
+  it('applies an aquifer ranking without naming any translation-helps tool or resource', () => {
+    const input = slotWithBlock(
+      '<!-- order: ["aquifer:WorldEnglishBible","aquifer:BereanStandardBible"] -->'
+    );
+    const result = applyResourcePriority(input);
+    expect(result.applied).toBe(true);
+    expect(result.order).toEqual(['aquifer:WorldEnglishBible', 'aquifer:BereanStandardBible']);
+    expect(result.toolGuidance).toContain(
+      '1. server aquifer: WorldEnglishBible, then BereanStandardBible'
+    );
+    expect(result.toolGuidance).not.toContain('fetch_scripture');
+    expect(result.toolGuidance).not.toContain('`ult`');
   });
 });
 
