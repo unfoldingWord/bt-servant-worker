@@ -22,7 +22,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { CfWorkerJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/cfworker';
 
 import { MCPError, MCPResponseTooLargeError } from '../../utils/errors.js';
-import { redactArgsForError, RequestLogger, summarizeArgs } from '../../utils/logger.js';
+import { redactArgsForError, RequestLogger, sanitizeArgsForLog } from '../../utils/logger.js';
 import {
   CallMCPToolOptions,
   DEFAULT_MAX_RESPONSE_SIZE_BYTES,
@@ -198,7 +198,7 @@ function logToolSuccess(
     server_id: ctx.serverId,
     transport: 'streamable-http',
     tool_name: ctx.toolName,
-    args: summarizeArgs(ctx.args),
+    args: sanitizeArgsForLog(ctx.args),
     duration_ms: ctx.responseTimeMs,
     has_metadata: !!metadata,
     downstream_calls: metadata?.downstream_api_calls,
@@ -249,7 +249,7 @@ export async function callMCPToolViaSdk(
     server_id: server.id,
     transport: 'streamable-http',
     tool_name: toolName,
-    args: summarizeArgs(args),
+    args: sanitizeArgsForLog(args),
   });
   let opened: ConnectedClient | null = null;
   try {
