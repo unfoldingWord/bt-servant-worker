@@ -408,6 +408,67 @@ describe('buildSystemPrompt - media formatting rules (non-overridable)', () => {
   });
 });
 
+describe('buildSystemPrompt - resource availability rules (non-overridable, #342)', () => {
+  const HEADING = '## Never invent resource availability';
+
+  it('grounds availability claims in tool results from this turn', () => {
+    const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
+    expect(prompt).toContain(HEADING);
+    expect(prompt).toContain('if a tool returned it during this turn');
+    expect(prompt).toContain('version-listing tool of each scripture server');
+    expect(prompt).toContain('check the other scripture servers');
+    expect(prompt).toContain('NEVER offer a substitute version that no tool returned');
+  });
+
+  it('survives when every overridable slot is replaced', () => {
+    const custom = {
+      identity: 'X_IDENTITY',
+      methodology: 'X_METHODOLOGY',
+      tool_guidance: 'X_TOOL_GUIDANCE',
+      instructions: 'X_INSTRUCTIONS',
+      client_instructions: 'X_CLIENT_INSTRUCTIONS',
+      memory_instructions: 'X_MEMORY',
+      closing: 'X_CLOSING',
+    };
+    const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], custom);
+    expect(prompt).toContain(HEADING);
+  });
+});
+
+describe('buildSystemPrompt - resource availability rules: placement and scope', () => {
+  const HEADING = '## Never invent resource availability';
+
+  it('is present in voice mode too, and sits before the closing', () => {
+    const prompt = buildSystemPrompt(
+      createEmptyCatalog(),
+      defaultPrefs,
+      [],
+      DEFAULT_PROMPT_VALUES,
+      { isVoiceMessage: true }
+    );
+    expect(prompt).toContain(HEADING);
+    expect(prompt.indexOf(HEADING)).toBeLessThan(prompt.indexOf(DEFAULT_PROMPT_VALUES.closing));
+  });
+
+  it('names no specific server or version', () => {
+    const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
+    const start = prompt.indexOf(HEADING);
+    const rule = prompt.slice(start, prompt.indexOf('\n\n## ', start + HEADING.length));
+    for (const name of [
+      'KJV',
+      'NIV',
+      'ESV',
+      'ASV',
+      'BSB',
+      'aquifer',
+      'yaapi',
+      'translation-helps',
+    ]) {
+      expect(rule).not.toContain(name);
+    }
+  });
+});
+
 describe('buildSystemPrompt - language guidance', () => {
   it('includes language guidance section when languageDocument is provided', () => {
     const prompt = buildSystemPrompt(
