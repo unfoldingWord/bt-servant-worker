@@ -169,7 +169,13 @@ gating a deploy — bump them deliberately, never to "latest":
   — HTTP 200 = good; it prints a `smoke_marker` to query for). Its trace-side companion is
   [`tools/send_trace.sh`](../../tools/send_trace.sh), which proves the OpenObserve leg. The
   smoke test goes **around** the collector, so it proves auth + org + ingest and nothing
-  about the delta→cumulative conversion — that is the invariant script's job.
+  about the delta→cumulative conversion — that is the invariant script's job. It sends
+  OTLP/JSON, which Mimir's OTLP parser accepts alongside protobuf (exact-match on
+  `application/json` / `application/x-protobuf`; anything else is a 415).
+- **Source IPs.** door43's gateway (`mimir.door43.org` and the old `metrics.door43.org`
+  resolve to the same host) does not answer TCP from arbitrary networks — a laptop on a home
+  ISP times out at connect. Run the smoke test from an allowed network, or prove the leg
+  through the collector's fly egress, which is what the Influx sink already relied on.
 - **Temporality.** The worker emits DELTA (ephemeral isolates; see the header of
   `src/services/telemetry/metrics.ts`). Mimir expects CUMULATIVE, so the `metrics/mimir`
   pipeline runs `deltatocumulative` (`max_stale: 1h`) and the OpenObserve pipeline does not.

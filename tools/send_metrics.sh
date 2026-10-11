@@ -6,6 +6,11 @@
 # to Mimir's native OTLP endpoint, carrying a unique marker so you can find exactly it.
 # Companion to send_trace.sh, which proves the collector→OpenObserve leg.
 #
+# Encoding: OTLP/JSON with `Content-Type: application/json`, which Mimir's OTLP parser
+# accepts alongside `application/x-protobuf` (pkg/distributor/otel.go, newOTLPParser:
+# exact-match switch on the two content types, 415 for anything else). JSON is used so
+# this stays a dependency-free bash script; the collector itself sends protobuf.
+#
 # Why it sends a CUMULATIVE sum: Mimir is Prometheus-shaped and expects cumulative
 # temporality. The worker emits DELTA and the collector's `deltatocumulative` processor
 # converts in between — this script goes around the collector, so it has to speak Mimir's
@@ -113,7 +118,8 @@ if [[ "$HTTP_CODE" =~ ^2 ]]; then
   echo "   (Mimir appends _total to monotonic sums; drop the suffix if your Mimir does not.)"
 else
   echo "❌ FAILED — Mimir returned HTTP ${HTTP_CODE} for user '${MIMIR_USER}'."
-  echo "   401/403 = bad username/password; 415 = this Mimir wants protobuf, not JSON —"
-  echo "   prove the leg through the collector instead (README 'Prove it')."
+  echo "   401/403 = bad username/password. 415 = content type or encoding rejected: Mimir"
+  echo "   accepts exactly 'application/json' or 'application/x-protobuf' (no charset"
+  echo "   suffix) and only gzip/lz4/zstd encodings — check for a proxy rewriting headers."
   exit 1
 fi
