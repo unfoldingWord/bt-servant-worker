@@ -1,45 +1,47 @@
 #!/usr/bin/env bash
 #
-# InfluxDB ingestion smoke test — verify the token↔bucket auth (JJ's Nginx) and the
-# auto-create-on-first-write behavior work, BEFORE wiring the OTel collector's influxdb
-# exporter ("opening the sluice"). Sends N line-protocol points straight to the write API.
+# Mimir ingestion smoke test — verify a door43 Mimir username↔password pair is accepted
+# and lands in the org that username maps to, BEFORE (or independently of) the OTel
+# collector's otlp_http/mimir_metrics exporter. Sends ONE real OTLP/JSON metric straight
+# to Mimir's native OTLP endpoint, carrying a unique marker so you can find exactly it.
+# Companion to send_trace.sh, which proves the collector→OpenObserve leg.
 #
-# Adapted from JJ's send_metrics.sh: parameterized for bucket/token, prints the HTTP
-# status so success/failure is unambiguous, and uses a labeled, easily-purged measurement
-# (`btservant_smoke_test`, tag source=smoke) instead of a generic `test_measure`.
+# Why it sends a CUMULATIVE sum: Mimir is Prometheus-shaped and expects cumulative
+# temporality. The worker emits DELTA and the collector's `deltatocumulative` processor
+# converts in between — this script goes around the collector, so it has to speak Mimir's
+# dialect itself. A 200 here proves auth + org + ingest; it says nothing about the
+# collector's conversion, which `assert-collector-invariants.py` guards instead.
 #
-# Usage (preferred — the script prompts for the token, so it never touches shell
+# Usage (preferred — the script prompts for the password, so it never touches shell
 # history OR any process's argv/environment listing):
-#   ./tools/send_metrics.sh <bucket>
+#   ./tools/send_metrics.sh <mimir-user>
 # Examples:
 #   ./tools/send_metrics.sh bt-servant-staging
 #   ./tools/send_metrics.sh bt-servant
 #
-# Non-interactive (CI) alternative: export INFLUX_TOKEN in the environment beforehand
-# (e.g. from a secret store). Avoid the inline `INFLUX_TOKEN=... ./tools/...` form —
+# Non-interactive (CI) alternative: export MIMIR_PASSWORD in the environment beforehand
+# (e.g. from a secret store). Avoid the inline `MIMIR_PASSWORD=... ./tools/...` form —
 # depending on shell/history settings the assignment can persist in history.
 #
 # Env overrides:
-#   INFLUX_URL   base URL (default https://metrics.door43.org)
-#   MAX_LOOPS    number of points to send (default 50)
+#   MIMIR_URL      full OTLP metrics URL (default https://mimir.door43.org/otlp/v1/metrics)
+#   SMOKE_MARKER   the unique id to search for (default: generated)
 set -euo pipefail
 
-BUCKET="${1:?usage: $0 <bucket>   (prompts for the token)}"
-BASE_URL="${INFLUX_URL:-https://metrics.door43.org}"
-MAX_LOOPS="${MAX_LOOPS:-50}"
+MIMIR_USER="${1:?usage: $0 <mimir-user>   (prompts for the password)}"
+URL="${MIMIR_URL:-https://mimir.door43.org/otlp/v1/metrics}"
+# Unique per run so you can find THIS sample and not a previous operator's.
+MARKER="${SMOKE_MARKER:-smoke-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 
-# Acquire the token without echoing it and without it ever appearing in argv.
-if [ -z "${INFLUX_TOKEN:-}" ]; then
-  read -rs -p "InfluxDB token for bucket '${BUCKET}': " INFLUX_TOKEN
+# Acquire the password without echoing it and without it ever appearing in argv.
+if [ -z "${MIMIR_PASSWORD:-}" ]; then
+  read -rs -p "Mimir password for user '${MIMIR_USER}': " MIMIR_PASSWORD
   echo
 fi
-[ -n "$INFLUX_TOKEN" ] || {
-  echo "❌ no token provided"
+[ -n "$MIMIR_PASSWORD" ] || {
+  echo "❌ no password provided"
   exit 1
 }
-
-URL="${BASE_URL%/}/api/v2/write?bucket=${BUCKET}"
-START_TIME=$(date +%s%N) # nanoseconds — v2 /api/v2/write defaults to ns precision
 
 PAYLOAD="$(mktemp)"
 RESP="$(mktemp)"
@@ -50,18 +52,54 @@ chmod 600 "$HEADERS"
 # The auth header goes to curl via a config FILE, not -H on the command line — a header
 # passed as an argument is visible to every local user in the process list (`ps`/Task
 # Manager) for the duration of the request. The file is 0600 and removed on exit.
-printf 'header = "X-InfluxDB-API-Token: %s"\n' "$INFLUX_TOKEN" >"$HEADERS"
+printf 'header = "Authorization: Basic %s"\n' \
+  "$(printf '%s:%s' "$MIMIR_USER" "$MIMIR_PASSWORD" | base64 | tr -d '\n')" >"$HEADERS"
 
-for ((count = 0; count < MAX_LOOPS; count++)); do
-  RAND_VAL=$((RANDOM % 101))
-  # Deduct 1ms per loop so every point has a unique, sequential timestamp.
-  POINT_TIME=$((START_TIME - (count * 1000000)))
-  echo "btservant_smoke_test,source=smoke,bucket=${BUCKET} value=${RAND_VAL}i ${POINT_TIME}" >>"$PAYLOAD"
-done
+NOW_NS="$(date +%s%N)"
 
-echo "POST ${URL}  (${MAX_LOOPS} points)"
+# One cumulative, monotonic sum with a single data point. aggregationTemporality 2 =
+# CUMULATIVE in OTLP's enum (1 = DELTA). Resource attributes mirror the worker's shape
+# (service.name + service.namespace) so the series lands as job="smoke/bt-servant-smoke"
+# in Mimir, well away from real traffic.
+cat >"$PAYLOAD" <<JSON
+{
+  "resourceMetrics": [{
+    "resource": {
+      "attributes": [
+        { "key": "service.name",      "value": { "stringValue": "bt-servant-smoke" } },
+        { "key": "service.namespace", "value": { "stringValue": "smoke" } }
+      ]
+    },
+    "scopeMetrics": [{
+      "scope": { "name": "tools/send_metrics.sh" },
+      "metrics": [{
+        "name": "btservant_smoke_test",
+        "description": "Mimir ingestion smoke test; safe to delete",
+        "unit": "1",
+        "sum": {
+          "aggregationTemporality": 2,
+          "isMonotonic": true,
+          "dataPoints": [{
+            "startTimeUnixNano": "${NOW_NS}",
+            "timeUnixNano": "${NOW_NS}",
+            "asInt": "1",
+            "attributes": [
+              { "key": "source",       "value": { "stringValue": "smoke" } },
+              { "key": "smoke_marker", "value": { "stringValue": "${MARKER}" } },
+              { "key": "mimir_user",   "value": { "stringValue": "${MIMIR_USER}" } }
+            ]
+          }]
+        }
+      }]
+    }]
+  }]
+}
+JSON
+
+echo "POST ${URL}  as ${MIMIR_USER}  (marker ${MARKER})"
 HTTP_CODE=$(curl -s -o "$RESP" -w '%{http_code}' -X POST "$URL" \
   --config "$HEADERS" \
+  -H 'Content-Type: application/json' \
   --data-binary @"$PAYLOAD")
 
 echo "HTTP ${HTTP_CODE}"
@@ -69,8 +107,13 @@ BODY="$(cat "$RESP")"
 [ -n "$BODY" ] && echo "Response: ${BODY}"
 
 if [[ "$HTTP_CODE" =~ ^2 ]]; then
-  echo "✅ OK — bucket '${BUCKET}' accepted ${MAX_LOOPS} points."
+  echo "✅ OK — Mimir accepted the sample for user '${MIMIR_USER}'."
+  echo "   Find it in Grafana (that user's org):"
+  echo "     btservant_smoke_test_total{smoke_marker=\"${MARKER}\"}"
+  echo "   (Mimir appends _total to monotonic sums; drop the suffix if your Mimir does not.)"
 else
-  echo "❌ FAILED — bucket '${BUCKET}' returned HTTP ${HTTP_CODE}."
+  echo "❌ FAILED — Mimir returned HTTP ${HTTP_CODE} for user '${MIMIR_USER}'."
+  echo "   401/403 = bad username/password; 415 = this Mimir wants protobuf, not JSON —"
+  echo "   prove the leg through the collector instead (README 'Prove it')."
   exit 1
 fi

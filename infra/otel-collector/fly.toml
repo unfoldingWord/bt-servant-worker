@@ -10,17 +10,19 @@ primary_region = "iad"
   #   fly deploy --build-arg OTELCOL_VERSION=<stable-tag>
 
 [env]
-  # The door43 InfluxDB bucket this app writes metrics to. NOT a secret — it is a bucket
-  # name, and only the paired INFLUX_TOKEN is sensitive. It lives here rather than in fly
-  # secrets because it is the single value that distinguishes staging from production, and
-  # as a secret it was invisible: `fly secrets list` shows a digest, never the value, so
-  # nothing could tell you which bucket an app was really writing to.
-  # `assert-collector-invariants.py` asserts this matches the app above.
+  # The Mimir (door43) username this app authenticates as. door43 maps each username to a
+  # fixed Mimir org, so this is what decides where the metrics land. NOT a secret — it is
+  # an org identifier, and only the paired MIMIR_PASSWORD is sensitive. It lives here
+  # rather than in fly secrets because it is the single value that distinguishes staging
+  # from production, and as a secret it would be invisible: `fly secrets list` shows a
+  # digest, never the value, so nothing could tell you which org an app was really
+  # writing to. `assert-collector-invariants.py` asserts this matches the app above.
   #
   # A fly SECRET of the same name takes precedence over this block. If `flyctl secrets list
-  # --app bt-servant-otel-collector` still shows INFLUX_BUCKET, that leftover is what the
-  # collector is using and this line is dead — `flyctl secrets unset INFLUX_BUCKET`.
-  INFLUX_BUCKET = "bt-servant-staging"
+  # --app bt-servant-otel-collector` ever shows MIMIR_USER, that leftover is what the
+  # collector is using and this line is dead — `flyctl secrets unset MIMIR_USER`. The
+  # deploy pre-flight fails on exactly that.
+  MIMIR_USER = "bt-servant-staging"
 
 [http_service]
   internal_port = 4318          # OTLP/HTTP; fly terminates TLS on 443 in front of this

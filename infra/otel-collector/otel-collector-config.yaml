@@ -1,11 +1,12 @@
 # OpenTelemetry Collector — bt-servant-worker telemetry pipe (fly.io)
 #
 # One bearer-authed OTLP/HTTP receiver exports every signal to OpenObserve
-# (self-hosted on fly); metrics ALSO fan out to InfluxDB 3 (door43). Kept as a
+# (self-hosted on fly); metrics ALSO fan out to Grafana Mimir (door43). Kept as a
 # collector (not worker→sink direct) so sinks are added/changed HERE ONLY — the
 # worker never redeploys.
 #
-# All ${env:...} values come from fly secrets (see README). Nothing secret in git.
+# All ${env:...} values come from fly secrets or `fly.toml [env]` (see README).
+# Nothing secret in git.
 
 extensions:
   # Validates the shared secret the worker sends as `Authorization: Bearer <token>`.
@@ -13,6 +14,19 @@ extensions:
   bearertokenauth/server:
     scheme: Bearer
     token: ${env:OTEL_INGEST_TOKEN}
+
+  # CLIENT credentials for the Mimir exporter below. door43 maps each Basic-auth username
+  # to a fixed Mimir org (tenant), so the USERNAME is what selects where metrics land:
+  # staging authenticates as `bt-servant-staging`, prod as `bt-servant`. It is an org
+  # identifier, not a credential, and lives in each app's `fly.toml [env]` where the
+  # app↔org pairing is diffable and asserted by `assert-collector-invariants.py`. Only
+  # the password is a fly secret. No default on purpose — an unset username resolves to
+  # "" and every export becomes a 401 while the collector stays healthy, which is why the
+  # deploy pre-flight checks the secret and the invariant script checks the [env].
+  basicauth/mimir:
+    client_auth:
+      username: ${env:MIMIR_USER}
+      password: ${env:MIMIR_PASSWORD}
 
 receivers:
   otlp:
@@ -47,6 +61,29 @@ processors:
       # pure liability here. Never weaken this back to `hash`.
       - { key: user_id, action: delete }
 
+  # ── Temporality bridge for the Mimir pipeline ONLY ──
+  # The worker emits DELTA metrics on purpose: Worker isolates are ephemeral and each
+  # drains its measurements once per invocation, so a cumulative counter would be a
+  # sawtooth of per-isolate resets (see src/services/telemetry/metrics.ts). Mimir is
+  # Prometheus-shaped and expects CUMULATIVE; its native delta ingestion is an
+  # experimental server-side flag we do not depend on. This processor accumulates the
+  # deltas in memory and re-emits running totals. It fits this producer unusually well:
+  # the worker's only resource attributes are service.name + service.namespace, so every
+  # isolate collapses into ONE stream per label set, and the label set is
+  # cardinality-bounded at the source. A collector restart just looks like a counter
+  # reset, which PromQL rate()/increase() handle natively.
+  #
+  # NOT on the OpenObserve pipeline: OpenObserve ingests delta as-is and its dashboards
+  # were built on that; converting there would change what they show.
+  #
+  # max_stale: how long an idle series is kept before being forgotten (default 5m). A
+  # forgotten series restarts from its next delta, which Prometheus reads as a reset —
+  # harmless, but 1h means far fewer of them for our low-traffic series, and memory at
+  # our cardinality is trivial. max_streams is left unbounded on purpose: a hit cap drops
+  # NEW streams silently, and memory_limiter already guards the machine.
+  deltatocumulative:
+    max_stale: 1h
+
   batch:
     timeout: 5s
     send_batch_size: 512
@@ -69,25 +106,19 @@ exporters:
     headers:
       Authorization: ${env:O2_AUTH} # metrics auto-stream, no stream-name
 
-  # ── Sink #2 (metrics only): InfluxDB 3 Core via door43's Nginx write proxy ──
-  # Influx 3 has NO native OTLP receiver, so this exporter converts OTLP metrics to
-  # line protocol and POSTs them to the v2-compat write API
-  # (`/api/v2/write?org=...&bucket=...`). The Nginx in front VALIDATES the
-  # `bucket=` in the request against the token, so `bucket` must be the exact name
-  # the token is mapped to; the bucket auto-creates on first write (retention is
-  # then set by infra, after creation). Auth is door43's CUSTOM header — the
-  # exporter's own `token` field would send `Authorization: Token ...`, which the
-  # proxy does not read, so it stays unset and the header is passed explicitly.
-  influxdb/door43_metrics:
-    endpoint: https://metrics.door43.org
-    org: unfoldingword # required by the exporter; Influx 3 ignores it (bucket is what's validated)
-    # Env-driven so ONE config file serves both collector apps: staging sets
-    # INFLUX_BUCKET=bt-servant-staging, prod sets INFLUX_BUCKET=bt-servant. No default
-    # on purpose — a wrong-but-plausible bucket is worse than a startup failure, and
-    # door43's Nginx validates the bucket against the token anyway.
-    bucket: ${env:INFLUX_BUCKET}
-    headers:
-      X-InfluxDB-API-Token: ${env:INFLUX_TOKEN}
+  # ── Sink #2 (metrics only): Grafana Mimir via door43 ──
+  # Mimir has a native OTLP/HTTP receiver, so this is a plain otlp_http exporter.
+  # `metrics_endpoint` is the FULL URL door43 published (used as-is, nothing appended),
+  # rather than `endpoint` + an implied /v1/metrics — so the config says exactly what
+  # the proxy expects and nothing else. Auth goes THROUGH the basicauth/mimir extension
+  # (not an ad-hoc `headers:` entry) so the username that selects the org is the one
+  # value the invariant script asserts; `assert-collector-invariants.py` fails the build
+  # if this exporter does not authenticate via that extension. Replaced the InfluxDB 3
+  # line-protocol exporter when door43 retired Influx.
+  otlp_http/mimir_metrics:
+    metrics_endpoint: https://mimir.door43.org/otlp/v1/metrics
+    auth:
+      authenticator: basicauth/mimir
 
   # DELIBERATELY NOT WIRED INTO ANY PIPELINE, and it must stay that way:
   # `assert-collector-invariants.py` FAILS if `debug` appears in any pipeline, and every
@@ -106,7 +137,7 @@ exporters:
     verbosity: detailed
 
 service:
-  extensions: [bearertokenauth/server]
+  extensions: [bearertokenauth/server, basicauth/mimir]
   pipelines:
     traces:
       receivers: [otlp]
@@ -116,10 +147,18 @@ service:
       receivers: [otlp]
       processors: [memory_limiter, attributes/redact, batch]
       exporters: [otlp_http/openobserve_logs]
+    # Metrics fan out via TWO pipelines off the same receiver rather than one pipeline with
+    # two exporters, because only the Mimir leg needs the delta→cumulative conversion and
+    # a processor applies to every exporter in its pipeline. Both run attributes/redact —
+    # the invariant script requires the user_id delete on EVERY pipeline.
     metrics:
       receivers: [otlp]
       processors: [memory_limiter, attributes/redact, batch]
-      exporters: [otlp_http/openobserve_metrics, influxdb/door43_metrics]
+      exporters: [otlp_http/openobserve_metrics]
+    metrics/mimir:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/redact, deltatocumulative, batch]
+      exporters: [otlp_http/mimir_metrics]
   telemetry:
     logs:
       level: info

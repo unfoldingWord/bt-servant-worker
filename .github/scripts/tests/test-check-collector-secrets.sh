@@ -32,7 +32,7 @@ STUB
 chmod +x "$stub_dir/flyctl"
 
 failures=0
-ALL_REQUIRED="OTEL_INGEST_TOKEN,O2_ENDPOINT,O2_AUTH,INFLUX_TOKEN"
+ALL_REQUIRED="OTEL_INGEST_TOKEN,O2_ENDPOINT,O2_AUTH,MIMIR_PASSWORD"
 
 # expect <exit> <label> <secret-list> [text that must appear in output]
 expect() {
@@ -60,30 +60,30 @@ expect() {
 
 echo "Testing $script"
 
-# ── The happy path: exactly the four secrets, and no bucket shadowing [env]. ───────────
+# ── The happy path: exactly the four secrets, and no Mimir user shadowing [env]. ───────
 expect 0 "all required present, no shadow" "$ALL_REQUIRED"
 
-# ── The reason PR B exists. A leftover INFLUX_BUCKET secret silently overrides the ─────
-# reviewed fly.toml [env] value, so the deploy must NOT proceed.
-expect 1 "INFLUX_BUCKET still set as a secret" \
-  "$ALL_REQUIRED,INFLUX_BUCKET" "flyctl secrets unset"
+# ── The reason PR B exists. A MIMIR_USER secret silently overrides the reviewed ────────
+# fly.toml [env] value, so the deploy must NOT proceed.
+expect 1 "MIMIR_USER set as a secret" \
+  "$ALL_REQUIRED,MIMIR_USER" "flyctl secrets unset"
 
 # ── The original direction must keep working. ─────────────────────────────────────────
 expect 1 "a required secret is missing" \
-  "OTEL_INGEST_TOKEN,O2_ENDPOINT,INFLUX_TOKEN" "O2_AUTH"
+  "OTEL_INGEST_TOKEN,O2_ENDPOINT,MIMIR_PASSWORD" "O2_AUTH"
 
 expect 1 "no secrets at all" "" "OTEL_INGEST_TOKEN"
 
 # ── Both problems at once must report BOTH, not just whichever is checked first. ───────
-expect 1 "missing required AND shadowed bucket (reports both)" \
-  "OTEL_INGEST_TOKEN,O2_ENDPOINT,INFLUX_TOKEN,INFLUX_BUCKET" "O2_AUTH"
-expect 1 "missing required AND shadowed bucket (reports the shadow too)" \
-  "OTEL_INGEST_TOKEN,O2_ENDPOINT,INFLUX_TOKEN,INFLUX_BUCKET" "INFLUX_BUCKET"
+expect 1 "missing required AND shadowed user (reports both)" \
+  "OTEL_INGEST_TOKEN,O2_ENDPOINT,MIMIR_PASSWORD,MIMIR_USER" "O2_AUTH"
+expect 1 "missing required AND shadowed user (reports the shadow too)" \
+  "OTEL_INGEST_TOKEN,O2_ENDPOINT,MIMIR_PASSWORD,MIMIR_USER" "MIMIR_USER"
 
 # ── A secret whose name merely CONTAINS a required name must not satisfy it. ───────────
 # `grep -qxF` is what makes this exact; a plain grep would pass on the substring.
 expect 1 "near-miss name does not count as present" \
-  "OTEL_INGEST_TOKEN_OLD,O2_ENDPOINT,O2_AUTH,INFLUX_TOKEN" "OTEL_INGEST_TOKEN"
+  "OTEL_INGEST_TOKEN_OLD,O2_ENDPOINT,O2_AUTH,MIMIR_PASSWORD" "OTEL_INGEST_TOKEN"
 
 if [ "$failures" -gt 0 ]; then
   echo "::error::$failures check-collector-secrets.sh self-test(s) failed"
