@@ -146,27 +146,41 @@ function zeroPoint<T>(point: DataPoint<T>, zero: T): DataPoint<T> {
   return { attributes: point.attributes, startTime: z, endTime: z, value: zero };
 }
 
-/** Prepend a zero point to every series `seen` has not exported before; records it. */
+/**
+ * Prepend a zero point to every series not in `seen`, and note each such series in
+ * `pending`. `seen` is read-only here on purpose: the SDK drains a delta whether or not
+ * its POST lands, so a series must only be committed as seen once the collector has
+ * accepted the export that carried its zero — otherwise a failed first export would
+ * suppress the zero forever. The caller commits `pending` into `seen` on success.
+ */
 function withStartZeros<T>(
   name: string,
   points: readonly DataPoint<T>[],
   zeroFor: (point: DataPoint<T>) => T,
-  seen: Set<string>
+  seen: ReadonlySet<string>,
+  pending: Set<string>
 ): DataPoint<T>[] {
   return points.flatMap((point) => {
     const key = seriesKey(name, point.attributes);
-    if (seen.has(key)) return [point];
-    seen.add(key);
+    if (seen.has(key) || pending.has(key)) return [point];
+    pending.add(key);
     return [zeroPoint(point, zeroFor(point)), point];
   });
 }
 
 /** Apply zero-at-start to the metric kinds this module emits (sums and histograms). */
-function injectStartZeros(metric: MetricData, seen: Set<string>): MetricData {
+function injectStartZeros(
+  metric: MetricData,
+  seen: ReadonlySet<string>,
+  pending: Set<string>
+): MetricData {
   const name = metric.descriptor.name;
   switch (metric.dataPointType) {
     case DataPointType.SUM:
-      return { ...metric, dataPoints: withStartZeros(name, metric.dataPoints, () => 0, seen) };
+      return {
+        ...metric,
+        dataPoints: withStartZeros(name, metric.dataPoints, () => 0, seen, pending),
+      };
     case DataPointType.HISTOGRAM:
       return {
         ...metric,
@@ -181,7 +195,8 @@ function injectStartZeros(metric: MetricData, seen: Set<string>): MetricData {
             sum: 0,
             count: 0,
           }),
-          seen
+          seen,
+          pending
         ),
       };
     default:
@@ -190,14 +205,18 @@ function injectStartZeros(metric: MetricData, seen: Set<string>): MetricData {
   }
 }
 
-/** The same ResourceMetrics with zero-at-start points added for first-seen series. */
+/**
+ * The same ResourceMetrics with zero-at-start points added for every series not yet in
+ * `seen`; those series are collected into `pending` for the caller to commit on success.
+ */
 function withSeriesStartZeros(
   resourceMetrics: ResourceMetrics,
-  seen: Set<string>
+  seen: ReadonlySet<string>,
+  pending: Set<string>
 ): ResourceMetrics {
   const scopeMetrics: ScopeMetrics[] = resourceMetrics.scopeMetrics.map((scope) => ({
     scope: scope.scope,
-    metrics: scope.metrics.map((metric) => injectStartZeros(metric, seen)),
+    metrics: scope.metrics.map((metric) => injectStartZeros(metric, seen, pending)),
   }));
   return { resource: resourceMetrics.resource, scopeMetrics };
 }
@@ -438,9 +457,12 @@ export function sanitizeMetricLabels(labels: MetricLabels): Record<string, Label
  */
 export class FetchMetricExporter implements PushMetricExporter {
   /**
-   * Series this isolate has already exported, for zero-at-start injection (file header).
-   * Bounded by the label discipline above: at most the allow-listed metrics × their
-   * per-metric series cap, and one exporter lives exactly as long as its isolate.
+   * Series whose zero-at-start point the collector has ACCEPTED (file header). Committed
+   * only on a 2xx, never while building a payload: the SDK drains a delta whether or not
+   * its POST lands, so an early mark would let one failed first export suppress the zero
+   * for good. Flushes are serialized per isolate, so the commit cannot race a later
+   * export. Bounded by the label discipline above: at most the allow-listed metrics ×
+   * their per-metric series cap, and one exporter lives exactly as long as its isolate.
    */
   private readonly seenSeries = new Set<string>();
 
@@ -456,10 +478,12 @@ export class FetchMetricExporter implements PushMetricExporter {
     resourceMetrics: ResourceMetrics,
     resultCallback: (result: { code: number; error?: Error }) => void
   ): void {
+    // Series receiving their zero in THIS payload; moved into seenSeries only on 2xx.
+    const pending = new Set<string>();
     let body: Uint8Array;
     try {
       const serialized = JsonMetricsSerializer.serializeRequest(
-        withSeriesStartZeros(resourceMetrics, this.seenSeries)
+        withSeriesStartZeros(resourceMetrics, this.seenSeries, pending)
       );
       if (!serialized) throw new Error('JsonMetricsSerializer produced no payload');
       body = serialized;
@@ -489,9 +513,23 @@ export class FetchMetricExporter implements PushMetricExporter {
       return;
     }
 
+    this.settle(responsePromise, pending, resultCallback);
+  }
+
+  /**
+   * Resolve one export: on 2xx commit the zero-seeded series and report success; on a
+   * non-2xx or a rejected/aborted fetch report failure and leave them uncommitted, so the
+   * next successful flush seeds them again (a duplicate zero is harmless downstream).
+   */
+  private settle(
+    responsePromise: Promise<Response>,
+    pending: ReadonlySet<string>,
+    resultCallback: (result: { code: number; error?: Error }) => void
+  ): void {
     responsePromise
       .then((response) => {
         if (response.ok) {
+          for (const key of pending) this.seenSeries.add(key);
           resultCallback({ code: 0 }); // ExportResultCode.SUCCESS
         } else {
           console.warn(`otlp_metrics_export_failed: HTTP ${response.status}`);

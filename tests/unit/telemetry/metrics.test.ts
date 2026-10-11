@@ -500,6 +500,46 @@ describe("zero-at-start sample ahead of a series' first delta", () => {
     expect(error).toEqual([0, 1]);
   });
 
+  it('still seeds the zero on the next flush when the first export was rejected', async () => {
+    // WHY (codex round 3): the SDK drains a delta whether or not its POST lands. If the
+    // series were marked "seen" while building the payload, a failed first export would
+    // suppress the zero forever and a one-flush isolate would again be unqueryable. The
+    // mark must commit only once the collector has accepted the export.
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fetchFn = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('network down'))
+      .mockResolvedValue(new Response(null, { status: 200 })) as unknown as typeof fetch;
+    initMetricTelemetry(ENABLED, { fetchFn });
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+
+    const mock = fetchFn as unknown as ReturnType<typeof vi.fn>;
+    expect(mock).toHaveBeenCalledTimes(3);
+    expect(pointsOf(mock.mock.calls[1][1].body, 'requests_total').map(valueOf)).toEqual([0, 1]);
+    expect(pointsOf(mock.mock.calls[2][1].body, 'requests_total').map(valueOf)).toEqual([1]);
+  });
+
+  it('still seeds the zero on the next flush when the first export got a non-2xx', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(null, { status: 503 }))
+      .mockResolvedValue(new Response(null, { status: 200 })) as unknown as typeof fetch;
+    initMetricTelemetry(ENABLED, { fetchFn });
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+
+    const mock = fetchFn as unknown as ReturnType<typeof vi.fn>;
+    expect(pointsOf(mock.mock.calls[1][1].body, 'requests_total').map(valueOf)).toEqual([0, 1]);
+  });
+
   it('prepends an empty histogram point for a histogram series', async () => {
     const fetchFn = okFetch();
     initMetricTelemetry(ENABLED, { fetchFn });
