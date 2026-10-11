@@ -1,6 +1,6 @@
 # fly.io app for the OpenTelemetry Collector — PRODUCTION.
 #
-# Identical to fly.toml except for `app` and the bucket in [env]. Same Dockerfile, same
+# Identical to fly.toml except for `app` and the Mimir user in [env]. Same Dockerfile, same
 # otel-collector-config.yaml, same pins — one config file serving two apps is the whole
 # reason the environment-specific values are parameterized (B1).
 #
@@ -16,11 +16,11 @@ primary_region = "iad"
   #   fly deploy --build-arg OTELCOL_VERSION=<stable-tag>
 
 [env]
-  # Production door43 bucket. See the longer note in fly.toml for why this is [env] and
-  # not a fly secret, and for the shadowing trap. Do NOT set INFLUX_BUCKET as a secret on
-  # this app — a secret silently wins over this line, which is precisely the invisible
-  # bucket↔environment mapping the move was made to eliminate.
-  INFLUX_BUCKET = "bt-servant"
+  # Production Mimir user (door43 maps it to the production org). See the longer note in
+  # fly.toml for why this is [env] and not a fly secret, and for the shadowing trap. Do NOT
+  # set MIMIR_USER as a secret on this app — a secret silently wins over this line, which
+  # is precisely the invisible user↔environment mapping this layout exists to eliminate.
+  MIMIR_USER = "bt-servant"
 
 [http_service]
   internal_port = 4318          # OTLP/HTTP; fly terminates TLS on 443 in front of this

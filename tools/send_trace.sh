@@ -2,7 +2,7 @@
 #
 # Collector→sink smoke test — send ONE real, non-empty OTLP span through a collector and
 # out to OpenObserve, BEFORE enabling the worker's telemetry secrets ("the switch").
-# Companion to send_metrics.sh, which tests the InfluxDB leg.
+# Companion to send_metrics.sh, which tests the Mimir leg.
 #
 # Why this exists: an empty batch (`{"resourceSpans":[]}`) returns HTTP 200 and proves the
 # receiver and bearer auth work, but it creates NO span — so there is nothing to look for

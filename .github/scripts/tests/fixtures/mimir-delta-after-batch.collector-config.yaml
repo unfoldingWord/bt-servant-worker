@@ -1,0 +1,33 @@
+# Fixture: deltatocumulative present on the Mimir pipeline but AFTER batch. The worker
+# serializes an isolate's flushes on the receiver's acknowledgement, and that ack only
+# implies "already accumulated" when the conversion runs before batch. This config
+# validates and boots; only the gate can see the ordering is wrong.
+extensions:
+  basicauth/mimir:
+    client_auth:
+      username: ${env:MIMIR_USER}
+      password: ${env:MIMIR_PASSWORD}
+
+processors:
+  attributes/redact:
+    actions:
+      - { key: user_id, action: delete }
+  deltatocumulative:
+    max_stale: 1h
+  batch: {}
+
+exporters:
+  otlp_http/mimir_metrics:
+    metrics_endpoint: https://mimir.door43.org/otlp/v1/metrics
+    auth:
+      authenticator: basicauth/mimir
+
+service:
+  extensions: [basicauth/mimir]
+  pipelines:
+    traces:
+      processors: [attributes/redact]
+      exporters: [otlp_http/openobserve_traces]
+    metrics/mimir:
+      processors: [attributes/redact, batch, deltatocumulative]
+      exporters: [otlp_http/mimir_metrics]
