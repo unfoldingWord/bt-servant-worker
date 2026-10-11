@@ -40,6 +40,16 @@
  * The OpenObserve leg strips the instance id again in the collector, so what it
  * receives is unchanged.
  *
+ * ZERO-AT-START SAMPLE. One cumulative series per isolate means a series with a single
+ * sample is invisible to PromQL rate()/increase() — an isolate that flushed exactly once
+ * would count for nothing. Prometheus's remedy is a zero sample at the series' created
+ * timestamp; in Mimir that is an experimental, default-off, server-side flag. So the
+ * exporter does it at the source: the first time a series (metric + label set) leaves
+ * this isolate, a zero-valued point at its start time travels in the same export,
+ * strictly before the real point (≥1ms, so the two survive Prometheus's millisecond
+ * timestamps). Downstream that becomes 0@start, v@end — two samples, rate() works, no
+ * external flag. The OpenObserve leg just sees a harmless 0 delta.
+ *
  * CARDINALITY is the governing constraint here, the metrics analogue of the logs/span
  * FAIL-CLOSED redaction, enforced in THREE layers (`sanitizeMetricLabels` + the reader):
  *   1. KEY allow-list — drops any key not in `ALLOWED_LABEL_KEYS`, so an unbounded/
@@ -65,11 +75,16 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { type Counter, type Histogram, type Meter } from '@opentelemetry/api';
 import {
   AggregationTemporality,
+  DataPointType,
   MeterProvider,
   MetricReader,
+  type DataPoint,
+  type MetricData,
   type PushMetricExporter,
   type ResourceMetrics,
+  type ScopeMetrics,
 } from '@opentelemetry/sdk-metrics';
+import type { HrTime } from '@opentelemetry/api';
 import { resourceFromAttributes } from '@opentelemetry/resources';
 import { JsonMetricsSerializer } from '@opentelemetry/otlp-transformer';
 import { __unwrappedFetch } from '@microlabs/otel-cf-workers';
@@ -91,6 +106,101 @@ function metricsEndpoint(base: string): string {
  * SDK keeps unexported deltas, so a timed-out export only delays them to the next flush.
  */
 const EXPORT_TIMEOUT_MS = 10_000;
+
+// ── Zero-at-start injection (see the file header) ────────────────────────────
+
+const NANOS_PER_MILLI = 1_000_000;
+const NANOS_PER_SECOND = 1_000_000_000;
+
+/** `a` is strictly earlier than `b`. */
+function hrTimeBefore(a: HrTime, b: HrTime): boolean {
+  return a[0] < b[0] || (a[0] === b[0] && a[1] < b[1]);
+}
+
+/** `t` minus one millisecond, borrowing a second if the nanos go negative. */
+function hrTimeMinusOneMilli(t: HrTime): HrTime {
+  const nanos = t[1] - NANOS_PER_MILLI;
+  return nanos >= 0 ? [t[0], nanos] : [t[0] - 1, nanos + NANOS_PER_SECOND];
+}
+
+/** Stable identity of a series within this isolate: metric name + canonical labels. */
+function seriesKey(metricName: string, attributes: DataPoint<unknown>['attributes']): string {
+  const labels = Object.keys(attributes)
+    .sort()
+    .map((k) => `${k}=${String(attributes[k])}`)
+    .join(',');
+  return `${metricName}|${labels}`;
+}
+
+/**
+ * A zero-valued twin of `point` at the series' start. It is a single instant `z` (start =
+ * end = z): the real point's start time, or one millisecond before the real point's end if
+ * that is earlier, so the zero always precedes the real sample even after Prometheus
+ * rounds to milliseconds. `z` never exceeds the real start, so the collector's
+ * delta→cumulative state (which rejects an older start than it has stored) is seeded with
+ * the earliest start the series will ever report.
+ */
+function zeroPoint<T>(point: DataPoint<T>, zero: T): DataPoint<T> {
+  const latest = hrTimeMinusOneMilli(point.endTime);
+  const z = hrTimeBefore(point.startTime, latest) ? point.startTime : latest;
+  return { attributes: point.attributes, startTime: z, endTime: z, value: zero };
+}
+
+/** Prepend a zero point to every series `seen` has not exported before; records it. */
+function withStartZeros<T>(
+  name: string,
+  points: readonly DataPoint<T>[],
+  zeroFor: (point: DataPoint<T>) => T,
+  seen: Set<string>
+): DataPoint<T>[] {
+  return points.flatMap((point) => {
+    const key = seriesKey(name, point.attributes);
+    if (seen.has(key)) return [point];
+    seen.add(key);
+    return [zeroPoint(point, zeroFor(point)), point];
+  });
+}
+
+/** Apply zero-at-start to the metric kinds this module emits (sums and histograms). */
+function injectStartZeros(metric: MetricData, seen: Set<string>): MetricData {
+  const name = metric.descriptor.name;
+  switch (metric.dataPointType) {
+    case DataPointType.SUM:
+      return { ...metric, dataPoints: withStartZeros(name, metric.dataPoints, () => 0, seen) };
+    case DataPointType.HISTOGRAM:
+      return {
+        ...metric,
+        dataPoints: withStartZeros(
+          name,
+          metric.dataPoints,
+          (point) => ({
+            buckets: {
+              boundaries: point.value.buckets.boundaries,
+              counts: point.value.buckets.counts.map(() => 0),
+            },
+            sum: 0,
+            count: 0,
+          }),
+          seen
+        ),
+      };
+    default:
+      // Gauges and exponential histograms: not emitted here; pass through untouched.
+      return metric;
+  }
+}
+
+/** The same ResourceMetrics with zero-at-start points added for first-seen series. */
+function withSeriesStartZeros(
+  resourceMetrics: ResourceMetrics,
+  seen: Set<string>
+): ResourceMetrics {
+  const scopeMetrics: ScopeMetrics[] = resourceMetrics.scopeMetrics.map((scope) => ({
+    scope: scope.scope,
+    metrics: scope.metrics.map((metric) => injectStartZeros(metric, seen)),
+  }));
+  return { resource: resourceMetrics.resource, scopeMetrics };
+}
 
 // ── Label discipline (the cardinality guard) ─────────────────────────────────
 
@@ -327,6 +437,13 @@ export function sanitizeMetricLabels(labels: MetricLabels): Record<string, Label
  * carries only the increment since the previous flush.
  */
 export class FetchMetricExporter implements PushMetricExporter {
+  /**
+   * Series this isolate has already exported, for zero-at-start injection (file header).
+   * Bounded by the label discipline above: at most the allow-listed metrics × their
+   * per-metric series cap, and one exporter lives exactly as long as its isolate.
+   */
+  private readonly seenSeries = new Set<string>();
+
   // `fetchFn` defaults to otel-cf-workers' RAW fetch (captured at its module load, so it
   // cannot be stubbed via globalThis); injectable purely so tests can supply a mock.
   constructor(
@@ -341,7 +458,9 @@ export class FetchMetricExporter implements PushMetricExporter {
   ): void {
     let body: Uint8Array;
     try {
-      const serialized = JsonMetricsSerializer.serializeRequest(resourceMetrics);
+      const serialized = JsonMetricsSerializer.serializeRequest(
+        withSeriesStartZeros(resourceMetrics, this.seenSeries)
+      );
       if (!serialized) throw new Error('JsonMetricsSerializer produced no payload');
       body = serialized;
     } catch (err) {

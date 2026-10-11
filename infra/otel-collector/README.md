@@ -190,11 +190,20 @@ gating a deploy — bump them deliberately, never to "latest":
   script). Query across isolates with `sum by (<labels>) (rate(<metric>[5m]))`. The
   OpenObserve pipeline strips the id again (`resource/strip_instance`), so OpenObserve's
   series are unchanged.
-- **Known gap: single-flush isolates.** An isolate that flushes exactly once yields a
-  one-sample cumulative series, which `rate()`/`increase()` cannot use. Mimir's experimental
-  created-timestamp zero ingestion closes it by inserting a 0 at the stream's start
-  (`-distributor.otel-created-timestamp-zero-ingestion-enabled`); that is a door43-side
-  flag, not a change here.
+- **Single-flush isolates count.** A one-sample cumulative series is invisible to
+  `rate()`/`increase()`, so an isolate that flushed exactly once would have contributed
+  nothing. The worker therefore ships a zero-valued point at the series' start, in the same
+  export and ≥1ms before the first real point (`src/services/telemetry/metrics.ts`,
+  "zero-at-start"). Downstream that is `0@start, v@end` — two samples, so every isolate's
+  first flush is already queryable. This is the source-side form of Mimir's experimental
+  `-distributor.otel-created-timestamp-zero-ingestion-enabled`, which stays off; nothing
+  here depends on a door43-side flag. Rollout check: after deploy, pick a brand-new
+  `instance` in Grafana and confirm `increase(requests_total{instance="<id>"}[10m])` is
+  non-zero on its first scrape window.
+- **Mimir rejects delta outright** unless its experimental
+  `-distributor.otel-native-delta-ingestion` is on ("If disabled, delta metrics will be
+  rejected"), which is why `deltatocumulative` on the Mimir pipeline is a gated invariant
+  and not a preference.
 - **Cardinality.** Per-isolate identity means a new series set per isolate (bounded label
   sets × isolates). Series go stale when the isolate dies; this is the normal Prometheus
   model for ephemeral workers, but it is new load on a shared Mimir — door43 should know.
