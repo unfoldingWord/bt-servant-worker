@@ -24,6 +24,22 @@
  * series. DELTA reports the increment since the previous flush and the backend sums
  * them — the correct model for a stateless/serverless producer.
  *
+ * PER-ISOLATE STREAM IDENTITY + ORDERED FLUSHES. The collector converts these deltas to
+ * cumulative for Mimir (Prometheus-shaped) with a processor that keys its state by
+ * resource identity and DROPS any point whose start is older than the stored stream's
+ * or whose timestamp is not strictly later. Two guarantees here keep that correct:
+ *   1. every isolate stamps a random `service.instance.id` on its metrics resource, so
+ *      concurrent isolates are separate streams (Mimir: `instance=<uuid>`, query with
+ *      `sum by (...) (rate(...))`) instead of one interleaved stream that undercounts;
+ *   2. `flushMetricTelemetry` serializes an isolate's flushes — the next collect+export
+ *      starts only after the previous POST was acknowledged — so one stream's deltas
+ *      reach the collector in collection order. The collector acknowledges only after
+ *      its synchronous processors (conversion included) have consumed the batch, which
+ *      is what makes "acknowledged" mean "accumulated". Each export carries an abort
+ *      timeout so a hung collector cannot stall the chain indefinitely.
+ * The OpenObserve leg strips the instance id again in the collector, so what it
+ * receives is unchanged.
+ *
  * CARDINALITY is the governing constraint here, the metrics analogue of the logs/span
  * FAIL-CLOSED redaction, enforced in THREE layers (`sanitizeMetricLabels` + the reader):
  *   1. KEY allow-list — drops any key not in `ALLOWED_LABEL_KEYS`, so an unbounded/
@@ -68,6 +84,13 @@ const METRIC_SCOPE_NAME = TELEMETRY_SERVICE_NAME;
 function metricsEndpoint(base: string): string {
   return `${base.replace(/\/+$/, '')}/v1/metrics`;
 }
+
+/**
+ * Upper bound on one export POST. Flushes are serialized per isolate (see the file
+ * header), so an export that never completes would hold up every flush behind it; the
+ * SDK keeps unexported deltas, so a timed-out export only delays them to the next flush.
+ */
+const EXPORT_TIMEOUT_MS = 10_000;
 
 // ── Label discipline (the cardinality guard) ─────────────────────────────────
 
@@ -338,14 +361,7 @@ export class FetchMetricExporter implements PushMetricExporter {
     const fetchFn = this.fetchFn;
     let responsePromise: Promise<Response>;
     try {
-      responsePromise = fetchFn(this.url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.token}`,
-        },
-        body,
-      });
+      responsePromise = fetchFn(this.url, this.requestInit(body));
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
 
@@ -372,6 +388,19 @@ export class FetchMetricExporter implements PushMetricExporter {
         console.warn(`otlp_metrics_export_error: ${error.message}`);
         resultCallback({ code: 1, error });
       });
+  }
+
+  /** One OTLP/JSON POST, bounded by EXPORT_TIMEOUT_MS (see the file header on why). */
+  private requestInit(body: Uint8Array): RequestInit {
+    return {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.token}`,
+      },
+      body,
+      signal: AbortSignal.timeout(EXPORT_TIMEOUT_MS),
+    };
   }
 
   selectAggregationTemporality(): AggregationTemporality {
@@ -434,6 +463,12 @@ export class PerInvocationMetricReader extends MetricReader {
 // ── Module singletons (one metrics stack per isolate) ────────────────────────
 let moduleMeter: Meter | null = null;
 let moduleProvider: MeterProvider | null = null;
+/**
+ * Tail of this isolate's flush chain. Every flush is appended here so collect+export
+ * runs strictly after the previous one was acknowledged (see the file header). Never
+ * left rejected: a failed flush is logged and the chain continues.
+ */
+let flushChain: Promise<void> = Promise.resolve();
 const counters = new Map<string, Counter>();
 const histograms = new Map<string, Histogram>();
 
@@ -533,6 +568,10 @@ export function initMetricTelemetry(env: Env, options?: { fetchFn?: typeof fetch
       'service.name': TELEMETRY_SERVICE_NAME,
       'service.namespace': env.ENVIRONMENT,
       'service.version': APP_VERSION,
+      // One id per metrics stack, i.e. per isolate: the stream identity the collector's
+      // delta→cumulative conversion keys on. Random, not derived — isolates have no
+      // stable name, and two isolates must never share a stream (see the file header).
+      'service.instance.id': crypto.randomUUID(),
     }),
     readers: [reader],
   });
@@ -545,17 +584,32 @@ export function initMetricTelemetry(env: Env, options?: { fetchFn?: typeof fetch
  * Flush this isolate's aggregated metrics at a request/DO boundary. Pass the ambient
  * `waitUntil` (Hono `c.executionCtx.waitUntil` or `DurableObjectState.waitUntil`) so
  * the collect+export runs without blocking the response. No-op when disabled.
+ *
+ * Flushes are SERIALIZED per isolate: this one's collect+export starts only after every
+ * earlier flush has been acknowledged by the collector, so the stream's deltas arrive in
+ * collection order (see the file header). Measurements recorded while a flush is waiting
+ * simply ride along in it — nothing is dropped by the wait.
  */
 export function flushMetricTelemetry(waitUntil: (promise: Promise<unknown>) => void): void {
   const provider = moduleProvider;
   if (!provider) return;
-  waitUntil(provider.forceFlush());
+  flushChain = flushChain
+    .then(() => provider.forceFlush())
+    .catch((err: unknown) => {
+      const error = err instanceof Error ? err : new Error(String(err));
+      // Same console path as the exporter's own failures (see FetchMetricExporter): the
+      // structured logger would re-enter telemetry. Logged so a wedged export is visible;
+      // the chain deliberately continues so later flushes are not held hostage by it.
+      console.warn(`otlp_metrics_flush_failed: ${error.message}`);
+    });
+  waitUntil(flushChain);
 }
 
 /** Test-only: reset module singletons and instrument caches between cases. */
 export function resetMetricTelemetryForTests(): void {
   moduleMeter = null;
   moduleProvider = null;
+  flushChain = Promise.resolve();
   counters.clear();
   histograms.clear();
 }

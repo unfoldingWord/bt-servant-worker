@@ -66,7 +66,9 @@ secret. Everything downstream (which sink(s), redaction, retry, temporality) is 
 once this way — InfluxDB 3 → Mimir when door43 retired Influx — without touching or
 redeploying the worker. The worker emits DELTA metrics (ephemeral isolates); Mimir expects
 CUMULATIVE; the collector's `deltatocumulative` processor bridges the two on the Mimir
-pipeline only, while OpenObserve keeps receiving delta as before.
+pipeline only, while OpenObserve keeps receiving delta as before. That bridge needs one
+producer per stream delivered in order, so the worker stamps a per-isolate
+`service.instance.id` and serializes its flushes (see `otel-collector/README.md`).
 
 **Governance.** OpenObserve is operated and queried only by us (fly is just an IaaS host);
 the control plane stays in our hands. We still **redact at source** (in the worker) and

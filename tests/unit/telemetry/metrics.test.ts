@@ -370,3 +370,113 @@ describe('metrics stack (init → emit → flush)', () => {
     expect(warn).toHaveBeenCalled();
   });
 });
+
+/** Pull `service.instance.id` out of a decoded OTLP payload's resource attributes. */
+function instanceIdOf(body: unknown): string | undefined {
+  const decoded = decodeBody(body) as {
+    resourceMetrics: Array<{
+      resource: { attributes: Array<{ key: string; value: { stringValue?: string } }> };
+    }>;
+  };
+  return decoded.resourceMetrics[0].resource.attributes.find((a) => a.key === 'service.instance.id')
+    ?.value.stringValue;
+}
+
+/** A fetch mock whose responses are held until the test releases them, in call order. */
+function heldFetch(): { fetchFn: typeof fetch; release: (n: number) => void } {
+  const resolvers: Array<() => void> = [];
+  const fetchFn = vi.fn(
+    () =>
+      new Promise<Response>((resolve) => {
+        resolvers.push(() => resolve(new Response(null, { status: 200 })));
+      })
+  ) as unknown as typeof fetch;
+  return { fetchFn, release: (n) => resolvers[n]() };
+}
+
+describe('per-isolate stream identity and ordered flushes', () => {
+  // WHY: the collector's deltatocumulative processor keys its state by resource identity
+  // and drops any delta whose start is older than the stored stream's, or whose timestamp
+  // is not strictly later. Every isolate sharing ONE identity meant concurrent isolates
+  // silently undercounted Mimir (codex review, #447). Each isolate therefore stamps its
+  // own service.instance.id, and flushes from one isolate are serialized so its deltas
+  // reach the collector in the order they were collected.
+
+  it('stamps one service.instance.id per isolate, stable across flushes', async () => {
+    const fetchFn = okFetch();
+    initMetricTelemetry(ENABLED, { fetchFn });
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+
+    const mock = fetchFn as unknown as ReturnType<typeof vi.fn>;
+    expect(mock).toHaveBeenCalledTimes(2);
+    const first = instanceIdOf(mock.mock.calls[0][1].body);
+    const second = instanceIdOf(mock.mock.calls[1][1].body);
+    expect(first).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    expect(second).toBe(first);
+  });
+
+  it('gives a fresh isolate a fresh instance id (re-init after reset)', async () => {
+    const fetchFn = okFetch();
+    initMetricTelemetry(ENABLED, { fetchFn });
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+    resetMetricTelemetryForTests();
+    initMetricTelemetry(ENABLED, { fetchFn });
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+
+    const mock = fetchFn as unknown as ReturnType<typeof vi.fn>;
+    expect(instanceIdOf(mock.mock.calls[1][1].body)).not.toBe(
+      instanceIdOf(mock.mock.calls[0][1].body)
+    );
+  });
+
+  it('does not start the next export until the previous one has been acknowledged', async () => {
+    const { fetchFn, release } = heldFetch();
+    initMetricTelemetry(ENABLED, { fetchFn });
+    const pending: Promise<unknown>[] = [];
+
+    countMetric('requests_total', { status: 'ok' });
+    flushMetricTelemetry((p) => pending.push(p));
+    // First POST is now in flight and unacknowledged.
+    await vi.waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(1));
+
+    // A second flush with fresh data must queue behind it, not race it: without the
+    // chain this collects and POSTs immediately, and the count below reads 2.
+    countMetric('requests_total', { status: 'ok' });
+    flushMetricTelemetry((p) => pending.push(p));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+
+    release(0);
+    await vi.waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(2));
+    release(1);
+    await Promise.all(pending);
+  });
+
+  it('a failed export does not wedge the flushes behind it', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fetchFn = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('network down'))
+      .mockResolvedValue(new Response(null, { status: 200 })) as unknown as typeof fetch;
+    initMetricTelemetry(ENABLED, { fetchFn });
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  it('bounds every export with an abort signal so a hung collector cannot stall the chain', async () => {
+    const fetchFn = okFetch();
+    initMetricTelemetry(ENABLED, { fetchFn });
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+    const [, init] = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+  });
+});

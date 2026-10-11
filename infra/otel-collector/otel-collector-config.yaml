@@ -63,26 +63,46 @@ processors:
 
   # ── Temporality bridge for the Mimir pipeline ONLY ──
   # The worker emits DELTA metrics on purpose: Worker isolates are ephemeral and each
-  # drains its measurements once per invocation, so a cumulative counter would be a
-  # sawtooth of per-isolate resets (see src/services/telemetry/metrics.ts). Mimir is
-  # Prometheus-shaped and expects CUMULATIVE; its native delta ingestion is an
+  # drains its measurements once per invocation (see src/services/telemetry/metrics.ts).
+  # Mimir is Prometheus-shaped and expects CUMULATIVE; its native delta ingestion is an
   # experimental server-side flag we do not depend on. This processor accumulates the
-  # deltas in memory and re-emits running totals. It fits this producer unusually well:
-  # the worker's only resource attributes are service.name + service.namespace, so every
-  # isolate collapses into ONE stream per label set, and the label set is
-  # cardinality-bounded at the source. A collector restart just looks like a counter
-  # reset, which PromQL rate()/increase() handle natively.
+  # deltas in memory and re-emits running totals.
+  #
+  # IT IS ONLY CORRECT WITH ONE PRODUCER PER STREAM, DELIVERED IN ORDER. The processor
+  # keys state by resource+scope+metric+attributes and DROPS any point whose start is
+  # older than the stored stream's (ErrOlderStart) or whose timestamp is not strictly
+  # later (ErrOutOfOrder). Two guarantees from the worker make that hold:
+  #   1. every isolate stamps its own `service.instance.id` on the metrics resource, so
+  #      concurrent isolates are separate streams rather than one interleaved one;
+  #   2. an isolate serializes its flushes (the next POST starts only after the previous
+  #      one was acknowledged), so a single stream's deltas arrive in collection order.
+  # The collector holds up its end by running this processor BEFORE `batch`: the OTLP
+  # receiver only acknowledges a POST after the synchronous processors have consumed it,
+  # so "acknowledged" means "already folded into the cumulative state". Moving it after
+  # `batch` would break that, which is why `assert-collector-invariants.py` asserts the
+  # order. Mimir then sees one cumulative series per isolate (`instance=<uuid>`); query
+  # with `sum by (...) (rate(...))`. A collector restart, or an isolate going idle past
+  # max_stale, reads as a counter reset, which rate()/increase() handle.
   #
   # NOT on the OpenObserve pipeline: OpenObserve ingests delta as-is and its dashboards
   # were built on that; converting there would change what they show.
   #
-  # max_stale: how long an idle series is kept before being forgotten (default 5m). A
-  # forgotten series restarts from its next delta, which Prometheus reads as a reset —
-  # harmless, but 1h means far fewer of them for our low-traffic series, and memory at
-  # our cardinality is trivial. max_streams is left unbounded on purpose: a hit cap drops
-  # NEW streams silently, and memory_limiter already guards the machine.
+  # max_stale: how long an idle stream is kept before being forgotten (default 5m). 1h
+  # keeps a live-but-quiet isolate's stream intact; memory is streams × isolates seen in
+  # the last hour at bounded label cardinality, trivial here. max_streams is left
+  # unbounded on purpose: a hit cap drops NEW streams silently, and memory_limiter
+  # already guards the machine.
   deltatocumulative:
     max_stale: 1h
+
+  # ── OpenObserve pipeline ONLY: drop the per-isolate id ──
+  # `service.instance.id` exists for the Mimir leg (see above). OpenObserve never needed
+  # it, and keeping it there would turn every isolate into its own series set. Deleting
+  # it here keeps what OpenObserve receives byte-for-byte what it received before the
+  # Mimir move. A `resource` processor, not `attributes`: it is a resource attribute.
+  resource/strip_instance:
+    attributes:
+      - { key: service.instance.id, action: delete }
 
   batch:
     timeout: 5s
@@ -148,12 +168,13 @@ service:
       processors: [memory_limiter, attributes/redact, batch]
       exporters: [otlp_http/openobserve_logs]
     # Metrics fan out via TWO pipelines off the same receiver rather than one pipeline with
-    # two exporters, because only the Mimir leg needs the delta→cumulative conversion and
-    # a processor applies to every exporter in its pipeline. Both run attributes/redact —
-    # the invariant script requires the user_id delete on EVERY pipeline.
+    # two exporters, because only the Mimir leg needs the delta→cumulative conversion (and
+    # only the OpenObserve leg strips the per-isolate id) and a processor applies to every
+    # exporter in its pipeline. Both run attributes/redact — the invariant script requires
+    # the user_id delete on EVERY pipeline. deltatocumulative MUST precede batch (asserted).
     metrics:
       receivers: [otlp]
-      processors: [memory_limiter, attributes/redact, batch]
+      processors: [memory_limiter, attributes/redact, resource/strip_instance, batch]
       exporters: [otlp_http/openobserve_metrics]
     metrics/mimir:
       receivers: [otlp]

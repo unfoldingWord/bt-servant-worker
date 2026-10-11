@@ -273,11 +273,26 @@ def main() -> int:
     if not mimir_pipelines:
         fail(f"no pipeline exports to {MIMIR_EXPORTER}, so Mimir receives nothing")
     for pipeline_name in mimir_pipelines:
-        if DELTA_PROCESSOR not in (pipelines[pipeline_name].get("processors") or []):
+        procs = pipelines[pipeline_name].get("processors") or []
+        if DELTA_PROCESSOR not in procs:
             fail(
                 f"service.pipelines.{pipeline_name} exports to {MIMIR_EXPORTER} without "
                 f"running processors.{DELTA_PROCESSOR}; the worker emits DELTA and Mimir "
                 f"expects CUMULATIVE, so every sample would be rejected or mis-typed"
+            )
+        # ── 5. ...and it must run BEFORE batch. ──────────────────────────────────
+        # The worker serializes an isolate's flushes on the receiver's acknowledgement,
+        # and the receiver acknowledges once the synchronous processors have consumed
+        # the batch. With the conversion before `batch`, "acknowledged" means "already
+        # accumulated", so a stream's deltas fold in collection order. After `batch`,
+        # the ack says nothing about accumulation order and the processor's
+        # strict-ordering rule starts dropping real samples.
+        elif "batch" in procs and procs.index("batch") < procs.index(DELTA_PROCESSOR):
+            fail(
+                f"service.pipelines.{pipeline_name} runs processors.{DELTA_PROCESSOR} "
+                f"after batch; it must precede batch so the receiver's acknowledgement "
+                f"(which the worker serializes its flushes on) implies the delta has "
+                f"already been accumulated"
             )
 
     if failures:
@@ -295,7 +310,10 @@ def main() -> int:
     print(f"  {MIMIR_AUTH_EXTENSION} username is {EXPECTED_MIMIR_USER}, used by {MIMIR_EXPORTER}")
     print(f"  user_id is deleted (processors.{user_id_rules[0][0]}), on every pipeline")
     print("  debug exporter is unwired")
-    print(f"  {DELTA_PROCESSOR} runs on every Mimir pipeline ({', '.join(mimir_pipelines)})")
+    print(
+        f"  {DELTA_PROCESSOR} runs before batch on every Mimir pipeline "
+        f"({', '.join(mimir_pipelines)})"
+    )
     for app, user in sorted(APP_MIMIR_USERS.items()):
         print(f"  {app} authenticates to Mimir as {user}")
     return 0

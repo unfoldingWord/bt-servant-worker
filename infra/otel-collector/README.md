@@ -181,6 +181,23 @@ gating a deploy — bump them deliberately, never to "latest":
   pipeline runs `deltatocumulative` (`max_stale: 1h`) and the OpenObserve pipeline does not.
   Counters therefore arrive in Mimir as running totals: use `rate()` / `increase()`, never
   the raw value. A collector restart reads as a counter reset, which PromQL handles.
+- **One stream per isolate, in order.** `deltatocumulative` keys its state by resource
+  identity and drops any point whose start is older than the stored stream's or whose
+  timestamp is not strictly later. So the worker stamps a random `service.instance.id` per
+  isolate (Mimir: `instance=<uuid>`) and serializes each isolate's flushes on the
+  collector's acknowledgement; the collector keeps the processor **before** `batch` so that
+  acknowledgement implies the delta is already accumulated (asserted by the invariant
+  script). Query across isolates with `sum by (<labels>) (rate(<metric>[5m]))`. The
+  OpenObserve pipeline strips the id again (`resource/strip_instance`), so OpenObserve's
+  series are unchanged.
+- **Known gap: single-flush isolates.** An isolate that flushes exactly once yields a
+  one-sample cumulative series, which `rate()`/`increase()` cannot use. Mimir's experimental
+  created-timestamp zero ingestion closes it by inserting a 0 at the stream's start
+  (`-distributor.otel-created-timestamp-zero-ingestion-enabled`); that is a door43-side
+  flag, not a change here.
+- **Cardinality.** Per-isolate identity means a new series set per isolate (bounded label
+  sets × isolates). Series go stale when the isolate dies; this is the normal Prometheus
+  model for ephemeral workers, but it is new load on a shared Mimir — door43 should know.
 - **Orgs.** door43 maps each username to a fixed Mimir org; ours are `bt-servant-staging`
   and `bt-servant`. There is no `X-Scope-OrgID` to set — the Basic-auth user does that.
   A new org means asking door43, not a config change here.

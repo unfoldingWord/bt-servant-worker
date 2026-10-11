@@ -105,6 +105,14 @@ expect 1 "Mimir pipeline without deltatocumulative" \
   --fly-toml "$fixtures/good-staging.fly.toml" \
   --fly-toml "$fixtures/good-prod.fly.toml"
 
+# Present but after batch: the receiver's ack (which the worker serializes flushes on) no
+# longer implies the delta was accumulated, so ordering across an isolate's flushes is lost.
+expect 1 "deltatocumulative after batch on the Mimir pipeline" \
+  --must-contain "runs processors.deltatocumulative after batch" -- \
+  "$fixtures/mimir-delta-after-batch.collector-config.yaml" \
+  --fly-toml "$fixtures/good-staging.fly.toml" \
+  --fly-toml "$fixtures/good-prod.fly.toml"
+
 if [ "$failures" -gt 0 ]; then
   echo "::error::$failures assert-collector-invariants.py self-test(s) failed"
   exit 1
