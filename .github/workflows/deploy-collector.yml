@@ -7,7 +7,9 @@ name: Deploy OTel Collector
 # validate runs on every PR that touches the collector; deploy runs only on main.
 # The M0 lesson: a config the collector rejects crash-loops the fly app on boot, and
 # fly happily rolls it out anyway. So we validate with the EXACT pinned image before
-# any deploy, and we pre-flight the fly secrets the config depends on.
+# any deploy, we pre-flight the fly secrets the config depends on, and after the deploy
+# we pin each app to exactly one machine (the Mimir pipeline's delta→cumulative state
+# lives in one process; a second machine corrupts the series).
 
 on:
   push:
@@ -110,6 +112,12 @@ jobs:
       - name: Self-test the secrets pre-flight
         run: .github/scripts/tests/test-check-collector-secrets.sh
 
+      # Same reasoning for the post-deploy machine-count gate: a second collector machine
+      # is a second deltatocumulative converter and Mimir rejects the split series, so the
+      # gate must keep failing on two machines and keep passing on one. Stubbed flyctl.
+      - name: Self-test the machine-count gate
+        run: .github/scripts/tests/test-pin-collector-machines.sh
+
   deploy-staging:
     name: Deploy Collector (Staging)
     needs: [validate]
@@ -155,11 +163,25 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: .github/scripts/check-collector-secrets.sh "${{ steps.app.outputs.app }}"
 
+      # --ha=false: fly's default for an app's FIRST deploy is two machines for HA. That is
+      # exactly wrong here — see the "Pin to one machine" step below.
       - name: Deploy
         working-directory: infra/otel-collector
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: flyctl deploy --remote-only --config fly.toml
+        run: flyctl deploy --remote-only --config fly.toml --ha=false
+
+      # The Mimir pipeline's deltatocumulative keeps each series' running total in ONE
+      # collector process, and fly load-balances with no affinity. Two machines therefore
+      # split an isolate's deltas across two converters and Mimir rejects the result as
+      # out-of-order (seen on prod, 2026-10-12). fly.toml has no "max machines", so this
+      # step scales to one and then fails the job if the app does not have exactly one.
+      # If the deploy token ever lacks the right to destroy a stray machine, this fails
+      # loudly rather than leaving a second converter running — run the scale by hand.
+      - name: Pin to one machine
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: .github/scripts/pin-collector-machines.sh "${{ steps.app.outputs.app }}"
 
   deploy-production:
     name: Deploy Collector (Production)
@@ -216,8 +238,14 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: .github/scripts/check-collector-secrets.sh "${{ steps.app.outputs.app }}"
 
+      # --ha=false and the pin step: same reasoning as the staging job.
       - name: Deploy
         working-directory: infra/otel-collector
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: flyctl deploy --remote-only --config fly.prod.toml
+        run: flyctl deploy --remote-only --config fly.prod.toml --ha=false
+
+      - name: Pin to one machine
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: .github/scripts/pin-collector-machines.sh "${{ steps.app.outputs.app }}"
