@@ -13,8 +13,12 @@ collector-only change. See [`../README.md`](../README.md) for the big picture.
 | `bt-servant-otel-collector`      | `fly.toml`      | `bt-servant-staging` | `staging`          |
 | `bt-servant-otel-collector-prod` | `fly.prod.toml` | `bt-servant`         | `production`       |
 
-Both deploy the **same** `otel-collector-config.yaml` from the same pinned image. The two fly
-configs differ only in `app` and `[env] MIMIR_USER`, and that pairing is asserted by
+Both deploy the **same** `otel-collector-config.yaml` from the same pinned image, and each
+runs **exactly one machine** — not for cost, but because the Mimir pipeline's
+delta→cumulative state lives in one collector process (see "One converter per stream" under
+[Mimir sink notes](#mimir-sink-notes)); the deploy workflow pins and asserts that count after
+every deploy. The two fly configs differ only in `app` and `[env] MIMIR_USER`, and that
+pairing is asserted by
 [`assert-collector-invariants.py`](../../.github/scripts/assert-collector-invariants.py):
 adding a third collector app means adding it to that script's `APP_MIMIR_USERS` map, in a
 PR. door43 fixes the username→org mapping on their side; a new org means asking them.
@@ -137,9 +141,14 @@ ignore it entirely.
   [both gates' self-tests](../../.github/scripts/tests/) run — the invariant
   checker against fixtures it must reject, and the secrets pre-flight against a stubbed
   `flyctl` (so it needs no credentials) in both directions: required-secret-missing and
-  banned-secret-present. A gate that has quietly stopped asserting still reports green,
-  which reads as proof.
-- **On push to `main` only** — pre-flight the fly secrets, then `flyctl deploy --remote-only`.
+  banned-secret-present, and the post-deploy machine-count gate against stubbed machine
+  lists (one, two, one-plus-stopped, none). A gate that has quietly stopped asserting still
+  reports green, which reads as proof.
+- **On push to `main` only** — pre-flight the fly secrets, then deploy with
+  `flyctl deploy --remote-only --ha=false`, then
+  [`pin-collector-machines.sh`](../../.github/scripts/pin-collector-machines.sh) scales the
+  app to one machine and **fails the job** unless exactly one is running (fly's `--ha`
+  default would otherwise hand a fresh app two machines, and fly.toml cannot cap the count).
   Deploy jobs are pinned to `refs/heads/main`, so a `workflow_dispatch` from another branch
   cannot ship an unmerged ref, and each is serialized on a per-app concurrency group.
 
@@ -190,6 +199,16 @@ gating a deploy — bump them deliberately, never to "latest":
   script). Query across isolates with `sum by (<labels>) (rate(<metric>[5m]))`. The
   OpenObserve pipeline strips the id again (`resource/strip_instance`), so OpenObserve's
   series are unchanged.
+- **One converter per stream.** `deltatocumulative` keeps its running totals in the memory
+  of the collector _process_, and fly load-balances requests across an app's machines with
+  no affinity. With two machines, one isolate's flushes land on two converters that each
+  emit the same series with partial values and interleaved timestamps, and Mimir answers
+  `Partial success` with `err-mimir-sample-out-of-order` — `target_info` first, then the
+  counters (seen on prod, 2026-10-12, after fly's `--ha` default had quietly given both apps
+  a second machine). So each collector app runs **exactly one machine**: the deploy passes
+  `--ha=false` and `pin-collector-machines.sh` asserts the count afterwards. If that
+  rejection ever shows up in `fly logs` again, check `fly machines list` before anything
+  else.
 - **Single-flush isolates count.** A one-sample cumulative series is invisible to
   `rate()`/`increase()`, so an isolate that flushed exactly once would have contributed
   nothing. The worker therefore ships a zero-valued point at the series' start, in the same
@@ -225,7 +244,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST \
   https://bt-servant-otel-collector.fly.dev/v1/traces \
   -H 'Content-Type: application/json' -d '{"resourceSpans":[]}'
 
-# 2. Startup line on every machine.
+# 2. Startup line on the machine (there is exactly one — see "One converter per stream").
 fly logs --app bt-servant-otel-collector   # "Everything is ready. Begin running and processing data."
 
 # 3. A REAL span, end to end — prompts for the ingest token.
@@ -271,5 +290,11 @@ the workflow deploy it — the worker is never touched.
 
 - fly terminates TLS on :443 and proxies to the collector's `internal_port = 4318`.
 - `auto_stop_machines = "off"` + `min_machines_running = 1`: a telemetry pipe should never
-  cold-start away and drop the worker's export.
+  cold-start away and drop the worker's export. And never **more** than one machine: the
+  Mimir pipeline needs a single delta→cumulative converter per stream (see
+  [Mimir sink notes](#mimir-sink-notes)), which the workflow enforces after every deploy.
+  The price is a ten-to-twenty-second restart gap per collector deploy while the one machine
+  rolls; the worker's export times out at 10s and logs `otlp_metrics_flush_failed` for the
+  flushes that hit it, so the gap is visible rather than silent. Blue-green would need health
+  checks the collector does not define.
 - Redaction here is **defense-in-depth**; the worker still redacts at source.

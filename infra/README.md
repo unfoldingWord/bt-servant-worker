@@ -55,10 +55,15 @@ expression yields a different token per job. **Those two lines are load-bearing*
 them silently repoints production at the staging token.
 
 Both collector apps run the **same** `otel-collector-config.yaml` from the same pinned
-image. The only difference between the two environments is each app's `fly.toml [env]` plus
-its own secrets, and `assert-collector-invariants.py` fails the build if an app's declared
-Mimir user is not the one the reviewed map assigns it. (door43 maps each username to a fixed
-Mimir org, so the username is what selects where metrics land.)
+image, each on **exactly one fly machine**. That count is load-bearing, not thrift: the
+Mimir pipeline converts the worker's delta metrics to cumulative inside one collector
+process, and a second machine splits each series across two converters, which Mimir rejects
+as out-of-order (see "One converter per stream" in
+[`otel-collector/README.md`](otel-collector/README.md)). The deploy workflow pins and asserts
+the count after every deploy. The only other difference between the two environments is each
+app's `fly.toml [env]` plus its own secrets, and `assert-collector-invariants.py` fails the
+build if an app's declared Mimir user is not the one the reviewed map assigns it. (door43 maps
+each username to a fixed Mimir org, so the username is what selects where metrics land.)
 
 **Why a collector at all?** The worker only ever talks to the collector — one endpoint, one
 secret. Everything downstream (which sink(s), redaction, retry, temporality) is a
