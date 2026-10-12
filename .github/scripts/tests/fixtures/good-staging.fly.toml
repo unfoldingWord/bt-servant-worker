@@ -4,4 +4,4 @@ app = "bt-servant-otel-collector"
 primary_region = "iad"
 
 [env]
-  INFLUX_BUCKET = "bt-servant-staging"
+  MIMIR_USER = "bt-servant-staging"
