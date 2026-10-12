@@ -44,6 +44,11 @@ function collectStrings(value: unknown, out: string[] = []): string[] {
   return out;
 }
 
+/** Number of distinct label sets among decoded data points. */
+function distinctSeries(points: unknown[]): number {
+  return new Set(points.map((p) => JSON.stringify((p as { attributes: unknown }).attributes))).size;
+}
+
 /** Drive a flush and await the promise it hands to `waitUntil`. */
 async function flushAndWait(): Promise<void> {
   const promises: Promise<unknown>[] = [];
@@ -300,8 +305,9 @@ describe('metrics stack (init → emit → flush)', () => {
       .flatMap((rm) => rm.scopeMetrics)
       .flatMap((sm) => sm.metrics)
       .find((m) => m.name === 'requests_total');
-    // Only {status:error, error_name:other} — a single series, never 1500.
-    expect(metric?.sum?.dataPoints.length).toBe(1);
+    // Only {status:error, error_name:other} — a single series, never 1500. Counted as
+    // distinct label sets: a series' first export also carries its zero-at-start twin.
+    expect(distinctSeries(metric?.sum?.dataPoints ?? [])).toBe(1);
     const joined = collectStrings(decoded).join('\n');
     expect(joined).not.toContain('Err0');
     expect(joined).not.toContain('Err1499');
@@ -328,8 +334,8 @@ describe('metrics stack (init → emit → flush)', () => {
       .flatMap((rm) => rm.scopeMetrics)
       .flatMap((sm) => sm.metrics)
       .find((m) => m.name === 'tool_calls_total');
-    // 1000 distinct + 1 overflow, never 1500.
-    expect(metric?.sum?.dataPoints.length).toBeLessThanOrEqual(1001);
+    // 1000 distinct + 1 overflow, never 1500 (distinct label sets; see above).
+    expect(distinctSeries(metric?.sum?.dataPoints ?? [])).toBeLessThanOrEqual(1001);
     expect(collectStrings(decoded)).toContain('otel.metric.overflow');
   });
 
@@ -368,5 +374,275 @@ describe('metrics stack (init → emit → flush)', () => {
     countMetric('requests_total', { status: 'ok' });
     await expect(flushAndWait()).resolves.toBeUndefined();
     expect(warn).toHaveBeenCalled();
+  });
+});
+
+/** Pull `service.instance.id` out of a decoded OTLP payload's resource attributes. */
+function instanceIdOf(body: unknown): string | undefined {
+  const decoded = decodeBody(body) as {
+    resourceMetrics: Array<{
+      resource: { attributes: Array<{ key: string; value: { stringValue?: string } }> };
+    }>;
+  };
+  return decoded.resourceMetrics[0].resource.attributes.find((a) => a.key === 'service.instance.id')
+    ?.value.stringValue;
+}
+
+/** A fetch mock whose responses are held until the test releases them, in call order. */
+function heldFetch(): { fetchFn: typeof fetch; release: (n: number) => void } {
+  const resolvers: Array<() => void> = [];
+  const fetchFn = vi.fn(
+    () =>
+      new Promise<Response>((resolve) => {
+        resolvers.push(() => resolve(new Response(null, { status: 200 })));
+      })
+  ) as unknown as typeof fetch;
+  return { fetchFn, release: (n) => resolvers[n]() };
+}
+
+type DecodedPoint = {
+  attributes: Array<{ key: string; value: { stringValue?: string } }>;
+  startTimeUnixNano: string;
+  timeUnixNano: string;
+  asInt?: number;
+  asDouble?: number;
+  count?: number;
+  sum?: number;
+  bucketCounts?: number[];
+  min?: number;
+  max?: number;
+};
+
+/** All data points of the named metric in a decoded payload, in wire order. */
+function pointsOf(body: unknown, metricName: string): DecodedPoint[] {
+  const decoded = decodeBody(body) as {
+    resourceMetrics: Array<{
+      scopeMetrics: Array<{
+        metrics: Array<{
+          name: string;
+          sum?: { dataPoints: DecodedPoint[] };
+          histogram?: { dataPoints: DecodedPoint[] };
+        }>;
+      }>;
+    }>;
+  };
+  const metric = decoded.resourceMetrics
+    .flatMap((r) => r.scopeMetrics)
+    .flatMap((sm) => sm.metrics)
+    .find((m) => m.name === metricName);
+  return metric?.sum?.dataPoints ?? metric?.histogram?.dataPoints ?? [];
+}
+
+const labelOf = (p: DecodedPoint, key: string): string | undefined =>
+  p.attributes.find((a) => a.key === key)?.value.stringValue;
+/** Counter value regardless of the serializer's int/double choice. */
+const valueOf = (p: DecodedPoint): number | undefined => p.asInt ?? p.asDouble;
+
+describe("zero-at-start sample ahead of a series' first delta", () => {
+  // WHY: downstream, each isolate's deltas become one cumulative series per isolate. A
+  // series with a single sample is invisible to PromQL rate()/increase(), so an isolate
+  // that flushed exactly once contributed nothing. Prometheus's own remedy is to inject a
+  // zero at the series' start ("created timestamp"), but in Mimir that is an experimental,
+  // default-off, server-side flag. So the worker does it at the source: the first time a
+  // series leaves this isolate, a zero-valued point at its start time travels in the same
+  // export, strictly before the real point. Two samples → rate() works, no external flag.
+
+  it('prepends a zero point the first time a series is exported, and only then', async () => {
+    const fetchFn = okFetch();
+    initMetricTelemetry(ENABLED, { fetchFn });
+    countMetric('requests_total', { status: 'ok' });
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+
+    const mock = fetchFn as unknown as ReturnType<typeof vi.fn>;
+    const first = pointsOf(mock.mock.calls[0][1].body, 'requests_total');
+    expect(first.map(valueOf)).toEqual([0, 2]);
+    expect(labelOf(first[0], 'status')).toBe('ok');
+    const second = pointsOf(mock.mock.calls[1][1].body, 'requests_total');
+    expect(second.map(valueOf)).toEqual([1]);
+  });
+
+  it('puts the zero strictly before the real point, by at least one millisecond', async () => {
+    const fetchFn = okFetch();
+    initMetricTelemetry(ENABLED, { fetchFn });
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+    const [zero, real] = pointsOf(
+      (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls[0][1].body,
+      'requests_total'
+    );
+    const gapNs = BigInt(real.timeUnixNano) - BigInt(zero.timeUnixNano);
+    expect(gapNs >= 1_000_000n).toBe(true);
+    // The zero is a single instant (valid OTLP: time >= start) that never sits after the
+    // real point's start, so it seeds the earliest start the series will ever report.
+    expect(zero.startTimeUnixNano).toBe(zero.timeUnixNano);
+    expect(BigInt(zero.timeUnixNano) <= BigInt(real.startTimeUnixNano)).toBe(true);
+  });
+
+  it('treats each label set as its own series', async () => {
+    const fetchFn = okFetch();
+    initMetricTelemetry(ENABLED, { fetchFn });
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+    countMetric('requests_total', { status: 'ok' });
+    countMetric('requests_total', { status: 'error' });
+    await flushAndWait();
+
+    const second = pointsOf(
+      (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls[1][1].body,
+      'requests_total'
+    );
+    const ok = second.filter((p) => labelOf(p, 'status') === 'ok').map(valueOf);
+    const error = second.filter((p) => labelOf(p, 'status') === 'error').map(valueOf);
+    expect(ok).toEqual([1]);
+    expect(error).toEqual([0, 1]);
+  });
+
+  it('still seeds the zero on the next flush when the first export was rejected', async () => {
+    // WHY (codex round 3): the SDK drains a delta whether or not its POST lands. If the
+    // series were marked "seen" while building the payload, a failed first export would
+    // suppress the zero forever and a one-flush isolate would again be unqueryable. The
+    // mark must commit only once the collector has accepted the export.
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fetchFn = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('network down'))
+      .mockResolvedValue(new Response(null, { status: 200 })) as unknown as typeof fetch;
+    initMetricTelemetry(ENABLED, { fetchFn });
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+
+    const mock = fetchFn as unknown as ReturnType<typeof vi.fn>;
+    expect(mock).toHaveBeenCalledTimes(3);
+    expect(pointsOf(mock.mock.calls[1][1].body, 'requests_total').map(valueOf)).toEqual([0, 1]);
+    expect(pointsOf(mock.mock.calls[2][1].body, 'requests_total').map(valueOf)).toEqual([1]);
+  });
+
+  it('still seeds the zero on the next flush when the first export got a non-2xx', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(null, { status: 503 }))
+      .mockResolvedValue(new Response(null, { status: 200 })) as unknown as typeof fetch;
+    initMetricTelemetry(ENABLED, { fetchFn });
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+
+    const mock = fetchFn as unknown as ReturnType<typeof vi.fn>;
+    expect(pointsOf(mock.mock.calls[1][1].body, 'requests_total').map(valueOf)).toEqual([0, 1]);
+  });
+
+  it('prepends an empty histogram point for a histogram series', async () => {
+    const fetchFn = okFetch();
+    initMetricTelemetry(ENABLED, { fetchFn });
+    recordMetric('claude_fetch_duration_ms', 42, { status: 'success' });
+    await flushAndWait();
+
+    const [zero, real] = pointsOf(
+      (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls[0][1].body,
+      'claude_fetch_duration_ms'
+    );
+    expect(zero.count).toBe(0);
+    expect(zero.sum).toBe(0);
+    expect(zero.bucketCounts).toEqual(real.bucketCounts?.map(() => 0));
+    expect(zero.min).toBeUndefined();
+    expect(zero.max).toBeUndefined();
+    expect(real.count).toBe(1);
+    expect(real.sum).toBe(42);
+  });
+});
+
+describe('per-isolate stream identity and ordered flushes', () => {
+  // WHY: the collector's deltatocumulative processor keys its state by resource identity
+  // and drops any delta whose start is older than the stored stream's, or whose timestamp
+  // is not strictly later. Every isolate sharing ONE identity meant concurrent isolates
+  // silently undercounted Mimir (codex review, #447). Each isolate therefore stamps its
+  // own service.instance.id, and flushes from one isolate are serialized so its deltas
+  // reach the collector in the order they were collected.
+
+  it('stamps one service.instance.id per isolate, stable across flushes', async () => {
+    const fetchFn = okFetch();
+    initMetricTelemetry(ENABLED, { fetchFn });
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+
+    const mock = fetchFn as unknown as ReturnType<typeof vi.fn>;
+    expect(mock).toHaveBeenCalledTimes(2);
+    const first = instanceIdOf(mock.mock.calls[0][1].body);
+    const second = instanceIdOf(mock.mock.calls[1][1].body);
+    expect(first).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    expect(second).toBe(first);
+  });
+
+  it('gives a fresh isolate a fresh instance id (re-init after reset)', async () => {
+    const fetchFn = okFetch();
+    initMetricTelemetry(ENABLED, { fetchFn });
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+    resetMetricTelemetryForTests();
+    initMetricTelemetry(ENABLED, { fetchFn });
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+
+    const mock = fetchFn as unknown as ReturnType<typeof vi.fn>;
+    expect(instanceIdOf(mock.mock.calls[1][1].body)).not.toBe(
+      instanceIdOf(mock.mock.calls[0][1].body)
+    );
+  });
+
+  it('does not start the next export until the previous one has been acknowledged', async () => {
+    const { fetchFn, release } = heldFetch();
+    initMetricTelemetry(ENABLED, { fetchFn });
+    const pending: Promise<unknown>[] = [];
+
+    countMetric('requests_total', { status: 'ok' });
+    flushMetricTelemetry((p) => pending.push(p));
+    // First POST is now in flight and unacknowledged.
+    await vi.waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(1));
+
+    // A second flush with fresh data must queue behind it, not race it: without the
+    // chain this collects and POSTs immediately, and the count below reads 2.
+    countMetric('requests_total', { status: 'ok' });
+    flushMetricTelemetry((p) => pending.push(p));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+
+    release(0);
+    await vi.waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(2));
+    release(1);
+    await Promise.all(pending);
+  });
+
+  it('a failed export does not wedge the flushes behind it', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fetchFn = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('network down'))
+      .mockResolvedValue(new Response(null, { status: 200 })) as unknown as typeof fetch;
+    initMetricTelemetry(ENABLED, { fetchFn });
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  it('bounds every export with an abort signal so a hung collector cannot stall the chain', async () => {
+    const fetchFn = okFetch();
+    initMetricTelemetry(ENABLED, { fetchFn });
+    countMetric('requests_total', { status: 'ok' });
+    await flushAndWait();
+    const [, init] = (fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(init.signal).toBeInstanceOf(AbortSignal);
   });
 });
