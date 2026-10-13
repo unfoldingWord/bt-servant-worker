@@ -3,14 +3,19 @@
  *
  * Parser tests run against fixtures captured verbatim from the live
  * servers: translation-helps `list_resources_for_language(en)` and aquifer
- * `list(eng)` (production, 2026-07-30), and translation-helps v2
- * `list_resources(en)` (staging, 2026-08-18). If a server changes its format,
+ * `list(eng)` (production, 2026-07-30), translation-helps v2
+ * `list_resources(en)` (staging, 2026-08-18), and obs-5m `list_resources(en)`
+ * / `list_resources(fr)` (2026-10-12). If a server changes its format,
  * refresh the fixture and these tests show the drift.
  */
 import { describe, expect, it, vi } from 'vitest';
 // Vite ?raw imports — the workers test pool has no filesystem access.
 // @ts-expect-error -- ?raw module resolution is handled by Vite, not tsc
 import AQUIFER_FIXTURE from '../fixtures/aquifer-list-eng.md?raw';
+// @ts-expect-error -- ?raw module resolution is handled by Vite, not tsc
+import OBS_5M_EN_FIXTURE from '../fixtures/obs-5m-list-en.txt?raw';
+// @ts-expect-error -- ?raw module resolution is handled by Vite, not tsc
+import OBS_5M_FR_FIXTURE from '../fixtures/obs-5m-list-fr.txt?raw';
 // @ts-expect-error -- ?raw module resolution is handled by Vite, not tsc
 import TH_FIXTURE from '../fixtures/translation-helps-list-en.json?raw';
 // @ts-expect-error -- ?raw module resolution is handled by Vite, not tsc
@@ -182,9 +187,9 @@ describe('parseTranslationHelpsV2Listing errors', () => {
     );
   });
 
-  it('throws when the available array is missing', () => {
+  it('throws when neither listing array is present', () => {
     expect(() => parseTranslationHelpsV2Listing('{"language":"en"}', 'th-v2')).toThrow(
-      /missing "available"/
+      /neither an "available" nor a "resources" array/
     );
   });
 
@@ -192,6 +197,40 @@ describe('parseTranslationHelpsV2Listing errors', () => {
     expect(() =>
       parseTranslationHelpsV2Listing('{"available":[{"type":"scripture"}]}', 'th-v2')
     ).toThrow(/missing abbreviation\/subject/);
+  });
+
+  it('names the tool, not a server family, in shape errors (#451)', () => {
+    // The adapter is picked by tool name alone, so the server behind it may
+    // not be translation-helps at all — the message must not claim it is.
+    const parse = () => parseTranslationHelpsV2Listing('{"language":"en"}', 'obs-5m');
+    expect(parse).toThrow(/^list_resources listing/);
+    expect(parse).not.toThrow(/translation-helps/);
+  });
+});
+
+// obs-5m is modelled on translation-helps v2 and reuses its `list_resources`
+// tool name, but sends only `resources` and flags each row with a boolean
+// instead of omitting the ones a language lacks (#451).
+describe('parseTranslationHelpsV2Listing with a resources-only payload', () => {
+  it('parses the live obs-5m fixture from its `resources` array', () => {
+    expect(parseTranslationHelpsV2Listing(OBS_5M_EN_FIXTURE, 'obs-5m')).toEqual([
+      { name: 'OBS-TF', subject: 'obs-theological-formation', serverId: 'obs-5m' },
+    ]);
+  });
+
+  it('drops rows the server flags as not available for the language', () => {
+    expect(parseTranslationHelpsV2Listing(OBS_5M_FR_FIXTURE, 'obs-5m')).toEqual([]);
+  });
+
+  it('prefers `available` when a payload carries both arrays', () => {
+    // translation-helps v2 sends both; `available` stays the source of truth.
+    const payload = JSON.stringify({
+      available: [{ subject: 'Bible', abbreviation: 'from-available' }],
+      resources: [{ subject: 'Bible', abbreviation: 'from-resources' }],
+    });
+    expect(parseTranslationHelpsV2Listing(payload, 's').map((i) => i.name)).toEqual([
+      'from-available',
+    ]);
   });
 });
 
@@ -319,6 +358,20 @@ describe('selectListingAdapter', () => {
     expect(adapter?.id).toBe('translation-helps');
   });
 
+  it('picks the list_resources adapter for the obs-5m manifest (#451)', () => {
+    // Tool names as discovered from the live server. Nothing in the manifest
+    // tells obs-5m apart from translation-helps v2, so the adapter has to
+    // cope with both payloads.
+    const adapter = selectListingAdapter([
+      tool('list_languages'),
+      tool('list_resources'),
+      tool('list_collections'),
+      tool('list_stories'),
+      tool('fetch_obs_study_manual'),
+    ]);
+    expect(adapter?.id).toBe('translation-helps-v2');
+  });
+
   it('passes the language tag through untranslated for v2', () => {
     const adapter = selectListingAdapter([tool('list_resources')]);
     expect(adapter?.buildArgs('en-US')).toEqual({ language: 'en-US' });
@@ -406,6 +459,62 @@ describe('listOrgResources', () => {
   it('returns empty aggregation for an org with no servers', async () => {
     const result = await listOrgResources([], 'en', logger, makeDeps());
     expect(result).toEqual({ resources: {}, servers: [] });
+  });
+});
+
+// Regression for #451: the staging Resources panel reported obs-5m as `error`
+// ("translation-helps v2 listing missing \"available\" array") although the
+// server answered correctly.
+describe('listOrgResources with an obs-5m style list_resources server', () => {
+  function obs5mDeps(listing: string): ListOrgResourcesDeps {
+    return makeDeps({
+      discoverAllTools: async (servers) =>
+        servers.map((s) => ({
+          serverId: s.id,
+          serverName: s.name,
+          tools: [tool('list_languages'), tool('list_resources'), tool('get_story')],
+        })),
+      callMCPTool: async () => ({ result: listing, metadata: undefined, responseTimeMs: 5 }),
+    });
+  }
+
+  it('reports ok and lists the resource for a language the server has', async () => {
+    const result = await listOrgResources(
+      [server('obs-5m')],
+      'en',
+      logger,
+      obs5mDeps(OBS_5M_EN_FIXTURE)
+    );
+    expect(result.servers).toEqual([
+      { serverId: 'obs-5m', serverName: 'Server obs-5m', status: 'ok' },
+    ]);
+    expect(result.resources).toEqual({
+      'obs-theological-formation': [
+        { name: 'OBS-TF', subject: 'obs-theological-formation', serverId: 'obs-5m' },
+      ],
+    });
+  });
+
+  it('reports ok with no resources for a language the server lacks', async () => {
+    const result = await listOrgResources(
+      [server('obs-5m')],
+      'fr',
+      logger,
+      obs5mDeps(OBS_5M_FR_FIXTURE)
+    );
+    expect(result.servers[0]?.status).toBe('ok');
+    expect(result.resources).toEqual({});
+  });
+
+  it('still reports error for a list_resources payload with neither array', async () => {
+    const result = await listOrgResources(
+      [server('other')],
+      'en',
+      logger,
+      obs5mDeps('{"language":"en","items":[]}')
+    );
+    expect(result.servers[0]?.status).toBe('error');
+    expect(result.servers[0]?.error).toMatch(/^list_resources listing has neither/);
   });
 });
 
