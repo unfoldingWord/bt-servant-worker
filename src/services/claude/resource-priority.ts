@@ -24,12 +24,15 @@
  *
  *  1. It strips the block's HTML-comment marker lines so they never reach the
  *     model.
- *  2. When the order parses, it appends an actionable directive that lists the
- *     ranked resources by their full `serverId:name` identity — preserving both
- *     the ordering and which server each belongs to — and tells the model to
- *     honor the order through each tool's own resource selector, citing
- *     `fetch_scripture`'s `resource` parameter (whose values are resource names
- *     such as `ult`/`ust`) as the concrete scripture lever.
+ *  2. When the order parses, it appends an actionable directive DERIVED FROM
+ *     THE RANKED IDS THEMSELVES: consecutive ids that share a server (the part
+ *     before the first `:`) are rendered as one entry naming that server and
+ *     its resource ids in ranked order (`server aquifer: WorldEnglishBible,
+ *     then BereanStandardBible`), and the model is told to use that server's
+ *     tools and pass the ids as written. No tool name or resource example is
+ *     hardcoded (#341): the earlier wording cited `fetch_scripture` and
+ *     `ult`/`ust` for every ranking, which for an Aquifer ranking named a tool
+ *     absent from the pool and primed the competing resource names.
  *
  * Everything is SCOPED TO THE FENCED BLOCK: parsing and marker-stripping act
  * only on the region between a whole-line opening marker and its whole-line
@@ -167,30 +170,55 @@ export function resourceNameFromId(id: string): string {
 const DIRECTIVE_HEADING = '### Applying the resource priority';
 
 /**
+ * Server id → catalog display name. The tool catalog the model sees headings
+ * each server by its display name, never by its id, so the directive carries
+ * the name as the join key and the id in parentheses.
+ */
+export type ServerNames = ReadonlyMap<string, string>;
+
+/** A run of consecutive ranked ids that share one server (`''` when unprefixed). */
+interface ServerRun {
+  serverId: string;
+  names: string[];
+}
+
+/**
  * Render the actionable directive for a non-empty order, or `''` when it yields
  * no usable ids. Entries are de-duplicated by their FULL composite id, so the
  * same resource name under two different servers keeps both ranking positions.
- * Each entry shows `name — serverId`, preserving which server (and therefore
- * which tool) a resource belongs to, so the model never sends one server's
- * resource name to another server's tool.
+ *
+ * Consecutive ids on the same server collapse into one numbered entry
+ * (`server aquifer: WorldEnglishBible, then BereanStandardBible`); a server
+ * change starts a new entry, so a mixed ranking keeps its exact order rather
+ * than being regrouped by server. Ids with no `server:` prefix are listed
+ * plainly. Nothing here names a tool or a resource that is not in `order`.
  */
-export function renderResourcePriorityDirective(order: readonly string[]): string {
+export function renderResourcePriorityDirective(
+  order: readonly string[],
+  serverNames?: ServerNames
+): string {
   const seen = new Set<string>();
-  const ranked: string[] = [];
+  const runs: ServerRun[] = [];
   for (const rawId of order) {
     const id = rawId.trim();
     if (id.length === 0 || seen.has(id)) continue;
     const { serverId, name } = splitResourceId(id);
-    if (name.trim().length === 0) continue;
+    const trimmedName = name.trim();
+    if (trimmedName.length === 0) continue;
     seen.add(id);
-    const position = ranked.length + 1;
-    ranked.push(
-      serverId.length > 0
-        ? `${position}. ${name.trim()} — ${serverId}`
-        : `${position}. ${name.trim()}`
-    );
+    const current = runs[runs.length - 1];
+    if (current && current.serverId === serverId) current.names.push(trimmedName);
+    else runs.push({ serverId, names: [trimmedName] });
   }
-  if (ranked.length === 0) return '';
+  if (runs.length === 0) return '';
+
+  const ranked = runs.map((run, index) => {
+    const names = run.names.join(', then ');
+    if (run.serverId.length === 0) return `${index + 1}. ${names}`;
+    const displayName = serverNames?.get(run.serverId);
+    const label = displayName ? `${displayName} (id ${run.serverId})` : run.serverId;
+    return `${index + 1}. server ${label}: ${names}`;
+  });
 
   return [
     DIRECTIVE_HEADING,
@@ -198,10 +226,11 @@ export function renderResourcePriorityDirective(order: readonly string[]): strin
     'Prefer the highest-ranked resource that covers the question, and fall back to a lower-ranked or',
     'unranked source only when it does not. When your answer draws on anything other than the',
     'highest-ranked source that covers the question, say so briefly in the same reply.',
-    'When a tool exposes a parameter that targets a specific resource, set it to honor this order —',
-    "for scripture, `fetch_scripture`'s `resource` parameter takes resource names such as `ult`,",
-    '`ust`, `t4t`, `ueb`. Match each resource below to the tool from its server; never pass one',
-    "server's resource name to another server's tool.",
+    'An entry written `server <name>: ...` names a server and its resource ids in ranked order.',
+    "Use that server's tools for those resources and, where a tool takes a resource selector, pass",
+    `only the resource id after the colon (for entry 1 that is \`${runs[0]?.names[0] ?? ''}\`), never the`,
+    '`server ...:` prefix. An entry without a `server` prefix is a bare resource id; pass it as listed.',
+    "Never pass one server's resource id to another server's tool.",
     'Ranked resources, most preferred first:',
     ...ranked,
   ].join('\n');
@@ -260,7 +289,8 @@ function stripMarkerLines(lines: readonly string[]): string[] {
  */
 function applyValidBlock(
   lines: readonly string[],
-  block: WellFormedBlock
+  block: WellFormedBlock,
+  serverNames?: ServerNames
 ): AppliedResourcePriority {
   const order = parseOrderLine(lines[block.order] ?? '');
   const prose = collapseBlankRuns(
@@ -270,7 +300,7 @@ function applyValidBlock(
   let middle = prose;
   let applied = false;
   if (order !== 'corrupt' && order.length > 0) {
-    const directive = renderResourcePriorityDirective(order);
+    const directive = renderResourcePriorityDirective(order, serverNames);
     if (directive.length > 0) {
       middle = prose.length > 0 ? `${prose}\n\n${directive}` : directive;
       applied = true;
@@ -293,7 +323,10 @@ function applyValidBlock(
  * Pure and non-mutating: returns the original string unchanged when there is no
  * marker syntax at all, so the common case is a cheap identity.
  */
-export function applyResourcePriority(toolGuidance: string): AppliedResourcePriority {
+export function applyResourcePriority(
+  toolGuidance: string,
+  serverNames?: ServerNames
+): AppliedResourcePriority {
   if (typeof toolGuidance !== 'string') {
     return { toolGuidance, order: null, applied: false };
   }
@@ -308,7 +341,7 @@ export function applyResourcePriority(toolGuidance: string): AppliedResourcePrio
   const block =
     markers.begins.length > 0 && markers.ends.length > 0 ? wellFormedBlock(markers) : null;
   if (block) {
-    return applyValidBlock(lines, block);
+    return applyValidBlock(lines, block, serverNames);
   }
 
   // A marker is present but there is no single well-formed block (multiple or
