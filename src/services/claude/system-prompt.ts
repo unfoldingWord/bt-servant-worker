@@ -176,6 +176,20 @@ const MEDIA_FORMATTING_RULES =
   '- NEVER construct a URL by pattern-matching from another field (e.g., do not derive a video URL from a photo URL by swapping path segments like `photos/…` → `videos/…`).\n' +
   '- Copy URLs verbatim from tool output.';
 
+// Non-overridable grounding rule (portal #342). The model only ever sees a
+// catalog of tools, never of versions, so without this it lists Bible versions
+// from training-data recall and offers substitutes no server holds. Kept
+// server-agnostic on purpose: which servers and versions exist is the pool's
+// business, not this string's. Injected in voice mode too — a spoken answer
+// can name an unavailable version just as easily as a written one.
+const RESOURCE_AVAILABILITY_RULES =
+  '## Never invent resource availability\n\n' +
+  'Only name a Bible version or other resource as available if a tool returned it during this turn. ' +
+  'Knowing that a version exists is not evidence that you have it.\n' +
+  '- When the user asks which versions are available, call the version-listing tool of each scripture server in the tool catalog and answer from those results.\n' +
+  '- If one server does not have a requested version, check the other scripture servers before telling the user it is unavailable.\n' +
+  '- NEVER offer a substitute version that no tool returned. If you could not check, say so instead of guessing.';
+
 /** Build the client platform + client_instructions section. */
 function buildClientSection(clientId: string | undefined, clientInstructions: string): string {
   const parts: string[] = [];
@@ -304,6 +318,7 @@ function pushUnmatchedTriggersSection(
  *   [language guidance] →
  *   [memory_instructions + TOC] → [audio guidance] → [voice guidance] →
  *   [user preferences] → [conversation context] → [first interaction] →
+ *   [resource availability rules (non-overridable)] →
  *   [media formatting rules (non-overridable, text mode only)] → [closing]
  */
 /** Push memory, audio, ptxprint, and voice sections in their declared order. */
@@ -444,6 +459,7 @@ export function buildSystemPromptBlocks(
     memoryEnabled,
   });
   sections.push(...buildConditionalSections(preferences, history));
+  sections.push(RESOURCE_AVAILABILITY_RULES);
   if (!isVoiceMessage) {
     sections.push(MEDIA_FORMATTING_RULES);
   }

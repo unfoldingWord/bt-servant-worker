@@ -31,6 +31,7 @@ describe('buildGetToolDefinitionsTool', () => {
 
     expect(tool.name).toBe('get_tool_definitions');
     expect(tool.description).toContain('JSON Schema');
+    expect(tool.description).toContain('description');
     expect(tool.input_schema.type).toBe('object');
     expect(tool.input_schema.required).toContain('tool_names');
   });
@@ -152,7 +153,10 @@ describe('getToolDefinitions', () => {
     const defs = getToolDefinitions(catalog, ['tool1']);
 
     expect(Object.keys(defs)).toEqual(['tool1']);
-    expect(defs['tool1']).toBeDefined();
+    expect(defs['tool1']).toEqual({
+      description: 'Tool 1',
+      inputSchema: { type: 'object', properties: { a: { type: 'string' } } },
+    });
   });
 
   it('should skip unknown tools', () => {
@@ -160,6 +164,29 @@ describe('getToolDefinitions', () => {
     const defs = getToolDefinitions(catalog, ['nonexistent']);
 
     expect(Object.keys(defs)).toHaveLength(0);
+  });
+});
+
+describe('getToolDefinitions - descriptions (#342)', () => {
+  it('returns the full description, not the truncated catalog summary', () => {
+    // Server-authored guidance (e.g. "call list_versions first") lives past the
+    // first sentence, which is all the prompt catalog shows.
+    const description =
+      'Fetch a passage. Always call list_versions first; do NOT guess version codes like kjv or niv.';
+    const catalog = buildToolCatalog(
+      [
+        {
+          serverId: 's1',
+          serverName: 'S1',
+          tools: [{ name: 'get_reference', description, inputSchema: { type: 'object' } }],
+        },
+      ],
+      [{ id: 's1', name: 'S1', url: 'http://test', enabled: true, priority: 1 }]
+    );
+
+    expect(getToolDefinitions(catalog, ['get_reference'])['get_reference']?.description).toBe(
+      description
+    );
   });
 });
 
