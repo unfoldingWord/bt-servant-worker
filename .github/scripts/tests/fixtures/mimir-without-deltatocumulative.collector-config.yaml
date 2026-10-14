@@ -1,0 +1,30 @@
+# Fixture: the Mimir pipeline with no `deltatocumulative` processor. The worker emits DELTA
+# temporality (ephemeral isolates); Mimir is Prometheus-shaped and expects CUMULATIVE. Without
+# the conversion the config still validates and the collector still boots, so this is only
+# caught here. Everything else is well-formed so the script fails for this reason only.
+extensions:
+  basicauth/mimir:
+    client_auth:
+      username: ${env:MIMIR_USER}
+      password: ${env:MIMIR_PASSWORD}
+
+processors:
+  attributes/redact:
+    actions:
+      - { key: user_id, action: delete }
+
+exporters:
+  otlp_http/mimir_metrics:
+    metrics_endpoint: https://mimir.door43.org/otlp/v1/metrics
+    auth:
+      authenticator: basicauth/mimir
+
+service:
+  extensions: [basicauth/mimir]
+  pipelines:
+    traces:
+      processors: [attributes/redact]
+      exporters: [otlp_http/openobserve_traces]
+    metrics/mimir:
+      processors: [attributes/redact]
+      exporters: [otlp_http/mimir_metrics]

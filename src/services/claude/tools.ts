@@ -3,11 +3,11 @@
  *
  * Claude has access to two meta-tools:
  * - execute_code: Run JS in QuickJS sandbox with MCP tool access
- * - get_tool_definitions: Get full schemas for MCP tools
+ * - get_tool_definitions: Get full descriptions and schemas for MCP tools
  *
  * MCP tools are NOT exposed directly to Claude. Instead:
  * - System prompt shows a compact catalog (name + summary)
- * - Claude calls get_tool_definitions to learn full schemas
+ * - Claude calls get_tool_definitions to learn full descriptions and schemas
  * - Claude uses execute_code to call MCP tools
  */
 
@@ -77,7 +77,7 @@ export function buildGetToolDefinitionsTool(): Anthropic.Tool {
   return {
     name: 'get_tool_definitions',
     description:
-      'Get the full JSON Schema definitions for one or more MCP tools. Use this to understand the exact parameters a tool accepts before calling it.',
+      "Get the full definitions for one or more MCP tools: each tool's description (the server's own usage guidance) and its input JSON Schema. Use this to understand what a tool does and the exact parameters it accepts before calling it.",
     input_schema: {
       type: 'object',
       properties: {
@@ -482,20 +482,27 @@ export function isR2KeyInput(input: unknown): input is { r2_key: string } {
   return typeof key === 'string' && key.length > 0 && key.length <= MAX_R2_KEY_LENGTH;
 }
 
+/** One entry in the get_tool_definitions result. */
+export interface ToolDefinition {
+  /** The server-authored description, in full (the prompt catalog only shows a one-line summary). */
+  description: string;
+  inputSchema: JSONSchema;
+}
+
 /**
  * Get tool definitions from catalog
  */
 export function getToolDefinitions(
   catalog: ToolCatalog,
   toolNames: string[]
-): Record<string, JSONSchema> {
-  const definitions: Record<string, JSONSchema> = {};
+): Record<string, ToolDefinition> {
+  const definitions: Record<string, ToolDefinition> = {};
 
   for (const name of toolNames) {
     const tool = catalog.tools.find((t) => t.name === name);
     if (tool) {
       // eslint-disable-next-line security/detect-object-injection -- name is from controlled toolNames array
-      definitions[name] = tool.inputSchema;
+      definitions[name] = { description: tool.description, inputSchema: tool.inputSchema };
     }
   }
 

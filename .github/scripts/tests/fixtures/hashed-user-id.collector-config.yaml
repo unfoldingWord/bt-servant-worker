@@ -1,18 +1,32 @@
 # Fixture: the privacy regression the script was originally written for — user_id hashed
 # rather than deleted. The collector's `hash` is an unsalted digest, reversible by brute
-# force for enumerable ids (phone numbers). Kept here so the fly.toml work below cannot
-# quietly break the assertion that matters most.
+# force for enumerable ids (phone numbers). Everything else here is well-formed (the Mimir
+# extension, exporter and pipeline are all correct) so the script fails for this reason only.
+extensions:
+  basicauth/mimir:
+    client_auth:
+      username: ${env:MIMIR_USER}
+      password: ${env:MIMIR_PASSWORD}
+
 processors:
   attributes/redact:
     actions:
       - { key: user_id, action: hash }
+  deltatocumulative:
+    max_stale: 1h
 
 exporters:
-  influxdb/door43_metrics:
-    bucket: ${env:INFLUX_BUCKET}
+  otlp_http/mimir_metrics:
+    metrics_endpoint: https://mimir.door43.org/otlp/v1/metrics
+    auth:
+      authenticator: basicauth/mimir
 
 service:
+  extensions: [basicauth/mimir]
   pipelines:
     traces:
       processors: [attributes/redact]
       exporters: [otlp_http/openobserve_traces]
+    metrics/mimir:
+      processors: [attributes/redact, deltatocumulative]
+      exporters: [otlp_http/mimir_metrics]

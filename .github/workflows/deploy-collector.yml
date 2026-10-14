@@ -7,7 +7,9 @@ name: Deploy OTel Collector
 # validate runs on every PR that touches the collector; deploy runs only on main.
 # The M0 lesson: a config the collector rejects crash-loops the fly app on boot, and
 # fly happily rolls it out anyway. So we validate with the EXACT pinned image before
-# any deploy, and we pre-flight the fly secrets the config depends on.
+# any deploy, we pre-flight the fly secrets the config depends on, and after the deploy
+# we pin each app to exactly one machine (the Mimir pipeline's delta→cumulative state
+# lives in one process; a second machine corrupts the series).
 
 on:
   push:
@@ -70,8 +72,8 @@ jobs:
             -e OTEL_INGEST_TOKEN=validate-only \
             -e O2_ENDPOINT=https://validate-only.invalid/api/default \
             -e O2_AUTH="Basic dmFsaWRhdGUtb25seQ==" \
-            -e INFLUX_TOKEN=validate-only \
-            -e INFLUX_BUCKET=validate-only \
+            -e MIMIR_USER=validate-only \
+            -e MIMIR_PASSWORD=validate-only \
             "otel/opentelemetry-collector-contrib:${{ steps.otelcol.outputs.version }}" \
             validate --config /cfg/otel-collector-config.yaml
 
@@ -84,18 +86,19 @@ jobs:
 
       # `validate` type-checks the config; it has no idea which values are
       # load-bearing for us. An unset or misspelled ${env:...} resolves to an empty
-      # string and validate still exits 0 — a collector missing INFLUX_BUCKET boots
-      # healthy and writes every metric to bucket="". Likewise it does not care
-      # whether user_id is deleted, hashed, or forwarded untouched. Hence exact
-      # assertions on the parsed YAML. The deploy jobs guard the fly-secret side.
-      # Runs with no --fly-toml flags, so it checks BOTH real fly.tomls by default:
-      # every collector app must declare its own INFLUX_BUCKET in [env] and it must be
-      # the bucket the reviewed map assigns that app.
+      # string and validate still exits 0 — a collector missing MIMIR_USER boots
+      # healthy and has every metrics export rejected with a 401. Likewise it does not
+      # care whether user_id is deleted, hashed, or forwarded untouched, or whether the
+      # Mimir pipeline converts the worker's DELTA metrics to the CUMULATIVE form Mimir
+      # expects. Hence exact assertions on the parsed YAML. The deploy jobs guard the
+      # fly-secret side. Runs with no --fly-toml flags, so it checks BOTH real fly.tomls
+      # by default: every collector app must declare its own MIMIR_USER in [env] and it
+      # must be the user the reviewed map assigns that app.
       - name: Assert collector invariants
         run: python3 .github/scripts/assert-collector-invariants.py infra/otel-collector/otel-collector-config.yaml
 
       # The gate has to be gated too. It is the only thing standing between a PR and a
-      # collector that hashes user_id or writes staging metrics into the prod bucket, and
+      # collector that hashes user_id or writes staging metrics into the prod Mimir org, and
       # a check that has quietly stopped asserting still reports green — which reads as
       # proof. These fixtures are configs it MUST reject.
       - name: Self-test the invariant checker
@@ -108,6 +111,12 @@ jobs:
       # waves bad configs through; one that always fails blocks every collector deploy.
       - name: Self-test the secrets pre-flight
         run: .github/scripts/tests/test-check-collector-secrets.sh
+
+      # Same reasoning for the post-deploy machine-count gate: a second collector machine
+      # is a second deltatocumulative converter and Mimir rejects the split series, so the
+      # gate must keep failing on two machines and keep passing on one. Stubbed flyctl.
+      - name: Self-test the machine-count gate
+        run: .github/scripts/tests/test-pin-collector-machines.sh
 
   deploy-staging:
     name: Deploy Collector (Staging)
@@ -154,11 +163,25 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: .github/scripts/check-collector-secrets.sh "${{ steps.app.outputs.app }}"
 
+      # --ha=false: fly's default for an app's FIRST deploy is two machines for HA. That is
+      # exactly wrong here — see the "Pin to one machine" step below.
       - name: Deploy
         working-directory: infra/otel-collector
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: flyctl deploy --remote-only --config fly.toml
+        run: flyctl deploy --remote-only --config fly.toml --ha=false
+
+      # The Mimir pipeline's deltatocumulative keeps each series' running total in ONE
+      # collector process, and fly load-balances with no affinity. Two machines therefore
+      # split an isolate's deltas across two converters and Mimir rejects the result as
+      # out-of-order (seen on prod, 2026-10-12). fly.toml has no "max machines", so this
+      # step scales to one and then fails the job if the app does not have exactly one.
+      # If the deploy token ever lacks the right to destroy a stray machine, this fails
+      # loudly rather than leaving a second converter running — run the scale by hand.
+      - name: Pin to one machine
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: .github/scripts/pin-collector-machines.sh "${{ steps.app.outputs.app }}"
 
   deploy-production:
     name: Deploy Collector (Production)
@@ -168,7 +191,7 @@ jobs:
     # and this job starts deploying — no workflow edit needed.
     #
     # Since B2 the app NAME comes from infra/otel-collector/fly.prod.toml, not from that
-    # variable, because the app now has environment-specific config ([env] INFLUX_BUCKET)
+    # variable, because the app now has environment-specific config ([env] MIMIR_USER)
     # that an --app override cannot carry. The variable is purely the enable switch, and
     # the step below fails if the two disagree rather than deploying to whichever one won.
     if: github.ref == 'refs/heads/main' && vars.FLY_PROD_COLLECTOR_APP != ''
@@ -215,8 +238,14 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: .github/scripts/check-collector-secrets.sh "${{ steps.app.outputs.app }}"
 
+      # --ha=false and the pin step: same reasoning as the staging job.
       - name: Deploy
         working-directory: infra/otel-collector
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-        run: flyctl deploy --remote-only --config fly.prod.toml
+        run: flyctl deploy --remote-only --config fly.prod.toml --ha=false
+
+      - name: Pin to one machine
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: .github/scripts/pin-collector-machines.sh "${{ steps.app.outputs.app }}"
