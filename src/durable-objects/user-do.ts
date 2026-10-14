@@ -1291,9 +1291,6 @@ export class UserDO {
       const callbacks = this.buildWebhookCallbacks(body, logger);
       try {
         const response = await this.processChat(body, workerOrigin, logger, timing, callbacks);
-        // #422: the webhook `onComplete` resolves only after the `complete` POST
-        // was attempted (and any deferred welcome record settled), so the lock
-        // below is held until those durable effects have landed.
         await callbacks?.onComplete?.(response);
         logger.log('immediate_callback_complete', { message_id: messageId });
       } catch (error) {
@@ -1535,8 +1532,6 @@ export class UserDO {
     try {
       locale = await this.readStatusLocale(body, logger);
       const response = await this.processChat(body, workerOrigin, logger, timing, callbacks);
-      // #422: resolves after the `complete` POST was attempted and any deferred
-      // welcome record settled — the queue lock is released only after this.
       await callbacks?.onComplete?.(response);
     } catch (error) {
       await callbacks?.onError?.(processingFailureDetail(error, locale));
@@ -2489,10 +2484,7 @@ export class UserDO {
    * the webhook/WhatsApp transport, which renders each send discretely and is the
    * only path with `onWelcome` present (FIX 1). The SSE path and `/chat/final`
    * have no `onWelcome`, so this returns `handledOutOfBand: false` for them and
-   * the caller prepends the welcome in-band into `responses`. #422: a webhook
-   * consumer in `progress_mode: 'complete'` also has no `onWelcome` (see
-   * `createWebhookCallbacks`), so its welcome rides in-band inside the single
-   * `complete` payload instead of a `progress` POST that mode ignores.
+   * the caller prepends the welcome in-band into `responses`.
    *
    * FIX C: delivery is NON-FATAL. On success it records the one-time flag and
    * clears any pending bit; on failure it LOGS (structured, per the no-silent-
@@ -2566,10 +2558,8 @@ export class UserDO {
    * — and a mid-turn client disconnect makes that write a no-op. So when the
    * caller supplies `deferInBandWelcomeRecord`, DEFER flag recording to it: the
    * caller runs the handed recorder after the `complete` write with `delivered =
-   * !clientDisconnected`. #422: a `progress_mode: 'complete'` webhook supplies
-   * the same hook and settles it with whether the `complete` POST got a 2xx. On
-   * `/chat/final` there is no stream to drop, so record inline right here (as
-   * before). A throw before this point re-emits on retry.
+   * !clientDisconnected`. On `/chat/final` there is no stream to drop, so record
+   * inline right here (as before). A throw before this point re-emits on retry.
    */
   private async finalizeEmittedWelcome(
     welcome: ModeWelcome | undefined,
@@ -2584,8 +2574,8 @@ export class UserDO {
     await this.recordAdminWelcomeEmitted(welcome);
     if (sentOutOfBand) return;
     if (callbacks?.deferInBandWelcomeRecord) {
-      // SSE / complete-mode webhook: the caller runs this after the terminal
-      // write, passing whether the client actually received it.
+      // SSE: the caller runs this after the `complete` write (see the SSE
+      // handlers), passing whether the client was still connected.
       callbacks.deferInBandWelcomeRecord((delivered) =>
         this.recordInBandWelcomeOutcome(welcome, delivered, logger)
       );

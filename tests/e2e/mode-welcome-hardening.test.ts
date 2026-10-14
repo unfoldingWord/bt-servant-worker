@@ -6,11 +6,11 @@
  *    bit and flips `first_interaction:false` in ONE storage transaction — a
  *    failure mid-way leaves no partial state (no "flag set, model still
  *    welcomes" double-welcome window).
- * 2. A `progress_mode: 'complete'` callback consumer receives the welcome
- *    INSIDE the single `complete` payload instead of a `progress` POST it
- *    ignores (README "Progress modes": only the final `complete` event).
  * 3. Steady-state plain turns skip the per-slug `mode_welcome_pending` reads:
  *    a single `mode_welcome_pending_any` marker gates `maybePendingWelcome`.
+ *
+ * Item 2 of #422 (the `progress_mode: 'complete'` welcome fold) is deferred
+ * until a complete-mode consumer exists; it is not covered here.
  */
 
 import { env, runInDurableObject } from 'cloudflare:test';
@@ -23,7 +23,6 @@ import {
 } from '../helpers/anthropic-capture.js';
 import { buildSSEFrames } from '../helpers/anthropic-sse.js';
 import type { ChatRequest, ChatResponse, StreamCallbacks } from '../../src/types/engine.js';
-import type { InternalQueueEntry } from '../../src/types/queue.js';
 import type { UserPreferencesInternal } from '../../src/types/engine.js';
 import type { OrgModes, PromptMode } from '../../src/types/prompt-overrides.js';
 import { createRequestLogger, type RequestLogger } from '../../src/utils/logger.js';
@@ -35,12 +34,6 @@ vi.mock('@anthropic-ai/sdk', () => ({ default: vi.fn() }));
 
 const PENDING_PREFIX = 'mode_welcome_pending:';
 const PENDING_ANY_KEY = 'mode_welcome_pending_any';
-const CALLBACK_URL = 'https://callback.example/hook';
-
-/** White-box handle to the DO's real webhook caller (`processCallbackEntry`). */
-interface ProcessCallbackEntryInstance {
-  processCallbackEntry(entry: InternalQueueEntry, logger: RequestLogger): Promise<void>;
-}
 
 /** White-box handle to the DO's private per-turn pipeline (callback-path tests). */
 interface ProcessChatInstance {
@@ -107,25 +100,11 @@ function anthropicStreamBody(text: string): string {
   ]);
 }
 
-interface CapturedPost {
-  type: string;
-  text?: string;
-}
-
-interface StreamingFetch {
-  posts: CapturedPost[];
-  /** HTTP status the callback URL answers with (mutable per turn). */
-  callbackStatus: number;
-}
-
 /**
  * Stub the Anthropic SDK ctor and route `globalThis.fetch`: the Anthropic host
- * answers a streaming 'ok'; the callback URL records each webhook POST body
- * and answers `callbackStatus` (default 200). Everything else passes through.
+ * answers a streaming 'ok'; everything else passes through.
  */
-function setupStreamingFetch(callbackStatus = 200): StreamingFetch {
-  const posts: CapturedPost[] = [];
-  const fetchState: StreamingFetch = { posts, callbackStatus };
+function setupStreamingFetch(): void {
   (Anthropic as unknown as ReturnType<typeof vi.fn>).mockImplementation(function MockAnthropic(
     this: object
   ) {
@@ -141,16 +120,10 @@ function setupStreamingFetch(callbackStatus = 200): StreamingFetch {
         headers: { 'content-type': 'text/event-stream' },
       });
     }
-    if (url.startsWith(CALLBACK_URL)) {
-      const raw = init?.body ?? (await (input as Request).text());
-      posts.push(JSON.parse(String(raw)) as CapturedPost);
-      return new Response(null, { status: fetchState.callbackStatus });
-    }
     return realFetch(input, init);
   });
   vi.spyOn(console, 'log').mockImplementation(() => {});
   vi.spyOn(console, 'warn').mockImplementation(() => {});
-  return fetchState;
 }
 
 /** Minimal webhook-flavored callbacks (onWelcome present ⇒ the callback path). */
@@ -345,123 +318,6 @@ describe('#422 item 1 — recordWelcomeDelivered is one storage transaction', ()
       'mode_welcome_record_txn_failed',
       expect.objectContaining({ welcomed_key: 'mode_welcomed:spoken' })
     );
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Item 2 — progress_mode: 'complete' gets the welcome in the complete payload
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Drive the DO's REAL webhook caller (`processCallbackEntry`: builds the
- * `ProgressCallbackSender` + `createWebhookCallbacks` from the body, runs the
- * turn, then AWAITS `onComplete`). Runs inside the DO's instrumented context,
- * exactly as the queue does in production, so the deferred welcome record that
- * settles after the `complete` POST executes with the DO's storage context.
- * The queue releases the per-conversation lock only after this resolves, so
- * every assertion below reads storage synchronously after it — proving the
- * record landed BEFORE a queued follow-up turn could start.
- */
-function runCallbackEntry(
-  stub: DurableObjectStub,
-  request: ChatRequest,
-  mode: 'complete' | 'iteration'
-): Promise<void> {
-  const entry: InternalQueueEntry = {
-    message_id: `msg-${mode}-${crypto.randomUUID()}`,
-    body: {
-      ...request,
-      progress_callback_url: CALLBACK_URL,
-      message_key: 'k',
-      progress_mode: mode,
-      _worker_origin: '',
-    },
-    enqueued_at: Date.now(),
-    retry_count: 0,
-  };
-  return runInDurableObject(stub, (instance) =>
-    (instance as unknown as ProcessCallbackEntryInstance).processCallbackEntry(
-      entry,
-      createRequestLogger('test-callback-entry')
-    )
-  );
-}
-
-describe("#422 item 2 — progress_mode 'complete' folds the welcome into the complete POST", () => {
-  let stub: DurableObjectStub;
-  let posts: CapturedPost[];
-
-  beforeEach(() => {
-    stub = env.USER_DO.get(env.USER_DO.newUniqueId());
-    posts = setupStreamingFetch().posts;
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
-  it("'complete' mode: exactly ONE webhook POST, type complete, carrying welcome + answer", async () => {
-    await runCallbackEntry(stub, body('#spoken hi'), 'complete');
-
-    // Recorded by the time the caller resolves (lock still held in production).
-    expect(await readWelcomed(stub, 'spoken')).toBe(true);
-    expect(posts).toHaveLength(1);
-    expect(posts[0]?.type).toBe('complete');
-    expect(posts[0]?.text).toContain('Welcome to Spoken mode!');
-    expect(posts[0]?.text).toContain('https://wa.me/15558196461?text=%23spoken');
-    expect(posts[0]?.text?.endsWith('\nok')).toBe(true);
-    // One-time flag recorded after the 2xx; nothing pending.
-    expect(await readPending(stub, 'spoken')).toBeUndefined();
-    // History stays model-only (the welcome is not the assistant's prior turn).
-    const history = await stub.fetch('http://fake-host/history?user_id=test-user');
-    const data = (await history.json()) as { entries: Array<{ assistant_response: string }> };
-    expect(data.entries.map((e) => e.assistant_response)).toEqual(['ok']);
-  });
-
-  it("'iteration' mode (control): welcome is still its own progress POST ahead of the answer", async () => {
-    await runCallbackEntry(stub, body('#spoken hi'), 'iteration');
-
-    expect(await readWelcomed(stub, 'spoken')).toBe(true);
-    expect(posts.length).toBeGreaterThanOrEqual(2);
-    expect(posts[0]?.type).toBe('progress');
-    expect(posts[0]?.text).toContain('Welcome to Spoken mode!');
-    const completes = posts.filter((p) => p.type === 'complete');
-    expect(completes).toHaveLength(1);
-    expect(completes[0]?.text ?? '').not.toContain('Welcome to Spoken mode!');
-  });
-});
-
-describe("#422 item 2 — 'complete' mode failed POST arms the re-emit (double-send over skip)", () => {
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
-  it('a 503 on the complete POST leaves the flag unset and pending armed; the next turn re-emits', async () => {
-    const stub = env.USER_DO.get(env.USER_DO.newUniqueId());
-    const fetchState = setupStreamingFetch(503);
-    const { posts } = fetchState;
-
-    await runCallbackEntry(stub, body('#spoken hi'), 'complete');
-    expect(posts).toHaveLength(1);
-    expect(posts[0]?.text).toContain('Welcome to Spoken mode!');
-
-    // The only POST carrying the welcome failed ⇒ NOT welcomed, pending armed
-    // (with its marker) BEFORE the caller resolved, first_interaction untouched.
-    expect(await readPending(stub, 'spoken')).toBe(true);
-    expect(await readWelcomed(stub, 'spoken')).toBeUndefined();
-    expect(await readPendingAny(stub)).toBe(true);
-    expect((await readPreferences(stub))?.first_interaction ?? true).toBe(true);
-
-    // Next plain same-mode turn with the gateway back: the welcome re-emits
-    // inside that turn's single complete POST, and only then is it recorded.
-    fetchState.callbackStatus = 200;
-    await runCallbackEntry(stub, body('hello again'), 'complete');
-    expect(await readWelcomed(stub, 'spoken')).toBe(true);
-    expect(posts).toHaveLength(2);
-    expect(posts[1]?.type).toBe('complete');
-    expect(posts[1]?.text).toContain('Welcome to Spoken mode!');
-    expect(await readPending(stub, 'spoken')).toBeUndefined();
-    expect(await readPendingAny(stub)).toBe(false);
   });
 });
 
