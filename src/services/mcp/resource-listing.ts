@@ -142,6 +142,18 @@ export function parseTranslationHelpsListing(text: string, serverId: string): Re
  *
  * The JSON is located by its first brace rather than by splitting on the blank
  * line, so the parser is indifferent to whether the summary block is present.
+ *
+ * The adapter is chosen by tool name alone (see selectListingAdapter), so it
+ * also receives servers that are modelled on v2 without being it. obs-5m
+ * (#451) reuses the `list_resources` name but sends only `resources`, one row
+ * per resource type with a per-row `available` boolean:
+ *
+ *   1 resource type(s) for en
+ *
+ *   {"language":"en","resources":[{id,type,subject,abbreviation,available, ...}], ...}
+ *
+ * Both shapes are accepted. Error messages name the tool rather than a server
+ * family, because the server behind the tool is not known here.
  */
 const TRANSLATION_HELPS_V2_COUNT_PATTERN = /^(\d+) resource\(s\) available/m;
 
@@ -157,33 +169,43 @@ function assertTranslationHelpsV2Count(text: string, parsedCount: number): void 
   const declared = Number(countMatch[1]);
   if (declared !== parsedCount) {
     throw new Error(
-      `translation-helps v2 listing declared ${declared} resources but ${parsedCount} parsed — format may have changed`
+      `list_resources listing declared ${declared} resources but ${parsedCount} parsed — format may have changed`
     );
   }
 }
 
-/** Pull the `available` array out of the v2 payload, throwing on any drift. */
+/** Pull the listing rows out of the payload, throwing on any drift. */
 function extractV2Available(text: string): unknown[] {
   const start = text.indexOf('{');
   if (start === -1) {
-    throw new Error('translation-helps v2 listing contained no JSON payload');
+    throw new Error('list_resources listing contained no JSON payload');
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(text.slice(start));
   } catch {
-    throw new Error('translation-helps v2 listing was not valid JSON');
+    throw new Error('list_resources listing was not valid JSON');
   }
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw new Error('translation-helps v2 listing JSON was not an object');
+    throw new Error('list_resources listing JSON was not an object');
   }
-  // `available` and `resources` have been byte-identical in every probe;
-  // prefer the semantically named one.
-  const available = (parsed as { available?: unknown }).available;
-  if (!Array.isArray(available)) {
-    throw new Error('translation-helps v2 listing missing "available" array');
-  }
-  return available;
+  const { available, resources } = parsed as { available?: unknown; resources?: unknown };
+  // `available` and `resources` have been byte-identical in every v2 probe;
+  // prefer the semantically named one. obs-5m sends only `resources`.
+  if (Array.isArray(available)) return available;
+  if (Array.isArray(resources)) return resources;
+  throw new Error('list_resources listing has neither an "available" nor a "resources" array');
+}
+
+/**
+ * obs-5m lists every resource type it knows and flags the ones a language
+ * lacks, where v2 simply omits them. A row is dropped only on an explicit
+ * `available: false`; v2 rows carry no such field and are all kept.
+ */
+function isFlaggedUnavailable(raw: unknown): boolean {
+  return (
+    typeof raw === 'object' && raw !== null && (raw as { available?: unknown }).available === false
+  );
 }
 
 /**
@@ -193,11 +215,11 @@ function extractV2Available(text: string): unknown[] {
  */
 function normalizeTranslationHelpsV2Item(raw: unknown, serverId: string): ResourceItem {
   if (typeof raw !== 'object' || raw === null) {
-    throw new Error('translation-helps v2 listing item was not an object');
+    throw new Error('list_resources listing item was not an object');
   }
   const item = raw as Record<string, unknown>;
   if (typeof item.abbreviation !== 'string' || typeof item.subject !== 'string') {
-    throw new Error('translation-helps v2 listing item missing abbreviation/subject');
+    throw new Error('list_resources listing item missing abbreviation/subject');
   }
   return {
     name: item.abbreviation,
@@ -207,9 +229,9 @@ function normalizeTranslationHelpsV2Item(raw: unknown, serverId: string): Resour
 }
 
 export function parseTranslationHelpsV2Listing(text: string, serverId: string): ResourceItem[] {
-  const items = extractV2Available(text).map((raw) =>
-    normalizeTranslationHelpsV2Item(raw, serverId)
-  );
+  const items = extractV2Available(text)
+    .filter((raw) => !isFlaggedUnavailable(raw))
+    .map((raw) => normalizeTranslationHelpsV2Item(raw, serverId));
   assertTranslationHelpsV2Count(text, items.length);
   return items;
 }
@@ -417,6 +439,9 @@ export function selectListingAdapter(
   // list_resources must keep the v1 payload, which carries organization and
   // version that v2 drops.
   if (names.has(TRANSLATION_HELPS_ADAPTER.toolName)) return TRANSLATION_HELPS_ADAPTER;
+  // `list_resources` is not unique to translation-helps v2 (obs-5m exposes it
+  // too, #451) and the manifest gives no way to tell the servers apart, so
+  // this adapter's parser accepts both payloads.
   if (names.has(TRANSLATION_HELPS_V2_ADAPTER.toolName)) return TRANSLATION_HELPS_V2_ADAPTER;
   if (names.has(AQUIFER_ADAPTER.toolName)) return AQUIFER_ADAPTER;
   return undefined;

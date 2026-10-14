@@ -5,9 +5,9 @@ These are POSITIVE, EXACT assertions on the PARSED YAML — not text greps. The
 grep version of this check was bypassable three ways, each of which reintroduced
 the exact bug the check exists to prevent:
 
-  * `bucket: ${env:INFLUX_BUKCET}` (typo) — "starts with ${env:" was enough to pass,
-    and a misspelled variable resolves to "" at runtime, silently sending every
-    metric to bucket="".
+  * `username: ${env:MIMIR_USRE}` (typo) — "starts with ${env:" was enough to pass,
+    and a misspelled variable resolves to "" at runtime, so every export is a 401
+    from Mimir while the collector reports healthy.
   * no `user_id` action at all — absence passed, but absence means the raw
     identifier is forwarded to every sink. Absent is NOT equivalent to deleted.
   * the block form
@@ -18,12 +18,18 @@ the exact bug the check exists to prevent:
 `otelcol validate` catches none of this: it type-checks the config, it does not
 know which values we consider load-bearing.
 
-Since B2 the script also checks the fly.toml side. `INFLUX_BUCKET` used to be a fly
-SECRET, which made the one value distinguishing staging from production invisible:
-`fly secrets list` prints a digest, never the value, so nothing could tell you which
-bucket an app was actually writing to. It now lives in each app's `fly.toml [env]`,
-where it is diffable and reviewable — and where a wrong value is a normal code bug,
-which is exactly what this file turns into a failed deploy.
+Since B2 the script also checks the fly.toml side. The value that distinguishes staging
+from production (originally the InfluxDB bucket, now the Mimir username, which selects
+the Mimir org) used to be a fly SECRET, which made it invisible: `fly secrets list`
+prints a digest, never the value, so nothing could tell you which org an app was
+actually writing to. It now lives in each app's `fly.toml [env]`, where it is diffable
+and reviewable — and where a wrong value is a normal code bug, which is exactly what
+this file turns into a failed deploy.
+
+The Mimir move added one more invariant: the worker emits DELTA temporality (ephemeral
+isolates) and Mimir, being Prometheus-shaped, expects CUMULATIVE. The `deltatocumulative`
+processor is the bridge, and a Mimir pipeline without it still validates and boots — so
+only this script can notice it is missing.
 
 Self-tested by tests/test-assert-collector-invariants.sh; run that after editing.
 """
@@ -41,15 +47,17 @@ DEFAULT_FLY_TOMLS = [
     REPO_ROOT / "infra/otel-collector/fly.toml",
     REPO_ROOT / "infra/otel-collector/fly.prod.toml",
 ]
-EXPECTED_BUCKET = "${env:INFLUX_BUCKET}"
-INFLUX_EXPORTER = "influxdb/door43_metrics"
+EXPECTED_MIMIR_USER = "${env:MIMIR_USER}"
+MIMIR_AUTH_EXTENSION = "basicauth/mimir"
+MIMIR_EXPORTER = "otlp_http/mimir_metrics"
+DELTA_PROCESSOR = "deltatocumulative"
 
-# The reviewed bucket↔environment mapping. This table IS the control: a new collector
-# app cannot inherit a bucket by accident, it has to be added here in a PR. The two
-# buckets are separate door43 tenants, and door43's Nginx validates the bucket against
-# the write token — so a swap here does not fail loudly, it writes staging traffic into
-# the production series.
-APP_BUCKETS = {
+# The reviewed user↔environment mapping. This table IS the control: a new collector app
+# cannot inherit a Mimir user by accident, it has to be added here in a PR. Each username
+# resolves to its own Mimir org (door43 fixes the mapping), and Mimir accepts any valid
+# credential — so a swap here does not fail loudly, it writes staging traffic into the
+# production org's series.
+APP_MIMIR_USERS = {
     "bt-servant-otel-collector": "bt-servant-staging",
     "bt-servant-otel-collector-prod": "bt-servant",
 }
@@ -80,7 +88,7 @@ def annotate(file: object) -> str:
 
 
 def check_fly_tomls(paths: list[Path]) -> None:
-    """Assert every collector app declares its own, correct, INFLUX_BUCKET."""
+    """Assert every collector app declares its own, correct, MIMIR_USER."""
     seen: dict[str, Path] = {}
 
     for path in paths:
@@ -98,15 +106,15 @@ def check_fly_tomls(paths: list[Path]) -> None:
 
         app = fly.get("app")
         if not app:
-            fail("no `app` key — cannot tell which bucket it should carry", path)
+            fail("no `app` key — cannot tell which Mimir user it should carry", path)
             continue
 
-        expected = APP_BUCKETS.get(app)
+        expected = APP_MIMIR_USERS.get(app)
         if expected is None:
             fail(
-                f"app {app!r} is not in the reviewed bucket map "
-                f"({sorted(APP_BUCKETS)}). Add it there — an unmapped collector app "
-                f"would deploy with whatever bucket happened to be in its [env].",
+                f"app {app!r} is not in the reviewed Mimir-user map "
+                f"({sorted(APP_MIMIR_USERS)}). Add it there — an unmapped collector app "
+                f"would deploy with whatever user happened to be in its [env].",
                 path,
             )
             continue
@@ -115,26 +123,27 @@ def check_fly_tomls(paths: list[Path]) -> None:
             fail(f"app {app!r} is also declared by {seen[app]}", path)
         seen[app] = path
 
-        bucket = (fly.get("env") or {}).get("INFLUX_BUCKET")
-        if bucket is None:
+        user = (fly.get("env") or {}).get("MIMIR_USER")
+        if user is None:
             fail(
-                f"[env] INFLUX_BUCKET is missing. The collector resolves an unset "
-                f"${{env:INFLUX_BUCKET}} to the empty string and boots healthy, writing "
-                f"every metric to bucket=\"\". Expected {expected!r} for app {app!r}.",
+                f"[env] MIMIR_USER is missing. The collector resolves an unset "
+                f"${{env:MIMIR_USER}} to the empty string and boots healthy, and every "
+                f"metrics export is then a 401 from Mimir. Expected {expected!r} for app "
+                f"{app!r}.",
                 path,
             )
-        elif bucket != expected:
+        elif user != expected:
             fail(
-                f"app {app!r} must write to bucket {expected!r}, got {bucket!r}. "
-                f"door43 validates the bucket against the write token, so a swap here "
-                f"mixes the two environments' metrics rather than failing.",
+                f"app {app!r} must authenticate to Mimir as {expected!r}, got {user!r}. "
+                f"The username selects the Mimir org, so a swap here mixes the two "
+                f"environments' metrics rather than failing.",
                 path,
             )
 
-    for app in sorted(set(APP_BUCKETS) - set(seen)):
+    for app in sorted(set(APP_MIMIR_USERS) - set(seen)):
         fail(
-            f"no fly.toml was checked for collector app {app!r} — it is in the bucket map "
-            f"but nothing asserted its config, so its bucket is unverified"
+            f"no fly.toml was checked for collector app {app!r} — it is in the Mimir-user "
+            f"map but nothing asserted its config, so its user is unverified"
         )
 
 
@@ -166,20 +175,44 @@ def main() -> int:
         print(f"::error file={path}::config did not parse as a YAML mapping")
         return 1
 
+    extensions = config.get("extensions") or {}
     exporters = config.get("exporters") or {}
     processors = config.get("processors") or {}
-    pipelines = ((config.get("service") or {}).get("pipelines")) or {}
+    service = config.get("service") or {}
+    pipelines = service.get("pipelines") or {}
 
-    # ── 1. The InfluxDB bucket must be EXACTLY the expected env reference. ──────
-    # Anything else — a hardcoded name, a typo'd variable — either pins both
-    # environments to one bucket or resolves to "" and loses metrics silently.
-    influx = exporters.get(INFLUX_EXPORTER)
-    if not isinstance(influx, dict):
-        fail(f"exporters.{INFLUX_EXPORTER} is missing")
-    elif influx.get("bucket") != EXPECTED_BUCKET:
+    # ── 1. The Mimir credential path must be EXACTLY the expected shape. ────────
+    # The username is what selects the Mimir org. Anything other than the env reference —
+    # a hardcoded name, a typo'd variable — either pins both environments to one org or
+    # resolves to "" and turns every export into a 401 while the collector stays healthy.
+    # The exporter must authenticate THROUGH the extension (not via an ad-hoc header), and
+    # the extension must be enabled in service.extensions or it never runs.
+    auth = extensions.get(MIMIR_AUTH_EXTENSION)
+    if not isinstance(auth, dict):
+        fail(f"extensions.{MIMIR_AUTH_EXTENSION} is missing")
+    else:
+        username = (auth.get("client_auth") or {}).get("username")
+        if username != EXPECTED_MIMIR_USER:
+            fail(
+                f"extensions.{MIMIR_AUTH_EXTENSION}.client_auth.username must be exactly "
+                f"{EXPECTED_MIMIR_USER!r} (got {username!r})"
+            )
+
+    mimir = exporters.get(MIMIR_EXPORTER)
+    if not isinstance(mimir, dict):
+        fail(f"exporters.{MIMIR_EXPORTER} is missing")
+    else:
+        authenticator = (mimir.get("auth") or {}).get("authenticator")
+        if authenticator != MIMIR_AUTH_EXTENSION:
+            fail(
+                f"exporters.{MIMIR_EXPORTER}.auth.authenticator must be exactly "
+                f"{MIMIR_AUTH_EXTENSION!r} (got {authenticator!r})"
+            )
+
+    if MIMIR_AUTH_EXTENSION not in (service.get("extensions") or []):
         fail(
-            f"exporters.{INFLUX_EXPORTER}.bucket must be exactly "
-            f"{EXPECTED_BUCKET!r} (got {influx.get('bucket')!r})"
+            f"service.extensions does not enable {MIMIR_AUTH_EXTENSION}; a defined but "
+            f"unlisted extension never runs, so the exporter would send no credentials"
         )
 
     # ── 2. Exactly one user_id rule, it must DELETE, and it must be on a ────────
@@ -227,6 +260,41 @@ def main() -> int:
                 f"bring-up aid and is far too expensive under real traffic"
             )
 
+    # ── 4. Every pipeline that reaches Mimir must convert DELTA → CUMULATIVE. ───
+    # The worker emits DELTA on purpose (ephemeral isolates). Mimir expects CUMULATIVE
+    # and, without the bridge, rejects or mis-types every sample — while the config
+    # validates and the collector boots and reports healthy. The exporter must also be
+    # wired into at least one pipeline, or Mimir simply receives nothing.
+    mimir_pipelines = [
+        name
+        for name, pipeline in pipelines.items()
+        if isinstance(pipeline, dict) and MIMIR_EXPORTER in (pipeline.get("exporters") or [])
+    ]
+    if not mimir_pipelines:
+        fail(f"no pipeline exports to {MIMIR_EXPORTER}, so Mimir receives nothing")
+    for pipeline_name in mimir_pipelines:
+        procs = pipelines[pipeline_name].get("processors") or []
+        if DELTA_PROCESSOR not in procs:
+            fail(
+                f"service.pipelines.{pipeline_name} exports to {MIMIR_EXPORTER} without "
+                f"running processors.{DELTA_PROCESSOR}; the worker emits DELTA and Mimir "
+                f"expects CUMULATIVE, so every sample would be rejected or mis-typed"
+            )
+        # ── 5. ...and it must run BEFORE batch. ──────────────────────────────────
+        # The worker serializes an isolate's flushes on the receiver's acknowledgement,
+        # and the receiver acknowledges once the synchronous processors have consumed
+        # the batch. With the conversion before `batch`, "acknowledged" means "already
+        # accumulated", so a stream's deltas fold in collection order. After `batch`,
+        # the ack says nothing about accumulation order and the processor's
+        # strict-ordering rule starts dropping real samples.
+        elif "batch" in procs and procs.index("batch") < procs.index(DELTA_PROCESSOR):
+            fail(
+                f"service.pipelines.{pipeline_name} runs processors.{DELTA_PROCESSOR} "
+                f"after batch; it must precede batch so the receiver's acknowledgement "
+                f"(which the worker serializes its flushes on) implies the delta has "
+                f"already been accumulated"
+            )
+
     if failures:
         for annotated_file, message in failures:
             print(f"::error file={annotate(annotated_file or path)}::{message}")
@@ -239,11 +307,15 @@ def main() -> int:
         return 1
 
     print(f"All collector invariants hold in {path}:")
-    print(f"  bucket is {EXPECTED_BUCKET}")
+    print(f"  {MIMIR_AUTH_EXTENSION} username is {EXPECTED_MIMIR_USER}, used by {MIMIR_EXPORTER}")
     print(f"  user_id is deleted (processors.{user_id_rules[0][0]}), on every pipeline")
     print("  debug exporter is unwired")
-    for app, bucket in sorted(APP_BUCKETS.items()):
-        print(f"  {app} writes to bucket {bucket}")
+    print(
+        f"  {DELTA_PROCESSOR} runs before batch on every Mimir pipeline "
+        f"({', '.join(mimir_pipelines)})"
+    )
+    for app, user in sorted(APP_MIMIR_USERS.items()):
+        print(f"  {app} authenticates to Mimir as {user}")
     return 0
 
 

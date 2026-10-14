@@ -24,6 +24,32 @@
  * series. DELTA reports the increment since the previous flush and the backend sums
  * them — the correct model for a stateless/serverless producer.
  *
+ * PER-ISOLATE STREAM IDENTITY + ORDERED FLUSHES. The collector converts these deltas to
+ * cumulative for Mimir (Prometheus-shaped) with a processor that keys its state by
+ * resource identity and DROPS any point whose start is older than the stored stream's
+ * or whose timestamp is not strictly later. Two guarantees here keep that correct:
+ *   1. every isolate stamps a random `service.instance.id` on its metrics resource, so
+ *      concurrent isolates are separate streams (Mimir: `instance=<uuid>`, query with
+ *      `sum by (...) (rate(...))`) instead of one interleaved stream that undercounts;
+ *   2. `flushMetricTelemetry` serializes an isolate's flushes — the next collect+export
+ *      starts only after the previous POST was acknowledged — so one stream's deltas
+ *      reach the collector in collection order. The collector acknowledges only after
+ *      its synchronous processors (conversion included) have consumed the batch, which
+ *      is what makes "acknowledged" mean "accumulated". Each export carries an abort
+ *      timeout so a hung collector cannot stall the chain indefinitely.
+ * The OpenObserve leg strips the instance id again in the collector, so what it
+ * receives is unchanged.
+ *
+ * ZERO-AT-START SAMPLE. One cumulative series per isolate means a series with a single
+ * sample is invisible to PromQL rate()/increase() — an isolate that flushed exactly once
+ * would count for nothing. Prometheus's remedy is a zero sample at the series' created
+ * timestamp; in Mimir that is an experimental, default-off, server-side flag. So the
+ * exporter does it at the source: the first time a series (metric + label set) leaves
+ * this isolate, a zero-valued point at its start time travels in the same export,
+ * strictly before the real point (≥1ms, so the two survive Prometheus's millisecond
+ * timestamps). Downstream that becomes 0@start, v@end — two samples, rate() works, no
+ * external flag. The OpenObserve leg just sees a harmless 0 delta.
+ *
  * CARDINALITY is the governing constraint here, the metrics analogue of the logs/span
  * FAIL-CLOSED redaction, enforced in THREE layers (`sanitizeMetricLabels` + the reader):
  *   1. KEY allow-list — drops any key not in `ALLOWED_LABEL_KEYS`, so an unbounded/
@@ -49,11 +75,16 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { type Counter, type Histogram, type Meter } from '@opentelemetry/api';
 import {
   AggregationTemporality,
+  DataPointType,
   MeterProvider,
   MetricReader,
+  type DataPoint,
+  type MetricData,
   type PushMetricExporter,
   type ResourceMetrics,
+  type ScopeMetrics,
 } from '@opentelemetry/sdk-metrics';
+import type { HrTime } from '@opentelemetry/api';
 import { resourceFromAttributes } from '@opentelemetry/resources';
 import { JsonMetricsSerializer } from '@opentelemetry/otlp-transformer';
 import { __unwrappedFetch } from '@microlabs/otel-cf-workers';
@@ -67,6 +98,127 @@ const METRIC_SCOPE_NAME = TELEMETRY_SERVICE_NAME;
 /** Build the OTLP/HTTP metrics URL from the collector's base endpoint. */
 function metricsEndpoint(base: string): string {
   return `${base.replace(/\/+$/, '')}/v1/metrics`;
+}
+
+/**
+ * Upper bound on one export POST. Flushes are serialized per isolate (see the file
+ * header), so an export that never completes would hold up every flush behind it; the
+ * SDK keeps unexported deltas, so a timed-out export only delays them to the next flush.
+ */
+const EXPORT_TIMEOUT_MS = 10_000;
+
+// ── Zero-at-start injection (see the file header) ────────────────────────────
+
+const NANOS_PER_MILLI = 1_000_000;
+const NANOS_PER_SECOND = 1_000_000_000;
+
+/** `a` is strictly earlier than `b`. */
+function hrTimeBefore(a: HrTime, b: HrTime): boolean {
+  return a[0] < b[0] || (a[0] === b[0] && a[1] < b[1]);
+}
+
+/** `t` minus one millisecond, borrowing a second if the nanos go negative. */
+function hrTimeMinusOneMilli(t: HrTime): HrTime {
+  const nanos = t[1] - NANOS_PER_MILLI;
+  return nanos >= 0 ? [t[0], nanos] : [t[0] - 1, nanos + NANOS_PER_SECOND];
+}
+
+/** Stable identity of a series within this isolate: metric name + canonical labels. */
+function seriesKey(metricName: string, attributes: DataPoint<unknown>['attributes']): string {
+  const labels = Object.keys(attributes)
+    .sort()
+    .map((k) => `${k}=${String(attributes[k])}`)
+    .join(',');
+  return `${metricName}|${labels}`;
+}
+
+/**
+ * A zero-valued twin of `point` at the series' start. It is a single instant `z` (start =
+ * end = z): the real point's start time, or one millisecond before the real point's end if
+ * that is earlier, so the zero always precedes the real sample even after Prometheus
+ * rounds to milliseconds. `z` never exceeds the real start, so the collector's
+ * delta→cumulative state (which rejects an older start than it has stored) is seeded with
+ * the earliest start the series will ever report.
+ */
+function zeroPoint<T>(point: DataPoint<T>, zero: T): DataPoint<T> {
+  const latest = hrTimeMinusOneMilli(point.endTime);
+  const z = hrTimeBefore(point.startTime, latest) ? point.startTime : latest;
+  return { attributes: point.attributes, startTime: z, endTime: z, value: zero };
+}
+
+/**
+ * Prepend a zero point to every series not in `seen`, and note each such series in
+ * `pending`. `seen` is read-only here on purpose: the SDK drains a delta whether or not
+ * its POST lands, so a series must only be committed as seen once the collector has
+ * accepted the export that carried its zero — otherwise a failed first export would
+ * suppress the zero forever. The caller commits `pending` into `seen` on success.
+ */
+function withStartZeros<T>(
+  name: string,
+  points: readonly DataPoint<T>[],
+  zeroFor: (point: DataPoint<T>) => T,
+  seen: ReadonlySet<string>,
+  pending: Set<string>
+): DataPoint<T>[] {
+  return points.flatMap((point) => {
+    const key = seriesKey(name, point.attributes);
+    if (seen.has(key) || pending.has(key)) return [point];
+    pending.add(key);
+    return [zeroPoint(point, zeroFor(point)), point];
+  });
+}
+
+/** Apply zero-at-start to the metric kinds this module emits (sums and histograms). */
+function injectStartZeros(
+  metric: MetricData,
+  seen: ReadonlySet<string>,
+  pending: Set<string>
+): MetricData {
+  const name = metric.descriptor.name;
+  switch (metric.dataPointType) {
+    case DataPointType.SUM:
+      return {
+        ...metric,
+        dataPoints: withStartZeros(name, metric.dataPoints, () => 0, seen, pending),
+      };
+    case DataPointType.HISTOGRAM:
+      return {
+        ...metric,
+        dataPoints: withStartZeros(
+          name,
+          metric.dataPoints,
+          (point) => ({
+            buckets: {
+              boundaries: point.value.buckets.boundaries,
+              counts: point.value.buckets.counts.map(() => 0),
+            },
+            sum: 0,
+            count: 0,
+          }),
+          seen,
+          pending
+        ),
+      };
+    default:
+      // Gauges and exponential histograms: not emitted here; pass through untouched.
+      return metric;
+  }
+}
+
+/**
+ * The same ResourceMetrics with zero-at-start points added for every series not yet in
+ * `seen`; those series are collected into `pending` for the caller to commit on success.
+ */
+function withSeriesStartZeros(
+  resourceMetrics: ResourceMetrics,
+  seen: ReadonlySet<string>,
+  pending: Set<string>
+): ResourceMetrics {
+  const scopeMetrics: ScopeMetrics[] = resourceMetrics.scopeMetrics.map((scope) => ({
+    scope: scope.scope,
+    metrics: scope.metrics.map((metric) => injectStartZeros(metric, seen, pending)),
+  }));
+  return { resource: resourceMetrics.resource, scopeMetrics };
 }
 
 // ── Label discipline (the cardinality guard) ─────────────────────────────────
@@ -304,6 +456,16 @@ export function sanitizeMetricLabels(labels: MetricLabels): Record<string, Label
  * carries only the increment since the previous flush.
  */
 export class FetchMetricExporter implements PushMetricExporter {
+  /**
+   * Series whose zero-at-start point the collector has ACCEPTED (file header). Committed
+   * only on a 2xx, never while building a payload: the SDK drains a delta whether or not
+   * its POST lands, so an early mark would let one failed first export suppress the zero
+   * for good. Flushes are serialized per isolate, so the commit cannot race a later
+   * export. Bounded by the label discipline above: at most the allow-listed metrics ×
+   * their per-metric series cap, and one exporter lives exactly as long as its isolate.
+   */
+  private readonly seenSeries = new Set<string>();
+
   // `fetchFn` defaults to otel-cf-workers' RAW fetch (captured at its module load, so it
   // cannot be stubbed via globalThis); injectable purely so tests can supply a mock.
   constructor(
@@ -316,9 +478,13 @@ export class FetchMetricExporter implements PushMetricExporter {
     resourceMetrics: ResourceMetrics,
     resultCallback: (result: { code: number; error?: Error }) => void
   ): void {
+    // Series receiving their zero in THIS payload; moved into seenSeries only on 2xx.
+    const pending = new Set<string>();
     let body: Uint8Array;
     try {
-      const serialized = JsonMetricsSerializer.serializeRequest(resourceMetrics);
+      const serialized = JsonMetricsSerializer.serializeRequest(
+        withSeriesStartZeros(resourceMetrics, this.seenSeries, pending)
+      );
       if (!serialized) throw new Error('JsonMetricsSerializer produced no payload');
       body = serialized;
     } catch (err) {
@@ -338,14 +504,7 @@ export class FetchMetricExporter implements PushMetricExporter {
     const fetchFn = this.fetchFn;
     let responsePromise: Promise<Response>;
     try {
-      responsePromise = fetchFn(this.url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${this.token}`,
-        },
-        body,
-      });
+      responsePromise = fetchFn(this.url, this.requestInit(body));
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
 
@@ -354,9 +513,23 @@ export class FetchMetricExporter implements PushMetricExporter {
       return;
     }
 
+    this.settle(responsePromise, pending, resultCallback);
+  }
+
+  /**
+   * Resolve one export: on 2xx commit the zero-seeded series and report success; on a
+   * non-2xx or a rejected/aborted fetch report failure and leave them uncommitted, so the
+   * next successful flush seeds them again (a duplicate zero is harmless downstream).
+   */
+  private settle(
+    responsePromise: Promise<Response>,
+    pending: ReadonlySet<string>,
+    resultCallback: (result: { code: number; error?: Error }) => void
+  ): void {
     responsePromise
       .then((response) => {
         if (response.ok) {
+          for (const key of pending) this.seenSeries.add(key);
           resultCallback({ code: 0 }); // ExportResultCode.SUCCESS
         } else {
           console.warn(`otlp_metrics_export_failed: HTTP ${response.status}`);
@@ -372,6 +545,19 @@ export class FetchMetricExporter implements PushMetricExporter {
         console.warn(`otlp_metrics_export_error: ${error.message}`);
         resultCallback({ code: 1, error });
       });
+  }
+
+  /** One OTLP/JSON POST, bounded by EXPORT_TIMEOUT_MS (see the file header on why). */
+  private requestInit(body: Uint8Array): RequestInit {
+    return {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${this.token}`,
+      },
+      body,
+      signal: AbortSignal.timeout(EXPORT_TIMEOUT_MS),
+    };
   }
 
   selectAggregationTemporality(): AggregationTemporality {
@@ -434,6 +620,12 @@ export class PerInvocationMetricReader extends MetricReader {
 // ── Module singletons (one metrics stack per isolate) ────────────────────────
 let moduleMeter: Meter | null = null;
 let moduleProvider: MeterProvider | null = null;
+/**
+ * Tail of this isolate's flush chain. Every flush is appended here so collect+export
+ * runs strictly after the previous one was acknowledged (see the file header). Never
+ * left rejected: a failed flush is logged and the chain continues.
+ */
+let flushChain: Promise<void> = Promise.resolve();
 const counters = new Map<string, Counter>();
 const histograms = new Map<string, Histogram>();
 
@@ -533,6 +725,10 @@ export function initMetricTelemetry(env: Env, options?: { fetchFn?: typeof fetch
       'service.name': TELEMETRY_SERVICE_NAME,
       'service.namespace': env.ENVIRONMENT,
       'service.version': APP_VERSION,
+      // One id per metrics stack, i.e. per isolate: the stream identity the collector's
+      // delta→cumulative conversion keys on. Random, not derived — isolates have no
+      // stable name, and two isolates must never share a stream (see the file header).
+      'service.instance.id': crypto.randomUUID(),
     }),
     readers: [reader],
   });
@@ -545,17 +741,32 @@ export function initMetricTelemetry(env: Env, options?: { fetchFn?: typeof fetch
  * Flush this isolate's aggregated metrics at a request/DO boundary. Pass the ambient
  * `waitUntil` (Hono `c.executionCtx.waitUntil` or `DurableObjectState.waitUntil`) so
  * the collect+export runs without blocking the response. No-op when disabled.
+ *
+ * Flushes are SERIALIZED per isolate: this one's collect+export starts only after every
+ * earlier flush has been acknowledged by the collector, so the stream's deltas arrive in
+ * collection order (see the file header). Measurements recorded while a flush is waiting
+ * simply ride along in it — nothing is dropped by the wait.
  */
 export function flushMetricTelemetry(waitUntil: (promise: Promise<unknown>) => void): void {
   const provider = moduleProvider;
   if (!provider) return;
-  waitUntil(provider.forceFlush());
+  flushChain = flushChain
+    .then(() => provider.forceFlush())
+    .catch((err: unknown) => {
+      const error = err instanceof Error ? err : new Error(String(err));
+      // Same console path as the exporter's own failures (see FetchMetricExporter): the
+      // structured logger would re-enter telemetry. Logged so a wedged export is visible;
+      // the chain deliberately continues so later flushes are not held hostage by it.
+      console.warn(`otlp_metrics_flush_failed: ${error.message}`);
+    });
+  waitUntil(flushChain);
 }
 
 /** Test-only: reset module singletons and instrument caches between cases. */
 export function resetMetricTelemetryForTests(): void {
   moduleMeter = null;
   moduleProvider = null;
+  flushChain = Promise.resolve();
   counters.clear();
   histograms.clear();
 }
