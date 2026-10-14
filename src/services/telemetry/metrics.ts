@@ -88,6 +88,7 @@ import type { HrTime } from '@opentelemetry/api';
 import { resourceFromAttributes } from '@opentelemetry/resources';
 import { JsonMetricsSerializer } from '@opentelemetry/otlp-transformer';
 import { __unwrappedFetch } from '@microlabs/otel-cf-workers';
+import { releaseBody } from '../../utils/http.js';
 import { Env } from '../../config/types.js';
 import { APP_VERSION } from '../../generated/version.js';
 import { isTelemetryEnabled, TELEMETRY_SERVICE_NAME } from './config.js';
@@ -528,6 +529,11 @@ export class FetchMetricExporter implements PushMetricExporter {
   ): void {
     responsePromise
       .then((response) => {
+        // Nothing in the collector's reply is used, but an unread body holds the
+        // connection open (see releaseBody).
+        releaseBody(response, (error) =>
+          console.warn(`otlp_metrics_body_release_failed: ${error.message}`)
+        );
         if (response.ok) {
           for (const key of pending) this.seenSeries.add(key);
           resultCallback({ code: 0 }); // ExportResultCode.SUCCESS

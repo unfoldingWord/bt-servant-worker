@@ -9,6 +9,7 @@ import {
   type IncrementalProgressConfig,
 } from '../../src/services/progress/callback.js';
 import { createRequestLogger, type RequestLogger } from '../../src/utils/logger.js';
+import { trackedResponse } from '../helpers/tracked-response.js';
 
 const testLogger = createRequestLogger('test-request-id');
 
@@ -1118,5 +1119,31 @@ describe('ProgressCallbackSender terminal ordering — error path and no-wait (#
     await sender.sendComplete('done');
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(logger.log).not.toHaveBeenCalledWith('webhook_complete_waited', expect.anything());
+  });
+});
+
+describe('ProgressCallbackSender releases gateway response bodies', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it.each([200, 500])('releases the body of a progress post (HTTP %i)', async (status) => {
+    const { response, wasCancelled } = trackedResponse(status);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response));
+    const sender = new ProgressCallbackSender(mockConfig, testLogger);
+
+    await sender.sendStatus({ key: 'status_processing', message: 'Processing your request...' });
+
+    await vi.waitFor(() => expect(wasCancelled()).toBe(true));
+  });
+
+  it('releases the body of the welcome post, and still throws on a non-2xx', async () => {
+    const { response, wasCancelled } = trackedResponse(502);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response));
+    const sender = new ProgressCallbackSender(mockConfig, testLogger);
+
+    await expect(sender.sendWelcome('Welcome!')).rejects.toThrow('HTTP 502');
+
+    await vi.waitFor(() => expect(wasCancelled()).toBe(true));
   });
 });

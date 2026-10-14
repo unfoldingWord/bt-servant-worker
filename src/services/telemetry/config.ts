@@ -12,14 +12,16 @@
  * Redaction runs inside the exporter (`RedactingSpanExporter`) because rc.52 never
  * invokes the `postProcessor` config hook — it must run at real export time.
  */
-import { OTLPExporter } from '@microlabs/otel-cf-workers';
+import { __unwrappedFetch } from '@microlabs/otel-cf-workers';
 import type {
   ExporterConfig,
   OTLPExporterConfig,
   ResolveConfigFn,
 } from '@microlabs/otel-cf-workers';
+import { JsonTraceSerializer } from '@opentelemetry/otlp-transformer';
 import { Env } from '../../config/types.js';
 import { APP_VERSION } from '../../generated/version.js';
+import { releaseBody } from '../../utils/http.js';
 
 /** Stable service.name reported to the collector for every signal. */
 export const TELEMETRY_SERVICE_NAME = 'bt-servant-worker';
@@ -138,24 +140,95 @@ export function otlpExporterConfig(env: Env): OTLPExporterConfig {
   };
 }
 
+type ExportResultCallback = (result: { code: number; error?: Error }) => void;
+type SerializableSpans = Parameters<typeof JsonTraceSerializer.serializeRequest>[0];
+
+const toError = (err: unknown): Error => (err instanceof Error ? err : new Error(String(err)));
+
 /**
- * Wraps the library's OTLPExporter and redacts every span at export time. This is
- * the only place redaction reliably runs in rc.52: the `postProcessor` config hook
- * is accepted but never invoked, so redacting there would be dead code.
+ * Redacts every span at export time and POSTs them to the collector as OTLP JSON,
+ * with the library's serializer and default headers. Exported for testing.
+ *
+ * This is the only place redaction reliably runs in rc.52: the `postProcessor`
+ * config hook is accepted but never invoked, so redacting there would be dead code.
+ * It sends the spans itself instead of handing them to the library's OTLPExporter,
+ * because rc.52's exporter never reads or cancels the collector's response body,
+ * and an unread body holds a connection open for the rest of the invocation (see
+ * releaseBody).
  */
-class RedactingSpanExporter {
-  private readonly inner: OTLPExporter;
-  constructor(config: OTLPExporterConfig) {
-    this.inner = new OTLPExporter(config);
+export class RedactingSpanExporter {
+  private readonly headers: Record<string, string>;
+
+  constructor(
+    private readonly config: OTLPExporterConfig,
+    private readonly fetchFn: typeof fetch = __unwrappedFetch
+  ) {
+    this.headers = {
+      accept: 'application/json',
+      'content-type': 'application/json',
+      ...config.headers,
+    };
   }
-  export(spans: unknown[], resultCallback: (result: { code: number }) => void): void {
-    for (const span of spans) {
-      redactSpan(span as MutableSpan);
+
+  export(spans: unknown[], resultCallback: ExportResultCallback): void {
+    let body: string;
+    try {
+      for (const span of spans) {
+        redactSpan(span as MutableSpan);
+      }
+      const serialized = JsonTraceSerializer.serializeRequest(spans as SerializableSpans);
+      if (!serialized) throw new Error('serializer returned no payload');
+      body = new TextDecoder().decode(serialized);
+    } catch (err) {
+      const error = toError(err);
+      console.warn(`otlp_traces_serialize_failed: ${error.message}`);
+      resultCallback({ code: 1, error }); // ExportResultCode.FAILED
+      return;
     }
-    this.inner.export(spans, resultCallback);
+
+    // Detach the fetcher from `this`: native fetch called with this exporter as its
+    // receiver throws `TypeError: Illegal invocation` (see FetchLogExporter). The throw
+    // is synchronous, so it is caught here rather than by the `.catch` below.
+    const fetchFn = this.fetchFn;
+    let responsePromise: Promise<Response>;
+    try {
+      responsePromise = fetchFn(this.config.url, { method: 'POST', headers: this.headers, body });
+    } catch (err) {
+      const error = toError(err);
+      console.warn(`otlp_traces_export_error: ${error.message}`);
+      resultCallback({ code: 1, error });
+      return;
+    }
+
+    this.settle(responsePromise, resultCallback);
   }
+
+  /** Report the export's outcome, releasing the collector's response body either way. */
+  private settle(responsePromise: Promise<Response>, resultCallback: ExportResultCallback): void {
+    responsePromise
+      .then((response) => {
+        releaseBody(response, (error) =>
+          console.warn(`otlp_traces_body_release_failed: ${error.message}`)
+        );
+        if (response.ok) {
+          resultCallback({ code: 0 }); // ExportResultCode.SUCCESS
+        } else {
+          console.warn(`otlp_traces_export_failed: HTTP ${response.status}`);
+          resultCallback({
+            code: 1,
+            error: new Error(`OTLP traces export HTTP ${response.status}`),
+          });
+        }
+      })
+      .catch((err: unknown) => {
+        const error = toError(err);
+        console.warn(`otlp_traces_export_error: ${error.message}`);
+        resultCallback({ code: 1, error });
+      });
+  }
+
   shutdown(): Promise<void> {
-    return this.inner.shutdown();
+    return Promise.resolve();
   }
 }
 
