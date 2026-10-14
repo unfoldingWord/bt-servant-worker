@@ -1,0 +1,9 @@
+# Fixture: THE bug this check exists to catch — the staging app authenticating as the
+# PRODUCTION Mimir user. Nothing else in the repo would notice: the collector boots healthy,
+# `otelcol validate` passes, Mimir accepts the credentials, and staging metrics quietly land
+# in the production org.
+app = "bt-servant-otel-collector"
+primary_region = "iad"
+
+[env]
+  MIMIR_USER = "bt-servant"

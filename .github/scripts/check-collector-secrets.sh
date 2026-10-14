@@ -3,9 +3,9 @@
 # config dereferences.
 #
 # Why this exists: `otelcol validate` resolves an unset ${env:VAR} to an empty string
-# and exits 0. A collector missing INFLUX_BUCKET therefore boots healthy and writes
-# every metric to bucket="" — silent data loss with a green deploy. Only the fly-app
-# side can catch that, so we check it here.
+# and exits 0. A collector missing MIMIR_PASSWORD therefore boots healthy and has every
+# metrics export rejected with a 401 — silent data loss with a green deploy. Only the
+# fly-app side can catch that, so we check it here.
 #
 # `flyctl secrets list` prints names + digests only; values are never readable.
 set -euo pipefail
@@ -18,24 +18,24 @@ app="${1:?usage: check-collector-secrets.sh <fly-app-name>}"
 FLYCTL="${FLYCTL:-flyctl}"
 
 # Every ${env:...} referenced by infra/otel-collector/otel-collector-config.yaml that is
-# actually SECRET. INFLUX_BUCKET is deliberately absent: it is a bucket name, not a
-# credential, and since B2 it lives in each app's `fly.toml [env]` where it is reviewable.
-# `assert-collector-invariants.py` is what verifies it now.
+# actually SECRET. MIMIR_USER is deliberately absent: it is an org identifier, not a
+# credential, and (like the InfluxDB bucket before it) it lives in each app's
+# `fly.toml [env]` where it is reviewable. `assert-collector-invariants.py` verifies it.
 required=(
   OTEL_INGEST_TOKEN
   O2_ENDPOINT
   O2_AUTH
-  INFLUX_TOKEN
+  MIMIR_PASSWORD
 )
 
 # Secrets that must NOT exist, because a fly secret silently takes precedence over
 # `fly.toml [env]`. A leftover here does not break the deploy — it makes the reviewed
-# value in git dead code while everything still looks correct, which is worse: the bucket
-# an app writes to becomes invisible again, and the two environments can drift apart with
-# nothing to show for it. `fly secrets list` prints digests, never values, so there is no
-# way to notice by looking.
+# value in git dead code while everything still looks correct, which is worse: the Mimir
+# org an app writes to becomes invisible again, and the two environments can drift apart
+# with nothing to show for it. `fly secrets list` prints digests, never values, so there
+# is no way to notice by looking.
 banned=(
-  INFLUX_BUCKET
+  MIMIR_USER
 )
 
 echo "Checking secrets on fly app: $app"
@@ -56,7 +56,8 @@ done
 # deploy that put [env] INFLUX_BUCKET into the machine config, and unsetting the secret
 # beforehand would have left the running collector writing every metric to bucket="".
 # That window is closed — no collector app carries the secret now — so the trap is shut
-# permanently rather than left as a note someone has to remember.
+# permanently rather than left as a note someone has to remember. The Mimir move kept the
+# same shape (MIMIR_USER in [env], MIMIR_PASSWORD as the secret), so the ban carried over.
 shadowed=()
 for secret in "${banned[@]}"; do
   if grep -qxF "$secret" <<<"$present"; then
