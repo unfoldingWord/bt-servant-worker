@@ -17,16 +17,20 @@ separately deployed services (fly.io) and their configs.
                                    └───────────┬────────────────┘
                                                │
                                        ────────▼──────── sink
-                                   OpenObserve (fly.io)
+                                   OpenObserve (fly.io)     all signals
                                    self-hosted, our UI
                                    governance = ours
+                                               │
+                                       ────────▼──────── sink #2 (metrics only)
+                                   Grafana Mimir (door43)
+                                   delta → cumulative in the collector
 ```
 
 ## Two environments, four apps
 
 Staging and production run **entirely separate** collectors and sinks. Nothing is shared
 between the columns below — not the app, not the OpenObserve instance, not the fly deploy
-token, not the door43 bucket.
+token, not the Mimir org.
 
 | Thing               | Staging                     | Production                       |
 | ------------------- | --------------------------- | -------------------------------- |
@@ -35,7 +39,7 @@ token, not the door43 bucket.
 | OpenObserve fly app | `bt-servant-openobserve`    | `bt-servant-openobserve-prod`    |
 | OpenObserve config  | `openobserve/fly.toml`      | `openobserve/fly.prod.toml`      |
 | OpenObserve storage | local volume                | Cloudflare R2 (`ZO_S3_*`)        |
-| door43 bucket       | `bt-servant-staging`        | `bt-servant`                     |
+| Mimir org (= user)  | `bt-servant-staging`        | `bt-servant`                     |
 | Deploy token        | `FLY_API_TOKEN` (repo)      | `FLY_API_TOKEN` (`production`)   |
 
 **Why two OpenObserve instances rather than one with two streams?** The OSS build reports
@@ -51,15 +55,25 @@ expression yields a different token per job. **Those two lines are load-bearing*
 them silently repoints production at the staging token.
 
 Both collector apps run the **same** `otel-collector-config.yaml` from the same pinned
-image. The only difference between the two environments is each app's `fly.toml [env]` plus
-its own secrets, and `assert-collector-invariants.py` fails the build if an app's declared
-bucket is not the one the reviewed map assigns it.
+image, each on **exactly one fly machine**. That count is load-bearing, not thrift: the
+Mimir pipeline converts the worker's delta metrics to cumulative inside one collector
+process, and a second machine splits each series across two converters, which Mimir rejects
+as out-of-order (see "One converter per stream" in
+[`otel-collector/README.md`](otel-collector/README.md)). The deploy workflow pins and asserts
+the count after every deploy. The only other difference between the two environments is each
+app's `fly.toml [env]` plus its own secrets, and `assert-collector-invariants.py` fails the
+build if an app's declared Mimir user is not the one the reviewed map assigns it. (door43 maps
+each username to a fixed Mimir org, so the username is what selects where metrics land.)
 
-**Why a collector at all** (when there's only one sink today)? The worker only ever talks
-to the collector — one endpoint, one secret. Everything downstream (which sink(s),
-redaction, retry) is a **collector-config-only** change the worker never sees. Adding a
-second sink later is: add an exporter block, append it to each pipeline, reload — the
-worker is never touched or redeployed.
+**Why a collector at all?** The worker only ever talks to the collector — one endpoint, one
+secret. Everything downstream (which sink(s), redaction, retry, temporality) is a
+**collector-config-only** change the worker never sees. The metrics sink has already moved
+once this way — InfluxDB 3 → Mimir when door43 retired Influx — without touching or
+redeploying the worker. The worker emits DELTA metrics (ephemeral isolates); Mimir expects
+CUMULATIVE; the collector's `deltatocumulative` processor bridges the two on the Mimir
+pipeline only, while OpenObserve keeps receiving delta as before. That bridge needs one
+producer per stream delivered in order, so the worker stamps a per-isolate
+`service.instance.id` and serializes its flushes (see `otel-collector/README.md`).
 
 **Governance.** OpenObserve is operated and queried only by us (fly is just an IaaS host);
 the control plane stays in our hands. We still **redact at source** (in the worker) and
@@ -101,11 +115,11 @@ Run the bring-up once per environment. Staging is already live; production is
 `docs/plans/production-otel.md` B3.
 
 All **secrets** live in the respective fly app (`fly secrets set ...`), never in git. Values
-that are not actually secret do not belong there: `INFLUX_BUCKET` is a bucket name and now
-lives in each app's `fly.toml [env]`, where the bucket↔environment mapping is diffable and
+that are not actually secret do not belong there: `MIMIR_USER` is an org identifier and lives
+in each app's `fly.toml [env]`, where the user↔environment mapping is diffable and
 code-reviewed instead of being a digest in `fly secrets list`.
 
 > **A fly secret of a given name takes precedence over `[env]` of the same name.** Setting
-> `INFLUX_BUCKET` as a secret on a collector app does not "also" set it — it overrides the
+> `MIMIR_USER` as a secret on a collector app does not "also" set it — it overrides the
 > reviewed value in git and nothing anywhere reports the difference. The deploy pre-flight
-> warns when it finds one.
+> fails the deploy when it finds one.
