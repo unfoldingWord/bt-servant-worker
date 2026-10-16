@@ -7,6 +7,7 @@
 
 import { Attachment, ChatResponse, ProgressMode, StreamCallbacks } from '../../types/engine.js';
 import type { StatusKey, StatusUpdate } from '../../i18n/ui-strings.js';
+import { releaseBody } from '../../utils/http.js';
 import { RequestLogger, safeAsync } from '../../utils/logger.js';
 import { countMetric } from '../telemetry/index.js';
 
@@ -272,16 +273,30 @@ export class ProgressCallbackSender {
     });
   }
 
+  /**
+   * POST one payload to the gateway. Callers use only the status, so the body is
+   * released here: an unread body holds the connection open (see releaseBody), and
+   * a WhatsApp turn posts several progress messages.
+   */
   private async fetchWithTimeout(payload: CallbackPayload): Promise<Response> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 10_000);
     try {
-      return await fetch(this.config.url, {
+      const response = await fetch(this.config.url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Engine-Token': this.config.token },
         body: JSON.stringify(payload),
         signal: controller.signal,
       });
+      releaseBody(response, (error) =>
+        this.logger?.warn('webhook_body_release_failed', {
+          error: error.message,
+          type: payload.type,
+          status: response.status,
+          user_id: this.config.user_id,
+        })
+      );
+      return response;
     } finally {
       clearTimeout(timeoutId);
     }

@@ -13,6 +13,7 @@ import {
   resetMetricTelemetryForTests,
 } from '../../../src/services/telemetry/metrics.js';
 import { Env } from '../../../src/config/types.js';
+import { trackedResponse } from '../../helpers/tracked-response.js';
 
 function makeEnv(overrides: Partial<Env> = {}): Env {
   return { ENVIRONMENT: 'test', ...overrides } as Env;
@@ -188,6 +189,19 @@ describe('FetchMetricExporter', () => {
 });
 
 describe('metrics stack (init → emit → flush)', () => {
+  it.each([200, 503])('releases the collector response body (HTTP %i)', async (status) => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { response, wasCancelled } = trackedResponse(status);
+    initMetricTelemetry(ENABLED, {
+      fetchFn: vi.fn(async () => response) as unknown as typeof fetch,
+    });
+    countMetric('requests_total', { transport: 'whatsapp' });
+
+    await flushAndWait();
+
+    await vi.waitFor(() => expect(wasCancelled()).toBe(true));
+  });
+
   it('is a genuine no-op when telemetry is disabled', async () => {
     const fetchFn = okFetch();
     initMetricTelemetry(DISABLED, { fetchFn });
