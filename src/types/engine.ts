@@ -5,7 +5,7 @@
 import { OrgLanguages } from './languages.js';
 import { MCPServerConfig } from './mcp.js';
 import { OrgConfig } from './org-config.js';
-import { OrgModes, PromptOverrides } from './prompt-overrides.js';
+import { ChatOrgModes, PromptOverrides } from './prompt-overrides.js';
 import type { StatusKey, StatusUpdate } from '../i18n/ui-strings.js';
 
 /**
@@ -127,8 +127,12 @@ export interface ChatRequest {
   /** Internal: Org-level prompt overrides injected by worker from KV (not from client) */
   _org_prompt_overrides?: PromptOverrides;
 
-  /** Internal: Org modes injected by worker from KV (not from client) */
-  _org_modes?: OrgModes;
+  /**
+   * Internal: modes injected by the worker from KV (not from client) — the
+   * request org's modes plus every other org's published modes, qualified as
+   * `<orgslug>/<slug>` (admin-portal#336, see `readAllPublishedModes`).
+   */
+  _org_modes?: ChatOrgModes;
 
   /** Internal: Org languages injected by worker from KV (not from client) */
   _org_languages?: OrgLanguages;

@@ -58,7 +58,7 @@ import {
   PromptOverrides,
   resolveActiveModeName,
   resolvePromptOverrides,
-  validateModeName,
+  validateModeSelection,
   validatePromptOverrides,
 } from '../types/prompt-overrides.js';
 import { resolveEffectiveMode } from '../types/mode-markdown.js';
@@ -3940,7 +3940,8 @@ export class UserDO {
   private async handleSetMode(request: Request): Promise<Response> {
     return withEndpointLogging(this.getLogger(), 'set_mode', async () => {
       const body = (await request.json()) as Record<string, unknown>;
-      const nameError = validateModeName(body.mode);
+      // Bare `<mode>` or `<orgslug>/<modeslug>` for another org's published mode (#336).
+      const nameError = validateModeSelection(body.mode);
       if (nameError) {
         return Response.json({ error: nameError }, { status: 400 });
       }
