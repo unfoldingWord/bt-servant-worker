@@ -293,7 +293,6 @@ export class ProgressCallbackSender {
           error: error.message,
           type: payload.type,
           status: response.status,
-          user_id: this.config.user_id,
         })
       );
       return response;

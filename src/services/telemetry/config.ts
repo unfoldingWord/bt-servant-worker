@@ -145,6 +145,12 @@ type SerializableSpans = Parameters<typeof JsonTraceSerializer.serializeRequest>
 
 const toError = (err: unknown): Error => (err instanceof Error ? err : new Error(String(err)));
 
+/** The header rc.52's OTLPExporter sends; keep it in step with the installed version. */
+const OTEL_EXPORTER_USER_AGENT = 'Cloudflare Worker @microlabs/otel-cf-workers v1.0.0-rc.52';
+
+/** Same limit as the progress webhook, so a collector that never answers cannot hold the invocation. */
+const TRACE_EXPORT_TIMEOUT_MS = 10_000;
+
 /**
  * Redacts every span at export time and POSTs them to the collector as OTLP JSON,
  * with the library's serializer and default headers. Exported for testing.
@@ -166,19 +172,20 @@ export class RedactingSpanExporter {
     this.headers = {
       accept: 'application/json',
       'content-type': 'application/json',
+      'user-agent': OTEL_EXPORTER_USER_AGENT,
       ...config.headers,
     };
   }
 
   export(spans: unknown[], resultCallback: ExportResultCallback): void {
-    let body: string;
+    let body: Uint8Array;
     try {
       for (const span of spans) {
         redactSpan(span as MutableSpan);
       }
       const serialized = JsonTraceSerializer.serializeRequest(spans as SerializableSpans);
       if (!serialized) throw new Error('serializer returned no payload');
-      body = new TextDecoder().decode(serialized);
+      body = serialized;
     } catch (err) {
       const error = toError(err);
       console.warn(`otlp_traces_serialize_failed: ${error.message}`);
@@ -190,22 +197,35 @@ export class RedactingSpanExporter {
     // receiver throws `TypeError: Illegal invocation` (see FetchLogExporter). The throw
     // is synchronous, so it is caught here rather than by the `.catch` below.
     const fetchFn = this.fetchFn;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), TRACE_EXPORT_TIMEOUT_MS);
     let responsePromise: Promise<Response>;
     try {
-      responsePromise = fetchFn(this.config.url, { method: 'POST', headers: this.headers, body });
+      responsePromise = fetchFn(this.config.url, {
+        method: 'POST',
+        headers: this.headers,
+        body,
+        signal: controller.signal,
+      });
     } catch (err) {
+      clearTimeout(timeoutId);
       const error = toError(err);
       console.warn(`otlp_traces_export_error: ${error.message}`);
       resultCallback({ code: 1, error });
       return;
     }
 
-    this.settle(responsePromise, resultCallback);
+    this.settle(responsePromise, resultCallback, () => clearTimeout(timeoutId));
   }
 
   /** Report the export's outcome, releasing the collector's response body either way. */
-  private settle(responsePromise: Promise<Response>, resultCallback: ExportResultCallback): void {
+  private settle(
+    responsePromise: Promise<Response>,
+    resultCallback: ExportResultCallback,
+    onSettled: () => void
+  ): void {
     responsePromise
+      .finally(onSettled)
       .then((response) => {
         releaseBody(response, (error) =>
           console.warn(`otlp_traces_body_release_failed: ${error.message}`)
@@ -227,6 +247,7 @@ export class RedactingSpanExporter {
       });
   }
 
+  /** Nothing to flush: an export in flight reports through its resultCallback when its POST settles. */
   shutdown(): Promise<void> {
     return Promise.resolve();
   }

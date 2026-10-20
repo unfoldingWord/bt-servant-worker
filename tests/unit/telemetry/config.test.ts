@@ -306,10 +306,18 @@ function exportSpans(
   return new Promise((resolve) => exporter.export(spans, resolve));
 }
 
+/** A fetch that never answers and rejects the way native fetch does when its signal aborts. */
+function untilAborted(signal: AbortSignal | undefined): Promise<Response> {
+  return new Promise<Response>((_resolve, reject) => {
+    signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+  });
+}
+
 describe('RedactingSpanExporter', () => {
   const config = { url: 'https://c.example/v1/traces', headers: { Authorization: 'Bearer t' } };
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
   });
 
@@ -327,10 +335,59 @@ describe('RedactingSpanExporter', () => {
     const headers = init.headers as Record<string, string>;
     expect(headers.Authorization).toBe('Bearer t');
     expect(headers['content-type']).toBe('application/json');
-    const body = init.body as string;
+    expect(headers['user-agent']).toBe('Cloudflare Worker @microlabs/otel-cf-workers v1.0.0-rc.52');
+    expect(init.body).toBeInstanceOf(Uint8Array);
+    const body = new TextDecoder().decode(init.body as Uint8Array);
     expect(body).toContain('"keep"');
     expect(body).not.toContain('u-1');
     expect(body).toContain('"Durable Object Fetch"');
+  });
+
+  it('keeps the user-agent in step with the installed otel-cf-workers version', async () => {
+    const { default: pkg } =
+      (await import('../../../node_modules/@microlabs/otel-cf-workers/package.json')) as {
+        default: { version: string };
+      };
+    const fetchMock = vi.fn(() => Promise.resolve(new Response(null, { status: 200 })));
+    const exporter = new RedactingSpanExporter(config, fetchMock as unknown as typeof fetch);
+
+    await exportSpans(exporter, [exportableSpan({})]);
+
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const headers = init.headers as Record<string, string>;
+    expect(headers['user-agent']).toBe(
+      `Cloudflare Worker @microlabs/otel-cf-workers v${pkg.version}`
+    );
+  });
+
+  it('aborts the trace POST after 10 s and reports FAILED', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let signal: AbortSignal | undefined;
+    const hanging = vi.fn((_url: string, init: RequestInit) => {
+      signal = init.signal ?? undefined;
+      return untilAborted(signal);
+    });
+    const exporter = new RedactingSpanExporter(config, hanging as unknown as typeof fetch);
+
+    const result = exportSpans(exporter, [exportableSpan({})]);
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(signal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect((await result).code).toBe(1);
+    expect(signal?.aborted).toBe(true);
+    vi.useRealTimers();
+  });
+
+  it('clears the abort timer once the collector answers', async () => {
+    vi.useFakeTimers();
+    const exporter = new RedactingSpanExporter(config, (() =>
+      Promise.resolve(new Response(null, { status: 200 }))) as unknown as typeof fetch);
+
+    expect((await exportSpans(exporter, [exportableSpan({})])).code).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+    vi.useRealTimers();
   });
 
   it.each([200, 503])('releases the collector response body (HTTP %i)', async (status) => {
