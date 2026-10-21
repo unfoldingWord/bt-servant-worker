@@ -42,6 +42,7 @@ import {
 import { resourceFromAttributes } from '@opentelemetry/resources';
 import { JsonLogsSerializer } from '@opentelemetry/otlp-transformer';
 import { __unwrappedFetch } from '@microlabs/otel-cf-workers';
+import { releaseBody } from '../../utils/http.js';
 import { Env } from '../../config/types.js';
 import { APP_VERSION } from '../../generated/version.js';
 import {
@@ -184,8 +185,21 @@ export class FetchLogExporter implements LogRecordExporter {
       return;
     }
 
+    this.settle(responsePromise, resultCallback);
+  }
+
+  /** Report the export's outcome, releasing the collector's response body either way. */
+  private settle(
+    responsePromise: Promise<Response>,
+    resultCallback: (result: { code: number; error?: Error }) => void
+  ): void {
     responsePromise
       .then((response) => {
+        // Nothing in the collector's reply is used, but an unread body holds the
+        // connection open (see releaseBody).
+        releaseBody(response, (error) =>
+          console.warn(`otlp_logs_body_release_failed: ${error.message}`)
+        );
         if (response.ok) {
           resultCallback({ code: 0 }); // ExportResultCode.SUCCESS
         } else {

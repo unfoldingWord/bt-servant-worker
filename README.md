@@ -10,7 +10,7 @@ A Cloudflare Worker (built with [Hono](https://hono.dev/)) that provides AI-powe
 
 bt-servant-worker is deployed on Cloudflare's edge network and provides:
 
-- **Claude-powered chat** with multi-turn orchestration (configurable tool-use loop, 100 iterations by default)
+- **Claude-powered chat** with multi-turn orchestration (configurable tool-use loop, 100 iterations by default) and prompt caching on the stable system prefix
 - **Dynamic MCP tool discovery** — discovers and calls MCP tools from configured servers, with a per-server-grouped catalog for source-ordered fallback
 - **Sandboxed code execution** via QuickJS compiled to WebAssembly
 - **Audio message support** — speech-to-text (STT) via Whisper (Workers AI) and text-to-speech (TTS) via OpenAI gpt-4o-mini-tts, with audio stored in R2
@@ -18,15 +18,17 @@ bt-servant-worker is deployed on Cloudflare's edge network and provides:
 - **Group & supergroup chat** — Telegram group/supergroup support with per-group DOs, thread-level isolation, speaker attribution, and shared group memory
 - **Per-conversation state** — chat history, preferences, prompt overrides, and persistent memory via Durable Objects (SQLite-backed)
 - **Request serialization** — one request at a time per conversation (user, group, or thread), preventing race conditions
-- **Streaming support** — real-time SSE streaming and webhook progress callbacks
+- **Streaming support** — real-time SSE streaming and webhook progress callbacks, with status lines localized to the user's response language
 - **Callback mode** — fire-and-forget with webhook progress callbacks for clients that can't hold long connections
 - **Dynamic prompt overrides** — org and user-level customization of Claude's system prompt
-- **Modes** — named prompt presets (e.g., "mast-methodology") with publish gating, group-only gating, aliases, and safe rename/clone/retire lifecycle
-- **Languages** — per-org language documents plus a `@<language>` trigger and per-request `response_language_hint`
-- **Trigger syntax** — messages may start with `#<mode>` and/or `@<language>`; a deterministic classifier with LLM-backed fuzzy disambiguation resolves them, and selections persist across turns
+- **Modes** — named prompt presets (e.g., "mast-methodology") with publish gating, group-only gating, aliases, a one-time first-contact welcome with a WhatsApp share link, a per-mode resource-priority directive, and safe rename/clone/retire lifecycle
+- **Languages** — per-org language documents plus a `@<language>` trigger, an org default language, and per-request `response_language_hint`
+- **Trigger syntax** — messages may start with `#<mode>` and/or `@<language>`; a deterministic classifier resolves them, and selections persist across turns
 - **Persistent memory** — schema-free sectioned memory per conversation, with pinning and auto-eviction
+- **Client-supplied history** — a client can own its conversation thread and suppress the welcome or memory for a turn
+- **Resource listing** — an admin endpoint aggregates the scripture resources every MCP server offers for a language, and the system prompt forbids the model from claiming availability it has not seen in a tool result
 - **Scripture PDF typesetting** — `generate_scripture_pdf` macro tool delegating to a ptxprint MCP service, with PDFs mirrored to R2 and returned as response attachments
-- **Tail-worker observability** — a separate tail worker captures failures the main worker cannot log (CPU exhaustion, uncaught exceptions, isolate eviction), and logs fan out to the bt-servant-telemetry workers
+- **Observability** — a separate tail worker captures failures the main worker cannot log (CPU exhaustion, uncaught exceptions, isolate eviction), logs fan out to the bt-servant-telemetry workers, and an opt-in OpenTelemetry pipe exports redacted traces, logs, and metrics to a self-hosted collector
 
 ## Architecture Overview
 
@@ -64,11 +66,13 @@ Full C4 ecosystem diagrams (system context + container) live in [docs/architectu
 
 **QuickJS Sandbox** — Replaces Node.js `isolated-vm` with QuickJS compiled to WebAssembly. Code runs in a completely isolated sandbox with no access to `fetch`, environment variables, or Worker APIs. Only explicitly injected MCP tool wrappers are available.
 
-**Durable Objects** — A single unified `UserDO` class (SQLite-backed) that handles chat processing, history, preferences, memory, prompt overrides, and an internal FIFO queue with alarm-based processing. The same DO class is used for private chats, group chats, and supergroup threads — polymorphic routing keys determine which DO instance handles each conversation. This flat architecture eliminates DO-to-DO chains that previously caused Cloudflare error 1003.
+**Durable Objects** — A single unified `UserDO` class (SQLite-backed) that handles chat processing, history, preferences, memory, prompt overrides, and an internal FIFO queue with alarm-based processing. The same DO class is used for private chats, group chats, and supergroup threads — polymorphic routing keys determine which DO instance handles each conversation. This flat architecture eliminates DO-to-DO chains that previously caused Cloudflare error 1003. Every chat turn also persists a small identity record (`do_name`, `org`, `chat_type`, ids, `client_id`) so an operator can open a DO by its hex id later via the snapshot endpoint and know whose it is.
 
-**MCP Catalog & Health Tracking** — Tool manifests from all configured MCP servers are merged into a single catalog, grouped by server in the system prompt so Claude can honor source-ordered fallback between overlapping servers. Health tracking blocks unhealthy servers; per-execution and per-request MCP call caps prevent runaway fan-out.
+**MCP Catalog & Health Tracking** — Tool manifests from all configured MCP servers are merged into a single catalog, grouped by server in the system prompt so Claude can honor source-ordered fallback between overlapping servers. Health tracking blocks unhealthy servers; per-execution and per-request MCP call caps prevent runaway fan-out. Integration patterns are described in [docs/mcp-integration-guidelines.md](docs/mcp-integration-guidelines.md).
 
-**MCP Servers (global pool)** — The MCP server list is one library shared by every organization (admin-portal#278), unlike modes and languages, which are per org. It is stored under the reserved `MCP_SERVERS` key `__global__`; the `:org` segment of the admin routes keeps the URL shape and is echoed in responses but does not select data, and an org literally named `__global__` is rejected with 400. Responses never include a server's `authToken` — they carry `hasAuthToken: boolean` instead — and writes merge the token by server `id`: omit the field to keep the stored token, send `null` or `""` to clear it, or a non-empty string to set it. Only the known config fields are persisted or returned. Migration: while `__global__` is absent (a stored `[]` is a real, empty pool), reads fall back to the legacy `unfoldingWord` key, log `mcp_global_key_missing`, and GET bodies carry `migrated: false`, `code: "MCP_POOL_NOT_MIGRATED"`, `fallback_found`, `legacy_keys`, `legacy_listing`, `stale_global_suspected` and a `warning`; **writes return `409 MCP_POOL_NOT_MIGRATED` (same fields plus `error`) until `__global__` exists** and are super-admin only. The API never creates `__global__` — the runbook on admin-portal#278 does, from the raw KV value of the legacy key(s). The API never declares a namespace empty (KV `get`/`list` are eventually consistent; `stale_global_suspected` flags a listing that saw `__global__` when the read did not): the operator runs `wrangler kv key list` and seeds `[]` only if that shows no keys. Once migrated, every admin GET carries `legacy_listing`, and `legacy_keys` plus a `warning` when leftovers were seen or the listing was incomplete. Once migrated the routes are plain KV read-modify-write (last write wins, like every admin config route), and for the duration of KV's propagation window a colo with a stale miss on `__global__` serves the legacy list (or nothing) to chat — reads on the chat path never list keys. Max 50 servers.
+**MCP Servers (global pool)** — The MCP server list is one library shared by every organization (admin-portal#278), unlike modes and languages, which are per org. It is stored under the reserved `MCP_SERVERS` key `__global__`; the `:org` segment of the admin routes keeps the URL shape and is echoed in responses but does not select data, and an org literally named `__global__` is rejected with 400. Responses never include a server's `authToken` — they carry `hasAuthToken: boolean` instead — and writes merge the token by server `id`: omit the field to keep the stored token, send `null` or `""` to clear it, or a non-empty string to set it. Only the known config fields are persisted or returned. Migration: while `__global__` is absent (a stored `[]` is a real, empty pool), reads fall back to the legacy `unfoldingWord` key, log `mcp_global_key_missing`, and GET bodies carry `migrated: false`, `code: "MCP_POOL_NOT_MIGRATED"`, `fallback_found`, `legacy_keys`, `legacy_listing`, `stale_global_suspected` and a `warning`; **writes return `409 MCP_POOL_NOT_MIGRATED` (same fields plus `error`) until `__global__` exists** and are super-admin only. The API never creates `__global__` — the runbook on admin-portal#278 does, from the raw KV value of the legacy key(s). The API never declares a namespace empty (KV `get`/`list` are eventually consistent; `stale_global_suspected` flags a listing that saw `__global__` when the read did not): the operator runs `wrangler kv key list` and seeds `[]` only if that shows no keys. Once migrated, every admin GET carries `legacy_listing`, and `legacy_keys` plus a `warning` when leftovers were seen or the listing was incomplete. Once migrated the routes are plain KV read-modify-write (last write wins, like every admin config route), and for the duration of KV's propagation window a colo with a stale miss on `__global__` serves the legacy list (or nothing) to chat — reads on the chat path never list keys. A chat turn that is served an empty `__global__` pool while a legacy per-org key still holds servers logs `mcp_global_pool_empty_over_legacy` (worker#432) so a hollow migration is visible. Max 50 servers.
+
+**Resource Listing** — `GET /api/v1/admin/orgs/:org/resources?language=xx` fans out to every enabled MCP server that exposes a listing tool, normalizes each server's vocabulary onto canonical subject slugs (`bible`, `aligned-bible`, `bible-stories`, `translation-notes`, `translation-questions`, `translation-words`, `translation-academy`, `study-notes`, `dictionary`, `lexicon`, `media`, …), and reports per-server capability honestly in `servers[]` (`ok` / `unsupported` / `error`). One failing server never hides another's results. The contract is locked on admin-portal#230 and the portal mirrors the types verbatim.
 
 **Persistent Memory** — Schema-free sectioned memory per conversation (user, group, or thread). A deterministic TOC is injected into the system prompt; Claude reads/writes specific sections via tools. Sections can be pinned; when the 128KB cap is exceeded, the oldest non-pinned sections are auto-evicted so writes never fail.
 
@@ -88,29 +92,36 @@ Prompt override text supports `{{version}}` as a template variable, replaced at 
 
 **Modes** — Named prompt presets stored per org (max 20). A mode may store its slot values either as a legacy `overrides` map or as a single markdown `document` with one H2 section per slot; both shapes are accepted and resolved identically at chat time. Mode fields:
 
-| Field            | Purpose                                                                |
-| ---------------- | ---------------------------------------------------------------------- |
-| `name`           | Unique slug (lowercase alphanumeric + hyphens)                         |
-| `aliases`        | Old slugs kept from renames/retires so subscribers are never stranded  |
-| `label`          | Human-readable display name                                            |
-| `description`    | What the mode does                                                     |
-| `published`      | Visibility gate — unpublished (draft) modes are visible to admins only |
-| `requires_group` | Gate group-only modes by chat type (hidden/blocked in private chats)   |
-| `overrides`      | Legacy slot map                                                        |
-| `document`       | Markdown document (H2 per slot)                                        |
+| Field             | Purpose                                                                                                    |
+| ----------------- | ---------------------------------------------------------------------------------------------------------- |
+| `name`            | Unique slug (lowercase alphanumeric + hyphens, max 64 chars)                                               |
+| `aliases`         | Old slugs kept from renames/retires so subscribers are never stranded (max 20)                             |
+| `label`           | Human-readable display name                                                                                |
+| `description`     | What the mode does                                                                                         |
+| `welcome_message` | Authored first-contact copy (max 1,000 chars) sent once per user the first time they enter the mode (#311) |
+| `published`       | Visibility gate — unpublished (draft) modes are visible to admins only                                     |
+| `requires_group`  | Gate group-only modes by chat type (hidden/blocked in private chats)                                       |
+| `overrides`       | Legacy slot map                                                                                            |
+| `document`        | Markdown document (H2 per slot)                                                                            |
 
 Lifecycle operations (`_rename`, `_clone`, `_retire`) manage modes without breaking users who have one selected — renames keep the old slug as an alias, retires forward the retired slug to a target mode. Users switch modes via the `switch_mode` tool, the `#<mode>` message trigger, or admin endpoints (per-user and per-group).
 
-**Languages** — Per-org language documents (max 20) with a shared language scaffold template. Users select a response language via the `@<language>` message trigger (persists across turns) or per-request `response_language_hint`.
+The first time a user reaches a mode (typically by scanning its QR code, which drops `#<slug>` into the chat), the worker — not the model — emits the mode's `welcome_message` followed by a deterministic `wa.me` share link built from `WHATSAPP_NUMBER`, byte-identical to the link the admin portal renders. The flag is per user and per mode, so an existing user still gets a new mode's welcome. A welcome whose delivery fails is marked pending and re-sent on the next turn in that mode.
 
-**Trigger Classifier** — Messages may begin with `#<mode>` and/or `@<language>` tokens. A deterministic cascade matches exact slugs first; fuzzy input falls back to a Haiku-powered LLM classifier for disambiguation.
+A mode document's `## Tool Guidance` section may carry a portal-authored, HTML-comment-fenced **resource priorities** block. At prompt-assembly time the worker strips the marker lines and turns the ranked resource ids into an actionable directive naming each server and its ids in order (#366, #341); stored documents are never mutated.
+
+**Languages** — Per-org language documents (max 20) with a shared language scaffold template. Users select a response language via the `@<language>` message trigger (persists across turns) or per-request `response_language_hint`; when neither is present, the org default language (`languages-default`, #356) applies. The active language document is injected into the system prompt as a `## Language Guidance` section.
+
+**Trigger Classifier** — Messages may begin with `#<mode>` and/or `@<language>` tokens. A deterministic, network-free cascade matches exact slugs, then unique prefixes, then a unique Levenshtein-distance ≤ 2 winner; tokens that fail all three tiers are passed to the orchestrator as unrecognized triggers so it can compose a "did you mean…" reply. Matching stops at the first non-trigger word.
+
+**Input language detection** — Each text turn's written language is detected locally (`tinyld/light`, 24 languages) and reported as `input_language` on the response and on the `chat_turn` telemetry record. It is telemetry only and never drives the reply language (#404).
 
 **Audio Pipeline** — When a user sends an audio message (`message_type: 'audio'`), the worker archives the inbound voice recording to R2 (`voice-submissions/…`), transcribes it using Whisper (`@cf/openai/whisper-large-v3-turbo` via Workers AI), processes the transcribed text through the normal Claude orchestration, then generates a spoken response using OpenAI's `gpt-4o-mini-tts` (with exponential-backoff retry on 429/5xx). TTS audio is stored in R2 and served via `/api/v1/audio/*`. TTS failure is non-fatal — the text response is always returned. `audio_format` accepts both bare extensions (`ogg`) and MIME forms (`audio/ogg`). The outbound TTS format is selectable per request via `voice_format` (`'opus'` default, or `'aac'` for clients like Signal that only inline-render AAC voice notes); it controls the OpenAI `response_format`, the R2 key extension, and the stored content type.
 
 | Constraint              | Value                                        |
 | ----------------------- | -------------------------------------------- |
 | Max audio input size    | 25 MB                                        |
-| Supported audio formats | ogg, mp3, wav, webm, flac, m4a               |
+| Supported audio formats | ogg, mp3, wav, webm, flac, m4a, aac          |
 | Max TTS input           | 10,000 characters (truncated beyond)         |
 | TTS output format       | OGG/Opus (default) or AAC via `voice_format` |
 | TTS model               | gpt-4o-mini-tts                              |
@@ -120,7 +131,13 @@ Lifecycle operations (`_rename`, `_clone`, `_retire`) manage modes without break
 
 **Scripture PDF Typesetting (ptxprint)** — The `generate_scripture_pdf` macro tool resolves a (translation, book) pair to a USFM source, submits a typesetting job to a ptxprint MCP service, polls for completion, mirrors the resulting PDF to R2, and returns it as a `pdf` attachment on the chat response. USFM sources, PDFs, and fonts are served publicly (no auth) from `/public/ptxprint/*`.
 
-**Tail Worker** — A separate worker (`tail-worker/`, deployed as `bt-servant-tail`) consumes trace events from the main worker and emits structured `worker_death` and `long_invocation` events for failures the main worker cannot observe itself: CPU exhaustion, uncaught exceptions, and isolate eviction. Logs also fan out to the `bt-servant-telemetry` workers. The main worker's CPU limit is raised to 300,000 ms (5 min) to accommodate long ptxprint flows.
+**Prompt Caching** — The Anthropic request carries two cache breakpoints (issue #333): an explicit one on the stable, org/mode-scoped system block (which, by render order, also covers the tool definitions), and the API's automatic top-level breakpoint, which advances as the orchestration loop re-sends accumulated tool results. Cache read and write token counts are recorded on each turn's usage record.
+
+**Localized status lines** — The few non-LLM strings the worker writes into a chat (queued, transcribing, generating audio, max-iterations notice, generic failure) are keyed by the user's `response_language` and emitted with a stable `key` alongside the text (`src/i18n/ui-strings.ts`, #405). English and Portuguese are bundled; adding a language is one table entry.
+
+**Tail Worker** — A separate worker (`tail-worker/`, deployed as `bt-servant-tail`) consumes trace events from the main worker and emits structured `worker_death` and `long_invocation` events (CPU ≥ 25 s or wall ≥ 60 s) for failures the main worker cannot observe itself: CPU exhaustion, uncaught exceptions, and isolate eviction. Logs also fan out to the `bt-servant-telemetry` workers. The main worker's CPU limit is raised to 300,000 ms (5 min) to accommodate long ptxprint flows.
+
+**OpenTelemetry (opt-in)** — `src/services/telemetry/` exports traces (via `@microlabs/otel-cf-workers` plus manual spans over the non-fetch seams), logs (teed from the structured logger), and delta-temporality metrics (bounded-label counters such as `requests_total`, `chat_turns_total`, `tool_calls_total`, `mcp_response_size_exceeded_total`, `rate_limits_total`) over OTLP/HTTP to a self-hosted collector. It is a genuine no-op unless both `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_COLLECTOR_TOKEN` are set. Redaction is fail-closed at the source: only numbers, booleans, URL origins, and an allow-list of bounded structural string keys egress raw; everything else is summarized to type and length, and user ids are replaced by an HMAC pseudonym keyed by `TELEMETRY_USER_ID_SALT` (unset ⇒ no pseudonym egresses). Flushes happen once per invocation via `waitUntil`; there are no background timers. The collector, the OpenObserve sink, and the Grafana Mimir metrics sink are deployed from [infra/](infra/README.md) on fly.io; the bring-up plan is [docs/plans/production-otel.md](docs/plans/production-otel.md).
 
 ### Claude Built-in Tools
 
@@ -128,8 +145,8 @@ Lifecycle operations (`_rename`, `_clone`, `_retire`) manage modes without break
 | ------------------------ | --------------------------------------------------------------- |
 | `execute_code`           | Run JavaScript in QuickJS sandbox with MCP tool access          |
 | `get_tool_definitions`   | Get full JSON schemas for MCP tools before using them           |
-| `read_memory`            | Read sections from the conversation's persistent memory         |
-| `update_memory`          | Create/update/delete memory sections (with pin/unpin)           |
+| `read_memory`            | Read sections from the conversation's persistent memory²        |
+| `update_memory`          | Create/update/delete memory sections (with pin/unpin)²          |
 | `request_audio`          | Request that the response be delivered as TTS audio             |
 | `generate_scripture_pdf` | Typeset a scripture book as a PDF via ptxprint                  |
 | `prepare_usfm_source`    | Resolve (translation, book) to a USFM source for typesetting    |
@@ -139,6 +156,7 @@ Lifecycle operations (`_rename`, `_clone`, `_retire`) manage modes without break
 | `switch_mode`            | Switch (or clear) the conversation's active prompt mode¹        |
 
 ¹ Only exposed when the org has modes configured. Unpublished and `requires_group` modes are filtered by caller context; admin clients see drafts.
+² Omitted entirely when the request sets `suppress_memory: true`.
 
 ## Authentication
 
@@ -152,7 +170,7 @@ All `/api/*` routes require a Bearer token in the `Authorization` header.
 Authorization: Bearer <ENGINE_API_KEY or org-specific admin key>
 ```
 
-`/health` and `/public/ptxprint/*` are unauthenticated.
+`/health` and `/public/ptxprint/*` are unauthenticated. Every auth rejection is logged as `auth_rejected` (token value never logged) and counted in `auth_rejections_total`.
 
 ## API Endpoints
 
@@ -184,32 +202,36 @@ Authorization: Bearer <ENGINE_API_KEY or org-specific admin key>
 
 All admin endpoints require Bearer token authentication with `ENGINE_API_KEY` (the global `/api/*` middleware accepts nothing else today; the org-specific `ORG_ADMIN_KEYS` branch below it is not reachable).
 
-| Endpoint                                                               | Method       | Description                                                                      |
-| ---------------------------------------------------------------------- | ------------ | -------------------------------------------------------------------------------- |
-| `/api/v1/admin/orgs/:org/mcp-servers`                                  | GET/PUT/POST | Global MCP server pool (`:org` ignored for storage; `?discover=true` for status) |
-| `/api/v1/admin/orgs/:org/mcp-servers/:serverId`                        | DELETE       | Remove MCP server from the global pool                                           |
-| `/api/v1/admin/orgs/:org/config`                                       | GET/PUT/DEL  | Org config (history limits)                                                      |
-| `/api/v1/admin/orgs/:org/prompt-overrides`                             | GET/PUT/DEL  | Org-level prompt overrides                                                       |
-| `/api/v1/admin/orgs/:org/modes`                                        | GET          | List org modes (markdown view)                                                   |
-| `/api/v1/admin/orgs/:org/modes/:modeName`                              | GET/PUT/DEL  | Manage individual mode (aliases resolve)                                         |
-| `/api/v1/admin/orgs/:org/modes/:modeName/_rename`                      | POST         | Rename a mode; old slug retained as alias                                        |
-| `/api/v1/admin/orgs/:org/modes/:modeName/_clone`                       | POST         | Clone a mode (clone starts unpublished)                                          |
-| `/api/v1/admin/orgs/:org/modes/:modeName/_retire`                      | POST         | Retire a mode, forwarding its slug to another mode                               |
-| `/api/v1/admin/orgs/:org/languages`                                    | GET          | List org languages                                                               |
-| `/api/v1/admin/orgs/:org/languages/:languageName`                      | GET/PUT/DEL  | Manage individual language document                                              |
-| `/api/v1/admin/orgs/:org/languages-default`                            | GET/PUT      | Org default language (chat-time fallback, #356)                                  |
-| `/api/v1/admin/orgs/:org/language-scaffold`                            | GET/PUT/DEL  | Org language scaffold template                                                   |
-| `/api/v1/admin/orgs/:org/users/:userId/mode`                           | GET/PUT/DEL  | User's active mode                                                               |
-| `/api/v1/admin/orgs/:org/users/:userId/prompt-overrides`               | GET/PUT/DEL  | User-level prompt overrides                                                      |
-| `/api/v1/admin/orgs/:org/users/:userId/memory`                         | GET/DEL      | User persistent memory                                                           |
-| `/api/v1/admin/orgs/:org/users/:userId/history`                        | DEL          | Delete user history                                                              |
-| `/api/v1/admin/orgs/:org/groups/:chatId/preferences`                   | GET/PUT      | Group preferences (response_language)                                            |
-| `/api/v1/admin/orgs/:org/groups/:chatId/history`                       | GET/DEL      | Group chat history                                                               |
-| `/api/v1/admin/orgs/:org/groups/:chatId/memory`                        | GET/DEL      | Group shared memory                                                              |
-| `/api/v1/admin/orgs/:org/groups/:chatId/mode`                          | GET/PUT/DEL  | Group's active mode                                                              |
-| `/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/preferences` | GET/PUT      | Thread preferences                                                               |
-| `/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/history`     | GET/DEL      | Thread chat history                                                              |
-| `/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/memory`      | GET/DEL      | Thread shared memory                                                             |
+| Endpoint                                                               | Method       | Description                                                                                 |
+| ---------------------------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------- |
+| `/api/v1/admin/orgs/:org/mcp-servers`                                  | GET/PUT/POST | Global MCP server pool (`:org` ignored for storage; `?discover=true` for status)            |
+| `/api/v1/admin/orgs/:org/mcp-servers/:serverId`                        | DELETE       | Remove MCP server from the global pool                                                      |
+| `/api/v1/admin/orgs/:org/resources`                                    | GET          | Aggregated resource listing across the pool (`?language=xx` required)                       |
+| `/api/v1/admin/orgs/:org/config`                                       | GET/PUT/DEL  | Org config (history limits)                                                                 |
+| `/api/v1/admin/orgs/:org/prompt-overrides`                             | GET/PUT/DEL  | Org-level prompt overrides                                                                  |
+| `/api/v1/admin/orgs/:org/modes`                                        | GET          | List org modes (markdown view)                                                              |
+| `/api/v1/admin/orgs/:org/modes/:modeName`                              | GET/PUT/DEL  | Manage individual mode (aliases resolve)                                                    |
+| `/api/v1/admin/orgs/:org/modes/:modeName/_rename`                      | POST         | Rename a mode; old slug retained as alias                                                   |
+| `/api/v1/admin/orgs/:org/modes/:modeName/_clone`                       | POST         | Clone a mode (clone starts unpublished)                                                     |
+| `/api/v1/admin/orgs/:org/modes/:modeName/_retire`                      | POST         | Retire a mode, forwarding its slug to another mode                                          |
+| `/api/v1/admin/orgs/:org/languages`                                    | GET          | List org languages                                                                          |
+| `/api/v1/admin/orgs/:org/languages/:languageName`                      | GET/PUT/DEL  | Manage individual language document                                                         |
+| `/api/v1/admin/orgs/:org/languages-default`                            | GET/PUT      | Org default language (chat-time fallback, #356)                                             |
+| `/api/v1/admin/orgs/:org/language-scaffold`                            | GET/PUT/DEL  | Org language scaffold template                                                              |
+| `/api/v1/admin/orgs/:org/users/:userId/mode`                           | GET/PUT/DEL  | User's active mode                                                                          |
+| `/api/v1/admin/orgs/:org/users/:userId/prompt-overrides`               | GET/PUT/DEL  | User-level prompt overrides                                                                 |
+| `/api/v1/admin/orgs/:org/users/:userId/memory`                         | GET/DEL      | User persistent memory                                                                      |
+| `/api/v1/admin/orgs/:org/users/:userId/history`                        | DEL          | Delete user history                                                                         |
+| `/api/v1/admin/orgs/:org/groups/:chatId/preferences`                   | GET/PUT      | Group preferences (response_language)                                                       |
+| `/api/v1/admin/orgs/:org/groups/:chatId/history`                       | GET/DEL      | Group chat history                                                                          |
+| `/api/v1/admin/orgs/:org/groups/:chatId/memory`                        | GET/DEL      | Group shared memory                                                                         |
+| `/api/v1/admin/orgs/:org/groups/:chatId/mode`                          | GET/PUT/DEL  | Group's active mode                                                                         |
+| `/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/preferences` | GET/PUT      | Thread preferences                                                                          |
+| `/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/history`     | GET/DEL      | Thread chat history                                                                         |
+| `/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/memory`      | GET/DEL      | Thread shared memory                                                                        |
+| `/api/v1/admin/do/:hexId/snapshot`                                     | GET          | Open a DO by its 64-hex object id; returns its stored identity and history (`?limit=`, 100) |
+
+The snapshot route is the only way into a DO whose `user:{org}:{user_id}` name is unknown (object ids from the Cloudflare REST listing are one-way), which is what makes the DO population enumerable after the fact. `identity` is `null` for DOs that predate identity persistence and have not chatted since.
 
 ### Chat Request/Response
 
@@ -221,7 +243,7 @@ interface ChatRequest {
   message?: string; // optional when message_type is 'audio'
   message_type: 'text' | 'audio';
   audio_base64?: string; // base64-encoded audio (required when message_type is 'audio')
-  audio_format?: string; // 'ogg' | 'mp3' | 'wav' | 'webm' | 'flac' | 'm4a' — bare or MIME form ('audio/ogg')
+  audio_format?: string; // 'ogg' | 'mp3' | 'wav' | 'webm' | 'flac' | 'm4a' | 'aac' — bare or MIME form ('audio/ogg')
   voice_format?: 'opus' | 'aac'; // outbound TTS voice-note format — defaults to 'opus'
   org?: string; // defaults to DEFAULT_ORG env var
   org_id?: string; // legacy alias for org (backward compat with whatsapp gateway)
@@ -405,7 +427,7 @@ The response carries the appended turn and the stored length, so the client can 
 }
 ```
 
-Threads longer than the org's `max_history_storage` are trimmed from the oldest end, never rejected; `history_length` reports what was kept. Uploaded entries are rebuilt from a whitelist (`user_message`, `assistant_response`, `timestamp`/`created_at`), so a client can never write R2 audio keys, `speaker`, or `attachments` into stored history.
+Threads longer than the org's `max_history_storage` are trimmed from the oldest end, never rejected; `history_length` reports what was kept. Each field is capped at 16,000 characters and the whole `history` payload at 512 KB (400 beyond that). Uploaded entries are rebuilt from a whitelist (`user_message`, `assistant_response`, `timestamp`/`created_at`), so a client can never write R2 audio keys, `speaker`, or `attachments` into stored history.
 
 ### SSE Event Types
 
@@ -438,6 +460,8 @@ interface CallbackPayload {
   voice_audio_url?: string | null; // for 'complete' — TTS audio URL (preferred)
   voice_audio_base64?: string | null; // for 'complete' — legacy, null when R2 is enabled
   attachments?: Attachment[]; // for 'complete' — PDFs / archived audio produced by tools
+  history_entry?: ChatResponse['history_entry']; // for 'complete', ONLY when the request sent `history`
+  history_length?: number; // for 'complete', ONLY when the request sent `history`
   chat_id?: string; // present for group/supergroup chats — use to route response to correct chat
   thread_id?: string; // present for supergroup threads — use to route response to correct thread
 }
@@ -468,25 +492,26 @@ All error responses follow a standard format:
 { "error": "ErrorName", "code": "ERROR_CODE", "message": "Human-readable description" }
 ```
 
-| Code                              | HTTP | Description                                        |
-| --------------------------------- | ---- | -------------------------------------------------- |
-| `VALIDATION_ERROR`                | 400  | Invalid request body or parameters                 |
-| `AUTHENTICATION_ERROR`            | 401  | Missing or invalid Bearer token                    |
-| `AUTHORIZATION_ERROR`             | 403  | Token valid but lacks permission for this org      |
-| `CONCURRENT_REQUEST_REJECTED`     | 429  | Another request for this conversation is in flight |
-| `MCP_CALL_LIMIT_EXCEEDED`         | 429  | Too many MCP calls in one `execute_code` run       |
-| `MCP_REQUEST_CALL_LIMIT_EXCEEDED` | 429  | Too many MCP calls across the whole request        |
-| `RATE_LIMIT_EXCEEDED`             | 429  | Rate limit hit on queue endpoints                  |
-| `QUEUE_DEPTH_EXCEEDED`            | 429  | Conversation's queue is full                       |
-| `QUEUE_BYTES_EXCEEDED`            | 429  | Conversation's queued request bytes over budget    |
-| `AUDIO_TRANSCRIPTION_ERROR`       | 400  | STT failed (bad format, oversized, invalid base64) |
-| `MCP_RESPONSE_TOO_LARGE`          | 413  | MCP server response exceeds size limit             |
-| `CODE_EXECUTION_ERROR`            | 500  | QuickJS sandbox error                              |
-| `INTERNAL_ERROR`                  | 500  | Unexpected server error                            |
-| `MCP_ERROR`                       | 502  | MCP server unreachable or returned error           |
-| `CLAUDE_API_ERROR`                | 502  | Claude API error                                   |
-| `AUDIO_SYNTHESIS_ERROR`           | 502  | TTS failed                                         |
-| `TIMEOUT_ERROR`                   | 504  | Operation timed out                                |
+| Code                              | HTTP | Description                                                         |
+| --------------------------------- | ---- | ------------------------------------------------------------------- |
+| `VALIDATION_ERROR`                | 400  | Invalid request body or parameters                                  |
+| `AUTHENTICATION_ERROR`            | 401  | Missing or invalid Bearer token                                     |
+| `AUTHORIZATION_ERROR`             | 403  | Token valid but lacks permission for this org                       |
+| `CONCURRENT_REQUEST_REJECTED`     | 429  | Another request for this conversation is in flight                  |
+| `MCP_CALL_LIMIT_EXCEEDED`         | 429  | Too many MCP calls in one `execute_code` run                        |
+| `MCP_REQUEST_CALL_LIMIT_EXCEEDED` | 429  | Too many MCP calls across the whole request                         |
+| `RATE_LIMIT_EXCEEDED`             | 429  | More than 300 chat enqueues on one conversation in a sliding minute |
+| `QUEUE_DEPTH_EXCEEDED`            | 429  | Conversation's queue is full                                        |
+| `QUEUE_BYTES_EXCEEDED`            | 429  | Conversation's queued request bytes over budget (1.5 MB)            |
+| `MCP_POOL_NOT_MIGRATED`           | 409  | MCP pool write refused while `__global__` is absent                 |
+| `AUDIO_TRANSCRIPTION_ERROR`       | 400  | STT failed (bad format, oversized, invalid base64)                  |
+| `MCP_RESPONSE_TOO_LARGE`          | 413  | MCP server response exceeds size limit                              |
+| `CODE_EXECUTION_ERROR`            | 500  | QuickJS sandbox error                                               |
+| `INTERNAL_ERROR`                  | 500  | Unexpected server error                                             |
+| `MCP_ERROR`                       | 502  | MCP server unreachable or returned error                            |
+| `CLAUDE_API_ERROR`                | 502  | Claude API error                                                    |
+| `AUDIO_SYNTHESIS_ERROR`           | 502  | TTS failed                                                          |
+| `TIMEOUT_ERROR`                   | 504  | Operation timed out                                                 |
 
 ## Request Serialization & Concurrency
 
@@ -586,24 +611,28 @@ Access control (who can reset a group, who counts as "addressed") is the **gatew
 
 ### Secrets (set via `wrangler secret put`)
 
-| Secret              | Description                                                               |
-| ------------------- | ------------------------------------------------------------------------- |
-| `ANTHROPIC_API_KEY` | API key for Claude                                                        |
-| `OPENAI_API_KEY`    | API key for OpenAI (TTS)                                                  |
-| `ENGINE_API_KEY`    | Bearer token for API auth + super-admin access + webhook `X-Engine-Token` |
+| Secret                        | Description                                                                                            |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `ANTHROPIC_API_KEY`           | API key for Claude                                                                                     |
+| `OPENAI_API_KEY`              | API key for OpenAI (TTS)                                                                               |
+| `ENGINE_API_KEY`              | Bearer token for API auth + super-admin access + webhook `X-Engine-Token`                              |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP base URL of the collector. Telemetry is a no-op unless this AND the token are set (optional) |
+| `OTEL_COLLECTOR_TOKEN`        | Bearer token the collector expects (optional)                                                          |
+| `TELEMETRY_USER_ID_SALT`      | HMAC key for the OTLP-path `user_hash` pseudonym; unset ⇒ no pseudonym egresses (optional)             |
 
 ### Required Environment Variables
 
-Set in `wrangler.toml` under `[vars]`:
+Set in `wrangler.toml` under `[vars]`. The top-level `[vars]` block **is** the production config (the Deploy workflow runs `wrangler deploy` with no `--env` and asserts `ENVIRONMENT = "production"`); `[env.staging.vars]` holds staging's copy.
 
-| Variable                       | Default           | Description                                 |
-| ------------------------------ | ----------------- | ------------------------------------------- |
-| `ENVIRONMENT`                  | `"development"`   | Runtime environment name                    |
-| `MAX_ORCHESTRATION_ITERATIONS` | `"100"`           | Max Claude tool-use loop iterations         |
-| `CODE_EXEC_TIMEOUT_MS`         | `"30000"`         | QuickJS execution timeout (ms)              |
-| `MAX_MCP_CALLS_PER_EXECUTION`  | `"10"`            | Max MCP calls per `execute_code` invocation |
-| `MAX_MCP_CALLS_PER_REQUEST`    | `"100"`           | Max MCP calls across a whole request        |
-| `DEFAULT_ORG`                  | `"unfoldingWord"` | Fallback org when not specified in request  |
+| Variable                       | Default           | Description                                                                                |
+| ------------------------------ | ----------------- | ------------------------------------------------------------------------------------------ |
+| `ENVIRONMENT`                  | `"production"`    | Runtime environment label (`"staging"` under `[env.staging]`); used as `service.namespace` |
+| `MAX_ORCHESTRATION_ITERATIONS` | `"100"`           | Max Claude tool-use loop iterations                                                        |
+| `CODE_EXEC_TIMEOUT_MS`         | `"30000"`         | QuickJS execution timeout (ms)                                                             |
+| `MAX_MCP_CALLS_PER_EXECUTION`  | `"10"`            | Max MCP calls per `execute_code` invocation                                                |
+| `MAX_MCP_CALLS_PER_REQUEST`    | `"100"`           | Max MCP calls across a whole request                                                       |
+| `DEFAULT_ORG`                  | `"unfoldingWord"` | Fallback org when not specified in request                                                 |
+| `WHATSAPP_NUMBER`              | `"15558196461"`   | WhatsApp business number (E.164 digits, no `+`) for the per-mode `wa.me` share link (#311) |
 
 ### Optional Environment Variables
 
@@ -616,8 +645,8 @@ These have sensible defaults and only need to be set to override:
 | `MAX_MCP_RESPONSE_SIZE_BYTES` | `"1048576"`           | Max response size from MCP servers (1 MB) |
 | `MAX_QUEUE_DEPTH`             | `"50"`                | Max queued messages per conversation      |
 | `QUEUE_MAX_RETRIES`           | `"3"`                 | Max retries for transient queue failures  |
-| `ADMIN_RATE_LIMIT_MAX`        | —                     | Admin endpoint rate limit (requests)      |
-| `ADMIN_RATE_LIMIT_WINDOW_MS`  | —                     | Admin endpoint rate limit window          |
+
+`ADMIN_RATE_LIMIT_MAX` and `ADMIN_RATE_LIMIT_WINDOW_MS` are declared on the `Env` type but nothing reads them; the only rate limiter in the worker is the fixed per-conversation enqueue limit (300 per sliding minute).
 
 ### Cloudflare Bindings
 
@@ -630,13 +659,13 @@ These have sensible defaults and only need to be set to override:
 | `ORG_ADMIN_KEYS`   | KV Namespace   | Per-org admin Bearer tokens                                               |
 | `MCP_SERVERS`      | KV Namespace   | MCP server configurations — one global pool under key `__global__` (#278) |
 | `ORG_CONFIG`       | KV Namespace   | Org-level configuration (history limits, etc.)                            |
-| `PROMPT_OVERRIDES` | KV Namespace   | Org-level prompt overrides, modes, languages                              |
+| `PROMPT_OVERRIDES` | KV Namespace   | Org-level prompt overrides, modes, languages, scaffold, default language  |
 
-The worker also declares **tail consumers** (`bt-servant-tail` for death detection, `bt-servant-telemetry` for log fanout) and raises the CPU limit to 300,000 ms for long ptxprint flows.
+The worker also declares **tail consumers** (`bt-servant-tail` for death detection and `bt-servant-telemetry-production` for log fanout; staging uses `bt-servant-tail-staging` and `bt-servant-telemetry-dev`), enables the `nodejs_compat` compatibility flag (AsyncLocalStorage for trace-context propagation), and raises the CPU limit to 300,000 ms for long ptxprint flows.
 
 ### Environments
 
-A staging environment is configured in `wrangler.toml` under `[env.staging]` with separate KV namespace IDs and worker name `bt-servant-worker-staging`. Observability is enabled at 100% sampling rate in all environments.
+A staging environment is configured in `wrangler.toml` under `[env.staging]` with separate KV namespace IDs, R2 buckets, tail consumers, and worker name `bt-servant-worker-staging`. Observability is enabled at 100% sampling rate in all environments. Production answers at `https://api.btservant.ai`, staging at `https://staging-api.btservant.ai`.
 
 ## Project Structure
 
@@ -647,31 +676,47 @@ bt-servant-worker/
 │   ├── config/                          # Environment configuration types
 │   ├── durable-objects/                 # UserDO — unified per-conversation Durable Object
 │   ├── generated/                       # Auto-generated files (version.ts)
+│   ├── i18n/                            # Worker-emitted UI strings + status emitter (#405)
 │   ├── services/
+│   │   ├── admin/                      # DO snapshot decoding
 │   │   ├── audio/                      # STT (Whisper), TTS (OpenAI), R2 storage
 │   │   ├── classifier/                 # #mode / @language trigger detection
-│   │   ├── claude/                      # Orchestrator, system prompt, tools
+│   │   ├── claude/                      # Orchestrator, system prompt, tools, resource priority
 │   │   ├── code-execution/             # QuickJS sandbox
-│   │   ├── mcp/                        # MCP discovery, catalog, health
+│   │   ├── language/                   # Written-language detection (#404)
+│   │   ├── mcp/                        # MCP discovery, catalog, health, resource listing
 │   │   ├── memory/                     # Persistent memory (parser, store)
 │   │   ├── progress/                   # Webhook progress callbacks
-│   │   └── ptxprint/                   # Scripture PDF typesetting (macro tool, polling, R2 mirror)
+│   │   ├── ptxprint/                   # Scripture PDF typesetting (macro tool, polling, R2 mirror)
+│   │   └── telemetry/                  # OTel traces, logs, metrics, redaction, pseudonym
 │   ├── types/                          # Shared TypeScript types
-│   └── utils/                          # Logger, crypto, errors, validation
+│   └── utils/                          # Logger, crypto, errors, validation, MCP pool, mode welcome
 ├── tail-worker/                        # Separate tail worker (bt-servant-tail) — death detection
+├── infra/                              # fly.io IaC + runbooks: OTel collector, OpenObserve (not bundled into the worker)
 ├── tests/
-│   ├── unit/                           # Unit tests
-│   └── e2e/                            # End-to-end tests
+│   ├── unit/                           # Unit tests (incl. unit/telemetry/)
+│   ├── e2e/                            # End-to-end tests (Workers pool)
+│   ├── fixtures/                       # Captured live MCP listing outputs
+│   └── helpers/                        # Anthropic SSE capture/mocks, mock logger
+├── tools/                              # Operator scripts: Mimir/collector smoke tests, yaapi RCA harness
+├── scripts/                            # Build helpers: version generation, audit, EOL normalization, voice-flow test
 ├── docs/
 │   ├── architecture/                   # C4 ecosystem diagrams (context + container)
 │   ├── implementation-plan.md          # Full implementation plan
+│   ├── client-supplied-history.md      # #392 spec
+│   ├── mcp-integration-guidelines.md   # Resilient MCP patterns
 │   ├── spoken-mode-document.md         # Spoken mode design (voice archival, ambient turns)
+│   ├── telemetry_rollout_soe.md        # Production bring-up sequence of events
 │   ├── curl-examples.md                # API usage examples
-│   └── plans/                          # Feature implementation plans
-├── .github/workflows/
-│   ├── ci.yml                          # CI: lint, typecheck, test, build, audit
-│   ├── deploy.yml                      # Deploy to Cloudflare (after CI passes)
-│   └── claude-review.yml              # Claude PR reviews
+│   └── plans/                          # Feature implementation plans (prompt caching, production OTel, memory)
+├── .github/
+│   ├── workflows/
+│   │   ├── ci.yml                      # CI: audit, lint, typecheck, architecture, test, build
+│   │   ├── deploy.yml                  # Production deploy (manual workflow_dispatch)
+│   │   ├── deploy-staging.yml          # Staging deploy (every PR push + after CI on main)
+│   │   ├── deploy-collector.yml        # OTel collector → fly.io (path-filtered)
+│   │   └── deploy-openobserve.yml      # OpenObserve → fly.io (path-filtered)
+│   └── scripts/                        # Deploy gates for the infra workflows + their self-tests
 ├── wrangler.toml                       # Cloudflare Worker config
 ├── wrangler.test.toml                  # Test config (omits [ai] binding for CI)
 ├── package.json                        # Dependencies and scripts
@@ -725,6 +770,7 @@ pnpm normalize:eol
 | `pnpm architecture`        | Check for circular dependencies              |
 | `pnpm audit:prod`          | Dependency audit (production tree)           |
 | `pnpm audit:all`           | Dependency audit (full tree, high+ severity) |
+| `pnpm generate:version`    | Regenerate `src/generated/version.ts`        |
 | `pnpm deploy:tail`         | Deploy the tail worker (CI/manual)           |
 | `pnpm deploy:tail:staging` | Deploy the tail worker to staging            |
 
@@ -757,16 +803,21 @@ Dependency-cruiser enforces onion architecture:
 - **types/** cannot import from routes, services, or durable-objects
 - **services/** cannot import from routes
 
+### Dependency Audit
+
+CI gates every PR on `pnpm audit` in two layers: the production tree fails on any severity, the full tree fails on high or critical. Neither gate may be weakened; fix with `pnpm update`, a targeted `pnpm.overrides` entry, or a direct dep bump, and open an issue if none of those work. Dependabot runs weekly and groups minor/patch bumps.
+
 ## Deployment
 
-Deployments go through CI/CD (never deploy directly):
+Deployments go through CI/CD (never run `wrangler deploy` by hand):
 
-1. Push to a branch and create a PR
-2. CI runs (lint, typecheck, test, build, dependency audit)
-3. Claude PR Review runs automatically
-4. On merge to `main`, deploy runs automatically
+1. Push to a branch and create a PR. **Every PR bumps the version** (`pnpm version patch|minor --no-git-tag-version`), which regenerates `src/generated/version.ts`; the version surfaces at `/health` and in `{{version}}`.
+2. CI runs (dependency audit, lint, typecheck, architecture check, test, build).
+3. **Staging deploys automatically** on every push to a PR and again after CI passes on `main`, so staging serves whichever was pushed last — check `/health` before testing against it.
+4. Review happens outside CI (Codex code review, triggered by the maintainer), then the PR is squash-merged and `main` is tagged `v<version>`. Tags are inert; no workflow listens to them.
+5. **Production deploys only by hand**: the `Deploy` workflow is `workflow_dispatch`. It asserts the top-level `ENVIRONMENT` is `"production"`, deploys the tail worker first (the producer references it as a tail consumer), then deploys the worker.
 
-The worker will be available at: `https://bt-servant-worker.<your-subdomain>.workers.dev`
+The OTel collector and OpenObserve have their own path-filtered workflows (`Deploy OTel Collector`, `Deploy OpenObserve`) that validate on PRs and deploy to fly.io on merge; see [infra/README.md](infra/README.md).
 
 ## Pre-commit Hooks
 
@@ -785,11 +836,12 @@ If any check fails, the commit is blocked.
 These projects depend on bt-servant-worker's API (see the [C4 ecosystem diagrams](docs/architecture/) for the full picture):
 
 - **[bt-servant-web-client](../bt-servant-web-client)** — Next.js chat frontend (SSE transport)
-- **[bt-servant-admin-portal](../bt-servant-admin-portal)** — Admin dashboard for org config, MCP servers, prompt overrides, modes, languages, and user management
+- **[bt-servant-admin-portal](../bt-servant-admin-portal)** — Admin dashboard for org config, MCP servers, resources, prompt overrides, modes, languages, and user management
 - **[bt-servant-whatsapp-gateway](../bt-servant-whatsapp-gateway)** — WhatsApp Business API integration (callback transport; audio messages forwarded as `message_type: 'audio'`)
 - **bt-servant-telegram-gateway** — Telegram Bot API integration (private, group, and supergroup chats with thread support and spoken mode)
 - **bt-servant-signal-gateway** — Signal messenger integration
 - **[baruch](../baruch)** — Cloudflare Worker companion service (self-administering via Claude tools and the admin API)
+- **bt-servant-telemetry** — Tail-worker consumer of this worker's logs (D1 metrics, PostHog conversation forwarding)
 
 ## Related Projects
 
