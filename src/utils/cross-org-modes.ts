@@ -248,6 +248,10 @@ export function mergeCrossOrgModes(
  * alongside the full count.
  */
 function capForeignKeys(keys: string[], logger: RequestLogger): string[] {
+  // TODO(review): accepted interim (2026-10-21). This slices the RAW key list before
+  // any value is read, so an org past the window is invisible on chat, and the
+  // prefix-less kv.list() in listForeignModesKeys can drop keys before this runs.
+  // Both are replaced by an index of publishing orgs in issue #459.
   const sorted = [...keys].sort();
   if (sorted.length <= MAX_FOREIGN_ORGS_PER_TURN) return sorted;
   const dropped = sorted.slice(MAX_FOREIGN_ORGS_PER_TURN);
