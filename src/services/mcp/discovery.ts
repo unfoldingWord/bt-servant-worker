@@ -25,6 +25,7 @@
  */
 
 import { MCPError, MCPResponseTooLargeError } from '../../utils/errors.js';
+import { releaseBody } from '../../utils/http.js';
 import { redactArgsForError, RequestLogger, sanitizeArgsForLog } from '../../utils/logger.js';
 import { recordFailure, recordSuccess } from './health.js';
 import { callMCPToolViaSdk, discoverServerToolsViaSdk } from './streamable-http-client.js';
@@ -112,7 +113,8 @@ function checkContentLengthHeader(response: Response, maxSize: number, serverId:
 async function readResponseWithSizeLimit(
   response: Response,
   maxSize: number,
-  serverId: string
+  serverId: string,
+  logger: RequestLogger
 ): Promise<string> {
   const reader = response.body?.getReader();
   if (!reader) {
@@ -128,7 +130,13 @@ async function readResponseWithSizeLimit(
 
     totalSize += value.length;
     if (totalSize > maxSize) {
-      reader.cancel();
+      reader.cancel().catch((error: unknown) => {
+        logger.warn('mcp_body_release_failed', {
+          server_id: serverId,
+          reason: 'streamed_body',
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
       countMetric('mcp_response_size_exceeded_total', {
         server: serverId,
         reason: 'streamed_body',
@@ -153,11 +161,49 @@ function parseJsonRpcResponse<T>(data: unknown, serverId: string): T {
 }
 
 /**
+ * Check a JSON-RPC response and read its body within the size limit.
+ *
+ * An error status or an oversized Content-Length throws before the body is read.
+ * An unread body holds the connection open (see releaseBody), so it is released
+ * before either throw.
+ */
+async function readJsonRpcResponseBody(
+  response: Response,
+  server: MCPServerConfig,
+  method: string,
+  maxResponseSizeBytes: number,
+  logger: RequestLogger
+): Promise<string> {
+  const releaseUnread = (): void =>
+    releaseBody(response, (error) =>
+      logger.warn('mcp_body_release_failed', {
+        server_id: server.id,
+        method,
+        status: response.status,
+        error: error.message,
+      })
+    );
+  if (!response.ok) {
+    releaseUnread();
+    throw new MCPError(`MCP server returned ${response.status}: ${response.statusText}`, server.id);
+  }
+
+  try {
+    checkContentLengthHeader(response, maxResponseSizeBytes, server.id);
+  } catch (error) {
+    releaseUnread();
+    throw error;
+  }
+  return readResponseWithSizeLimit(response, maxResponseSizeBytes, server.id, logger);
+}
+
+/**
  * Send a JSON-RPC 2.0 request to an MCP server
  */
 async function sendJsonRpcRequest<T>(
   server: MCPServerConfig,
   method: string,
+  logger: RequestLogger,
   params: Record<string, unknown> = {},
   options: SendOptions = {}
 ): Promise<T> {
@@ -183,15 +229,13 @@ async function sendJsonRpcRequest<T>(
       signal: controller.signal,
     });
 
-    if (!response.ok) {
-      throw new MCPError(
-        `MCP server returned ${response.status}: ${response.statusText}`,
-        server.id
-      );
-    }
-
-    checkContentLengthHeader(response, maxResponseSizeBytes, server.id);
-    const text = await readResponseWithSizeLimit(response, maxResponseSizeBytes, server.id);
+    const text = await readJsonRpcResponseBody(
+      response,
+      server,
+      method,
+      maxResponseSizeBytes,
+      logger
+    );
     const data = JSON.parse(text) as unknown;
     return parseJsonRpcResponse<T>(data, server.id);
   } finally {
@@ -230,7 +274,7 @@ export async function discoverServerTools(
   });
 
   try {
-    const result = await sendJsonRpcRequest<ToolsListResult>(server, 'tools/list');
+    const result = await sendJsonRpcRequest<ToolsListResult>(server, 'tools/list', logger);
     const rawTools = result.tools ?? [];
     const tools = filterTools(rawTools, server.allowedTools);
 
@@ -353,6 +397,7 @@ async function callMCPToolViaJsonRpc(
     const result = await sendJsonRpcRequest<ToolCallResult>(
       server,
       'tools/call',
+      logger,
       { name: toolName, arguments: args },
       sendOptions
     );

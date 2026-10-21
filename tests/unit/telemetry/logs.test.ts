@@ -12,6 +12,7 @@ import {
 import type { LogRecordExporter, ReadableLogRecord } from '@opentelemetry/sdk-logs';
 import { createRequestLogger } from '../../../src/utils/logger.js';
 import { Env } from '../../../src/config/types.js';
+import { trackedResponse } from '../../helpers/tracked-response.js';
 
 function makeEnv(overrides: Partial<Env> = {}): Env {
   return { ENVIRONMENT: 'test', ...overrides } as Env;
@@ -323,6 +324,19 @@ describe('BufferingLogRecordProcessor', () => {
 });
 
 describe('FetchLogExporter', () => {
+  it.each([200, 503])('releases the collector response body (HTTP %i)', async (status) => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { response, wasCancelled } = trackedResponse(status);
+    const exporter = new FetchLogExporter('https://c.example/v1/logs', 't', (() =>
+      Promise.resolve(response)) as unknown as typeof fetch);
+
+    await new Promise<{ code: number }>((resolve) =>
+      exporter.export([serializableRecord({ a: 1 })], resolve)
+    );
+
+    await vi.waitFor(() => expect(wasCancelled()).toBe(true));
+  });
+
   it('POSTs OTLP JSON to /v1/logs with the bearer token and redacts records', async () => {
     const fetchMock = vi.fn(() => Promise.resolve(new Response(null, { status: 200 })));
     const exporter = new FetchLogExporter(

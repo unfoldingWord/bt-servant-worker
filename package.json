@@ -1,6 +1,6 @@
 {
   "name": "bt-servant-worker",
-  "version": "2.56.7",
+  "version": "2.56.8",
   "private": true,
   "license": "MIT",
   "type": "module",
