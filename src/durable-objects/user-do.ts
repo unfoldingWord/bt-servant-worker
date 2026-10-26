@@ -79,7 +79,12 @@ import {
   voiceFormatSpec,
 } from '../services/audio/index.js';
 import { AttachmentsContext, createAttachmentsContext } from '../services/ptxprint/index.js';
-import { AppError, AudioTranscriptionError, ValidationError } from '../utils/errors.js';
+import {
+  AppError,
+  AudioTranscriptionError,
+  RouteChainExhaustedError,
+  ValidationError,
+} from '../utils/errors.js';
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
 import { countryFromPhoneUserId } from '../utils/phone-country.js';
 import { applyTemplateVariables } from '../utils/template.js';
@@ -588,6 +593,11 @@ function buildChatTurnPayload(
     language: turn.activeLanguageName ?? null,
     language_source: turn.languageSource,
     model: turn.orchestration.model,
+    // #403: the model/route that actually answered, and usage split per served
+    // model so a turn that fell over mid-way is priced per model, not per turn.
+    served_model: turn.orchestration.servedModel,
+    route: turn.orchestration.route,
+    usage_by_model: turn.orchestration.usageByModel,
     iterations: turn.orchestration.iterations,
     exit_reason: turn.orchestration.exitReason,
     stop_reason: turn.orchestration.finalStopReason,
@@ -747,6 +757,10 @@ export function buildFailedChatTurnRecord(
     user_country: dims.userCountry ?? null,
     edge_country: dims.edgeCountry ?? null,
     model: env.CLAUDE_MODEL ?? DEFAULT_MODEL,
+    // #403: no route answered; which ones were tried is the useful fact.
+    served_model: null,
+    route: null,
+    routes_attempted: error instanceof RouteChainExhaustedError ? error.routesAttempted : [],
     exit_reason: 'error',
     error_type: failureType(error),
     had_inbound_voice: body.message_type === 'audio',

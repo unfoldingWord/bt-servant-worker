@@ -380,3 +380,63 @@ describe('route chain — breaker cannot cause a total outage', () => {
     expect(eventsNamed(sink, 'route_breaker_skipped')).toHaveLength(0);
   });
 });
+
+describe('route chain — served model telemetry', () => {
+  const toolCall = {
+    type: 'tool_use',
+    id: 'tool_1',
+    name: 'execute_code',
+    input: { code: '__result__ = "x"' },
+  } as unknown as Anthropic.ContentBlock;
+
+  it('reports the model and route that answered, and usage split per served model', async () => {
+    const sink: LoggedEvent[] = [];
+    // Iteration 1 is served by the primary; it then goes down and the alt finishes the turn.
+    let primaryCalls = 0;
+    scriptFetch((c) => {
+      if (c.model === 'claude-sonnet-4-6') {
+        primaryCalls += 1;
+        return primaryCalls === 1
+          ? json(message('step one', 'claude-sonnet-4-6', 'tool_use', [toolCall]))
+          : status(529);
+      }
+      return json(message('step two', 'claude-opus-4-6'));
+    });
+
+    const result = await run(fullEnv(), sink);
+
+    expect(result.telemetry.model).toBe('claude-sonnet-4-6');
+    expect(result.telemetry.servedModel).toBe('claude-opus-4-6');
+    expect(result.telemetry.route).toBe('anthropic-alt');
+    expect(Object.keys(result.telemetry.usageByModel).sort()).toEqual([
+      'claude-opus-4-6',
+      'claude-sonnet-4-6',
+    ]);
+    expect(result.telemetry.usageByModel['claude-sonnet-4-6']!.input_tokens).toBe(10);
+    expect(result.telemetry.usageByModel['claude-opus-4-6']!.input_tokens).toBe(10);
+    expect(result.telemetry.usage.input_tokens).toBe(20);
+  });
+
+  it('labels the token counters with the SERVED model and route', async () => {
+    const sink: LoggedEvent[] = [];
+    scriptFetch((c) =>
+      c.model === 'claude-sonnet-4-6' ? status(529) : json(message('ok', 'claude-opus-4-6'))
+    );
+
+    await run(fullEnv(), sink);
+
+    const inputCall = countMetricSpy.mock.calls.find((c) => c[0] === 'claude_input_tokens_total');
+    expect(inputCall![1]).toMatchObject({ model: 'claude-opus-4-6', route: 'anthropic-alt' });
+  });
+
+  it('on the happy path the served model is whatever the primary reported and the route is primary', async () => {
+    const sink: LoggedEvent[] = [];
+    scriptFetch((c) => json(message('ok', c.model)));
+
+    const result = await run(fullEnv(), sink);
+
+    expect(result.telemetry.servedModel).toBe('claude-sonnet-4-6');
+    expect(result.telemetry.route).toBe('primary');
+    expect(Object.keys(result.telemetry.usageByModel)).toEqual(['claude-sonnet-4-6']);
+  });
+});

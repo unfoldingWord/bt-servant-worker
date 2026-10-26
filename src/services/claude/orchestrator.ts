@@ -292,6 +292,12 @@ interface OrchestrationContext {
   /** Shared breaker (#403): which routes other turns found down recently. */
   routeHealth: RouteHealthStore;
   /**
+   * Model that SERVED the most recent response, as the endpoint reported it
+   * (`message.model`), falling back to the route's model string. Null until the
+   * first response of the turn lands.
+   */
+  servedModel: string | null;
+  /**
    * Index into `routes` of the route currently serving this turn. Advances when
    * a route reports an outage and stays there for the rest of the turn (sticky):
    * the history by then carries that route's tool_use blocks, and the next turn
@@ -383,6 +389,16 @@ export interface OrchestrationTelemetry {
   finalStopReason: string | null;
   /** Token counts SUMMED across every iteration (not last-write-wins). */
   usage: UsageSummary;
+  /**
+   * The same counts split by the model that served each iteration (#403). A
+   * turn that fell over mid-way was served by two models at two prices, so a
+   * single summed figure times one rate would misprice it.
+   */
+  usageByModel: Record<string, UsageSummary>;
+  /** Model that served the LAST response of the turn, or null if none landed. */
+  servedModel: string | null;
+  /** Route that served the last response (the sticky route at turn end). */
+  route: RouteId;
   /** MCP/host-function calls made this run. */
   mcpCallsMade: number;
   /**
@@ -451,6 +467,7 @@ interface TelemetryAccumulator {
   exitReason: 'done' | 'max_iterations';
   finalStopReason: string | null;
   usage: UsageSummary;
+  usageByModel: Record<string, UsageSummary>;
   modeSwitchedTo: string | null;
   toolCalls: ToolCallRecord[];
 }
@@ -462,6 +479,7 @@ function createTelemetryAccumulator(): TelemetryAccumulator {
     exitReason: 'max_iterations',
     finalStopReason: null,
     usage: { ...EMPTY_USAGE },
+    usageByModel: {},
     modeSwitchedTo: null,
     toolCalls: [],
   };
@@ -1326,6 +1344,16 @@ async function eligibleRoutes(ctx: OrchestrationContext): Promise<ModelRoute[]> 
   });
 }
 
+/** Remember which model answered: the endpoint's own `model` field, else the route's. */
+function recordServedModel(
+  ctx: OrchestrationContext,
+  route: ModelRoute,
+  message: Anthropic.Message
+): void {
+  ctx.servedModel =
+    typeof message.model === 'string' && message.model ? message.model : route.model;
+}
+
 async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message> {
   if (ctx.callbacks) return streamClaudeResponse(ctx);
   // signal omitted: the body read below is governed by the fetch's signal regardless;
@@ -1336,8 +1364,10 @@ async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message>
   } = await fetchWithRouteFallback(ctx, false);
   try {
     const parsed = (await response.json()) as Anthropic.Message;
+    recordServedModel(ctx, route, parsed);
     ctx.logger.log('claude_fetch_complete', {
       route: route.id,
+      served_model: ctx.servedModel,
       streaming: false,
       stop_reason: parsed.stop_reason,
       content_blocks: parsed.content.length,
@@ -1360,8 +1390,10 @@ async function streamClaudeResponse(ctx: OrchestrationContext): Promise<Anthropi
   try {
     if (!response.body) await throwAnthropicHttpError(ctx, response, true, fetchStart);
     const parsed = await parseSSEStream(response.body!, ctx.logger, ctx.callbacks, signal);
+    recordServedModel(ctx, route, parsed);
     ctx.logger.log('claude_fetch_complete', {
       route: route.id,
+      served_model: ctx.servedModel,
       streaming: true,
       stop_reason: parsed.stop_reason,
       content_blocks: parsed.content.length,
@@ -1647,7 +1679,13 @@ async function executeIterationTools(
  * information while still costing cardinality.
  */
 function emitUsageMetrics(ctx: OrchestrationContext, usage: UsageSummary): void {
-  const labels = { model: ctx.model, ...(ctx.activeMode ? { mode: ctx.activeMode } : {}) };
+  // Labelled by the model that SERVED this call, not the one requested (#403):
+  // after a fallback the two differ, and the price follows the served one.
+  const labels = {
+    model: ctx.servedModel ?? ctx.model,
+    route: currentRoute(ctx).id,
+    ...(ctx.activeMode ? { mode: ctx.activeMode } : {}),
+  };
 
   const counters: Array<[string, number, Record<string, string>]> = [
     ['claude_input_tokens_total', usage.input_tokens, labels],
@@ -1684,10 +1722,15 @@ function reportClaudeResponse(
   const usage = summarizeUsage(response.usage);
   // Accumulate BEFORE logging so a throw in the log path cannot lose the counts.
   addUsage(ctx.telemetry.usage, usage);
+  const servedModel = ctx.servedModel ?? ctx.model;
+  const perModel = (ctx.telemetry.usageByModel[servedModel] ??= { ...EMPTY_USAGE });
+  addUsage(perModel, usage);
   ctx.telemetry.finalStopReason = response.stop_reason;
   ctx.logger.log('claude_response', {
     ...(ctx.turnId ? { turn_id: ctx.turnId } : {}),
     iteration,
+    served_model: servedModel,
+    route: currentRoute(ctx).id,
     stop_reason: response.stop_reason,
     tool_calls_count: toolCalls.length,
     text_blocks_count: response.content.filter((b) => b.type === 'text').length,
@@ -1699,6 +1742,42 @@ function reportClaudeResponse(
     billable_input_tokens: usage.billable_input_tokens,
   });
   emitUsageMetrics(ctx, usage);
+}
+
+/**
+ * Make a response safe to replay as history (#403). Anthropic tolerates these
+ * shapes on the way OUT but rejects them on the way back IN, and a fallback
+ * model behind a translator may be less forgiving still:
+ * - a `tool_use.input` left as a raw string because its JSON never parsed
+ *   (see `finalizeToolInput`) becomes `{}` — the tool then fails validation
+ *   loudly instead of the whole next request 400ing;
+ * - an empty text block is dropped (`messages.N: text content blocks must be
+ *   non-empty`).
+ */
+function sanitizeAssistantContent(
+  content: Anthropic.ContentBlock[],
+  logger: RequestLogger
+): Anthropic.ContentBlock[] {
+  let coercedInputs = 0;
+  let droppedEmptyText = 0;
+  const cleaned = content.filter((block) => {
+    if (block.type === 'text' && block.text.length === 0) {
+      droppedEmptyText += 1;
+      return false;
+    }
+    if (block.type === 'tool_use' && typeof block.input === 'string') {
+      (block as { input: unknown }).input = {};
+      coercedInputs += 1;
+    }
+    return true;
+  });
+  if (coercedInputs > 0 || droppedEmptyText > 0) {
+    logger.warn('assistant_content_sanitized', {
+      coerced_tool_inputs: coercedInputs,
+      dropped_empty_text_blocks: droppedEmptyText,
+    });
+  }
+  return cleaned;
 }
 
 function processIteration(ctx: OrchestrationContext, iteration: number): Promise<boolean> {
@@ -1730,6 +1809,7 @@ function processIteration(ctx: OrchestrationContext, iteration: number): Promise
     }
 
     const response = await callClaudeForIteration(ctx, iteration, iterStart);
+    response.content = sanitizeAssistantContent(response.content, ctx.logger);
     const toolCalls = extractToolCalls(response.content);
     reportClaudeResponse(ctx, { iteration, response, toolCalls, iterStart });
 
@@ -2000,13 +2080,14 @@ function routingState(
   options: OrchestratorOptions
 ): Pick<
   OrchestrationContext,
-  'model' | 'routes' | 'routeIndex' | 'forcedRouteIndex' | 'clock' | 'routeHealth'
+  'model' | 'routes' | 'routeIndex' | 'forcedRouteIndex' | 'clock' | 'routeHealth' | 'servedModel'
 > {
   const { routes, forcedRoute } = config.chain;
   return {
     model: config.model,
     routes,
     routeIndex: 0,
+    servedModel: null,
     forcedRouteIndex: routes.findIndex((r) => r.id === forcedRoute),
     clock: options.retryClock ?? REAL_CLOCK,
     routeHealth: options.routeHealth ?? defaultRouteHealthStore(options.env, options.logger),
@@ -2232,6 +2313,9 @@ function buildOrchestrationTelemetry(ctx: OrchestrationContext): OrchestrationTe
     exitReason: ctx.telemetry.exitReason,
     finalStopReason: ctx.telemetry.finalStopReason,
     usage: ctx.telemetry.usage,
+    usageByModel: ctx.telemetry.usageByModel,
+    servedModel: ctx.servedModel,
+    route: currentRoute(ctx).id,
     mcpCallsMade: ctx.mcpCallsMade.count,
     mode: ctx.activeMode,
     modeSwitchedTo: ctx.telemetry.modeSwitchedTo,

@@ -15,7 +15,11 @@
  *      never become a label.
  */
 import { describe, it, expect } from 'vitest';
-import { buildChatTurnRecord } from '../../../src/durable-objects/user-do.js';
+import {
+  buildChatTurnRecord,
+  buildFailedChatTurnRecord,
+} from '../../../src/durable-objects/user-do.js';
+import { RouteChainExhaustedError } from '../../../src/utils/errors.js';
 import type { DetectedLanguage } from '../../../src/services/language/index.js';
 import type { ChatRequest } from '../../../src/types/engine.js';
 import type { ChatTurnText } from '../../../src/services/telemetry/chat-turn-text.js';
@@ -97,6 +101,19 @@ function turnContext(inputLanguage: DetectedLanguage | null) {
       mode: 'dbs-coach',
       modeSwitchedTo: null,
       toolCalls: [TOOL_CALL],
+      servedModel: 'claude-opus-4-6',
+      route: 'anthropic-alt' as const,
+      usageByModel: {
+        'claude-opus-4-6': {
+          input_tokens: 120,
+          output_tokens: 340,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 1500,
+          cache_write_5m_tokens: 0,
+          cache_write_1h_tokens: 0,
+          billable_input_tokens: 270,
+        },
+      },
     },
     durationMs: 4200,
     hadInboundVoice: false,
@@ -226,5 +243,49 @@ describe('buildChatTurnRecord — provenance', () => {
     expect(payload.tool_calls).toEqual([TOOL_CALL]);
     expect(Object.keys(labels)).not.toContain('tool_calls');
     expect(Object.keys(labels)).not.toContain('engine_version');
+  });
+});
+
+describe('buildChatTurnRecord — model fallback fields (#403)', () => {
+  it('carries the served model, the route and the per-model usage split', () => {
+    const { payload } = buildChatTurnRecord(
+      body(),
+      'en',
+      DEFAULT_ORG,
+      turnContext({ code: 'pt', confidence: 0.87 })
+    );
+    expect(payload).toMatchObject({
+      model: 'claude-sonnet-4-20250514',
+      served_model: 'claude-opus-4-6',
+      route: 'anthropic-alt',
+    });
+    expect(payload.usage_by_model).toEqual({
+      'claude-opus-4-6': expect.objectContaining({ input_tokens: 120, output_tokens: 340 }),
+    });
+  });
+
+  it('a failed turn records no served model, no route, and the routes it tried', () => {
+    const error = new RouteChainExhaustedError(['primary', 'anthropic-alt'], 'http_5xx', 529);
+    const record = buildFailedChatTurnRecord(
+      body(),
+      { DEFAULT_ORG, CLAUDE_MODEL: undefined },
+      error
+    );
+    expect(record).toMatchObject({
+      exit_reason: 'error',
+      error_type: 'CLAUDE_API_ERROR',
+      served_model: null,
+      route: null,
+      routes_attempted: ['primary', 'anthropic-alt'],
+    });
+  });
+
+  it('a failed turn that never reached the chain reports an empty routes_attempted', () => {
+    const record = buildFailedChatTurnRecord(
+      body(),
+      { DEFAULT_ORG, CLAUDE_MODEL: undefined },
+      new Error('x')
+    );
+    expect(record).toMatchObject({ served_model: null, route: null, routes_attempted: [] });
   });
 });

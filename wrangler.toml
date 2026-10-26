@@ -122,6 +122,11 @@ MAX_MCP_CALLS_PER_REQUEST = "100"
 DEFAULT_ORG = "unfoldingWord"
 # See top-level [vars] note. Same wa.me share number as prod/portal (#311).
 WHATSAPP_NUMBER = "15558196461"
+# Model fallback chain (#403), last tier: a non-Claude model via OpenRouter. Set
+# on staging first so its answers can be checked (quality, theology) with the
+# FALLBACK_FORCE_ROUTE drill before production gets a value. Needs the
+# OPENROUTER_API_KEY secret or the tier is simply absent. See README "Model fallback".
+OPENROUTER_ALT_MODEL = "openai/gpt-5.4"
 
 [[env.staging.kv_namespaces]]
 binding = "ORG_ADMIN_KEYS"

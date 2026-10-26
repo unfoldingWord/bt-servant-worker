@@ -22,6 +22,8 @@ import Anthropic from '@anthropic-ai/sdk';
 import type { ChatRequest, ChatResponse } from '../../src/types/engine.js';
 
 export const ANTHROPIC_HOST = 'api.anthropic.com';
+/** The fallback tiers (#403) post the same Messages-API shape here; never let a test reach it live. */
+export const OPENROUTER_HOST = 'openrouter.ai';
 
 export interface CapturedAnthropicCall {
   /** The `system` prompt flattened back to text (see {@link renderSystem}). */
@@ -142,7 +144,8 @@ export function setupAnthropicFetchCapture(): AnthropicCapture {
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
     const url =
       typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
-    if (!url.includes(ANTHROPIC_HOST)) return realFetch(input, init);
+    const isModelEndpoint = url.includes(ANTHROPIC_HOST) || url.includes(OPENROUTER_HOST);
+    if (!isModelEndpoint) return realFetch(input, init);
     const rawBody = await readMockRequestBody(input, init);
     const parsed = rawBody ? (JSON.parse(rawBody) as Record<string, unknown>) : {};
     calls.push({ system: renderSystem(parsed.system), body: parsed });

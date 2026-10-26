@@ -97,12 +97,11 @@ export function createKvRouteHealthStore(
   now: () => number = () => Date.now()
 ): RouteHealthStore {
   async function readUncached(ids: readonly RouteId[]): Promise<Set<RouteId>> {
-    const open = new Set<RouteId>();
     try {
-      const values = await Promise.all(ids.map((id) => kv.get(routeHealthKey(id))));
-      values.forEach((value, i) => {
-        if (value !== null) open.add(ids[i]!);
-      });
+      const found = await Promise.all(
+        ids.map(async (id) => ((await kv.get(routeHealthKey(id))) === null ? null : id))
+      );
+      return new Set(found.filter((id): id is RouteId => id !== null));
     } catch (error) {
       // Degrade to "nothing open": the chain still probes every route in order.
       logger.warn('route_health_read_failed', {
@@ -110,7 +109,6 @@ export function createKvRouteHealthStore(
       });
       return new Set();
     }
-    return open;
   }
 
   return {
