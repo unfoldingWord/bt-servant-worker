@@ -442,6 +442,27 @@ describe('fetchRouteWithRetry — a success with nothing in it is an outage', ()
 
     expect(outcome).toMatchObject({ ok: false, outage: 'empty_response', status: 200 });
   });
+});
+
+describe('fetchRouteWithRetry — empty responses on the non-streaming path', () => {
+  it('non-streaming: a 200 whose body stream closes immediately is classified empty_response', async () => {
+    const logger = createMockLogger();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.close();
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        )
+    );
+
+    const outcome = await run(logger, routes().alt, false, makeClock());
+
+    expect(outcome).toMatchObject({ ok: false, outage: 'empty_response', status: 200 });
+  });
 
   it('non-streaming: a 200 with body === null is classified empty_response too', async () => {
     const logger = createMockLogger();

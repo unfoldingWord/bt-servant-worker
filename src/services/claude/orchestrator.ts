@@ -982,13 +982,12 @@ async function attemptRouteFetch(
     });
     if (!headersOnly.ok) return { ok: false, response: headersOnly, cleanup, fetchStart };
     // A 2xx that carries nothing is a broken endpoint, not a success; it must
-    // stay inside the chain. Streaming: the deadline is only satisfied by the
-    // first NON-EMPTY chunk, and a stream that closes before one counts as
-    // empty too. The non-streaming path arms no first-byte timer (headers arrive
-    // after the whole generation there), so only the null-body check applies.
-    const response = streaming
-      ? await awaitFirstChunk(headersOnly, signal)
-      : headersOnly.body && headersOnly;
+    // stay inside the chain. Both paths wait for the first NON-EMPTY chunk: a
+    // null body, a stream that closes before one, or zero-length chunks then
+    // EOF all count as empty. Only the streaming path arms the 20s timer
+    // (non-streaming headers arrive after the whole generation), so the
+    // non-streaming wait here is bounded by the 90s body guard alone.
+    const response = await awaitFirstChunk(headersOnly, signal);
     if (!response)
       return { ok: false, response: headersOnly, emptyResponse: true, cleanup, fetchStart };
     guard.firstByteReceived();
