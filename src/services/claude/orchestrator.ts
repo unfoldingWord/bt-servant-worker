@@ -27,11 +27,12 @@ import {
   ClaudeAPIError,
   MCPError,
   MCPRequestCallLimitError,
+  RouteChainExhaustedError,
   ValidationError,
 } from '../../utils/errors.js';
 import { redactToolInputForError, RequestLogger, summarizeToolInput } from '../../utils/logger.js';
 import { stripUlyssesComments } from '../../utils/ulysses-comments.js';
-import { buildRouteChain, ModelRoute } from './routes.js';
+import { buildRouteChain, ModelRoute, RouteId } from './routes.js';
 import { UnmatchedTrigger } from '../classifier/index.js';
 import { createMCPHostFunctions, executeCode } from '../code-execution/index.js';
 import { withSpan, recordSpanError, countMetric, recordMetric } from '../telemetry/index.js';
@@ -194,6 +195,8 @@ interface OrchestratorOptions {
   attachmentsContext?: AttachmentsContext | undefined;
   /** Public worker origin (e.g. https://bt-servant-worker-staging.example.workers.dev). Used to build public URLs for ptxprint artifacts. */
   workerOrigin?: string | undefined;
+  /** Clock for retry backoff and the route-chain window (#403). Tests inject an instant one. */
+  retryClock?: RetryClock | undefined;
   clientId?: string | undefined;
   groupContext?: GroupChatContext | undefined;
   isVoiceMessage?: boolean | undefined;
@@ -275,6 +278,10 @@ interface OrchestrationContext {
   model: string;
   /** The fallback chain for this turn (#403), primary first. Never empty. */
   routes: ModelRoute[];
+  /** Staging drill: index of `FALLBACK_FORCE_ROUTE` in `routes`, or -1. Routes before it are skipped. */
+  forcedRouteIndex: number;
+  /** Clock for retry backoff and the chain window; injectable so tests run instantly. */
+  clock: RetryClock;
   /**
    * Index into `routes` of the route currently serving this turn. Advances when
    * a route reports an outage and stays there for the rest of the turn (sticky):
@@ -850,8 +857,15 @@ async function throwAnthropicHttpError(
   );
 }
 
-function logFetchCommencement(ctx: OrchestrationContext, body: string, streaming: boolean): void {
+function logFetchCommencement(
+  ctx: OrchestrationContext,
+  route: ModelRoute,
+  body: string,
+  streaming: boolean
+): void {
   ctx.logger.log('claude_fetch_start', {
+    route: route.id,
+    model: route.model,
     streaming,
     body_size_bytes: body.length,
     message_count: ctx.messages.length,
@@ -1178,37 +1192,109 @@ export async function fetchRouteWithRetry(
   throw new Error('fetchRouteWithRetry: exhausted loop without resolution');
 }
 
+type RouteOutage = Extract<RouteFetchOutcome, { ok: false }>;
+
+/** A route that answered, with the fetch result the caller must consume. */
+interface ServedFetch {
+  result: AnthropicFetchResult;
+  route: ModelRoute;
+}
+
 /**
- * Interim single-route adapter: fetch on the current route and surface an outage
- * as the terminal error. Replaced by the route chain in the next step (#403).
+ * Try ONE route for this call. A route before the forced one (staging drill)
+ * reports a synthetic outage without any network call; otherwise the body is
+ * built for that route (model string, cache flags) and sent with retry.
  */
-async function fetchCurrentRouteOrThrow(
+async function tryRoute(
   ctx: OrchestrationContext,
-  body: string,
-  streaming: boolean
-): Promise<AnthropicFetchResult> {
-  const outcome = await fetchRouteWithRetry(ctx, currentRoute(ctx), body, {
-    streaming,
-    overallStart: Date.now(),
+  route: ModelRoute,
+  streaming: boolean,
+  overallStart: number
+): Promise<RouteFetchOutcome> {
+  if (ctx.routes.indexOf(route) < ctx.forcedRouteIndex) {
+    return { ok: false, outage: 'forced', status: undefined, attempts: 0 };
+  }
+  const body = buildMessageBody(ctx, route, streaming);
+  assertRequestBodyWithinLimit(body, ctx);
+  logFetchCommencement(ctx, route, body, streaming);
+  return fetchRouteWithRetry(ctx, route, body, { streaming, overallStart, clock: ctx.clock });
+}
+
+/** Log and meter one hop from a route that is down to the next one in the chain. */
+function recordRouteHop(
+  ctx: OrchestrationContext,
+  from: ModelRoute,
+  to: ModelRoute,
+  outage: RouteOutage
+): void {
+  ctx.logger.warn('model_route_fallback', {
+    ...(ctx.turnId ? { turn_id: ctx.turnId } : {}),
+    from_route: from.id,
+    to_route: to.id,
+    from_model: from.model,
+    to_model: to.model,
+    outage: outage.outage,
+    status: outage.status,
+    attempts: outage.attempts,
   });
-  if (outcome.ok) return outcome.result;
-  throw new ClaudeAPIError(
-    `Model route ${currentRoute(ctx).id} unavailable (${outcome.outage})`,
-    outcome.status
-  );
+  countMetric('model_route_fallback_total', {
+    from_route: from.id,
+    to_route: to.id,
+    reason: outage.outage,
+  });
+}
+
+/**
+ * Walk the chain from the route currently serving this turn (#403).
+ *
+ * On success the serving route becomes STICKY for the rest of the turn: the
+ * history now carries that route's tool_use blocks, and bouncing back to a route
+ * that just failed would only re-pay its outage budget. The next turn starts at
+ * the primary again. When the last route is down too, the error that escapes is
+ * generic on purpose — per-route reasons are already in the logs.
+ */
+async function fetchWithRouteFallback(
+  ctx: OrchestrationContext,
+  streaming: boolean
+): Promise<ServedFetch> {
+  const overallStart = ctx.clock.now();
+  const attempted: RouteId[] = [];
+  let last: RouteOutage | undefined;
+  for (const [i, route] of ctx.routes.entries()) {
+    if (i < ctx.routeIndex) continue;
+    attempted.push(route.id);
+    const outcome = await tryRoute(ctx, route, streaming, overallStart);
+    if (outcome.ok) {
+      ctx.routeIndex = i;
+      return { result: outcome.result, route };
+    }
+    last = outcome;
+    const next = ctx.routes.at(i + 1);
+    if (next) recordRouteHop(ctx, route, next, outcome);
+  }
+  ctx.logger.error('model_route_chain_exhausted', null, {
+    ...(ctx.turnId ? { turn_id: ctx.turnId } : {}),
+    streaming,
+    routes_attempted: attempted,
+    routes_attempted_count: attempted.length,
+    last_outage: last!.outage,
+    last_status: last!.status,
+  });
+  throw new RouteChainExhaustedError(attempted, last!.outage, last!.status);
 }
 
 async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message> {
   if (ctx.callbacks) return streamClaudeResponse(ctx);
-  const body = buildMessageBody(ctx, currentRoute(ctx), false);
-  assertRequestBodyWithinLimit(body, ctx);
-  logFetchCommencement(ctx, body, false);
   // signal omitted: the body read below is governed by the fetch's signal regardless;
   // cleanup (in finally) keeps the hang-guard timer live until the read completes.
-  const { response, cleanup, fetchStart } = await fetchCurrentRouteOrThrow(ctx, body, false);
+  const {
+    result: { response, cleanup, fetchStart },
+    route,
+  } = await fetchWithRouteFallback(ctx, false);
   try {
     const parsed = (await response.json()) as Anthropic.Message;
     ctx.logger.log('claude_fetch_complete', {
+      route: route.id,
       streaming: false,
       stop_reason: parsed.stop_reason,
       content_blocks: parsed.content.length,
@@ -1224,14 +1310,15 @@ async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message>
 }
 
 async function streamClaudeResponse(ctx: OrchestrationContext): Promise<Anthropic.Message> {
-  const body = buildMessageBody(ctx, currentRoute(ctx), true);
-  assertRequestBodyWithinLimit(body, ctx);
-  logFetchCommencement(ctx, body, true);
-  const { response, signal, cleanup, fetchStart } = await fetchCurrentRouteOrThrow(ctx, body, true);
+  const {
+    result: { response, signal, cleanup, fetchStart },
+    route,
+  } = await fetchWithRouteFallback(ctx, true);
   try {
     if (!response.body) await throwAnthropicHttpError(ctx, response, true, fetchStart);
     const parsed = await parseSSEStream(response.body!, ctx.logger, ctx.callbacks, signal);
     ctx.logger.log('claude_fetch_complete', {
+      route: route.id,
       streaming: true,
       stop_reason: parsed.stop_reason,
       content_blocks: parsed.content.length,
@@ -1464,13 +1551,17 @@ async function callClaudeForIteration(
   const callStart = Date.now();
   try {
     const response = await callClaude(ctx);
-    recordMetric('claude_fetch_duration_ms', Date.now() - callStart, { status: 'success' });
-    countMetric('claude_fetch_total', { status: 'success' });
+    // Read AFTER the call: the chain may have advanced the serving route (#403).
+    const route = currentRoute(ctx).id;
+    recordMetric('claude_fetch_duration_ms', Date.now() - callStart, { status: 'success', route });
+    countMetric('claude_fetch_total', { status: 'success', route });
     return response;
   } catch (error) {
-    recordMetric('claude_fetch_duration_ms', Date.now() - callStart, { status: 'error' });
+    const route = currentRoute(ctx).id;
+    recordMetric('claude_fetch_duration_ms', Date.now() - callStart, { status: 'error', route });
     countMetric('claude_fetch_total', {
       status: 'error',
+      route,
       error_name: error instanceof Error ? error.name : 'Error',
     });
     ctx.logger.error('iteration_claude_call_failed', error, {
@@ -1860,6 +1951,21 @@ function turnTools(catalog: ToolCatalog, options: OrchestratorOptions): Anthropi
   });
 }
 
+/** The route-chain slice of the context (#403): requested model, chain, cursor, drill, clock. */
+function routingState(
+  config: ReturnType<typeof parseEnvConfig>,
+  options: OrchestratorOptions
+): Pick<OrchestrationContext, 'model' | 'routes' | 'routeIndex' | 'forcedRouteIndex' | 'clock'> {
+  const { routes, forcedRoute } = config.chain;
+  return {
+    model: config.model,
+    routes,
+    routeIndex: 0,
+    forcedRouteIndex: routes.findIndex((r) => r.id === forcedRoute),
+    clock: options.retryClock ?? REAL_CLOCK,
+  };
+}
+
 function createOrchestrationContext(
   userMessage: string,
   options: OrchestratorOptions,
@@ -1881,9 +1987,7 @@ function createOrchestrationContext(
 
   return {
     client: new Anthropic({ apiKey: env.ANTHROPIC_API_KEY }),
-    model: config.model,
-    routes: config.chain.routes,
-    routeIndex: 0,
+    ...routingState(config, options),
     maxTokens: config.maxTokens,
     systemStable: systemBlocks.stable,
     systemVolatile: systemBlocks.volatile,
@@ -1998,6 +2102,9 @@ function logOrchestrationSummary(ctx: OrchestrationContext): void {
 
 function handleOrchestrationError(error: unknown, logger: RequestLogger): never {
   logger.error('claude_error', error);
+  // Domain errors (RouteChainExhaustedError, MCPError, …) already carry a code
+  // and status; only a raw SDK error needs wrapping.
+  if (error instanceof AppError) throw error;
   if (error instanceof Anthropic.APIError) {
     throw new ClaudeAPIError(error.message, error.status);
   }
