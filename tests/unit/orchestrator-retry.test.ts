@@ -402,6 +402,59 @@ describe('fetchRouteWithRetry — first-byte deadline (streaming only)', () => {
   });
 });
 
+describe('fetchRouteWithRetry — a success with nothing in it is an outage', () => {
+  // Codex re-review on #464: a bodyless 200 or a stream that closes before any
+  // byte used to be reported as success, so the failure escaped the chain.
+  it('streaming: a 200 with body === null is classified empty_response', async () => {
+    const logger = createMockLogger();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async () =>
+        new Response(null, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+    );
+
+    const outcome = await run(logger, routes().alt, true, makeClock());
+
+    expect(outcome).toMatchObject({
+      ok: false,
+      outage: 'empty_response',
+      status: 200,
+      attempts: 1,
+    });
+    expect(warnEvents(logger)).toContain('claude_route_outage');
+  });
+
+  it('streaming: a stream that closes before yielding any data is classified empty_response', async () => {
+    const logger = createMockLogger();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new Uint8Array(0));
+              controller.close();
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'text/event-stream' } }
+        )
+    );
+
+    const outcome = await run(logger, routes().alt, true, makeClock());
+
+    expect(outcome).toMatchObject({ ok: false, outage: 'empty_response', status: 200 });
+  });
+
+  it('non-streaming: a 200 with body === null is classified empty_response too', async () => {
+    const logger = createMockLogger();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async () => new Response(null, { status: 200 })
+    );
+
+    const outcome = await run(logger, routes().alt, false, makeClock());
+
+    expect(outcome).toMatchObject({ ok: false, outage: 'empty_response', status: 200 });
+  });
+});
+
 describe('fetchRouteWithRetry — first chunk replay and timer release', () => {
   it('streaming: the first chunk is replayed, so the caller still reads the whole body', async () => {
     const logger = createMockLogger();

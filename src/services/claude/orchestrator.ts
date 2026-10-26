@@ -947,6 +947,8 @@ interface AnthropicAttemptFailure {
   networkError?: unknown;
   /** The first-byte deadline aborted this attempt (streaming only). */
   firstByteTimeout?: boolean;
+  /** A 2xx with no body, or (streaming) a body that closed before any byte. */
+  emptyResponse?: boolean;
   cleanup: () => void;
   fetchStart: number;
 }
@@ -979,10 +981,16 @@ async function attemptRouteFetch(
       duration_ms: Date.now() - fetchStart,
     });
     if (!headersOnly.ok) return { ok: false, response: headersOnly, cleanup, fetchStart };
-    // Streaming: the deadline is only satisfied by the first body chunk. The
-    // non-streaming path arms no first-byte timer (headers arrive after the whole
-    // generation there), so this is a no-op wait for it.
-    const response = streaming ? await awaitFirstChunk(headersOnly, signal) : headersOnly;
+    // A 2xx that carries nothing is a broken endpoint, not a success; it must
+    // stay inside the chain. Streaming: the deadline is only satisfied by the
+    // first NON-EMPTY chunk, and a stream that closes before one counts as
+    // empty too. The non-streaming path arms no first-byte timer (headers arrive
+    // after the whole generation there), so only the null-body check applies.
+    const response = streaming
+      ? await awaitFirstChunk(headersOnly, signal)
+      : headersOnly.body && headersOnly;
+    if (!response)
+      return { ok: false, response: headersOnly, emptyResponse: true, cleanup, fetchStart };
     guard.firstByteReceived();
     return { ok: true, result: { response, signal, cleanup, fetchStart } };
   } catch (networkError) {
@@ -1006,8 +1014,10 @@ function rejectOnAbort(signal: AbortSignal): Promise<never> {
 }
 
 /**
- * Wait for the first body chunk under the attempt's signal, then hand back an
- * equivalent response whose body replays that chunk ahead of the rest.
+ * Wait for the first NON-EMPTY body chunk under the attempt's signal, then hand
+ * back an equivalent response whose body replays that chunk ahead of the rest.
+ * Returns null when there is no body or the stream closes before any byte —
+ * the caller treats both as an outage (Codex review on #464).
  *
  * `fetch` resolves on headers; in workerd a later abort of the fetch signal does
  * tear the body down, but a test double's body is not tied to the signal, so the
@@ -1015,12 +1025,14 @@ function rejectOnAbort(signal: AbortSignal): Promise<never> {
  * error. On abort the reader is cancelled and the AbortError propagates to the
  * caller's catch, where `firstByteFired()` classifies it.
  */
-async function awaitFirstChunk(response: Response, signal: AbortSignal): Promise<Response> {
-  if (!response.body) return response;
+async function awaitFirstChunk(response: Response, signal: AbortSignal): Promise<Response | null> {
+  if (!response.body) return null;
   const reader = response.body.getReader();
   let first: ReadableStreamReadResult<Uint8Array>;
   try {
-    first = await Promise.race([reader.read(), rejectOnAbort(signal)]);
+    do {
+      first = await Promise.race([reader.read(), rejectOnAbort(signal)]);
+    } while (!first.done && first.value.byteLength === 0);
   } catch (error) {
     // Best-effort release of the upstream connection; the abort itself is what the
     // caller logs (`claude_route_outage` / `claude_fetch_aborted`), so a cancel
@@ -1028,10 +1040,11 @@ async function awaitFirstChunk(response: Response, signal: AbortSignal): Promise
     reader.cancel('first-byte-timeout').catch(() => undefined);
     throw error;
   }
+  if (first.done) return null;
+  const chunk = first.value;
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
-      if (first.done) controller.close();
-      else controller.enqueue(first.value);
+      controller.enqueue(chunk);
     },
     async pull(controller) {
       const { done, value } = await reader.read();
@@ -1045,7 +1058,7 @@ async function awaitFirstChunk(response: Response, signal: AbortSignal): Promise
 
 /** Whether a failed attempt is worth retrying (excludes our own timeout abort). */
 function isAttemptRetryable(failure: AnthropicAttemptFailure): boolean {
-  if (failure.firstByteTimeout) return true;
+  if (failure.firstByteTimeout || failure.emptyResponse) return true;
   return failure.networkError
     ? !isOurTimeoutAbort(failure.networkError)
     : isRetryableStatus(failure.response!.status);
@@ -1055,7 +1068,8 @@ function isAttemptRetryable(failure: AnthropicAttemptFailure): boolean {
  * Why a route is considered DOWN (#403). Bounded enum — safe as a metric label.
  * `forced` is the staging drill (`FALLBACK_FORCE_ROUTE`), never a real failure.
  */
-export type OutageReason = 'network_error' | 'first_byte_timeout' | 'http_5xx' | 'forced';
+export type OutageReason =
+  'network_error' | 'first_byte_timeout' | 'empty_response' | 'http_5xx' | 'forced';
 
 /** Statuses that mean "this endpoint cannot serve right now". 429 is deliberately absent. */
 const OUTAGE_STATUSES = new Set([500, 502, 503, 504, 529]);
@@ -1068,6 +1082,7 @@ const OUTAGE_STATUSES = new Set([500, 502, 503, 504, 529]);
  */
 function classifyOutage(failure: AnthropicAttemptFailure): OutageReason | null {
   if (failure.firstByteTimeout) return 'first_byte_timeout';
+  if (failure.emptyResponse) return 'empty_response';
   if (failure.networkError) return isOurTimeoutAbort(failure.networkError) ? null : 'network_error';
   return OUTAGE_STATUSES.has(failure.response!.status) ? 'http_5xx' : null;
 }
