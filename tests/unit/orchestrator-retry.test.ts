@@ -1,33 +1,49 @@
 /**
- * Tests for Anthropic API retry/backoff (issue #248).
+ * Tests for per-route retry/backoff (issue #248) and outage classification (#403).
  *
- * The worker calls the Anthropic Messages API via raw `globalThis.fetch` (the SDK's
- * HTTP layer 1003s from inside our nested Durable Object chain — see PR #104), which
- * means we also lost the SDK's built-in retry/backoff. `fetchAnthropicWithRetry`
- * restores it: jittered exponential backoff on 429/5xx/529 and transient network
- * errors, honoring `Retry-After`, bounded by an overall wall-clock window, with a
- * fresh per-attempt 90s hang-guard. Retries happen strictly BEFORE any response body
+ * The worker calls the Messages API via raw `globalThis.fetch` (the SDK's HTTP
+ * layer 1003s from inside our nested Durable Object chain — see PR #104), which
+ * means we also lost the SDK's built-in retry/backoff. `fetchRouteWithRetry`
+ * restores it per route: jittered exponential backoff on 429, honoring
+ * `Retry-After`, bounded by an overall wall-clock window, with a fresh
+ * per-attempt 90s hang-guard. Retries happen strictly BEFORE any response body
  * is consumed, so the streaming path can only retry pre-first-byte.
+ *
+ * #403 adds OUTAGE classification: connection errors, 5xx/529 and (streaming
+ * only) a missing first byte are "outage-class". Those get `route.outageAttempts`
+ * tries, then the function RETURNS a tagged outage so the caller can move to the
+ * next route, instead of throwing. 429 is deliberately NOT outage-class: failing
+ * over on a rate limit just migrates the throttling to the next provider.
  */
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
-  fetchAnthropicWithRetry,
+  fetchRouteWithRetry,
   computeBackoffDelay,
   parseRetryAfter,
   isRetryableStatus,
   type RetryClock,
 } from '../../src/services/claude/orchestrator.js';
+import { buildRouteChain, type ModelRoute } from '../../src/services/claude/routes.js';
 import { RequestLogger } from '../../src/utils/logger.js';
 
-type RetryCtx = Parameters<typeof fetchAnthropicWithRetry>[0];
+type RetryCtx = Parameters<typeof fetchRouteWithRetry>[0];
 
 function createMockLogger(): RequestLogger {
   return { log: vi.fn(), warn: vi.fn(), error: vi.fn() } as unknown as RequestLogger;
 }
 
 function makeCtx(logger: RequestLogger): RetryCtx {
-  return { logger, apiKey: 'test-key' } as unknown as RetryCtx;
+  return { logger } as unknown as RetryCtx;
+}
+
+/** `primary` (2 outage attempts) and `anthropic-alt` (1 outage attempt). */
+function routes(): { primary: ModelRoute; alt: ModelRoute } {
+  const chain = buildRouteChain(
+    { ENVIRONMENT: 'staging', ANTHROPIC_API_KEY: 'k' },
+    createMockLogger()
+  ).routes;
+  return { primary: chain[0]!, alt: chain[1]! };
 }
 
 /**
@@ -53,15 +69,41 @@ function jsonResponse(status: number, body = '{}', headers: Record<string, strin
   });
 }
 
+/** A fetch that never answers and only rejects (as an AbortError) when its signal aborts. */
+function hangingFetch(): typeof fetch {
+  return ((_input: unknown, init?: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () =>
+        reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
+      );
+    })) as unknown as typeof fetch;
+}
+
 function eventsFor(fn: unknown): string[] {
   return (fn as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0] as string);
 }
 const warnEvents = (l: RequestLogger): string[] => eventsFor(l.warn);
 const errorEvents = (l: RequestLogger): string[] => eventsFor(l.error);
 
-afterEach(() => vi.restoreAllMocks());
+async function run(
+  logger: RequestLogger,
+  route: ModelRoute,
+  streaming: boolean,
+  clock: RetryClock
+): ReturnType<typeof fetchRouteWithRetry> {
+  return fetchRouteWithRetry(makeCtx(logger), route, '{}', {
+    streaming,
+    overallStart: clock.now(),
+    clock,
+  });
+}
 
-describe('Anthropic retry/backoff — pure helpers', () => {
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
+
+describe('retry/backoff — pure helpers', () => {
   it('isRetryableStatus: retries 429/500/502/503/504/529, not 4xx-deterministic', () => {
     for (const s of [429, 500, 502, 503, 504, 529]) expect(isRetryableStatus(s)).toBe(true);
     for (const s of [200, 400, 401, 403, 404, 422]) expect(isRetryableStatus(s)).toBe(false);
@@ -87,7 +129,7 @@ describe('Anthropic retry/backoff — pure helpers', () => {
   });
 });
 
-describe('fetchAnthropicWithRetry — retries then succeeds', () => {
+describe('fetchRouteWithRetry — 429 retries then succeeds (not an outage)', () => {
   it('retries on 429 twice then succeeds (logs claude_api_retry each time)', async () => {
     const logger = createMockLogger();
     const fetchSpy = vi
@@ -97,14 +139,16 @@ describe('fetchAnthropicWithRetry — retries then succeeds', () => {
       .mockResolvedValueOnce(jsonResponse(200, '{"ok":true}'));
     const clock = makeClock();
 
-    const result = await fetchAnthropicWithRetry(makeCtx(logger), '{}', false, clock);
+    const outcome = await run(logger, routes().primary, false, clock);
 
-    expect(result.response.status).toBe(200);
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) throw new Error('unreachable');
+    expect(outcome.result.response.status).toBe(200);
     expect(fetchSpy).toHaveBeenCalledTimes(3);
     expect(clock.sleep).toHaveBeenCalledTimes(2);
     expect(warnEvents(logger).filter((e) => e === 'claude_api_retry')).toHaveLength(2);
     expect(errorEvents(logger)).not.toContain('claude_api_retry_exhausted');
-    result.cleanup();
+    outcome.result.cleanup();
   });
 
   it('honors Retry-After when larger than computed backoff', async () => {
@@ -114,15 +158,13 @@ describe('fetchAnthropicWithRetry — retries then succeeds', () => {
       .mockResolvedValueOnce(jsonResponse(200));
     const clock = makeClock({ random: 0 }); // computed backoff = 0 → Retry-After wins
 
-    const result = await fetchAnthropicWithRetry(makeCtx(logger), '{}', false, clock);
+    const outcome = await run(logger, routes().primary, false, clock);
 
-    expect(result.response.status).toBe(200);
+    expect(outcome.ok).toBe(true);
     expect(clock.sleep).toHaveBeenCalledWith(5_000);
-    result.cleanup();
+    if (outcome.ok) outcome.result.cleanup();
   });
-});
 
-describe('fetchAnthropicWithRetry — streaming and network retries', () => {
   it('streaming path retries a pre-first-byte 429 then returns the stream response', async () => {
     const logger = createMockLogger();
     vi.spyOn(globalThis, 'fetch')
@@ -135,15 +177,18 @@ describe('fetchAnthropicWithRetry — streaming and network retries', () => {
       );
     const clock = makeClock();
 
-    const result = await fetchAnthropicWithRetry(makeCtx(logger), '{}', true, clock);
+    const outcome = await run(logger, routes().primary, true, clock);
 
-    expect(result.response.status).toBe(200);
-    expect(result.response.body).toBeTruthy();
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) throw new Error('unreachable');
+    expect(outcome.result.response.body).toBeTruthy();
     expect(warnEvents(logger).filter((e) => e === 'claude_api_retry')).toHaveLength(1);
-    result.cleanup();
+    outcome.result.cleanup();
   });
+});
 
-  it('retries a transient network error then succeeds', async () => {
+describe('fetchRouteWithRetry — outage-class failures use the route budget', () => {
+  it('primary: one transient network error is retried and then succeeds', async () => {
     const logger = createMockLogger();
     vi.spyOn(globalThis, 'fetch')
       .mockImplementationOnce(async () => {
@@ -152,22 +197,78 @@ describe('fetchAnthropicWithRetry — streaming and network retries', () => {
       .mockResolvedValueOnce(jsonResponse(200));
     const clock = makeClock();
 
-    const result = await fetchAnthropicWithRetry(makeCtx(logger), '{}', false, clock);
+    const outcome = await run(logger, routes().primary, false, clock);
 
-    expect(result.response.status).toBe(200);
+    expect(outcome.ok).toBe(true);
     expect(clock.sleep).toHaveBeenCalledTimes(1);
     expect(warnEvents(logger).filter((e) => e === 'claude_api_retry')).toHaveLength(1);
-    result.cleanup();
+    if (outcome.ok) outcome.result.cleanup();
+  });
+
+  it('primary: two network errors return a tagged outage instead of throwing', async () => {
+    const logger = createMockLogger();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      throw new TypeError('network failure');
+    });
+    const clock = makeClock();
+
+    const outcome = await run(logger, routes().primary, false, clock);
+
+    expect(outcome).toMatchObject({ ok: false, outage: 'network_error', attempts: 2 });
+    expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+    expect(clock.sleep).toHaveBeenCalledTimes(1);
+    expect(warnEvents(logger)).toContain('claude_route_outage');
+    expect(errorEvents(logger)).not.toContain('claude_api_retry_exhausted');
   });
 });
 
-describe('fetchAnthropicWithRetry — terminal failures', () => {
+describe('fetchRouteWithRetry — outage budget per route', () => {
+  it('primary: 503 twice returns an http_5xx outage carrying the status', async () => {
+    const logger = createMockLogger();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => jsonResponse(503));
+    const clock = makeClock();
+
+    const outcome = await run(logger, routes().primary, false, clock);
+
+    expect(outcome).toMatchObject({ ok: false, outage: 'http_5xx', status: 503, attempts: 2 });
+    expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('a fallback route gets a single attempt before reporting an outage (no backoff sleep)', async () => {
+    const logger = createMockLogger();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => jsonResponse(529));
+    const clock = makeClock();
+
+    const outcome = await run(logger, routes().alt, false, clock);
+
+    expect(outcome).toMatchObject({ ok: false, outage: 'http_5xx', status: 529, attempts: 1 });
+    expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    expect(clock.sleep).not.toHaveBeenCalled();
+  });
+
+  it('a 429 after a 5xx keeps retrying on the route: the rate limit is not an outage', async () => {
+    const logger = createMockLogger();
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(jsonResponse(503))
+      .mockResolvedValueOnce(jsonResponse(429))
+      .mockResolvedValueOnce(jsonResponse(200));
+    const clock = makeClock();
+
+    const outcome = await run(logger, routes().primary, false, clock);
+
+    expect(outcome.ok).toBe(true);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(3);
+    if (outcome.ok) outcome.result.cleanup();
+  });
+});
+
+describe('fetchRouteWithRetry — terminal failures still throw', () => {
   it('exhausts retries on persistent 429 (logs exhausted + http_error, throws)', async () => {
     const logger = createMockLogger();
     vi.spyOn(globalThis, 'fetch').mockImplementation(async () => jsonResponse(429));
     const clock = makeClock();
 
-    await expect(fetchAnthropicWithRetry(makeCtx(logger), '{}', false, clock)).rejects.toThrow();
+    await expect(run(logger, routes().primary, false, clock)).rejects.toThrow();
 
     expect(globalThis.fetch).toHaveBeenCalledTimes(4); // 1 + 3 retries
     expect(clock.sleep).toHaveBeenCalledTimes(3);
@@ -175,38 +276,38 @@ describe('fetchAnthropicWithRetry — terminal failures', () => {
     expect(errorEvents(logger)).toContain('claude_fetch_http_error');
   });
 
-  it('does NOT retry deterministic 4xx (400) — fails fast', async () => {
+  it('does NOT retry deterministic 4xx (400) — fails fast, no outage', async () => {
     const logger = createMockLogger();
     vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
       jsonResponse(400, '{"error":"x"}')
     );
     const clock = makeClock();
 
-    await expect(fetchAnthropicWithRetry(makeCtx(logger), '{}', false, clock)).rejects.toThrow();
+    await expect(run(logger, routes().primary, false, clock)).rejects.toThrow();
 
     expect(globalThis.fetch).toHaveBeenCalledTimes(1);
     expect(clock.sleep).not.toHaveBeenCalled();
     expect(warnEvents(logger)).not.toContain('claude_api_retry');
-    expect(errorEvents(logger)).not.toContain('claude_api_retry_exhausted');
+    expect(warnEvents(logger)).not.toContain('claude_route_outage');
     expect(errorEvents(logger)).toContain('claude_fetch_http_error');
   });
 });
 
-describe('fetchAnthropicWithRetry — window and abort terminals', () => {
+describe('fetchRouteWithRetry — window and hang-guard terminals', () => {
   it('stops early when the next backoff would exceed the overall window', async () => {
     const logger = createMockLogger();
     vi.spyOn(globalThis, 'fetch').mockImplementation(async () => jsonResponse(429));
     // overallStart=0, then the elapsed check returns 200s (> 180s window).
     const clock = makeClock({ nowValues: [0, 200_000] });
 
-    await expect(fetchAnthropicWithRetry(makeCtx(logger), '{}', false, clock)).rejects.toThrow();
+    await expect(run(logger, routes().primary, false, clock)).rejects.toThrow();
 
     expect(globalThis.fetch).toHaveBeenCalledTimes(1); // no further attempts
     expect(clock.sleep).not.toHaveBeenCalled();
     expect(errorEvents(logger)).toContain('claude_api_retry_exhausted');
   });
 
-  it('does NOT retry our own timeout AbortError (logs claude_fetch_aborted)', async () => {
+  it('does NOT retry our own body hang-guard AbortError (logs claude_fetch_aborted)', async () => {
     const logger = createMockLogger();
     // A timeout abort surfaces as an error whose `name` is 'AbortError' (what
     // isOurTimeoutAbort keys on); a plain Error exercises that branch.
@@ -218,7 +319,7 @@ describe('fetchAnthropicWithRetry — window and abort terminals', () => {
 
     let caught: unknown;
     try {
-      await fetchAnthropicWithRetry(makeCtx(logger), '{}', false, clock);
+      await run(logger, routes().primary, false, clock);
     } catch (error) {
       caught = error;
     }
@@ -230,7 +331,65 @@ describe('fetchAnthropicWithRetry — window and abort terminals', () => {
   });
 });
 
-describe('fetchAnthropicWithRetry — terminal abort-guard lifecycle', () => {
+describe('fetchRouteWithRetry — first-byte deadline (streaming only)', () => {
+  it('streaming: no headers within 20s is an outage, classified first_byte_timeout', async () => {
+    vi.useFakeTimers();
+    const logger = createMockLogger();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(hangingFetch());
+    const clock = makeClock();
+
+    const pending = run(logger, routes().alt, true, clock);
+    await vi.advanceTimersByTimeAsync(20_000);
+    const outcome = await pending;
+
+    expect(outcome).toMatchObject({ ok: false, outage: 'first_byte_timeout', attempts: 1 });
+    expect(errorEvents(logger)).not.toContain('claude_fetch_aborted');
+  });
+
+  it('non-streaming: a slow response is NOT cut at 20s; the 90s hang-guard still applies', async () => {
+    vi.useFakeTimers();
+    const logger = createMockLogger();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(hangingFetch());
+    const clock = makeClock();
+
+    let settled = false;
+    const pending = run(logger, routes().alt, false, clock).then(
+      () => (settled = true),
+      () => (settled = true)
+    );
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(settled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(70_000);
+    await pending;
+    expect(settled).toBe(true);
+    expect(errorEvents(logger)).toContain('claude_fetch_aborted');
+    expect(warnEvents(logger)).not.toContain('claude_route_outage');
+  });
+
+  it('streaming: once headers arrive the first-byte timer is cleared (long bodies survive)', async () => {
+    vi.useFakeTimers();
+    const logger = createMockLogger();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async () =>
+        new Response('data: {}\n', {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        })
+    );
+    const clock = makeClock();
+
+    const outcome = await run(logger, routes().alt, true, clock);
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) throw new Error('unreachable');
+
+    await vi.advanceTimersByTimeAsync(25_000);
+    expect(outcome.result.signal.aborted).toBe(false);
+    outcome.result.cleanup();
+  });
+});
+
+describe('fetchRouteWithRetry — terminal abort-guard lifecycle', () => {
   // Regression: the terminal HTTP-error path reads response.text(); the per-attempt
   // abort guard must stay live until that read completes, so a stalled error body is
   // bounded by the 90s timeout instead of hanging after cleanup.
@@ -252,9 +411,7 @@ describe('fetchAnthropicWithRetry — terminal abort-guard lifecycle', () => {
     });
     vi.spyOn(globalThis, 'fetch').mockImplementation(async () => jsonResponse(400, '{"e":1}'));
 
-    await expect(
-      fetchAnthropicWithRetry(makeCtx(logger), '{}', false, makeClock())
-    ).rejects.toThrow();
+    await expect(run(logger, routes().primary, false, makeClock())).rejects.toThrow();
 
     expect(bodyReadWhileGuardLive).toBe(true);
   });

@@ -31,6 +31,7 @@ import {
 } from '../../utils/errors.js';
 import { redactToolInputForError, RequestLogger, summarizeToolInput } from '../../utils/logger.js';
 import { stripUlyssesComments } from '../../utils/ulysses-comments.js';
+import { buildRouteChain, ModelRoute } from './routes.js';
 import { UnmatchedTrigger } from '../classifier/index.js';
 import { createMCPHostFunctions, executeCode } from '../code-execution/index.js';
 import { withSpan, recordSpanError, countMetric, recordMetric } from '../telemetry/index.js';
@@ -152,8 +153,8 @@ function assertRequestBodyWithinLimit(body: string, ctx: OrchestrationContext): 
   );
 }
 
-/** Default Claude model - can be overridden via CLAUDE_MODEL env var */
-export const DEFAULT_MODEL = 'claude-sonnet-4-6';
+/** Default Claude model — lives in routes.ts with the rest of the chain; re-exported for callers. */
+export { DEFAULT_MODEL } from './routes.js';
 
 /** Default max tokens - can be overridden via CLAUDE_MAX_TOKENS env var */
 const DEFAULT_MAX_TOKENS = 4096;
@@ -268,16 +269,19 @@ function isGetToolDefinitionsInput(input: unknown): input is { tool_names: strin
   );
 }
 
-/** Anthropic API base URL */
-const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
-
-/** Anthropic API version header value */
-const ANTHROPIC_API_VERSION = '2023-06-01';
-
 interface OrchestrationContext {
   client: Anthropic;
-  apiKey: string;
+  /** The model REQUESTED for this turn — `routes[0].model`. The served model can differ (#403). */
   model: string;
+  /** The fallback chain for this turn (#403), primary first. Never empty. */
+  routes: ModelRoute[];
+  /**
+   * Index into `routes` of the route currently serving this turn. Advances when
+   * a route reports an outage and stays there for the rest of the turn (sticky):
+   * the history by then carries that route's tool_use blocks, and the next turn
+   * starts from the primary again.
+   */
+  routeIndex: number;
   maxTokens: number;
   /**
    * Org/mode-scoped system prefix, byte-identical for every user in that scope.
@@ -512,16 +516,26 @@ function buildSystemBlocks(ctx: OrchestrationContext): Anthropic.TextBlockParam[
  *
  * Prompt caching is GA — no beta header is required.
  */
-export function buildMessageBody(ctx: OrchestrationContext, stream: boolean): string {
+export function buildMessageBody(
+  ctx: OrchestrationContext,
+  route: ModelRoute,
+  stream: boolean
+): string {
   return JSON.stringify({
-    model: ctx.model,
+    model: route.model,
     max_tokens: ctx.maxTokens,
     system: buildSystemBlocks(ctx),
     messages: ctx.messages,
     ...(ctx.tools.length > 0 ? { tools: ctx.tools } : {}),
-    cache_control: { type: 'ephemeral' },
+    // The rolling breakpoint is only honoured by Anthropic-direct endpoints (#403).
+    ...(route.topLevelCacheControl ? { cache_control: { type: 'ephemeral' } } : {}),
     stream,
   });
+}
+
+/** The route currently serving this turn. */
+function currentRoute(ctx: OrchestrationContext): ModelRoute {
+  return ctx.routes[ctx.routeIndex]!;
 }
 
 /**
@@ -745,27 +759,67 @@ function isOurTimeoutAbort(error: unknown): boolean {
   return (error as Error | undefined)?.name === 'AbortError';
 }
 
-function buildClaudeAbortSignal(timeoutMs: number): {
+/**
+ * Streaming-only first-byte deadline (#403). An endpoint that accepts the
+ * connection but never answers is the slowest kind of outage; without this a
+ * dead route costs the full 90s hang-guard before the chain can move on.
+ *
+ * Streaming only, on purpose: a non-streaming response sends its headers only
+ * after the whole generation, and a tool-heavy iteration routinely takes longer
+ * than this — a first-byte deadline on that path would manufacture outages.
+ */
+const CLAUDE_FIRST_BYTE_TIMEOUT_MS = 20_000;
+
+/**
+ * One controller, two timers. Both fire an identical `AbortError` out of `fetch`,
+ * so the two are told apart by STATE, not by the error: `firstByteFired` is set by
+ * the first-byte timer before it aborts, and `headersReceived()` clears that timer
+ * the moment `fetch` resolves so a long body can never trip it.
+ */
+interface AttemptGuard {
   signal: AbortSignal;
+  /** Clears both timers. Caller MUST invoke once the body has been read. */
   cleanup: () => void;
-} {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  return { signal: controller.signal, cleanup: () => clearTimeout(timer) };
+  /** Call when `fetch` resolves: the first-byte deadline no longer applies. */
+  headersReceived: () => void;
+  /** True once the first-byte timer aborted the attempt. */
+  firstByteFired: () => boolean;
 }
 
-async function postToAnthropic(
-  body: string,
-  signal: AbortSignal,
-  apiKey: string
-): Promise<Response> {
-  return globalThis.fetch(ANTHROPIC_API_URL, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': ANTHROPIC_API_VERSION,
+function buildAttemptGuard(bodyTimeoutMs: number, firstByteTimeoutMs?: number): AttemptGuard {
+  const controller = new AbortController();
+  let firstByte = false;
+  const bodyTimer = setTimeout(() => controller.abort(), bodyTimeoutMs);
+  const firstByteTimer =
+    firstByteTimeoutMs === undefined
+      ? undefined
+      : setTimeout(() => {
+          firstByte = true;
+          controller.abort();
+        }, firstByteTimeoutMs);
+  const clearFirstByte = (): void => {
+    if (firstByteTimer !== undefined) clearTimeout(firstByteTimer);
+  };
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      clearTimeout(bodyTimer);
+      clearFirstByte();
     },
+    headersReceived: clearFirstByte,
+    firstByteFired: () => firstByte,
+  };
+}
+
+/** POST a Messages-API body to a route's endpoint with that route's credential (#403). */
+export async function postToRoute(
+  route: ModelRoute,
+  body: string,
+  signal: AbortSignal
+): Promise<Response> {
+  return globalThis.fetch(route.url, {
+    method: 'POST',
+    headers: route.headers(),
     body,
     signal,
   });
@@ -848,6 +902,8 @@ export interface AnthropicFetchResult {
 interface AnthropicAttemptFailure {
   response?: Response;
   networkError?: unknown;
+  /** The first-byte deadline aborted this attempt (streaming only). */
+  firstByteTimeout?: boolean;
   cleanup: () => void;
   fetchStart: number;
 }
@@ -855,18 +911,25 @@ interface AnthropicAttemptFailure {
 type AnthropicAttemptOutcome =
   { ok: true; result: AnthropicFetchResult } | ({ ok: false } & AnthropicAttemptFailure);
 
-/** Perform a single Anthropic fetch attempt with its own hang-guard signal. */
-async function attemptAnthropicFetch(
+/** Perform a single fetch attempt against `route` with its own hang-guard signal. */
+async function attemptRouteFetch(
   ctx: OrchestrationContext,
+  route: ModelRoute,
   body: string,
   streaming: boolean,
   attempt: number
 ): Promise<AnthropicAttemptOutcome> {
-  const { signal, cleanup } = buildClaudeAbortSignal(CLAUDE_REQUEST_TIMEOUT_MS);
+  const guard = buildAttemptGuard(
+    CLAUDE_REQUEST_TIMEOUT_MS,
+    streaming ? CLAUDE_FIRST_BYTE_TIMEOUT_MS : undefined
+  );
+  const { signal, cleanup } = guard;
   const fetchStart = Date.now();
   try {
-    const response = await postToAnthropic(body, signal, ctx.apiKey);
+    const response = await postToRoute(route, body, signal);
+    guard.headersReceived();
     ctx.logger.log('claude_fetch_response_received', {
+      route: route.id,
       streaming,
       status: response.status,
       attempt,
@@ -876,15 +939,113 @@ async function attemptAnthropicFetch(
     if (response.ok) return { ok: true, result: { response, signal, cleanup, fetchStart } };
     return { ok: false, response, cleanup, fetchStart };
   } catch (networkError) {
-    return { ok: false, networkError, cleanup, fetchStart };
+    return {
+      ok: false,
+      networkError,
+      firstByteTimeout: guard.firstByteFired(),
+      cleanup,
+      fetchStart,
+    };
   }
 }
 
 /** Whether a failed attempt is worth retrying (excludes our own timeout abort). */
 function isAttemptRetryable(failure: AnthropicAttemptFailure): boolean {
+  if (failure.firstByteTimeout) return true;
   return failure.networkError
     ? !isOurTimeoutAbort(failure.networkError)
     : isRetryableStatus(failure.response!.status);
+}
+
+/**
+ * Why a route is considered DOWN (#403). Bounded enum — safe as a metric label.
+ * `forced` is the staging drill (`FALLBACK_FORCE_ROUTE`), never a real failure.
+ */
+export type OutageReason = 'network_error' | 'first_byte_timeout' | 'http_5xx' | 'forced';
+
+/** Statuses that mean "this endpoint cannot serve right now". 429 is deliberately absent. */
+const OUTAGE_STATUSES = new Set([500, 502, 503, 504, 529]);
+
+/**
+ * Classify a failed attempt as outage-class or not. A 429 is a rate limit, not an
+ * outage: failing over on it would only migrate the throttling to the next
+ * provider, so it stays on the route under the normal retry policy. Our own
+ * body hang-guard abort is terminal, as before.
+ */
+function classifyOutage(failure: AnthropicAttemptFailure): OutageReason | null {
+  if (failure.firstByteTimeout) return 'first_byte_timeout';
+  if (failure.networkError) return isOurTimeoutAbort(failure.networkError) ? null : 'network_error';
+  return OUTAGE_STATUSES.has(failure.response!.status) ? 'http_5xx' : null;
+}
+
+/** A route gave up: either a successful fetch, or an outage the caller may route around. */
+export type RouteFetchOutcome =
+  | { ok: true; result: AnthropicFetchResult }
+  | { ok: false; outage: OutageReason; status: number | undefined; attempts: number };
+
+/**
+ * Release a failed attempt and report the route as down. Drains the error body
+ * (best-effort, like the retry path) so the connection is freed before the chain
+ * moves on; the body is discarded on cleanup regardless.
+ */
+async function reportRouteOutage(
+  ctx: OrchestrationContext,
+  route: ModelRoute,
+  streaming: boolean,
+  failure: AnthropicAttemptFailure,
+  verdict: { outage: OutageReason; attempts: number }
+): Promise<RouteFetchOutcome> {
+  const status = failure.response?.status;
+  ctx.logger.warn('claude_route_outage', {
+    route: route.id,
+    model: route.model,
+    streaming,
+    outage: verdict.outage,
+    status,
+    attempts: verdict.attempts,
+    network_error: failure.networkError ? (failure.networkError as Error).message : undefined,
+  });
+  try {
+    if (failure.response) await failure.response.text().catch(() => undefined);
+  } finally {
+    failure.cleanup();
+  }
+  return { ok: false, outage: verdict.outage, status, attempts: verdict.attempts };
+}
+
+/** What to do after a failed attempt on a route. */
+type RetryDecision =
+  | { action: 'outage'; outage: OutageReason }
+  | { action: 'give_up'; reason: 'max_attempts' | 'overall_window_exceeded' | null }
+  | { action: 'retry'; delayMs: number; retryAfterMs: number };
+
+function decideAfterFailure(
+  route: ModelRoute,
+  failure: AnthropicAttemptFailure,
+  attempt: number,
+  overallStart: number,
+  clock: RetryClock
+): RetryDecision {
+  const isLast = attempt >= CLAUDE_MAX_ATTEMPTS;
+  const retryable = isAttemptRetryable(failure);
+  const { delayMs, retryAfterMs } = computeRetryDelay(attempt, failure, clock);
+  const windowExceeded = clock.now() - overallStart + delayMs > CLAUDE_OVERALL_RETRY_WINDOW_MS;
+
+  const outage = classifyOutage(failure);
+  if (outage && (attempt >= route.outageAttempts || windowExceeded)) {
+    return { action: 'outage', outage };
+  }
+  if (!retryable) return { action: 'give_up', reason: null };
+  if (isLast) return { action: 'give_up', reason: 'max_attempts' };
+  if (windowExceeded) return { action: 'give_up', reason: 'overall_window_exceeded' };
+  return { action: 'retry', delayMs, retryAfterMs };
+}
+
+export interface RouteRetryOptions {
+  streaming: boolean;
+  /** Start of the whole chain's wall-clock window, so the window spans routes. */
+  overallStart: number;
+  clock?: RetryClock;
 }
 
 /**
@@ -970,27 +1131,41 @@ async function exhaustAnthropicRetries(
   }
 }
 
-export async function fetchAnthropicWithRetry(
+/**
+ * POST `body` to ONE route with retry/backoff (#248) and outage classification (#403).
+ *
+ * Outage-class failures (connection error, first-byte timeout, 5xx/529) get
+ * `route.outageAttempts` tries — or fewer if the overall window runs out — and
+ * then RETURN a tagged outage so the caller can move to the next route. Every
+ * other failure keeps the original policy: 429 retries up to CLAUDE_MAX_ATTEMPTS
+ * inside the window, deterministic 4xx and our own body hang-guard abort throw
+ * at once. `overallStart` is supplied by the caller so the window spans the
+ * whole chain, not each route.
+ */
+export async function fetchRouteWithRetry(
   ctx: OrchestrationContext,
+  route: ModelRoute,
   body: string,
-  streaming: boolean,
-  clock: RetryClock = REAL_CLOCK
-): Promise<AnthropicFetchResult> {
-  const overallStart = clock.now();
+  opts: RouteRetryOptions
+): Promise<RouteFetchOutcome> {
+  const { streaming, overallStart } = opts;
+  const clock = opts.clock ?? REAL_CLOCK;
   for (let attempt = 1; attempt <= CLAUDE_MAX_ATTEMPTS; attempt++) {
-    const outcome = await attemptAnthropicFetch(ctx, body, streaming, attempt);
-    if (outcome.ok) return outcome.result;
+    const outcome = await attemptRouteFetch(ctx, route, body, streaming, attempt);
+    if (outcome.ok) return outcome;
 
-    const isLast = attempt >= CLAUDE_MAX_ATTEMPTS;
-    const retryable = isAttemptRetryable(outcome);
-    const { delayMs, retryAfterMs } = computeRetryDelay(attempt, outcome, clock);
-    const windowExceeded = clock.now() - overallStart + delayMs > CLAUDE_OVERALL_RETRY_WINDOW_MS;
-
-    if (!retryable || isLast || windowExceeded) {
-      const reason = isLast ? 'max_attempts' : 'overall_window_exceeded';
-      await exhaustAnthropicRetries(ctx, streaming, attempt, outcome, retryable ? reason : null);
+    const decision = decideAfterFailure(route, outcome, attempt, overallStart, clock);
+    if (decision.action === 'outage') {
+      return reportRouteOutage(ctx, route, streaming, outcome, {
+        outage: decision.outage,
+        attempts: attempt,
+      });
+    }
+    if (decision.action === 'give_up') {
+      await exhaustAnthropicRetries(ctx, streaming, attempt, outcome, decision.reason);
     }
 
+    const { delayMs, retryAfterMs } = decision as Extract<RetryDecision, { action: 'retry' }>;
     logAnthropicRetry(ctx, streaming, outcome, { attempt, delayMs, retryAfterMs });
     // Drain the error body so the connection is freed before we back off. Best-effort:
     // the retry is already logged above, and a failed drain is harmless (the body is
@@ -1000,17 +1175,37 @@ export async function fetchAnthropicWithRetry(
     await clock.sleep(delayMs);
   }
   // Unreachable: every iteration either returns or throws.
-  throw new Error('fetchAnthropicWithRetry: exhausted loop without resolution');
+  throw new Error('fetchRouteWithRetry: exhausted loop without resolution');
+}
+
+/**
+ * Interim single-route adapter: fetch on the current route and surface an outage
+ * as the terminal error. Replaced by the route chain in the next step (#403).
+ */
+async function fetchCurrentRouteOrThrow(
+  ctx: OrchestrationContext,
+  body: string,
+  streaming: boolean
+): Promise<AnthropicFetchResult> {
+  const outcome = await fetchRouteWithRetry(ctx, currentRoute(ctx), body, {
+    streaming,
+    overallStart: Date.now(),
+  });
+  if (outcome.ok) return outcome.result;
+  throw new ClaudeAPIError(
+    `Model route ${currentRoute(ctx).id} unavailable (${outcome.outage})`,
+    outcome.status
+  );
 }
 
 async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message> {
   if (ctx.callbacks) return streamClaudeResponse(ctx);
-  const body = buildMessageBody(ctx, false);
+  const body = buildMessageBody(ctx, currentRoute(ctx), false);
   assertRequestBodyWithinLimit(body, ctx);
   logFetchCommencement(ctx, body, false);
   // signal omitted: the body read below is governed by the fetch's signal regardless;
   // cleanup (in finally) keeps the hang-guard timer live until the read completes.
-  const { response, cleanup, fetchStart } = await fetchAnthropicWithRetry(ctx, body, false);
+  const { response, cleanup, fetchStart } = await fetchCurrentRouteOrThrow(ctx, body, false);
   try {
     const parsed = (await response.json()) as Anthropic.Message;
     ctx.logger.log('claude_fetch_complete', {
@@ -1029,10 +1224,10 @@ async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message>
 }
 
 async function streamClaudeResponse(ctx: OrchestrationContext): Promise<Anthropic.Message> {
-  const body = buildMessageBody(ctx, true);
+  const body = buildMessageBody(ctx, currentRoute(ctx), true);
   assertRequestBodyWithinLimit(body, ctx);
   logFetchCommencement(ctx, body, true);
-  const { response, signal, cleanup, fetchStart } = await fetchAnthropicWithRetry(ctx, body, true);
+  const { response, signal, cleanup, fetchStart } = await fetchCurrentRouteOrThrow(ctx, body, true);
   try {
     if (!response.body) await throwAnthropicHttpError(ctx, response, true, fetchStart);
     const parsed = await parseSSEStream(response.body!, ctx.logger, ctx.callbacks, signal);
@@ -1485,7 +1680,8 @@ function parseIntEnvVar(
 }
 
 function parseClaudeConfig(env: Env, logger: RequestLogger) {
-  const model = env.CLAUDE_MODEL ?? DEFAULT_MODEL;
+  const chain = buildRouteChain(env, logger);
+  const model = chain.routes[0]!.model;
   if (!env.CLAUDE_MODEL) {
     logger.log('config_default', { key: 'CLAUDE_MODEL', value: model });
   }
@@ -1495,7 +1691,7 @@ function parseClaudeConfig(env: Env, logger: RequestLogger) {
     DEFAULT_MAX_TOKENS,
     logger
   );
-  return { model, maxTokens };
+  return { model, maxTokens, chain };
 }
 
 function parseOrchestrationConfig(env: Env, logger: RequestLogger) {
@@ -1685,8 +1881,9 @@ function createOrchestrationContext(
 
   return {
     client: new Anthropic({ apiKey: env.ANTHROPIC_API_KEY }),
-    apiKey: env.ANTHROPIC_API_KEY,
     model: config.model,
+    routes: config.chain.routes,
+    routeIndex: 0,
     maxTokens: config.maxTokens,
     systemStable: systemBlocks.stable,
     systemVolatile: systemBlocks.volatile,
