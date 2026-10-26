@@ -807,15 +807,17 @@ const CLAUDE_FIRST_BYTE_TIMEOUT_MS = 20_000;
 /**
  * One controller, two timers. Both fire an identical `AbortError` out of `fetch`,
  * so the two are told apart by STATE, not by the error: `firstByteFired` is set by
- * the first-byte timer before it aborts, and `headersReceived()` clears that timer
- * the moment `fetch` resolves so a long body can never trip it.
+ * the first-byte timer before it aborts, and `firstByteReceived()` clears that
+ * timer once the stream has yielded its first chunk — not when `fetch` resolves,
+ * because headers alone prove nothing: a `200` whose body never starts is the
+ * slowest outage of all (Codex review on #464).
  */
 interface AttemptGuard {
   signal: AbortSignal;
   /** Clears both timers. Caller MUST invoke once the body has been read. */
   cleanup: () => void;
-  /** Call when `fetch` resolves: the first-byte deadline no longer applies. */
-  headersReceived: () => void;
+  /** Call once the first body chunk has arrived: the first-byte deadline no longer applies. */
+  firstByteReceived: () => void;
   /** True once the first-byte timer aborted the attempt. */
   firstByteFired: () => boolean;
 }
@@ -840,7 +842,7 @@ function buildAttemptGuard(bodyTimeoutMs: number, firstByteTimeoutMs?: number): 
       clearTimeout(bodyTimer);
       clearFirstByte();
     },
-    headersReceived: clearFirstByte,
+    firstByteReceived: clearFirstByte,
     firstByteFired: () => firstByte,
   };
 }
@@ -967,18 +969,22 @@ async function attemptRouteFetch(
   const { signal, cleanup } = guard;
   const fetchStart = Date.now();
   try {
-    const response = await postToRoute(route, body, signal);
-    guard.headersReceived();
+    const headersOnly = await postToRoute(route, body, signal);
     ctx.logger.log('claude_fetch_response_received', {
       route: route.id,
       streaming,
-      status: response.status,
+      status: headersOnly.status,
       attempt,
-      has_body: !!response.body,
+      has_body: !!headersOnly.body,
       duration_ms: Date.now() - fetchStart,
     });
-    if (response.ok) return { ok: true, result: { response, signal, cleanup, fetchStart } };
-    return { ok: false, response, cleanup, fetchStart };
+    if (!headersOnly.ok) return { ok: false, response: headersOnly, cleanup, fetchStart };
+    // Streaming: the deadline is only satisfied by the first body chunk. The
+    // non-streaming path arms no first-byte timer (headers arrive after the whole
+    // generation there), so this is a no-op wait for it.
+    const response = streaming ? await awaitFirstChunk(headersOnly, signal) : headersOnly;
+    guard.firstByteReceived();
+    return { ok: true, result: { response, signal, cleanup, fetchStart } };
   } catch (networkError) {
     return {
       ok: false,
@@ -988,6 +994,53 @@ async function attemptRouteFetch(
       fetchStart,
     };
   }
+}
+
+/** Rejects with an `AbortError` the moment `signal` aborts (already-aborted included). */
+function rejectOnAbort(signal: AbortSignal): Promise<never> {
+  return new Promise((_resolve, reject) => {
+    const abort = (): void => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+    if (signal.aborted) abort();
+    else signal.addEventListener('abort', abort, { once: true });
+  });
+}
+
+/**
+ * Wait for the first body chunk under the attempt's signal, then hand back an
+ * equivalent response whose body replays that chunk ahead of the rest.
+ *
+ * `fetch` resolves on headers; in workerd a later abort of the fetch signal does
+ * tear the body down, but a test double's body is not tied to the signal, so the
+ * read is raced against the signal explicitly rather than trusting the stream to
+ * error. On abort the reader is cancelled and the AbortError propagates to the
+ * caller's catch, where `firstByteFired()` classifies it.
+ */
+async function awaitFirstChunk(response: Response, signal: AbortSignal): Promise<Response> {
+  if (!response.body) return response;
+  const reader = response.body.getReader();
+  let first: ReadableStreamReadResult<Uint8Array>;
+  try {
+    first = await Promise.race([reader.read(), rejectOnAbort(signal)]);
+  } catch (error) {
+    // Best-effort release of the upstream connection; the abort itself is what the
+    // caller logs (`claude_route_outage` / `claude_fetch_aborted`), so a cancel
+    // rejection — e.g. the stream already errored — adds nothing.
+    reader.cancel('first-byte-timeout').catch(() => undefined);
+    throw error;
+  }
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      if (first.done) controller.close();
+      else controller.enqueue(first.value);
+    },
+    async pull(controller) {
+      const { done, value } = await reader.read();
+      if (done) controller.close();
+      else controller.enqueue(value);
+    },
+    cancel: (reason) => reader.cancel(reason),
+  });
+  return new Response(body, { status: response.status, headers: response.headers });
 }
 
 /** Whether a failed attempt is worth retrying (excludes our own timeout abort). */

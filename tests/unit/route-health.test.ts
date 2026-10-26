@@ -15,7 +15,7 @@ import {
   ROUTE_HEALTH_TTL_SECONDS,
   type RouteHealthStore,
 } from '../../src/services/claude/route-health.js';
-import { buildRouteChain } from '../../src/services/claude/routes.js';
+import { buildRouteChain, ROUTE_ORDER } from '../../src/services/claude/routes.js';
 import type { RequestLogger } from '../../src/utils/logger.js';
 
 function createMockLogger(): RequestLogger {
@@ -83,7 +83,8 @@ describe('KV route health store — read', () => {
     const open = await store.readOpen(ids());
 
     expect([...open]).toEqual(['primary']);
-    expect(kv.get).toHaveBeenCalledTimes(2);
+    // Every route is read regardless of the subset asked for (see the memo test).
+    expect(kv.get).toHaveBeenCalledTimes(ROUTE_ORDER.length);
   });
 
   it('a failed read degrades to "nothing open" with a warning', async () => {
@@ -98,18 +99,30 @@ describe('KV route health store — read', () => {
     expect(warnEvents(logger)).toContain('route_health_read_failed');
   });
 
-  it('memoizes the read per store for a few seconds so the loop does not hit KV per iteration', async () => {
+  it('memoizes the read for a few seconds so the loop does not hit KV per iteration', async () => {
     const { kv } = fakeKv();
     let now = 1_000;
     const store = createKvRouteHealthStore(kv, createMockLogger(), () => now);
 
     await store.readOpen(ids());
     await store.readOpen(ids());
-    expect(kv.get).toHaveBeenCalledTimes(2);
+    expect(kv.get).toHaveBeenCalledTimes(ROUTE_ORDER.length);
 
     now += 6_000;
     await store.readOpen(ids());
-    expect(kv.get).toHaveBeenCalledTimes(4);
+    expect(kv.get).toHaveBeenCalledTimes(ROUTE_ORDER.length * 2);
+  });
+
+  it('a read for a route SUBSET never hides an open route from the next full-chain read', async () => {
+    // Codex review on #464: a sticky iteration reads only the chain suffix; a new
+    // turn in the same 5s window must still learn the primary is open.
+    const { kv } = fakeKv({ [`${ROUTE_HEALTH_KEY_PREFIX}primary`]: '{"outage":"http_5xx"}' });
+    let now = 1_000;
+    const store = createKvRouteHealthStore(kv, createMockLogger(), () => now);
+
+    expect([...(await store.readOpen(['anthropic-alt', 'openrouter-claude']))]).toEqual([]);
+    now += 1_000;
+    expect([...(await store.readOpen(ids()))]).toEqual(['primary']);
   });
 });
 

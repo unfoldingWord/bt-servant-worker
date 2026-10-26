@@ -79,6 +79,20 @@ function hangingFetch(): typeof fetch {
     })) as unknown as typeof fetch;
 }
 
+/** A body that yields `first` at once and `second` a few ms later, then closes. */
+function twoChunkStream(first: string, second: string): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode(first));
+      setTimeout(() => {
+        controller.enqueue(encoder.encode(second));
+        controller.close();
+      }, 5);
+    },
+  });
+}
+
 function eventsFor(fn: unknown): string[] {
   return (fn as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0] as string);
 }
@@ -367,7 +381,47 @@ describe('fetchRouteWithRetry — first-byte deadline (streaming only)', () => {
     expect(warnEvents(logger)).not.toContain('claude_route_outage');
   });
 
-  it('streaming: once headers arrive the first-byte timer is cleared (long bodies survive)', async () => {
+  it('streaming: 200 headers with a body that never yields is still a first_byte_timeout outage', async () => {
+    vi.useFakeTimers();
+    const logger = createMockLogger();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async () =>
+        new Response(new ReadableStream<Uint8Array>({ start() {} }), {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        })
+    );
+    const clock = makeClock();
+
+    const pending = run(logger, routes().alt, true, clock);
+    await vi.advanceTimersByTimeAsync(20_000);
+    const outcome = await pending;
+
+    expect(outcome).toMatchObject({ ok: false, outage: 'first_byte_timeout', attempts: 1 });
+    expect(warnEvents(logger)).toContain('claude_route_outage');
+  });
+});
+
+describe('fetchRouteWithRetry — first chunk replay and timer release', () => {
+  it('streaming: the first chunk is replayed, so the caller still reads the whole body', async () => {
+    const logger = createMockLogger();
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async () =>
+        new Response(twoChunkStream('data: {"a":1}\n', 'data: {"b":2}\n'), {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        })
+    );
+
+    const outcome = await run(logger, routes().alt, true, makeClock());
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) throw new Error('unreachable');
+
+    expect(await outcome.result.response.text()).toBe('data: {"a":1}\ndata: {"b":2}\n');
+    outcome.result.cleanup();
+  });
+
+  it('streaming: once the first chunk arrives the first-byte timer is cleared (long bodies survive)', async () => {
     vi.useFakeTimers();
     const logger = createMockLogger();
     vi.spyOn(globalThis, 'fetch').mockImplementation(

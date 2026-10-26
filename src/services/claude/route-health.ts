@@ -21,7 +21,7 @@
 
 import type { RequestLogger } from '../../utils/logger.js';
 import { countMetric } from '../telemetry/index.js';
-import type { ModelRoute, RouteId } from './routes.js';
+import { ROUTE_ORDER, type ModelRoute, type RouteId } from './routes.js';
 
 /** Reserved key prefix in the `ORG_CONFIG` namespace. Never a valid org id. */
 export const ROUTE_HEALTH_KEY_PREFIX = '__route_health__:';
@@ -40,7 +40,12 @@ export interface RouteFailureFacts {
 }
 
 export interface RouteHealthStore {
-  /** The subset of `ids` currently marked open (to be skipped). Never throws. */
+  /**
+   * The subset of `ids` currently marked open (to be skipped). Never throws.
+   * Implementations must answer for ANY subset consistently: a read for the
+   * chain's suffix (a sticky iteration) and a read for the whole chain (a new
+   * turn) in the same window must agree about every route.
+   */
   readOpen(ids: readonly RouteId[]): Promise<Set<RouteId>>;
   /** Mark `route` open for the TTL. Never throws. */
   open(route: ModelRoute, facts: RouteFailureFacts): Promise<void>;
@@ -57,7 +62,10 @@ export function routeHealthKey(id: RouteId): string {
 
 /**
  * Last read per KV namespace, shared by every store instance in the isolate so
- * the many DOs on one isolate do not each pay a read per turn.
+ * the many DOs on one isolate do not each pay a read per turn. Always holds the
+ * state of EVERY route (`ROUTE_ORDER`), whatever subset the caller asked for —
+ * otherwise a suffix read by a sticky iteration would leave a memo that hides an
+ * open primary from the next new turn (Codex review on #464).
  */
 const memos = new WeakMap<KVNamespace, { at: number; open: Set<RouteId> }>();
 
@@ -96,10 +104,11 @@ export function createKvRouteHealthStore(
   logger: RequestLogger,
   now: () => number = () => Date.now()
 ): RouteHealthStore {
-  async function readUncached(ids: readonly RouteId[]): Promise<Set<RouteId>> {
+  /** Reads ALL routes, never just the requested subset — see `memos`. */
+  async function readUncached(): Promise<Set<RouteId>> {
     try {
       const found = await Promise.all(
-        ids.map(async (id) => ((await kv.get(routeHealthKey(id))) === null ? null : id))
+        ROUTE_ORDER.map(async (id) => ((await kv.get(routeHealthKey(id))) === null ? null : id))
       );
       return new Set(found.filter((id): id is RouteId => id !== null));
     } catch (error) {
@@ -115,10 +124,9 @@ export function createKvRouteHealthStore(
     async readOpen(ids) {
       const at = now();
       const memo = memos.get(kv);
-      if (memo && at - memo.at < READ_MEMO_MS) return memo.open;
-      const open = await readUncached(ids);
-      memos.set(kv, { at, open });
-      return open;
+      const open = memo && at - memo.at < READ_MEMO_MS ? memo.open : await readUncached();
+      if (open !== memo?.open) memos.set(kv, { at, open });
+      return new Set(ids.filter((id) => open.has(id)));
     },
     async open(route, facts) {
       await writeOpenRecord(kv, logger, route, { ...facts, opened_at: now() });
