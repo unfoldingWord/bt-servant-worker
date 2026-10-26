@@ -614,6 +614,7 @@ Access control (who can reset a group, who counts as "addressed") is the **gatew
 | Secret                        | Description                                                                                            |
 | ----------------------------- | ------------------------------------------------------------------------------------------------------ |
 | `ANTHROPIC_API_KEY`           | API key for Claude                                                                                     |
+| `OPENROUTER_API_KEY`          | OpenRouter key for the two OpenRouter fallback tiers (#403). Unset ⇒ those tiers are absent (optional) |
 | `OPENAI_API_KEY`              | API key for OpenAI (TTS)                                                                               |
 | `ENGINE_API_KEY`              | Bearer token for API auth + super-admin access + webhook `X-Engine-Token`                              |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP base URL of the collector. Telemetry is a no-op unless this AND the token are set (optional) |
@@ -638,15 +639,38 @@ Set in `wrangler.toml` under `[vars]`. The top-level `[vars]` block **is** the p
 
 These have sensible defaults and only need to be set to override:
 
-| Variable                      | Default               | Description                               |
-| ----------------------------- | --------------------- | ----------------------------------------- |
-| `CLAUDE_MODEL`                | `"claude-sonnet-4-6"` | Claude model ID                           |
-| `CLAUDE_MAX_TOKENS`           | `"4096"`              | Max tokens per Claude response            |
-| `MAX_MCP_RESPONSE_SIZE_BYTES` | `"1048576"`           | Max response size from MCP servers (1 MB) |
-| `MAX_QUEUE_DEPTH`             | `"50"`                | Max queued messages per conversation      |
-| `QUEUE_MAX_RETRIES`           | `"3"`                 | Max retries for transient queue failures  |
+| Variable                      | Default                         | Description                                                                                       |
+| ----------------------------- | ------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `CLAUDE_MODEL`                | `"claude-sonnet-4-6"`           | Claude model ID (the `primary` route)                                                             |
+| `CLAUDE_MAX_TOKENS`           | `"4096"`                        | Max tokens per Claude response                                                                    |
+| `FALLBACK_CLAUDE_MODEL`       | `"claude-opus-4-6"`             | `anthropic-alt` route model; `""` disables the tier                                               |
+| `OPENROUTER_CLAUDE_MODEL`     | `"anthropic/claude-sonnet-4.6"` | `openrouter-claude` route model (OpenRouter slug)                                                 |
+| `OPENROUTER_ALT_MODEL`        | _(unset)_                       | `openrouter-alt` route model (non-Claude); unset ⇒ tier absent                                    |
+| `FALLBACK_FORCE_ROUTE`        | _(unset)_                       | Staging-only outage drill: routes before this id report a synthetic outage. Refused in production |
+| `MAX_MCP_RESPONSE_SIZE_BYTES` | `"1048576"`                     | Max response size from MCP servers (1 MB)                                                         |
+| `MAX_QUEUE_DEPTH`             | `"50"`                          | Max queued messages per conversation                                                              |
+| `QUEUE_MAX_RETRIES`           | `"3"`                           | Max retries for transient queue failures                                                          |
 
 `ADMIN_RATE_LIMIT_MAX` and `ADMIN_RATE_LIMIT_WINDOW_MS` are declared on the `Env` type but nothing reads them; the only rate limiter in the worker is the fixed per-conversation enqueue limit (300 per sliding minute).
+
+### Model fallback (#403)
+
+When the model endpoint serving a turn is down, the same call is retried on the next configured route, silently to the user. The chain, in order (`src/services/claude/routes.ts`):
+
+| Route               | Endpoint                         | Model                     | Enabled when                                     |
+| ------------------- | -------------------------------- | ------------------------- | ------------------------------------------------ |
+| `primary`           | api.anthropic.com                | `CLAUDE_MODEL`            | always                                           |
+| `anthropic-alt`     | api.anthropic.com                | `FALLBACK_CLAUDE_MODEL`   | not `""`                                         |
+| `openrouter-claude` | openrouter.ai `/api/v1/messages` | `OPENROUTER_CLAUDE_MODEL` | `OPENROUTER_API_KEY` set                         |
+| `openrouter-alt`    | openrouter.ai `/api/v1/messages` | `OPENROUTER_ALT_MODEL`    | `OPENROUTER_API_KEY` set and the model non-empty |
+
+Primary traffic never touches OpenRouter; it is a failover path only. OpenRouter's Messages endpoint is Anthropic-shaped, so every route sends the same request body (OpenRouter itself fails over between Anthropic, Bedrock and Vertex for Claude models).
+
+- **What counts as an outage:** a connection error, HTTP 500/502/503/504/529, a 2xx with no body, or (streaming only) no body data within 20s or a stream that closes before yielding a byte. The primary gets two attempts, each fallback one. A 429 is a rate limit, not an outage: it is retried on the same route with the usual backoff and never falls over. Other 4xx fail the turn as before.
+- **Sticky within the turn:** once a fallback answers, the rest of that turn's iterations stay on it. The next turn starts from the primary again.
+- **Shared breaker:** a route that reports an outage is marked open for 90s in the `ORG_CONFIG` KV namespace under the reserved key `__route_health__:<route>`, so other conversations skip it. TTL expiry is the probe. If every route is open, all are tried in order. Admin org-config routes refuse `__`-prefixed org ids for this reason.
+- **Observability:** `model_route_fallback` (warn, with `from_route` / `to_route` / `outage`), `route_breaker_opened` / `route_breaker_skipped`, `model_route_chain_exhausted` (error). Metrics `model_route_fallback_total{from_route,to_route,reason}` and `route_breaker_total{route,reason}`; the token counters are labelled by the model that **served** the call. Each `chat_turn` carries `served_model`, `route` and `usage_by_model` next to the requested `model`.
+- **Drill on staging:** set `FALLBACK_FORCE_ROUTE` to a route id; every route before it reports a synthetic `forced` outage without a network call, so each tier can be exercised with real traffic. Refused (and logged) when `ENVIRONMENT` is `production`.
 
 ### Cloudflare Bindings
 

@@ -248,6 +248,10 @@ export const ALLOWED_LABEL_KEYS = new Set<string>([
   'edge_country',
   'model',
   'mode',
+  // Model fallback chain (#403): route ids are a closed enum (see routes.ts).
+  'route',
+  'from_route',
+  'to_route',
   'server',
   'tool',
   'tool_name',
@@ -320,6 +324,10 @@ export interface MetricLabels {
    * the prompt-cache savings metrics (issue #333).
    */
   mode?: string;
+  /** Model route id (#403): `primary` | `anthropic-alt` | `openrouter-claude` | `openrouter-alt`. */
+  route?: string;
+  from_route?: string;
+  to_route?: string;
   server?: string;
   tool?: string;
   tool_name?: string;

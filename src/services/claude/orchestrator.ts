@@ -27,10 +27,17 @@ import {
   ClaudeAPIError,
   MCPError,
   MCPRequestCallLimitError,
+  RouteChainExhaustedError,
   ValidationError,
 } from '../../utils/errors.js';
 import { redactToolInputForError, RequestLogger, summarizeToolInput } from '../../utils/logger.js';
 import { stripUlyssesComments } from '../../utils/ulysses-comments.js';
+import { buildRouteChain, ModelRoute, RouteId } from './routes.js';
+import {
+  createKvRouteHealthStore,
+  createMemoryRouteHealthStore,
+  RouteHealthStore,
+} from './route-health.js';
 import { UnmatchedTrigger } from '../classifier/index.js';
 import { createMCPHostFunctions, executeCode } from '../code-execution/index.js';
 import { withSpan, recordSpanError, countMetric, recordMetric } from '../telemetry/index.js';
@@ -152,8 +159,8 @@ function assertRequestBodyWithinLimit(body: string, ctx: OrchestrationContext): 
   );
 }
 
-/** Default Claude model - can be overridden via CLAUDE_MODEL env var */
-export const DEFAULT_MODEL = 'claude-sonnet-4-6';
+/** Default Claude model — lives in routes.ts with the rest of the chain; re-exported for callers. */
+export { DEFAULT_MODEL } from './routes.js';
 
 /** Default max tokens - can be overridden via CLAUDE_MAX_TOKENS env var */
 const DEFAULT_MAX_TOKENS = 4096;
@@ -193,6 +200,10 @@ interface OrchestratorOptions {
   attachmentsContext?: AttachmentsContext | undefined;
   /** Public worker origin (e.g. https://bt-servant-worker-staging.example.workers.dev). Used to build public URLs for ptxprint artifacts. */
   workerOrigin?: string | undefined;
+  /** Clock for retry backoff and the route-chain window (#403). Tests inject an instant one. */
+  retryClock?: RetryClock | undefined;
+  /** Shared route breaker (#403). Defaults to the KV store on `ORG_CONFIG`; tests inject a memory one. */
+  routeHealth?: RouteHealthStore | undefined;
   clientId?: string | undefined;
   groupContext?: GroupChatContext | undefined;
   isVoiceMessage?: boolean | undefined;
@@ -268,16 +279,31 @@ function isGetToolDefinitionsInput(input: unknown): input is { tool_names: strin
   );
 }
 
-/** Anthropic API base URL */
-const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
-
-/** Anthropic API version header value */
-const ANTHROPIC_API_VERSION = '2023-06-01';
-
 interface OrchestrationContext {
   client: Anthropic;
-  apiKey: string;
+  /** The model REQUESTED for this turn — `routes[0].model`. The served model can differ (#403). */
   model: string;
+  /** The fallback chain for this turn (#403), primary first. Never empty. */
+  routes: ModelRoute[];
+  /** Staging drill: index of `FALLBACK_FORCE_ROUTE` in `routes`, or -1. Routes before it are skipped. */
+  forcedRouteIndex: number;
+  /** Clock for retry backoff and the chain window; injectable so tests run instantly. */
+  clock: RetryClock;
+  /** Shared breaker (#403): which routes other turns found down recently. */
+  routeHealth: RouteHealthStore;
+  /**
+   * Model that SERVED the most recent response, as the endpoint reported it
+   * (`message.model`), falling back to the route's model string. Null until the
+   * first response of the turn lands.
+   */
+  servedModel: string | null;
+  /**
+   * Index into `routes` of the route currently serving this turn. Advances when
+   * a route reports an outage and stays there for the rest of the turn (sticky):
+   * the history by then carries that route's tool_use blocks, and the next turn
+   * starts from the primary again.
+   */
+  routeIndex: number;
   maxTokens: number;
   /**
    * Org/mode-scoped system prefix, byte-identical for every user in that scope.
@@ -363,6 +389,16 @@ export interface OrchestrationTelemetry {
   finalStopReason: string | null;
   /** Token counts SUMMED across every iteration (not last-write-wins). */
   usage: UsageSummary;
+  /**
+   * The same counts split by the model that served each iteration (#403). A
+   * turn that fell over mid-way was served by two models at two prices, so a
+   * single summed figure times one rate would misprice it.
+   */
+  usageByModel: Record<string, UsageSummary>;
+  /** Model that served the LAST response of the turn, or null if none landed. */
+  servedModel: string | null;
+  /** Route that served the last response (the sticky route at turn end). */
+  route: RouteId;
   /** MCP/host-function calls made this run. */
   mcpCallsMade: number;
   /**
@@ -431,6 +467,7 @@ interface TelemetryAccumulator {
   exitReason: 'done' | 'max_iterations';
   finalStopReason: string | null;
   usage: UsageSummary;
+  usageByModel: Record<string, UsageSummary>;
   modeSwitchedTo: string | null;
   toolCalls: ToolCallRecord[];
 }
@@ -442,6 +479,7 @@ function createTelemetryAccumulator(): TelemetryAccumulator {
     exitReason: 'max_iterations',
     finalStopReason: null,
     usage: { ...EMPTY_USAGE },
+    usageByModel: {},
     modeSwitchedTo: null,
     toolCalls: [],
   };
@@ -512,16 +550,26 @@ function buildSystemBlocks(ctx: OrchestrationContext): Anthropic.TextBlockParam[
  *
  * Prompt caching is GA — no beta header is required.
  */
-export function buildMessageBody(ctx: OrchestrationContext, stream: boolean): string {
+export function buildMessageBody(
+  ctx: OrchestrationContext,
+  route: ModelRoute,
+  stream: boolean
+): string {
   return JSON.stringify({
-    model: ctx.model,
+    model: route.model,
     max_tokens: ctx.maxTokens,
     system: buildSystemBlocks(ctx),
     messages: ctx.messages,
     ...(ctx.tools.length > 0 ? { tools: ctx.tools } : {}),
-    cache_control: { type: 'ephemeral' },
+    // The rolling breakpoint is only honoured by Anthropic-direct endpoints (#403).
+    ...(route.topLevelCacheControl ? { cache_control: { type: 'ephemeral' } } : {}),
     stream,
   });
+}
+
+/** The route currently serving this turn. */
+function currentRoute(ctx: OrchestrationContext): ModelRoute {
+  return ctx.routes[ctx.routeIndex]!;
 }
 
 /**
@@ -745,27 +793,69 @@ function isOurTimeoutAbort(error: unknown): boolean {
   return (error as Error | undefined)?.name === 'AbortError';
 }
 
-function buildClaudeAbortSignal(timeoutMs: number): {
+/**
+ * Streaming-only first-byte deadline (#403). An endpoint that accepts the
+ * connection but never answers is the slowest kind of outage; without this a
+ * dead route costs the full 90s hang-guard before the chain can move on.
+ *
+ * Streaming only, on purpose: a non-streaming response sends its headers only
+ * after the whole generation, and a tool-heavy iteration routinely takes longer
+ * than this — a first-byte deadline on that path would manufacture outages.
+ */
+const CLAUDE_FIRST_BYTE_TIMEOUT_MS = 20_000;
+
+/**
+ * One controller, two timers. Both fire an identical `AbortError` out of `fetch`,
+ * so the two are told apart by STATE, not by the error: `firstByteFired` is set by
+ * the first-byte timer before it aborts, and `firstByteReceived()` clears that
+ * timer once the stream has yielded its first chunk — not when `fetch` resolves,
+ * because headers alone prove nothing: a `200` whose body never starts is the
+ * slowest outage of all (Codex review on #464).
+ */
+interface AttemptGuard {
   signal: AbortSignal;
+  /** Clears both timers. Caller MUST invoke once the body has been read. */
   cleanup: () => void;
-} {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  return { signal: controller.signal, cleanup: () => clearTimeout(timer) };
+  /** Call once the first body chunk has arrived: the first-byte deadline no longer applies. */
+  firstByteReceived: () => void;
+  /** True once the first-byte timer aborted the attempt. */
+  firstByteFired: () => boolean;
 }
 
-async function postToAnthropic(
-  body: string,
-  signal: AbortSignal,
-  apiKey: string
-): Promise<Response> {
-  return globalThis.fetch(ANTHROPIC_API_URL, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': ANTHROPIC_API_VERSION,
+function buildAttemptGuard(bodyTimeoutMs: number, firstByteTimeoutMs?: number): AttemptGuard {
+  const controller = new AbortController();
+  let firstByte = false;
+  const bodyTimer = setTimeout(() => controller.abort(), bodyTimeoutMs);
+  const firstByteTimer =
+    firstByteTimeoutMs === undefined
+      ? undefined
+      : setTimeout(() => {
+          firstByte = true;
+          controller.abort();
+        }, firstByteTimeoutMs);
+  const clearFirstByte = (): void => {
+    if (firstByteTimer !== undefined) clearTimeout(firstByteTimer);
+  };
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      clearTimeout(bodyTimer);
+      clearFirstByte();
     },
+    firstByteReceived: clearFirstByte,
+    firstByteFired: () => firstByte,
+  };
+}
+
+/** POST a Messages-API body to a route's endpoint with that route's credential (#403). */
+export async function postToRoute(
+  route: ModelRoute,
+  body: string,
+  signal: AbortSignal
+): Promise<Response> {
+  return globalThis.fetch(route.url, {
+    method: 'POST',
+    headers: route.headers(),
     body,
     signal,
   });
@@ -796,8 +886,15 @@ async function throwAnthropicHttpError(
   );
 }
 
-function logFetchCommencement(ctx: OrchestrationContext, body: string, streaming: boolean): void {
+function logFetchCommencement(
+  ctx: OrchestrationContext,
+  route: ModelRoute,
+  body: string,
+  streaming: boolean
+): void {
   ctx.logger.log('claude_fetch_start', {
+    route: route.id,
+    model: route.model,
     streaming,
     body_size_bytes: body.length,
     message_count: ctx.messages.length,
@@ -848,6 +945,10 @@ export interface AnthropicFetchResult {
 interface AnthropicAttemptFailure {
   response?: Response;
   networkError?: unknown;
+  /** The first-byte deadline aborted this attempt (streaming only). */
+  firstByteTimeout?: boolean;
+  /** A 2xx with no body, or (streaming) a body that closed before any byte. */
+  emptyResponse?: boolean;
   cleanup: () => void;
   fetchStart: number;
 }
@@ -855,36 +956,204 @@ interface AnthropicAttemptFailure {
 type AnthropicAttemptOutcome =
   { ok: true; result: AnthropicFetchResult } | ({ ok: false } & AnthropicAttemptFailure);
 
-/** Perform a single Anthropic fetch attempt with its own hang-guard signal. */
-async function attemptAnthropicFetch(
+/** Perform a single fetch attempt against `route` with its own hang-guard signal. */
+async function attemptRouteFetch(
   ctx: OrchestrationContext,
+  route: ModelRoute,
   body: string,
   streaming: boolean,
   attempt: number
 ): Promise<AnthropicAttemptOutcome> {
-  const { signal, cleanup } = buildClaudeAbortSignal(CLAUDE_REQUEST_TIMEOUT_MS);
+  const guard = buildAttemptGuard(
+    CLAUDE_REQUEST_TIMEOUT_MS,
+    streaming ? CLAUDE_FIRST_BYTE_TIMEOUT_MS : undefined
+  );
+  const { signal, cleanup } = guard;
   const fetchStart = Date.now();
   try {
-    const response = await postToAnthropic(body, signal, ctx.apiKey);
+    const headersOnly = await postToRoute(route, body, signal);
     ctx.logger.log('claude_fetch_response_received', {
+      route: route.id,
       streaming,
-      status: response.status,
+      status: headersOnly.status,
       attempt,
-      has_body: !!response.body,
+      has_body: !!headersOnly.body,
       duration_ms: Date.now() - fetchStart,
     });
-    if (response.ok) return { ok: true, result: { response, signal, cleanup, fetchStart } };
-    return { ok: false, response, cleanup, fetchStart };
+    if (!headersOnly.ok) return { ok: false, response: headersOnly, cleanup, fetchStart };
+    // A 2xx that carries nothing is a broken endpoint, not a success; it must
+    // stay inside the chain. Both paths wait for the first NON-EMPTY chunk: a
+    // null body, a stream that closes before one, or zero-length chunks then
+    // EOF all count as empty. Only the streaming path arms the 20s timer
+    // (non-streaming headers arrive after the whole generation), so the
+    // non-streaming wait here is bounded by the 90s body guard alone.
+    const response = await awaitFirstChunk(headersOnly, signal);
+    if (!response)
+      return { ok: false, response: headersOnly, emptyResponse: true, cleanup, fetchStart };
+    guard.firstByteReceived();
+    return { ok: true, result: { response, signal, cleanup, fetchStart } };
   } catch (networkError) {
-    return { ok: false, networkError, cleanup, fetchStart };
+    return {
+      ok: false,
+      networkError,
+      firstByteTimeout: guard.firstByteFired(),
+      cleanup,
+      fetchStart,
+    };
   }
+}
+
+/** Rejects with an `AbortError` the moment `signal` aborts (already-aborted included). */
+function rejectOnAbort(signal: AbortSignal): Promise<never> {
+  return new Promise((_resolve, reject) => {
+    const abort = (): void => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+    if (signal.aborted) abort();
+    else signal.addEventListener('abort', abort, { once: true });
+  });
+}
+
+/**
+ * Wait for the first NON-EMPTY body chunk under the attempt's signal, then hand
+ * back an equivalent response whose body replays that chunk ahead of the rest.
+ * Returns null when there is no body or the stream closes before any byte —
+ * the caller treats both as an outage (Codex review on #464).
+ *
+ * `fetch` resolves on headers; in workerd a later abort of the fetch signal does
+ * tear the body down, but a test double's body is not tied to the signal, so the
+ * read is raced against the signal explicitly rather than trusting the stream to
+ * error. On abort the reader is cancelled and the AbortError propagates to the
+ * caller's catch, where `firstByteFired()` classifies it.
+ */
+async function awaitFirstChunk(response: Response, signal: AbortSignal): Promise<Response | null> {
+  if (!response.body) return null;
+  const reader = response.body.getReader();
+  let first: ReadableStreamReadResult<Uint8Array>;
+  try {
+    do {
+      first = await Promise.race([reader.read(), rejectOnAbort(signal)]);
+    } while (!first.done && first.value.byteLength === 0);
+  } catch (error) {
+    // Best-effort release of the upstream connection; the abort itself is what the
+    // caller logs (`claude_route_outage` / `claude_fetch_aborted`), so a cancel
+    // rejection — e.g. the stream already errored — adds nothing.
+    reader.cancel('first-byte-timeout').catch(() => undefined);
+    throw error;
+  }
+  if (first.done) return null;
+  const chunk = first.value;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(chunk);
+    },
+    async pull(controller) {
+      const { done, value } = await reader.read();
+      if (done) controller.close();
+      else controller.enqueue(value);
+    },
+    cancel: (reason) => reader.cancel(reason),
+  });
+  return new Response(body, { status: response.status, headers: response.headers });
 }
 
 /** Whether a failed attempt is worth retrying (excludes our own timeout abort). */
 function isAttemptRetryable(failure: AnthropicAttemptFailure): boolean {
+  if (failure.firstByteTimeout || failure.emptyResponse) return true;
   return failure.networkError
     ? !isOurTimeoutAbort(failure.networkError)
     : isRetryableStatus(failure.response!.status);
+}
+
+/**
+ * Why a route is considered DOWN (#403). Bounded enum — safe as a metric label.
+ * `forced` is the staging drill (`FALLBACK_FORCE_ROUTE`), never a real failure.
+ */
+export type OutageReason =
+  'network_error' | 'first_byte_timeout' | 'empty_response' | 'http_5xx' | 'forced';
+
+/** Statuses that mean "this endpoint cannot serve right now". 429 is deliberately absent. */
+const OUTAGE_STATUSES = new Set([500, 502, 503, 504, 529]);
+
+/**
+ * Classify a failed attempt as outage-class or not. A 429 is a rate limit, not an
+ * outage: failing over on it would only migrate the throttling to the next
+ * provider, so it stays on the route under the normal retry policy. Our own
+ * body hang-guard abort is terminal, as before.
+ */
+function classifyOutage(failure: AnthropicAttemptFailure): OutageReason | null {
+  if (failure.firstByteTimeout) return 'first_byte_timeout';
+  if (failure.emptyResponse) return 'empty_response';
+  if (failure.networkError) return isOurTimeoutAbort(failure.networkError) ? null : 'network_error';
+  return OUTAGE_STATUSES.has(failure.response!.status) ? 'http_5xx' : null;
+}
+
+/** A route gave up: either a successful fetch, or an outage the caller may route around. */
+export type RouteFetchOutcome =
+  | { ok: true; result: AnthropicFetchResult }
+  | { ok: false; outage: OutageReason; status: number | undefined; attempts: number };
+
+/**
+ * Release a failed attempt and report the route as down. Drains the error body
+ * (best-effort, like the retry path) so the connection is freed before the chain
+ * moves on; the body is discarded on cleanup regardless.
+ */
+async function reportRouteOutage(
+  ctx: OrchestrationContext,
+  route: ModelRoute,
+  streaming: boolean,
+  failure: AnthropicAttemptFailure,
+  verdict: { outage: OutageReason; attempts: number }
+): Promise<RouteFetchOutcome> {
+  const status = failure.response?.status;
+  ctx.logger.warn('claude_route_outage', {
+    route: route.id,
+    model: route.model,
+    streaming,
+    outage: verdict.outage,
+    status,
+    attempts: verdict.attempts,
+    network_error: failure.networkError ? (failure.networkError as Error).message : undefined,
+  });
+  try {
+    if (failure.response) await failure.response.text().catch(() => undefined);
+  } finally {
+    failure.cleanup();
+  }
+  return { ok: false, outage: verdict.outage, status, attempts: verdict.attempts };
+}
+
+/** What to do after a failed attempt on a route. */
+type RetryDecision =
+  | { action: 'outage'; outage: OutageReason }
+  | { action: 'give_up'; reason: 'max_attempts' | 'overall_window_exceeded' | null }
+  | { action: 'retry'; delayMs: number; retryAfterMs: number };
+
+function decideAfterFailure(
+  route: ModelRoute,
+  failure: AnthropicAttemptFailure,
+  attempt: number,
+  overallStart: number,
+  clock: RetryClock
+): RetryDecision {
+  const isLast = attempt >= CLAUDE_MAX_ATTEMPTS;
+  const retryable = isAttemptRetryable(failure);
+  const { delayMs, retryAfterMs } = computeRetryDelay(attempt, failure, clock);
+  const windowExceeded = clock.now() - overallStart + delayMs > CLAUDE_OVERALL_RETRY_WINDOW_MS;
+
+  const outage = classifyOutage(failure);
+  if (outage && (attempt >= route.outageAttempts || windowExceeded)) {
+    return { action: 'outage', outage };
+  }
+  if (!retryable) return { action: 'give_up', reason: null };
+  if (isLast) return { action: 'give_up', reason: 'max_attempts' };
+  if (windowExceeded) return { action: 'give_up', reason: 'overall_window_exceeded' };
+  return { action: 'retry', delayMs, retryAfterMs };
+}
+
+export interface RouteRetryOptions {
+  streaming: boolean;
+  /** Start of the whole chain's wall-clock window, so the window spans routes. */
+  overallStart: number;
+  clock?: RetryClock;
 }
 
 /**
@@ -970,27 +1239,41 @@ async function exhaustAnthropicRetries(
   }
 }
 
-export async function fetchAnthropicWithRetry(
+/**
+ * POST `body` to ONE route with retry/backoff (#248) and outage classification (#403).
+ *
+ * Outage-class failures (connection error, first-byte timeout, 5xx/529) get
+ * `route.outageAttempts` tries — or fewer if the overall window runs out — and
+ * then RETURN a tagged outage so the caller can move to the next route. Every
+ * other failure keeps the original policy: 429 retries up to CLAUDE_MAX_ATTEMPTS
+ * inside the window, deterministic 4xx and our own body hang-guard abort throw
+ * at once. `overallStart` is supplied by the caller so the window spans the
+ * whole chain, not each route.
+ */
+export async function fetchRouteWithRetry(
   ctx: OrchestrationContext,
+  route: ModelRoute,
   body: string,
-  streaming: boolean,
-  clock: RetryClock = REAL_CLOCK
-): Promise<AnthropicFetchResult> {
-  const overallStart = clock.now();
+  opts: RouteRetryOptions
+): Promise<RouteFetchOutcome> {
+  const { streaming, overallStart } = opts;
+  const clock = opts.clock ?? REAL_CLOCK;
   for (let attempt = 1; attempt <= CLAUDE_MAX_ATTEMPTS; attempt++) {
-    const outcome = await attemptAnthropicFetch(ctx, body, streaming, attempt);
-    if (outcome.ok) return outcome.result;
+    const outcome = await attemptRouteFetch(ctx, route, body, streaming, attempt);
+    if (outcome.ok) return outcome;
 
-    const isLast = attempt >= CLAUDE_MAX_ATTEMPTS;
-    const retryable = isAttemptRetryable(outcome);
-    const { delayMs, retryAfterMs } = computeRetryDelay(attempt, outcome, clock);
-    const windowExceeded = clock.now() - overallStart + delayMs > CLAUDE_OVERALL_RETRY_WINDOW_MS;
-
-    if (!retryable || isLast || windowExceeded) {
-      const reason = isLast ? 'max_attempts' : 'overall_window_exceeded';
-      await exhaustAnthropicRetries(ctx, streaming, attempt, outcome, retryable ? reason : null);
+    const decision = decideAfterFailure(route, outcome, attempt, overallStart, clock);
+    if (decision.action === 'outage') {
+      return reportRouteOutage(ctx, route, streaming, outcome, {
+        outage: decision.outage,
+        attempts: attempt,
+      });
+    }
+    if (decision.action === 'give_up') {
+      await exhaustAnthropicRetries(ctx, streaming, attempt, outcome, decision.reason);
     }
 
+    const { delayMs, retryAfterMs } = decision as Extract<RetryDecision, { action: 'retry' }>;
     logAnthropicRetry(ctx, streaming, outcome, { attempt, delayMs, retryAfterMs });
     // Drain the error body so the connection is freed before we back off. Best-effort:
     // the retry is already logged above, and a failed drain is harmless (the body is
@@ -1000,20 +1283,158 @@ export async function fetchAnthropicWithRetry(
     await clock.sleep(delayMs);
   }
   // Unreachable: every iteration either returns or throws.
-  throw new Error('fetchAnthropicWithRetry: exhausted loop without resolution');
+  throw new Error('fetchRouteWithRetry: exhausted loop without resolution');
+}
+
+type RouteOutage = Extract<RouteFetchOutcome, { ok: false }>;
+
+/** A route that answered, with the fetch result the caller must consume. */
+interface ServedFetch {
+  result: AnthropicFetchResult;
+  route: ModelRoute;
+}
+
+/**
+ * Try ONE route for this call. A route before the forced one (staging drill)
+ * reports a synthetic outage without any network call; otherwise the body is
+ * built for that route (model string, cache flags) and sent with retry.
+ */
+async function tryRoute(
+  ctx: OrchestrationContext,
+  route: ModelRoute,
+  streaming: boolean,
+  overallStart: number
+): Promise<RouteFetchOutcome> {
+  if (ctx.routes.indexOf(route) < ctx.forcedRouteIndex) {
+    return { ok: false, outage: 'forced', status: undefined, attempts: 0 };
+  }
+  const body = buildMessageBody(ctx, route, streaming);
+  assertRequestBodyWithinLimit(body, ctx);
+  logFetchCommencement(ctx, route, body, streaming);
+  return fetchRouteWithRetry(ctx, route, body, { streaming, overallStart, clock: ctx.clock });
+}
+
+/** The breaker told us this route is down; say so and move on without a network call. */
+function recordRouteSkip(ctx: OrchestrationContext, route: ModelRoute): void {
+  ctx.logger.warn('route_breaker_skipped', { route: route.id, model: route.model });
+  countMetric('route_breaker_total', { route: route.id, reason: 'skipped' });
+}
+
+/** Open the shared breaker for a route that just reported a REAL outage (never for the drill). */
+async function markRouteDown(
+  ctx: OrchestrationContext,
+  route: ModelRoute,
+  outage: RouteOutage
+): Promise<void> {
+  if (outage.outage === 'forced') return;
+  await ctx.routeHealth.open(route, outage);
+}
+
+/** Log and meter one hop from a route that is down to the next one in the chain. */
+function recordRouteHop(
+  ctx: OrchestrationContext,
+  from: ModelRoute,
+  to: ModelRoute,
+  outage: RouteOutage
+): void {
+  ctx.logger.warn('model_route_fallback', {
+    ...(ctx.turnId ? { turn_id: ctx.turnId } : {}),
+    from_route: from.id,
+    to_route: to.id,
+    from_model: from.model,
+    to_model: to.model,
+    outage: outage.outage,
+    status: outage.status,
+    attempts: outage.attempts,
+  });
+  countMetric('model_route_fallback_total', {
+    from_route: from.id,
+    to_route: to.id,
+    reason: outage.outage,
+  });
+}
+
+/**
+ * Walk the chain from the route currently serving this turn (#403).
+ *
+ * On success the serving route becomes STICKY for the rest of the turn: the
+ * history now carries that route's tool_use blocks, and bouncing back to a route
+ * that just failed would only re-pay its outage budget. The next turn starts at
+ * the primary again. When the last route is down too, the error that escapes is
+ * generic on purpose — per-route reasons are already in the logs.
+ */
+async function fetchWithRouteFallback(
+  ctx: OrchestrationContext,
+  streaming: boolean
+): Promise<ServedFetch> {
+  const overallStart = ctx.clock.now();
+  const attempted: RouteId[] = [];
+  let last: { route: ModelRoute; outage: RouteOutage } | undefined;
+  for (const route of await eligibleRoutes(ctx)) {
+    // The hop is recorded when its destination is actually tried, so a skipped
+    // route in between never shows up as a `to_route`.
+    if (last) recordRouteHop(ctx, last.route, route, last.outage);
+    attempted.push(route.id);
+    const outcome = await tryRoute(ctx, route, streaming, overallStart);
+    if (outcome.ok) {
+      ctx.routeIndex = ctx.routes.indexOf(route);
+      return { result: outcome.result, route };
+    }
+    last = { route, outage: outcome };
+    await markRouteDown(ctx, route, outcome);
+  }
+  ctx.logger.error('model_route_chain_exhausted', null, {
+    ...(ctx.turnId ? { turn_id: ctx.turnId } : {}),
+    streaming,
+    routes_attempted: attempted,
+    routes_attempted_count: attempted.length,
+    last_outage: last?.outage.outage,
+    last_status: last?.outage.status,
+  });
+  throw new RouteChainExhaustedError(attempted, last?.outage.outage ?? 'none', last?.outage.status);
+}
+
+/**
+ * The routes to try this call, in chain order from the cursor, minus the ones
+ * the breaker says are open. When EVERY candidate is open there is nothing left
+ * to prefer, so nothing is skipped: a breaker must never turn a partial outage
+ * into a total one.
+ */
+async function eligibleRoutes(ctx: OrchestrationContext): Promise<ModelRoute[]> {
+  const candidates = ctx.routes.slice(ctx.routeIndex);
+  const open = await ctx.routeHealth.readOpen(candidates.map((r) => r.id));
+  if (candidates.every((r) => open.has(r.id))) return candidates;
+  return candidates.filter((route) => {
+    if (!open.has(route.id)) return true;
+    recordRouteSkip(ctx, route);
+    return false;
+  });
+}
+
+/** Remember which model answered: the endpoint's own `model` field, else the route's. */
+function recordServedModel(
+  ctx: OrchestrationContext,
+  route: ModelRoute,
+  message: Anthropic.Message
+): void {
+  ctx.servedModel =
+    typeof message.model === 'string' && message.model ? message.model : route.model;
 }
 
 async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message> {
   if (ctx.callbacks) return streamClaudeResponse(ctx);
-  const body = buildMessageBody(ctx, false);
-  assertRequestBodyWithinLimit(body, ctx);
-  logFetchCommencement(ctx, body, false);
   // signal omitted: the body read below is governed by the fetch's signal regardless;
   // cleanup (in finally) keeps the hang-guard timer live until the read completes.
-  const { response, cleanup, fetchStart } = await fetchAnthropicWithRetry(ctx, body, false);
+  const {
+    result: { response, cleanup, fetchStart },
+    route,
+  } = await fetchWithRouteFallback(ctx, false);
   try {
     const parsed = (await response.json()) as Anthropic.Message;
+    recordServedModel(ctx, route, parsed);
     ctx.logger.log('claude_fetch_complete', {
+      route: route.id,
+      served_model: ctx.servedModel,
       streaming: false,
       stop_reason: parsed.stop_reason,
       content_blocks: parsed.content.length,
@@ -1029,14 +1450,17 @@ async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message>
 }
 
 async function streamClaudeResponse(ctx: OrchestrationContext): Promise<Anthropic.Message> {
-  const body = buildMessageBody(ctx, true);
-  assertRequestBodyWithinLimit(body, ctx);
-  logFetchCommencement(ctx, body, true);
-  const { response, signal, cleanup, fetchStart } = await fetchAnthropicWithRetry(ctx, body, true);
+  const {
+    result: { response, signal, cleanup, fetchStart },
+    route,
+  } = await fetchWithRouteFallback(ctx, true);
   try {
     if (!response.body) await throwAnthropicHttpError(ctx, response, true, fetchStart);
     const parsed = await parseSSEStream(response.body!, ctx.logger, ctx.callbacks, signal);
+    recordServedModel(ctx, route, parsed);
     ctx.logger.log('claude_fetch_complete', {
+      route: route.id,
+      served_model: ctx.servedModel,
       streaming: true,
       stop_reason: parsed.stop_reason,
       content_blocks: parsed.content.length,
@@ -1269,13 +1693,17 @@ async function callClaudeForIteration(
   const callStart = Date.now();
   try {
     const response = await callClaude(ctx);
-    recordMetric('claude_fetch_duration_ms', Date.now() - callStart, { status: 'success' });
-    countMetric('claude_fetch_total', { status: 'success' });
+    // Read AFTER the call: the chain may have advanced the serving route (#403).
+    const route = currentRoute(ctx).id;
+    recordMetric('claude_fetch_duration_ms', Date.now() - callStart, { status: 'success', route });
+    countMetric('claude_fetch_total', { status: 'success', route });
     return response;
   } catch (error) {
-    recordMetric('claude_fetch_duration_ms', Date.now() - callStart, { status: 'error' });
+    const route = currentRoute(ctx).id;
+    recordMetric('claude_fetch_duration_ms', Date.now() - callStart, { status: 'error', route });
     countMetric('claude_fetch_total', {
       status: 'error',
+      route,
       error_name: error instanceof Error ? error.name : 'Error',
     });
     ctx.logger.error('iteration_claude_call_failed', error, {
@@ -1318,7 +1746,13 @@ async function executeIterationTools(
  * information while still costing cardinality.
  */
 function emitUsageMetrics(ctx: OrchestrationContext, usage: UsageSummary): void {
-  const labels = { model: ctx.model, ...(ctx.activeMode ? { mode: ctx.activeMode } : {}) };
+  // Labelled by the model that SERVED this call, not the one requested (#403):
+  // after a fallback the two differ, and the price follows the served one.
+  const labels = {
+    model: ctx.servedModel ?? ctx.model,
+    route: currentRoute(ctx).id,
+    ...(ctx.activeMode ? { mode: ctx.activeMode } : {}),
+  };
 
   const counters: Array<[string, number, Record<string, string>]> = [
     ['claude_input_tokens_total', usage.input_tokens, labels],
@@ -1355,10 +1789,15 @@ function reportClaudeResponse(
   const usage = summarizeUsage(response.usage);
   // Accumulate BEFORE logging so a throw in the log path cannot lose the counts.
   addUsage(ctx.telemetry.usage, usage);
+  const servedModel = ctx.servedModel ?? ctx.model;
+  const perModel = (ctx.telemetry.usageByModel[servedModel] ??= { ...EMPTY_USAGE });
+  addUsage(perModel, usage);
   ctx.telemetry.finalStopReason = response.stop_reason;
   ctx.logger.log('claude_response', {
     ...(ctx.turnId ? { turn_id: ctx.turnId } : {}),
     iteration,
+    served_model: servedModel,
+    route: currentRoute(ctx).id,
     stop_reason: response.stop_reason,
     tool_calls_count: toolCalls.length,
     text_blocks_count: response.content.filter((b) => b.type === 'text').length,
@@ -1370,6 +1809,42 @@ function reportClaudeResponse(
     billable_input_tokens: usage.billable_input_tokens,
   });
   emitUsageMetrics(ctx, usage);
+}
+
+/**
+ * Make a response safe to replay as history (#403). Anthropic tolerates these
+ * shapes on the way OUT but rejects them on the way back IN, and a fallback
+ * model behind a translator may be less forgiving still:
+ * - a `tool_use.input` left as a raw string because its JSON never parsed
+ *   (see `finalizeToolInput`) becomes `{}` — the tool then fails validation
+ *   loudly instead of the whole next request 400ing;
+ * - an empty text block is dropped (`messages.N: text content blocks must be
+ *   non-empty`).
+ */
+function sanitizeAssistantContent(
+  content: Anthropic.ContentBlock[],
+  logger: RequestLogger
+): Anthropic.ContentBlock[] {
+  let coercedInputs = 0;
+  let droppedEmptyText = 0;
+  const cleaned = content.filter((block) => {
+    if (block.type === 'text' && block.text.length === 0) {
+      droppedEmptyText += 1;
+      return false;
+    }
+    if (block.type === 'tool_use' && typeof block.input === 'string') {
+      (block as { input: unknown }).input = {};
+      coercedInputs += 1;
+    }
+    return true;
+  });
+  if (coercedInputs > 0 || droppedEmptyText > 0) {
+    logger.warn('assistant_content_sanitized', {
+      coerced_tool_inputs: coercedInputs,
+      dropped_empty_text_blocks: droppedEmptyText,
+    });
+  }
+  return cleaned;
 }
 
 function processIteration(ctx: OrchestrationContext, iteration: number): Promise<boolean> {
@@ -1401,6 +1876,7 @@ function processIteration(ctx: OrchestrationContext, iteration: number): Promise
     }
 
     const response = await callClaudeForIteration(ctx, iteration, iterStart);
+    response.content = sanitizeAssistantContent(response.content, ctx.logger);
     const toolCalls = extractToolCalls(response.content);
     reportClaudeResponse(ctx, { iteration, response, toolCalls, iterStart });
 
@@ -1485,7 +1961,8 @@ function parseIntEnvVar(
 }
 
 function parseClaudeConfig(env: Env, logger: RequestLogger) {
-  const model = env.CLAUDE_MODEL ?? DEFAULT_MODEL;
+  const chain = buildRouteChain(env, logger);
+  const model = chain.routes[0]!.model;
   if (!env.CLAUDE_MODEL) {
     logger.log('config_default', { key: 'CLAUDE_MODEL', value: model });
   }
@@ -1495,7 +1972,7 @@ function parseClaudeConfig(env: Env, logger: RequestLogger) {
     DEFAULT_MAX_TOKENS,
     logger
   );
-  return { model, maxTokens };
+  return { model, maxTokens, chain };
 }
 
 function parseOrchestrationConfig(env: Env, logger: RequestLogger) {
@@ -1664,6 +2141,37 @@ function turnTools(catalog: ToolCatalog, options: OrchestratorOptions): Anthropi
   });
 }
 
+/** The route-chain slice of the context (#403): requested model, chain, cursor, drill, clock. */
+function routingState(
+  config: ReturnType<typeof parseEnvConfig>,
+  options: OrchestratorOptions
+): Pick<
+  OrchestrationContext,
+  'model' | 'routes' | 'routeIndex' | 'forcedRouteIndex' | 'clock' | 'routeHealth' | 'servedModel'
+> {
+  const { routes, forcedRoute } = config.chain;
+  return {
+    model: config.model,
+    routes,
+    routeIndex: 0,
+    servedModel: null,
+    forcedRouteIndex: routes.findIndex((r) => r.id === forcedRoute),
+    clock: options.retryClock ?? REAL_CLOCK,
+    routeHealth: options.routeHealth ?? defaultRouteHealthStore(options.env, options.logger),
+  };
+}
+
+/**
+ * The KV breaker when the binding exists; otherwise a per-request memory store,
+ * which is a no-op across turns. Only test fixtures omit the binding, but a
+ * missing one is still logged so a misconfigured deploy cannot hide behind it.
+ */
+function defaultRouteHealthStore(env: Env, logger: RequestLogger): RouteHealthStore {
+  if (env.ORG_CONFIG) return createKvRouteHealthStore(env.ORG_CONFIG, logger);
+  logger.warn('route_health_store_unavailable', { reason: 'ORG_CONFIG binding missing' });
+  return createMemoryRouteHealthStore();
+}
+
 function createOrchestrationContext(
   userMessage: string,
   options: OrchestratorOptions,
@@ -1685,8 +2193,7 @@ function createOrchestrationContext(
 
   return {
     client: new Anthropic({ apiKey: env.ANTHROPIC_API_KEY }),
-    apiKey: env.ANTHROPIC_API_KEY,
-    model: config.model,
+    ...routingState(config, options),
     maxTokens: config.maxTokens,
     systemStable: systemBlocks.stable,
     systemVolatile: systemBlocks.volatile,
@@ -1801,6 +2308,9 @@ function logOrchestrationSummary(ctx: OrchestrationContext): void {
 
 function handleOrchestrationError(error: unknown, logger: RequestLogger): never {
   logger.error('claude_error', error);
+  // Domain errors (RouteChainExhaustedError, MCPError, …) already carry a code
+  // and status; only a raw SDK error needs wrapping.
+  if (error instanceof AppError) throw error;
   if (error instanceof Anthropic.APIError) {
     throw new ClaudeAPIError(error.message, error.status);
   }
@@ -1870,6 +2380,9 @@ function buildOrchestrationTelemetry(ctx: OrchestrationContext): OrchestrationTe
     exitReason: ctx.telemetry.exitReason,
     finalStopReason: ctx.telemetry.finalStopReason,
     usage: ctx.telemetry.usage,
+    usageByModel: ctx.telemetry.usageByModel,
+    servedModel: ctx.servedModel,
+    route: currentRoute(ctx).id,
     mcpCallsMade: ctx.mcpCallsMade.count,
     mode: ctx.activeMode,
     modeSwitchedTo: ctx.telemetry.modeSwitchedTo,

@@ -25,6 +25,16 @@ export interface Env {
   CLAUDE_MODEL?: string;
   CLAUDE_MAX_TOKENS?: string;
 
+  // Model fallback chain (#403) — see src/services/claude/routes.ts.
+  /** Tier-2 Claude model on Anthropic's API. Default `claude-opus-4-6`; `""` disables the tier. */
+  FALLBACK_CLAUDE_MODEL?: string;
+  /** Tier-3 model slug on OpenRouter. Default `anthropic/claude-sonnet-4.6`. */
+  OPENROUTER_CLAUDE_MODEL?: string;
+  /** Tier-4 (non-Claude) model slug on OpenRouter. Unset ⇒ tier absent. */
+  OPENROUTER_ALT_MODEL?: string;
+  /** Staging-only outage drill: routes before this id report a synthetic outage. Refused in production. */
+  FALLBACK_FORCE_ROUTE?: string;
+
   // MCP call limits (optional - has defaults)
   MAX_MCP_CALLS_PER_EXECUTION?: string;
   MAX_MCP_CALLS_PER_REQUEST?: string;
@@ -40,6 +50,8 @@ export interface Env {
   ANTHROPIC_API_KEY: string;
   ENGINE_API_KEY: string;
   OPENAI_API_KEY: string;
+  /** OpenRouter key for the two OpenRouter fallback tiers (#403). Unset ⇒ both tiers absent. */
+  OPENROUTER_API_KEY?: string;
 
   // KV Namespaces
   ORG_ADMIN_KEYS: KVNamespace;

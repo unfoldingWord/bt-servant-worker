@@ -64,6 +64,22 @@ export class ClaudeAPIError extends AppError {
   }
 }
 
+/**
+ * Every model route in the fallback chain reported an outage (#403). The
+ * message is deliberately generic: per-route diagnostics (network error text,
+ * upstream bodies) go to the logs, never to the user-facing detail.
+ */
+export class RouteChainExhaustedError extends ClaudeAPIError {
+  constructor(
+    public readonly routesAttempted: readonly string[],
+    public readonly lastOutage: string,
+    lastStatus?: number
+  ) {
+    super(`All model routes failed (last: ${lastOutage})`, lastStatus);
+    this.name = 'RouteChainExhaustedError';
+  }
+}
+
 export class TimeoutError extends AppError {
   constructor(message: string = 'Operation timed out') {
     super(message, 'TIMEOUT_ERROR', 504);
