@@ -10,6 +10,10 @@ import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import Anthropic from '@anthropic-ai/sdk';
 import { orchestrate, type RetryClock } from '../../src/services/claude/orchestrator.js';
 import { ClaudeAPIError } from '../../src/utils/errors.js';
+import {
+  createMemoryRouteHealthStore,
+  type RouteHealthStore,
+} from '../../src/services/claude/route-health.js';
 import type { Env } from '../../src/config/types.js';
 import type { RequestLogger } from '../../src/utils/logger.js';
 import type { ToolCatalog } from '../../src/services/mcp/index.js';
@@ -293,5 +297,86 @@ describe('route chain — FALLBACK_FORCE_ROUTE drill', () => {
     );
 
     expect(calls.map((c) => c.model)).toEqual(['claude-sonnet-4-6']);
+  });
+});
+
+describe('route chain — shared breaker', () => {
+  async function runWithStore(env: Env, sink: LoggedEvent[], routeHealth: RouteHealthStore) {
+    return orchestrate('hello', {
+      env,
+      catalog: { tools: [], serverMap: new Map() } as ToolCatalog,
+      history: [],
+      preferences: { response_language: 'en', first_interaction: false },
+      logger: createMockLogger(sink),
+      retryClock: INSTANT_CLOCK,
+      routeHealth,
+    });
+  }
+
+  it('a route the breaker reports open is skipped without a network call', async () => {
+    const sink: LoggedEvent[] = [];
+    const store = createMemoryRouteHealthStore();
+    await store.open({ id: 'primary', model: 'claude-sonnet-4-6' } as never, {
+      outage: 'http_5xx',
+      status: 529,
+      attempts: 2,
+    });
+    const calls = scriptFetch((c) => json(message('skipped primary', c.model)));
+
+    const result = await runWithStore(fullEnv(), sink, store);
+
+    expect(result.responses).toEqual(['skipped primary']);
+    expect(calls.map((c) => c.model)).toEqual(['claude-opus-4-6']);
+    const skipped = eventsNamed(sink, 'route_breaker_skipped');
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]!.data).toMatchObject({ route: 'primary' });
+  });
+
+  it('an outage opens the breaker for that route; a forced skip does not', async () => {
+    const sink: LoggedEvent[] = [];
+    const store = createMemoryRouteHealthStore();
+    scriptFetch((c) =>
+      c.model === 'claude-sonnet-4-6' ? status(503) : json(message('ok', c.model))
+    );
+
+    await runWithStore(fullEnv(), sink, store);
+    expect([...(await store.readOpen(['primary', 'anthropic-alt']))]).toEqual(['primary']);
+
+    const drillStore = createMemoryRouteHealthStore();
+    await runWithStore(fullEnv({ FALLBACK_FORCE_ROUTE: 'anthropic-alt' }), [], drillStore);
+    expect((await drillStore.readOpen(['primary', 'anthropic-alt'])).size).toBe(0);
+  });
+});
+
+describe('route chain — breaker cannot cause a total outage', () => {
+  async function runWithStore(env: Env, sink: LoggedEvent[], routeHealth: RouteHealthStore) {
+    return orchestrate('hello', {
+      env,
+      catalog: { tools: [], serverMap: new Map() } as ToolCatalog,
+      history: [],
+      preferences: { response_language: 'en', first_interaction: false },
+      logger: createMockLogger(sink),
+      retryClock: INSTANT_CLOCK,
+      routeHealth,
+    });
+  }
+
+  it('when every route is open they are all tried anyway, in order', async () => {
+    const sink: LoggedEvent[] = [];
+    const store = createMemoryRouteHealthStore();
+    for (const id of ['primary', 'anthropic-alt', 'openrouter-claude', 'openrouter-alt']) {
+      await store.open({ id, model: 'm' } as never, {
+        outage: 'http_5xx',
+        status: 503,
+        attempts: 1,
+      });
+    }
+    const calls = scriptFetch((c) => json(message('all open', c.model)));
+
+    const result = await runWithStore(fullEnv(), sink, store);
+
+    expect(result.responses).toEqual(['all open']);
+    expect(calls.map((c) => c.model)).toEqual(['claude-sonnet-4-6']);
+    expect(eventsNamed(sink, 'route_breaker_skipped')).toHaveLength(0);
   });
 });

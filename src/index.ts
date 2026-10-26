@@ -684,7 +684,17 @@ app.delete('/api/v1/admin/orgs/:org/mcp-servers/:serverId', async (c) => {
   }
 });
 
-// Admin endpoints for org config management
+// Admin endpoints for org config management.
+// `ORG_CONFIG` also holds the model-route breaker (#403) under reserved
+// `__route_health__:<route>` keys, and these routes take the org id straight
+// from the path — so a `__`-prefixed "org" must never reach the KV calls.
+app.use('/api/v1/admin/orgs/:org/config', async (c, next) => {
+  if (c.req.param('org').startsWith('__')) {
+    return c.json({ error: 'Org ids starting with "__" are reserved' }, 400);
+  }
+  return next();
+});
+
 app.get('/api/v1/admin/orgs/:org/config', async (c) => {
   const org = c.req.param('org');
   const logger = createRequestLogger(crypto.randomUUID());

@@ -33,6 +33,11 @@ import {
 import { redactToolInputForError, RequestLogger, summarizeToolInput } from '../../utils/logger.js';
 import { stripUlyssesComments } from '../../utils/ulysses-comments.js';
 import { buildRouteChain, ModelRoute, RouteId } from './routes.js';
+import {
+  createKvRouteHealthStore,
+  createMemoryRouteHealthStore,
+  RouteHealthStore,
+} from './route-health.js';
 import { UnmatchedTrigger } from '../classifier/index.js';
 import { createMCPHostFunctions, executeCode } from '../code-execution/index.js';
 import { withSpan, recordSpanError, countMetric, recordMetric } from '../telemetry/index.js';
@@ -197,6 +202,8 @@ interface OrchestratorOptions {
   workerOrigin?: string | undefined;
   /** Clock for retry backoff and the route-chain window (#403). Tests inject an instant one. */
   retryClock?: RetryClock | undefined;
+  /** Shared route breaker (#403). Defaults to the KV store on `ORG_CONFIG`; tests inject a memory one. */
+  routeHealth?: RouteHealthStore | undefined;
   clientId?: string | undefined;
   groupContext?: GroupChatContext | undefined;
   isVoiceMessage?: boolean | undefined;
@@ -282,6 +289,8 @@ interface OrchestrationContext {
   forcedRouteIndex: number;
   /** Clock for retry backoff and the chain window; injectable so tests run instantly. */
   clock: RetryClock;
+  /** Shared breaker (#403): which routes other turns found down recently. */
+  routeHealth: RouteHealthStore;
   /**
    * Index into `routes` of the route currently serving this turn. Advances when
    * a route reports an outage and stays there for the rest of the turn (sticky):
@@ -1220,6 +1229,22 @@ async function tryRoute(
   return fetchRouteWithRetry(ctx, route, body, { streaming, overallStart, clock: ctx.clock });
 }
 
+/** The breaker told us this route is down; say so and move on without a network call. */
+function recordRouteSkip(ctx: OrchestrationContext, route: ModelRoute): void {
+  ctx.logger.warn('route_breaker_skipped', { route: route.id, model: route.model });
+  countMetric('route_breaker_total', { route: route.id, reason: 'skipped' });
+}
+
+/** Open the shared breaker for a route that just reported a REAL outage (never for the drill). */
+async function markRouteDown(
+  ctx: OrchestrationContext,
+  route: ModelRoute,
+  outage: RouteOutage
+): Promise<void> {
+  if (outage.outage === 'forced') return;
+  await ctx.routeHealth.open(route, outage);
+}
+
 /** Log and meter one hop from a route that is down to the next one in the chain. */
 function recordRouteHop(
   ctx: OrchestrationContext,
@@ -1259,28 +1284,46 @@ async function fetchWithRouteFallback(
 ): Promise<ServedFetch> {
   const overallStart = ctx.clock.now();
   const attempted: RouteId[] = [];
-  let last: RouteOutage | undefined;
-  for (const [i, route] of ctx.routes.entries()) {
-    if (i < ctx.routeIndex) continue;
+  let last: { route: ModelRoute; outage: RouteOutage } | undefined;
+  for (const route of await eligibleRoutes(ctx)) {
+    // The hop is recorded when its destination is actually tried, so a skipped
+    // route in between never shows up as a `to_route`.
+    if (last) recordRouteHop(ctx, last.route, route, last.outage);
     attempted.push(route.id);
     const outcome = await tryRoute(ctx, route, streaming, overallStart);
     if (outcome.ok) {
-      ctx.routeIndex = i;
+      ctx.routeIndex = ctx.routes.indexOf(route);
       return { result: outcome.result, route };
     }
-    last = outcome;
-    const next = ctx.routes.at(i + 1);
-    if (next) recordRouteHop(ctx, route, next, outcome);
+    last = { route, outage: outcome };
+    await markRouteDown(ctx, route, outcome);
   }
   ctx.logger.error('model_route_chain_exhausted', null, {
     ...(ctx.turnId ? { turn_id: ctx.turnId } : {}),
     streaming,
     routes_attempted: attempted,
     routes_attempted_count: attempted.length,
-    last_outage: last!.outage,
-    last_status: last!.status,
+    last_outage: last?.outage.outage,
+    last_status: last?.outage.status,
   });
-  throw new RouteChainExhaustedError(attempted, last!.outage, last!.status);
+  throw new RouteChainExhaustedError(attempted, last?.outage.outage ?? 'none', last?.outage.status);
+}
+
+/**
+ * The routes to try this call, in chain order from the cursor, minus the ones
+ * the breaker says are open. When EVERY candidate is open there is nothing left
+ * to prefer, so nothing is skipped: a breaker must never turn a partial outage
+ * into a total one.
+ */
+async function eligibleRoutes(ctx: OrchestrationContext): Promise<ModelRoute[]> {
+  const candidates = ctx.routes.slice(ctx.routeIndex);
+  const open = await ctx.routeHealth.readOpen(candidates.map((r) => r.id));
+  if (candidates.every((r) => open.has(r.id))) return candidates;
+  return candidates.filter((route) => {
+    if (!open.has(route.id)) return true;
+    recordRouteSkip(ctx, route);
+    return false;
+  });
 }
 
 async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message> {
@@ -1955,7 +1998,10 @@ function turnTools(catalog: ToolCatalog, options: OrchestratorOptions): Anthropi
 function routingState(
   config: ReturnType<typeof parseEnvConfig>,
   options: OrchestratorOptions
-): Pick<OrchestrationContext, 'model' | 'routes' | 'routeIndex' | 'forcedRouteIndex' | 'clock'> {
+): Pick<
+  OrchestrationContext,
+  'model' | 'routes' | 'routeIndex' | 'forcedRouteIndex' | 'clock' | 'routeHealth'
+> {
   const { routes, forcedRoute } = config.chain;
   return {
     model: config.model,
@@ -1963,7 +2009,19 @@ function routingState(
     routeIndex: 0,
     forcedRouteIndex: routes.findIndex((r) => r.id === forcedRoute),
     clock: options.retryClock ?? REAL_CLOCK,
+    routeHealth: options.routeHealth ?? defaultRouteHealthStore(options.env, options.logger),
   };
+}
+
+/**
+ * The KV breaker when the binding exists; otherwise a per-request memory store,
+ * which is a no-op across turns. Only test fixtures omit the binding, but a
+ * missing one is still logged so a misconfigured deploy cannot hide behind it.
+ */
+function defaultRouteHealthStore(env: Env, logger: RequestLogger): RouteHealthStore {
+  if (env.ORG_CONFIG) return createKvRouteHealthStore(env.ORG_CONFIG, logger);
+  logger.warn('route_health_store_unavailable', { reason: 'ORG_CONFIG binding missing' });
+  return createMemoryRouteHealthStore();
 }
 
 function createOrchestrationContext(
