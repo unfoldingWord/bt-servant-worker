@@ -83,7 +83,8 @@ export function orgSlug(org: string): string {
     .replace(/^-+|-+$/g, '');
 }
 
-function modesKey(org: string): string {
+/** The PROMPT_OVERRIDES key holding `org`'s modes. Exact, unnormalized: `' PBT'` and `'PBT'` are different keys. */
+export function modesKey(org: string): string {
   return `${org}${MODES_KEY_SUFFIX}`;
 }
 
@@ -97,7 +98,7 @@ function isOrgModes(value: unknown): value is OrgModes {
 }
 
 /** Why an enumerated org is not mergeable, or null when it is. */
-function orgSkipReason(org: string, slug: string): 'reserved' | 'empty_slug' | null {
+export function orgSkipReason(org: string, slug: string): 'reserved' | 'empty_slug' | null {
   if (org === MCP_GLOBAL_KEY) return 'reserved';
   if (slug === '') return 'empty_slug';
   return null;
@@ -215,6 +216,19 @@ function mergeForeignOrg(
 }
 
 /**
+ * The merged list plus what the merge decided along the way: which org claimed
+ * each qualified name/alias (first in sorted org order) and which enumerated
+ * orgs were skipped. The share-code endpoint (admin-portal#345) reads these to
+ * explain WHY a mode does not resolve; the chat path only needs `modes`.
+ */
+export interface CrossOrgMergeDetail extends ChatOrgModes {
+  /** Qualified name or alias → raw org name that claimed it. */
+  claimed: ReadonlyMap<string, string>;
+  /** Raw org name → why it was not merged. */
+  skippedOrgs: ReadonlyMap<string, 'reserved' | 'empty_slug'>;
+}
+
+/**
  * Merge the home org's modes (verbatim, first) with every other org's
  * published modes (qualified, in sorted org-name order). Pure; never throws.
  */
@@ -223,7 +237,17 @@ export function mergeCrossOrgModes(
   foreign: ForeignOrgModes[],
   logger: RequestLogger
 ): ChatOrgModes {
+  return { modes: mergeCrossOrgModesDetailed(home, foreign, logger).modes };
+}
+
+/** `mergeCrossOrgModes` with its claim and skip decisions exposed. Same code path. */
+export function mergeCrossOrgModesDetailed(
+  home: OrgModes,
+  foreign: ForeignOrgModes[],
+  logger: RequestLogger
+): CrossOrgMergeDetail {
   const modes: ChatMode[] = [...home.modes];
+  const skippedOrgs = new Map<string, 'reserved' | 'empty_slug'>();
   // Home names are bare and MODE_NAME_PATTERN forbids `/`, so only qualified
   // names can ever collide with each other.
   const claimed: ClaimedNames = new Map();
@@ -234,11 +258,12 @@ export function mergeCrossOrgModes(
     const reason = orgSkipReason(org, slug);
     if (reason !== null) {
       logger.warn('cross_org_modes_org_skipped', { org, reason });
+      skippedOrgs.set(org, reason);
       continue;
     }
     mergeForeignOrg({ org, slug, modes: orgModes }, modes, claimed, logger);
   }
-  return { modes };
+  return { modes, claimed, skippedOrgs };
 }
 
 /**
@@ -264,6 +289,15 @@ function capForeignKeys(keys: string[], logger: RequestLogger): string[] {
   return sorted.slice(0, MAX_FOREIGN_ORGS_PER_TURN);
 }
 
+/** Outcome of enumerating the foreign `*:modes` keys. */
+interface ForeignKeyListing {
+  keys: string[];
+  /** The listing threw; `keys` is empty and the turn is home-only. */
+  failed: boolean;
+  /** MAX_MODES_KEY_PAGES ran out before the listing completed. */
+  truncated: boolean;
+}
+
 /**
  * Enumerate every `*:modes` key other than the home org's. Paged and bounded;
  * a listing failure is logged and yields the empty list (home-only turn).
@@ -272,7 +306,7 @@ async function listForeignModesKeys(
   kv: KVNamespace,
   homeKey: string,
   logger: RequestLogger
-): Promise<string[]> {
+): Promise<ForeignKeyListing> {
   const names: string[] = [];
   try {
     let cursor: string | undefined;
@@ -283,18 +317,18 @@ async function listForeignModesKeys(
       for (const { name } of result.keys) {
         if (name.endsWith(MODES_KEY_SUFFIX) && name !== homeKey) names.push(name);
       }
-      if (result.list_complete) return names;
+      if (result.list_complete) return { keys: names, failed: false, truncated: false };
       cursor = result.cursor;
     }
     logger.warn('cross_org_modes_list_truncated', {
       pages: MAX_MODES_KEY_PAGES,
       listed: names.length,
     });
-    return names;
+    return { keys: names, failed: false, truncated: true };
   } catch (error) {
     logger.error('cross_org_modes_list_failed', error, { listed: names.length });
     // Degrade to the home org only — the turn must never fail on this read.
-    return [];
+    return { keys: [], failed: true, truncated: false };
   }
 }
 
@@ -346,27 +380,54 @@ async function readHomeModes(
   return value;
 }
 
+/** Everything the chat path read, before merging, plus how the read went. */
+export interface CrossOrgModeSources {
+  home: OrgModes;
+  /** Foreign records that were read and had a modes shape. */
+  foreign: ForeignOrgModes[];
+  /** Foreign keys the listing returned (home key excluded). */
+  listedKeys: string[];
+  /** The subset of `listedKeys` inside the per-turn cap — the only foreign keys read. */
+  readKeys: string[];
+  listFailed: boolean;
+  listTruncated: boolean;
+}
+
+/**
+ * The chat path's raw read: the home get and the key listing in parallel, then
+ * the capped foreign gets in parallel. Never throws.
+ */
+export async function readCrossOrgModeSources(
+  kv: KVNamespace,
+  homeOrg: string,
+  logger: RequestLogger
+): Promise<CrossOrgModeSources> {
+  const homeKey = modesKey(homeOrg);
+  const [home, listing] = await Promise.all([
+    readHomeModes(kv, homeKey, logger),
+    listForeignModesKeys(kv, homeKey, logger),
+  ]);
+  const readKeys = capForeignKeys(listing.keys, logger);
+  const foreign = await Promise.all(readKeys.map((key) => readForeignModes(kv, key, logger)));
+  return {
+    home,
+    foreign: foreign.filter((entry): entry is ForeignOrgModes => entry !== null),
+    listedKeys: listing.keys,
+    readKeys,
+    listFailed: listing.failed,
+    listTruncated: listing.truncated,
+  };
+}
+
 /**
  * The chat path's modes read: the home org's modes plus every other org's
- * published modes, merged by `mergeCrossOrgModes`. The home get and the key
- * listing run in parallel, then the foreign gets run in parallel. Never throws.
+ * published modes, merged by `mergeCrossOrgModes`. Never throws.
  */
 export async function readAllPublishedModes(
   kv: KVNamespace,
   homeOrg: string,
   logger: RequestLogger
 ): Promise<ChatOrgModes> {
-  const homeKey = modesKey(homeOrg);
-  const [home, foreignKeys] = await Promise.all([
-    readHomeModes(kv, homeKey, logger),
-    listForeignModesKeys(kv, homeKey, logger),
-  ]);
-  const foreign = await Promise.all(
-    capForeignKeys(foreignKeys, logger).map((key) => readForeignModes(kv, key, logger))
-  );
-  return mergeCrossOrgModes(
-    home,
-    foreign.filter((entry): entry is ForeignOrgModes => entry !== null),
-    logger
-  );
+  const sources = await readCrossOrgModeSources(kv, homeOrg, logger);
+  return mergeCrossOrgModes(sources.home, sources.foreign, logger);
 }

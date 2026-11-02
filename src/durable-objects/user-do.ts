@@ -64,6 +64,7 @@ import {
 import { resolveEffectiveMode } from '../types/mode-markdown.js';
 import { buildModeWelcomeText } from '../utils/mode-welcome.js';
 import { WA_ME_ORIGIN } from '../utils/mode-share-link.js';
+import { chatTriggerModeOptions } from '../utils/mode-share-code.js';
 import {
   transcribeAudio,
   synthesizeSpeech,
@@ -2299,9 +2300,11 @@ export class UserDO {
   ) {
     const isGroupChat = this.isGroupChatType(body);
     const classified = classifyTriggers(loaded.messageText, {
-      availableModes: loaded.orgModes.modes
-        .filter((m) => isModeVisible(m, { isGroupChat, isAdmin: loaded.isAdmin }))
-        .map((m) => ({ name: m.name, label: m.label, aliases: m.aliases })),
+      // Shared with the admin share-code endpoint (admin-portal#345) so both see one list.
+      availableModes: chatTriggerModeOptions(loaded.orgModes.modes, {
+        isGroupChat,
+        isAdmin: loaded.isAdmin,
+      }),
       availableLanguages: loaded.orgLanguages.languages
         .filter((l) => loaded.isAdmin || l.published === true)
         .map((l) => ({ name: l.name, label: l.label })),

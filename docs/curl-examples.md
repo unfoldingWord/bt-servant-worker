@@ -588,6 +588,67 @@ mode + language selection") before involving a real Telegram group.
 
 ---
 
+## Admin: Mode Share Code (admin-portal#345)
+
+The authoritative WhatsApp chat code for a mode, as seen from the org a
+WhatsApp request carries (`home_org`, the gateway's `ENGINE_ORG`). The worker
+answers by running its own chat path: the same cross-org read (per-turn org
+cap included), the same first-wins collision handling, and the real `#`-token
+classifier (exact, then prefix, then fuzzy) over `#<code>`. The portal uses it
+instead of re-deriving the code for QR codes and `wa.me` links.
+
+`home_org` is compared to `:org` by exact key, like the chat path: `PBT` and
+`pbt` are different orgs.
+
+```bash
+curl -s "http://localhost:$PORT/api/v1/admin/orgs/PBT/modes/obt-coach/share-code?home_org=unfoldingWord" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+**Response (200):**
+
+```json
+{
+  "code": "pbt/obt-coach",
+  "resolves": true,
+  "resolved_org": "PBT",
+  "worker_version": "2.59.0"
+}
+```
+
+- `code`: the token without `#`. A bare slug for a home mode, `<orgslug>/<slug>`
+  for another org's. `null` only when the org name slugs to nothing.
+- `resolves`: `true` only when sending `#<code>` from `home_org` selects exactly
+  this org's mode.
+- `reason` (only when `resolves` is false): `draft`, `requires_group`,
+  `reserved` (a home slug that is a clear token, like `default`; `pbt/default`
+  is not one), `collision` (another org with the same slug claimed the name
+  first), `capped` (the org is past the per-turn foreign-org cap, so the chat
+  path never reads it), `org_skipped`, `ambiguous` (the token would open a
+  different mode by prefix or fuzzy match), or `not_found` (not in the chat
+  pool, for example a malformed record).
+- `resolved_org`: the raw org name of the mode `#<code>` actually opens, when it
+  opens one. On `collision` it names the winning org.
+
+Draft and `requires_group` modes still return the would-be `code`.
+
+**Errors:**
+
+| Status | Body                                | When                                                                             |
+| ------ | ----------------------------------- | -------------------------------------------------------------------------------- |
+| 400    | `{"error":"home_org_required",...}` | `home_org` missing                                                               |
+| 400    | `{"error":"invalid_mode_name",...}` | `:modeName` fails the slug pattern                                               |
+| 404    | `{"error":"mode_not_found",...}`    | no such org or mode                                                              |
+| 503    | `{"error":"modes_unavailable",...}` | the cross-org key listing failed, so a foreign answer would not be authoritative |
+
+A 404 without `"error":"mode_not_found"` means the route itself is missing (a
+worker older than 2.59.0).
+
+Cost: one chat-path read per call (one get of the org's record, one home get,
+one key listing, up to 50 foreign gets). Admin-only and low traffic.
+
+---
+
 ## Testing All E2E Scenarios
 
 ```bash
