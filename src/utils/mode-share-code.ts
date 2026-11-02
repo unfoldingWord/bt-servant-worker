@@ -7,26 +7,29 @@
  * the chat path's cross-org rules: the per-turn org cap, first-wins collisions
  * between orgs whose names slug the same, skipped orgs, the exact-key home
  * comparison, and the classifier's exact → prefix → fuzzy cascade. Rather than
- * have the portal re-implement those, this module answers by RUNNING them:
- * the same read (`readCrossOrgModeSources`), the same merge
- * (`mergeCrossOrgModesDetailed`), the same option list the DO hands the
- * classifier (`chatTriggerModeOptions`), and the real `classifyTriggers` over
- * `#<code>`. Nothing here decides resolution on its own; the extra fields only
- * explain a `false`.
+ * have the portal re-implement those, this module RUNS them: the chat path's
+ * read (`readCrossOrgModeSources`) and merge (`mergeCrossOrgModesDetailed`),
+ * the DO's option list (`chatTriggerModeOptions`), and the classifier's own
+ * token resolver (`resolveTriggerToken`), which reports which option matched
+ * and through which tier.
+ *
+ * `resolves`, `reason` and `resolved_org` come ONLY from that actual match.
+ * The merge's first-wins claims and the cap are consulted solely to explain
+ * WHY this org's name is not what the token opened.
  *
  * The classifier partitions tokens by `/` (`matchToken`): a bare token only
  * ever sees bare (home) names and a qualified token only qualified (foreign)
  * names. So a home target is classified against the home record alone, with
  * no cross-org read, and the home record never affects a foreign answer.
  */
-import { classifyTriggers } from '../services/classifier/index.js';
+import { type MatchTier, resolveTriggerToken } from '../services/classifier/index.js';
 import type { ChatMode, OrgModes, PromptMode } from '../types/prompt-overrides.js';
 import { chatTriggerModeOptions, findModeBySlug } from '../types/prompt-overrides.js';
 import {
+  compareOrgs,
   CorruptModesRecordError,
   type CrossOrgMergeDetail,
   type CrossOrgModeSources,
-  isModeRecord,
   isOrgModes,
   mergeCrossOrgModesDetailed,
   modesKey,
@@ -35,8 +38,9 @@ import {
   orgSlug,
   readCrossOrgModeSources,
   readModesJson,
+  sanitizeModeElements,
 } from './cross-org-modes.js';
-import type { RequestLogger } from './logger.js';
+import { type RequestLogger, withLogContext } from './logger.js';
 
 /** Why a code does not (or cannot) open the mode. */
 export type ShareCodeReason =
@@ -55,20 +59,28 @@ export interface ShareCodeAnswer {
   /** True only when the real classifier, over the real pool, selects exactly this org's mode for `#<code>`. */
   resolves: boolean;
   reason?: ShareCodeReason;
-  /** Raw org name of the mode `#<code>` actually opens (this org when it resolves; the winner otherwise). */
+  /** Raw org name of the mode `#<code>` actually opens, when it opens one. */
   resolved_org?: string;
 }
 
 /** Why no authoritative answer could be given right now; every case is worth a retry. */
 export type ShareCodeUnavailableDetail = 'list_failed' | 'read_failed' | 'listing_lag';
 
-/** Thrown when the chat-path read degraded in a way that could change the answer. */
+/**
+ * Thrown when a transient read problem could change the answer. Not logged
+ * where it is thrown: the route logs it once, at warn, with `detail`.
+ */
 export class ShareCodeUnavailableError extends Error {
   readonly detail: ShareCodeUnavailableDetail;
-  constructor(detail: ShareCodeUnavailableDetail) {
-    super(detail);
+  readonly key: string | undefined;
+  constructor(
+    detail: ShareCodeUnavailableDetail,
+    opts: { key?: string | undefined; cause?: unknown } = {}
+  ) {
+    super(detail, { cause: opts.cause });
     this.name = 'ShareCodeUnavailableError';
     this.detail = detail;
+    this.key = opts.key;
   }
 }
 
@@ -80,167 +92,148 @@ export interface ShareCodeTarget {
   /** The org a WhatsApp request will carry (gateway ENGINE_ORG). */
   homeOrg: string;
   /**
-   * The parsed values the caller already read, keyed by
-   * modes key: at least `<org>:modes` and `<homeOrg>:modes`. The answer is
-   * computed from this snapshot; those keys are not read again.
+   * The parsed values the caller already read, keyed by modes key: at least
+   * `<org>:modes` and `<homeOrg>:modes`. The answer is computed from this
+   * snapshot; those keys are not read again.
    */
   snapshot: ReadonlyMap<string, unknown>;
 }
 
-/** The would-be code, or null when no token can be formed (empty org slug). */
-function wouldBeCode(target: ShareCodeTarget): string | null {
-  if (target.org === target.homeOrg) return target.mode.name;
-  const slug = orgSlug(target.org);
-  return slug === '' ? null : `${slug}/${target.mode.name}`;
-}
+/** A WhatsApp share link opens a private chat with a non-admin user. */
+const WHATSAPP_CHAT = { isGroupChat: false, isAdmin: false } as const;
+
+/** Tag the shared reader's events so admin traffic is distinguishable from chat turns. */
+const SHARE_CODE_LOG_CONTEXT = { source: 'share_code' } as const;
 
 /** A reason decided from the stored mode alone, before any pool read. */
-function staticReason(target: ShareCodeTarget): ShareCodeReason | null {
-  if (target.mode.published !== true) return 'draft';
-  // WhatsApp share links open a private chat, where requires_group modes are hidden.
-  if (target.mode.requires_group === true) return 'requires_group';
-  if (target.org !== target.homeOrg && orgSkipReason(target.org, orgSlug(target.org)) !== null) {
-    return 'org_skipped';
+function staticReason(mode: PromptMode): ShareCodeReason | null {
+  if (mode.published !== true) return 'draft';
+  // Hidden in the private chat a share link opens.
+  if (mode.requires_group === true) return 'requires_group';
+  return null;
+}
+
+/** What the classifier actually selected for `#<code>`, with its provenance. */
+type ActualMatch =
+  | { kind: 'clear' }
+  | { kind: 'none' }
+  | { kind: 'mode'; name: string; tier: MatchTier; org: string };
+
+/** Run the classifier's resolver for `code` over `pool` and say which mode, of which org, it opened. */
+function matchCode(code: string, pool: ChatMode[], homeOrg: string): ActualMatch {
+  // `classifyTriggers` strips the `#` and hands this same raw token to
+  // `resolveTriggerToken`; a code never contains whitespace, so it is one token.
+  const resolved = resolveTriggerToken(code, chatTriggerModeOptions(pool, WHATSAPP_CHAT));
+  if (resolved.kind === 'clear') return { kind: 'clear' };
+  if (resolved.kind === 'unmatched') return { kind: 'none' };
+  const owner = pool.find((m) => m.name === resolved.match.name);
+  if (owner === undefined) return { kind: 'none' };
+  // Only qualified (foreign) entries are stamped with `org` by the merge; a
+  // bare name is always the home org's, whatever a stored record carries.
+  const org = owner.name.includes('/') && owner.org !== undefined ? owner.org : homeOrg;
+  return { kind: 'mode', name: owner.name, tier: resolved.match.tier, org };
+}
+
+/** The match is this org's own mode, by its canonical name, on the exact tier. */
+function isOwnExactMatch(match: ActualMatch, expected: { name: string; org: string }): boolean {
+  return (
+    match.kind === 'mode' &&
+    match.tier === 'exact' &&
+    match.name === expected.name &&
+    match.org === expected.org
+  );
+}
+
+/**
+ * Build the answer from the actual match. `whyMissing` explains a miss when
+ * the cross-org rules removed this org's name from the pool; otherwise the
+ * miss is `ambiguous` (something else matched) or `not_found` (nothing did).
+ */
+function answerFromMatch(
+  code: string,
+  match: ActualMatch,
+  expected: { name: string; org: string },
+  whyMissing: ShareCodeReason | null
+): ShareCodeAnswer {
+  if (match.kind === 'clear') return { code, resolves: false, reason: 'reserved' };
+  if (isOwnExactMatch(match, expected)) {
+    return { code, resolves: true, resolved_org: expected.org };
   }
+  const fallback: ShareCodeReason = match.kind === 'mode' ? 'ambiguous' : 'not_found';
+  const answer: ShareCodeAnswer = { code, resolves: false, reason: whyMissing ?? fallback };
+  if (match.kind === 'mode') answer.resolved_org = match.org;
+  return answer;
+}
+
+/** Home target: a bare token only matches bare names, so the home record is the whole pool. */
+function resolveHome(target: ShareCodeTarget): ShareCodeAnswer {
+  const code = target.mode.name;
+  const record = target.snapshot.get(modesKey(target.homeOrg)) as OrgModes;
+  const pool = sanitizeModeElements(record.modes).modes;
+  const match = matchCode(code, pool, target.homeOrg);
+  return answerFromMatch(code, match, { name: code, org: target.org }, null);
+}
+
+/** Why this org's qualified name is absent from the pool, when the merge or the cap removed it. */
+function whyForeignMissing(
+  code: string,
+  org: string,
+  pool: { sources: CrossOrgModeSources; merged: CrossOrgMergeDetail }
+): ShareCodeReason | null {
+  const claimedBy = pool.merged.claimed.get(code);
+  if (claimedBy !== undefined && claimedBy !== org) return 'collision';
+  // Listed but beyond the per-turn cap, or past a truncated listing.
+  if (!pool.sources.readKeys.includes(modesKey(org))) return 'capped';
   return null;
 }
 
 /**
- * The one sanitizer for every record this endpoint looks up or matches against.
- * The home record reaches the chat path unvalidated, and a manual KV write can
- * leave anything in `modes[]`. Skips non-objects and elements without a string
- * `name`; `aliases` that is not an array (`null` included) counts as none, and
- * non-string alias entries are dropped. Never mutates the stored elements.
- */
-export function matcherSafeModes(modes: readonly unknown[]): ChatMode[] {
-  const safe: ChatMode[] = [];
-  for (const mode of modes) {
-    if (!isModeRecord(mode) || typeof mode.name !== 'string') continue;
-    const { aliases, ...rest } = mode as ChatMode;
-    safe.push(
-      Array.isArray(aliases)
-        ? { ...rest, aliases: aliases.filter((a: unknown): a is string => typeof a === 'string') }
-        : rest
-    );
-  }
-  return safe;
-}
-
-/** What `#<code>` selects: a clear, a mode (name + raw org), or nothing. */
-type MatchOutcome = 'clear' | { name: string; org: string } | null;
-
-/**
- * Send `#<code>` through the real classifier over the pool a WhatsApp
- * recipient (non-admin, private chat) sees.
- */
-function runChatMatcher(code: string, modes: readonly unknown[], homeOrg: string): MatchOutcome {
-  const pool = matcherSafeModes(modes);
-  const classified = classifyTriggers(`#${code}`, {
-    availableModes: chatTriggerModeOptions(pool, { isGroupChat: false, isAdmin: false }),
-    availableLanguages: [],
-  });
-  if (classified.clearMode) return 'clear';
-  if (classified.modeName === undefined) return null;
-  const winner = pool.find((m) => m.name === classified.modeName);
-  if (winner === undefined) return null;
-  // Only qualified (foreign) entries are stamped with `org` by the merge; a
-  // bare name is always the home org's, whatever a stored record carries.
-  const winnerOrg = winner.name.includes('/') ? winner.org : homeOrg;
-  return winnerOrg === undefined ? null : { name: winner.name, org: winnerOrg };
-}
-
-/** The answer once the matcher has run: resolves, or the generic miss. */
-function answerFromMatch(
-  code: string,
-  expected: { name: string; org: string },
-  match: MatchOutcome
-): ShareCodeAnswer {
-  if (match === 'clear') return { code, resolves: false, reason: 'reserved' };
-  if (match?.name === expected.name && match.org === expected.org) {
-    return { code, resolves: true, resolved_org: expected.org };
-  }
-  if (match === null) return { code, resolves: false, reason: 'not_found' };
-  return { code, resolves: false, reason: 'ambiguous', resolved_org: match.org };
-}
-
-/**
- * Home target: the chat path hands the home record to the DO verbatim, and a
- * bare token only matches bare names, so the home record is the whole pool.
- */
-function resolveHome(target: ShareCodeTarget, code: string): ShareCodeAnswer {
-  const record = target.snapshot.get(modesKey(target.homeOrg)) as OrgModes;
-  const match = runChatMatcher(code, record.modes, target.homeOrg);
-  return answerFromMatch(code, { name: target.mode.name, org: target.org }, match);
-}
-
-/** Refine a foreign miss with the cross-org causes: collision first, then the cap. */
-function explainForeignMiss(
-  answer: ShareCodeAnswer,
-  code: string,
-  org: string,
-  pool: { sources: CrossOrgModeSources; merged: CrossOrgMergeDetail }
-): ShareCodeAnswer {
-  const claimedBy = pool.merged.claimed.get(code);
-  if (claimedBy !== undefined && claimedBy !== org) {
-    return { code, resolves: false, reason: 'collision', resolved_org: claimedBy };
-  }
-  if (!pool.sources.readKeys.includes(modesKey(org))) {
-    // Listed but beyond the per-turn cap, or past a truncated listing.
-    const capped: ShareCodeAnswer = { code, resolves: false, reason: 'capped' };
-    if (answer.resolved_org !== undefined) capped.resolved_org = answer.resolved_org;
-    return capped;
-  }
-  return answer;
-}
-
-/**
- * Whether a failed foreign get could have changed the RAW match result (before
- * any reason is refined). The merge is first-wins in sorted org order, so an
- * exact owner of `code` (the target, or a collision winner) can only be
- * pre-empted by a failed org with the same slug that sorts BEFORE it. Without
- * an exact owner the classifier fell through to prefix/fuzzy (or nothing), and
- * a look-alike could sit in any failed org.
+ * Whether a failed foreign get could change this answer. Anything short of an
+ * exact match on this org's own mode could change: the failed org may hold the
+ * mode the token would really open. An own exact match can only be pre-empted
+ * by a failed org that the merge would have processed first (merge order,
+ * `compareOrgs`) with the same slug, since it could claim the same name.
  */
 function failureCouldChange(
-  raw: ShareCodeAnswer,
-  target: { code: string; org: string },
-  pool: { sources: CrossOrgModeSources; merged: CrossOrgMergeDetail }
+  answer: ShareCodeAnswer,
+  target: { org: string; slug: string },
+  sources: CrossOrgModeSources
 ): boolean {
-  const failedOrgs = pool.sources.failedKeys.map(orgFromModesKey);
-  if (failedOrgs.length === 0) return false;
-  const slug = orgSlug(target.org);
-  const canPreempt = (owner: string): boolean =>
-    failedOrgs.some((failed) => orgSlug(failed) === slug && failed < owner);
-  if (raw.resolves) return canPreempt(target.org);
-  const claimedBy = pool.merged.claimed.get(target.code);
-  return claimedBy === undefined ? true : canPreempt(claimedBy);
+  if (sources.failedKeys.length === 0) return false;
+  if (!answer.resolves) return true;
+  return sources.failedKeys
+    .map(orgFromModesKey)
+    .some((failed) => orgSlug(failed) === target.slug && compareOrgs(failed, target.org) < 0);
 }
 
 async function resolveForeign(
   kv: KVNamespace,
   target: ShareCodeTarget,
-  code: string,
+  slug: string,
   logger: RequestLogger
 ): Promise<ShareCodeAnswer> {
   const { org, homeOrg } = target;
-  const sources = await readCrossOrgModeSources(kv, homeOrg, logger, target.snapshot);
+  const code = `${slug}/${target.mode.name}`;
+  const tagged = withLogContext(logger, SHARE_CODE_LOG_CONTEXT);
+  const sources = await readCrossOrgModeSources(kv, homeOrg, tagged, target.snapshot);
   if (sources.listFailed) throw new ShareCodeUnavailableError('list_failed');
   // The record exists (the caller just read it), yet a COMPLETE listing does
   // not show it: KV list lag. The chat path cannot see it yet either; retry.
   if (!sources.listTruncated && !sources.listedKeys.includes(modesKey(org))) {
-    throw new ShareCodeUnavailableError('listing_lag');
+    throw new ShareCodeUnavailableError('listing_lag', { key: modesKey(org) });
   }
-  const merged = mergeCrossOrgModesDetailed(sources.home, sources.foreign, logger);
-  const pool = { sources, merged };
-  const raw = answerFromMatch(
+  const merged = mergeCrossOrgModesDetailed(sources.home, sources.foreign, tagged);
+  const match = matchCode(code, merged.modes, homeOrg);
+  const answer = answerFromMatch(
     code,
+    match,
     { name: code, org },
-    runChatMatcher(code, merged.modes, homeOrg)
+    whyForeignMissing(code, org, { sources, merged })
   );
-  if (failureCouldChange(raw, { code, org }, pool)) {
-    throw new ShareCodeUnavailableError('read_failed');
+  if (failureCouldChange(answer, { org, slug }, sources)) {
+    throw new ShareCodeUnavailableError('read_failed', { key: sources.failedKeys[0] });
   }
-  return raw.resolves ? raw : explainForeignMiss(raw, code, org, pool);
+  return answer;
 }
 
 /**
@@ -250,21 +243,33 @@ async function resolveForeign(
  * foreign target adds one key listing (paged) and up to
  * MAX_FOREIGN_ORGS_PER_TURN foreign gets, minus the keys in the snapshot.
  *
- * Throws ShareCodeUnavailableError when a degraded read could change the
- * answer, so a transient failure is never reported as a firm `false`.
+ * Throws ShareCodeUnavailableError when a transient read problem could change
+ * the answer, so it is never reported as a firm `false`.
  */
 export async function resolveModeShareCode(
   kv: KVNamespace,
   target: ShareCodeTarget,
   logger: RequestLogger
 ): Promise<ShareCodeAnswer> {
-  const code = wouldBeCode(target);
-  if (code === null) return { code, resolves: false, reason: 'org_skipped' };
-  const early = staticReason(target);
-  if (early !== null) return { code, resolves: false, reason: early };
-  return target.org === target.homeOrg
-    ? resolveHome(target, code)
-    : resolveForeign(kv, target, code, logger);
+  const { org, mode } = target;
+  if (org === target.homeOrg) {
+    const early = staticReason(mode);
+    return early === null
+      ? resolveHome(target)
+      : { code: mode.name, resolves: false, reason: early };
+  }
+  const slug = orgSlug(org);
+  if (orgSkipReason(org, slug) !== null) {
+    // The chat path never merges this org; an empty slug cannot even form a code.
+    return {
+      code: slug === '' ? null : `${slug}/${mode.name}`,
+      resolves: false,
+      reason: 'org_skipped',
+    };
+  }
+  const early = staticReason(mode);
+  if (early !== null) return { code: `${slug}/${mode.name}`, resolves: false, reason: early };
+  return resolveForeign(kv, target, slug, logger);
 }
 
 /** Outcome of loading the records a share-code answer is computed from. */
@@ -278,10 +283,13 @@ export type ShareCodeLoad =
   | { kind: 'mode_not_found' }
   | { kind: 'corrupt_record'; key: string };
 
+/** Marker for a stored value that is not JSON. */
+const CORRUPT: unique symbol = Symbol('corrupt');
+
 /**
- * Read one snapshot key. A transport error is logged and becomes the retryable
- * ShareCodeUnavailableError('read_failed'); a value that is not JSON is
- * permanent and comes back as `'corrupt'`.
+ * Read one snapshot key. A transport error becomes the retryable
+ * ShareCodeUnavailableError('read_failed') (logged once by the route); a value
+ * that is not JSON is permanent and comes back as CORRUPT.
  */
 async function readSnapshotValue(
   kv: KVNamespace,
@@ -295,13 +303,9 @@ async function readSnapshotValue(
       logger.warn('mode_share_code_corrupt_record', { key });
       return CORRUPT;
     }
-    logger.error('mode_share_code_read_failed', error, { key });
-    throw new ShareCodeUnavailableError('read_failed');
+    throw new ShareCodeUnavailableError('read_failed', { key, cause: error });
   }
 }
-
-/** Marker for a stored value that is not JSON. */
-const CORRUPT: unique symbol = Symbol('corrupt');
 
 /**
  * Read `<org>:modes` and `<homeOrg>:modes` once (one get when they are the same
@@ -324,7 +328,7 @@ export async function loadShareCodeTarget(
   if (snapshot.get(homeKey) === CORRUPT) snapshot.set(homeKey, null);
 
   const mode = isOrgModes(record)
-    ? findModeBySlug(matcherSafeModes(record.modes), p.modeName)
+    ? findModeBySlug(sanitizeModeElements(record.modes).modes, p.modeName)
     : undefined;
   if (mode === undefined) return { kind: 'mode_not_found' };
   return {
@@ -332,4 +336,16 @@ export async function loadShareCodeTarget(
     target: { org: p.org, mode, homeOrg: p.homeOrg, snapshot },
     homeHasModes: isOrgModes(snapshot.get(homeKey)),
   };
+}
+
+/** Workers KV rejects keys over 512 bytes; `<org>:modes` must fit. */
+const MAX_KV_KEY_BYTES = 512;
+
+/** Error message when `org` cannot name a modes key, or null when it can. */
+export function invalidOrgError(org: string): string | null {
+  if (org === '') return 'Org must not be empty';
+  if (new TextEncoder().encode(modesKey(org)).length > MAX_KV_KEY_BYTES) {
+    return `Org is too long: '<org>:modes' must be at most ${MAX_KV_KEY_BYTES} bytes`;
+  }
+  return null;
 }

@@ -12,6 +12,7 @@ import { chatTriggerModeOptions } from '../../src/types/prompt-overrides.js';
 import { MAX_FOREIGN_ORGS_PER_TURN } from '../../src/utils/cross-org-modes.js';
 import type { RequestLogger } from '../../src/utils/logger.js';
 import {
+  invalidOrgError,
   loadShareCodeTarget,
   resolveModeShareCode,
   ShareCodeUnavailableError,
@@ -499,7 +500,7 @@ describe('resolveModeShareCode — failure impact is judged on the raw match', (
     expect(await unavailableDetail(resolve(kv, 'zzz', 'x'))).toBe('read_failed');
   });
 
-  it('a collision loser is firm when the failed org sorts after the winner', async () => {
+  it('any failed read makes a non-own-exact answer unavailable, even a collision loss', async () => {
     const kv = fakeKv(
       {
         'PBT:modes': { modes: [published('x')] },
@@ -508,11 +509,52 @@ describe('resolveModeShareCode — failure impact is judged on the raw match', (
       },
       { failGet: ['pbt.:modes'] }
     );
-    expect(await resolve(kv, 'pbt', 'x')).toMatchObject({
+    expect(await unavailableDetail(resolve(kv, 'pbt', 'x'))).toBe('read_failed');
+  });
+});
+
+describe('resolveModeShareCode — answers come from the actual match', () => {
+  it('a requires_group claimant hidden in private chat is never reported as the opened org', async () => {
+    const kv = fakeKv({
+      // PBT claims `pbt/x` first, but its mode is group-only, so in a private
+      // WhatsApp chat `#pbt/x` opens nothing.
+      'PBT:modes': { modes: [published('x', { requires_group: true })] },
+      'pbt:modes': { modes: [published('x')] },
+    });
+    expect(await resolve(kv, 'pbt', 'x')).toEqual({
+      code: 'pbt/x',
       resolves: false,
       reason: 'collision',
-      resolved_org: 'PBT',
     });
+  });
+
+  it('shared-reader warnings carry source: share_code', async () => {
+    const kv = fakeKv({
+      'PBT:modes': { modes: [published('x')] },
+      'pbt:modes': { modes: [published('x')] },
+    });
+    const logger = spyLogger();
+    const loaded = await loadShareCodeTarget(
+      kv,
+      { org: 'pbt', homeOrg: HOME, modeName: 'x' },
+      logger
+    );
+    if (loaded.kind !== 'ok') throw new Error('setup');
+    await resolveModeShareCode(kv, loaded.target, logger);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'cross_org_mode_collision',
+      expect.objectContaining({ org: 'pbt', source: 'share_code' })
+    );
+  });
+});
+
+describe('invalidOrgError', () => {
+  it('accepts an org whose modes key fits 512 bytes and rejects empty or longer ones', () => {
+    expect(invalidOrgError('a'.repeat(506))).toBeNull();
+    expect(invalidOrgError('a'.repeat(507))).toMatch(/512 bytes/);
+    // Bytes, not characters: 'é' is two bytes in UTF-8.
+    expect(invalidOrgError('é'.repeat(254))).toMatch(/512 bytes/);
+    expect(invalidOrgError('')).toMatch(/empty/);
   });
 });
 

@@ -9,7 +9,8 @@
 import { env } from 'cloudflare:test';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { OrgModes, PromptMode } from '../../src/types/prompt-overrides.js';
-import { validateModeSelection } from '../../src/types/prompt-overrides.js';
+import { chatTriggerModeOptions, validateModeSelection } from '../../src/types/prompt-overrides.js';
+import { resolveTriggerToken } from '../../src/services/classifier/index.js';
 import {
   MAX_MODES_KEY_PAGES,
   MAX_FOREIGN_ORGS_PER_TURN,
@@ -736,5 +737,46 @@ describe('validateModeSelection', () => {
     expect(validateModeSelection(undefined)).not.toBeNull();
     expect(validateModeSelection(42)).not.toBeNull();
     expect(validateModeSelection('')).not.toBeNull();
+  });
+});
+
+// ─── Chat path: malformed home elements (admin-portal#345 round 3) ────────────
+
+describe('readAllPublishedModes — malformed home elements are sanitized for chat', () => {
+  it('drops null / primitive / non-string-name elements and resets bad aliases, with a warn', async () => {
+    const kv = fakeKv({
+      'home:modes': {
+        modes: [
+          null,
+          7,
+          { name: 5, published: true },
+          { name: 'a', published: true, overrides: {}, aliases: null },
+          { name: 'b', published: true, overrides: {}, aliases: ['old-b', 3] },
+          { name: 'c', published: true, overrides: {}, aliases: 'c-old' },
+        ],
+      },
+    });
+    const logger = spyLogger();
+    const merged = await readAllPublishedModes(kv, 'home', logger);
+    expect(merged.modes.map((m) => m.name)).toEqual(['a', 'b', 'c']);
+    expect(merged.modes.map((m) => m.aliases)).toEqual([undefined, ['old-b'], undefined]);
+    expect(logger.warn).toHaveBeenCalledWith('org_modes_invalid_elements', {
+      key: 'home:modes',
+      dropped: 3,
+      aliases_reset: 3,
+    });
+    // What the DO does next must not throw: visibility filter + classifier.
+    const options = chatTriggerModeOptions(merged.modes, { isGroupChat: false, isAdmin: false });
+    expect(resolveTriggerToken('old-b', options)).toEqual({
+      kind: 'matched',
+      match: { name: 'b', tier: 'alias' },
+    });
+  });
+
+  it('a clean home record logs nothing extra', async () => {
+    const kv = fakeKv({ 'home:modes': { modes: [published('h')] } });
+    const logger = spyLogger();
+    await readAllPublishedModes(kv, 'home', logger);
+    expect(logger.warn).not.toHaveBeenCalledWith('org_modes_invalid_elements', expect.anything());
   });
 });

@@ -115,6 +115,15 @@ describe('GET …/modes/:modeName/share-code — errors', () => {
 });
 
 describe('GET …/modes/:modeName/share-code — auth and home org', () => {
+  it('an org or home_org too long for a KV key is a 400 invalid_org, not a 503', async () => {
+    const long = 'a'.repeat(600);
+    for (const target of [url(long, 'u345-coach', HOME), url(HOME, 'u345-coach', long)]) {
+      const res = await SELF.fetch(target, { headers: AUTH });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ error: 'invalid_org' });
+    }
+  });
+
   it('an org-scoped admin key cannot reach the route (super admin only)', async () => {
     await seed();
     await env.ORG_ADMIN_KEYS.put(PARTNER, 'u345-org-key');

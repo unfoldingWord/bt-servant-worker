@@ -48,6 +48,7 @@ import { validateResourceLanguage } from './types/resources.js';
 import { synthesizeModeDocument } from './types/mode-markdown.js';
 import { readAllPublishedModes } from './utils/cross-org-modes.js';
 import {
+  invalidOrgError,
   loadShareCodeTarget,
   resolveModeShareCode,
   ShareCodeUnavailableError,
@@ -900,13 +901,50 @@ app.get('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
 /** Incoming X-Request-ID the BFF may forward, so its logs and ours correlate. */
 const FORWARDED_REQUEST_ID = /^[\w.:-]{1,128}$/;
 
-/** 503 body for a share-code answer that a degraded read could have changed. */
-function shareCodeUnavailableBody(error: ShareCodeUnavailableError) {
-  return {
-    error: 'modes_unavailable',
-    detail: error.detail,
-    message: 'Published modes could not be read consistently; retry',
-  };
+/** 400 body for bad share-code input, or null when the input is usable. */
+function shareCodeInputError(
+  org: string,
+  homeOrg: string | undefined,
+  modeName: string
+): { error: string; message: string } | null {
+  const nameError = validateModeName(modeName);
+  if (nameError) return { error: 'invalid_mode_name', message: nameError };
+  if (homeOrg === undefined || homeOrg === '') {
+    return { error: 'home_org_required', message: 'home_org query parameter is required' };
+  }
+  // A key KV would reject is caller input, not a transient failure.
+  const orgError = invalidOrgError(org) ?? invalidOrgError(homeOrg);
+  return orgError === null ? null : { error: 'invalid_org', message: orgError };
+}
+
+/**
+ * Response for a share-code failure, logged exactly once: a retryable
+ * ShareCodeUnavailableError at warn with its detail (503), anything else at
+ * error (500).
+ */
+function shareCodeFailure(
+  error: unknown,
+  logger: RequestLogger,
+  ctx: { org: string; home_org: string }
+): { body: Record<string, unknown>; status: 500 | 503 } {
+  if (error instanceof ShareCodeUnavailableError) {
+    logger.warn('mode_share_code_unavailable', {
+      ...ctx,
+      detail: error.detail,
+      key: error.key,
+      cause: error.cause instanceof Error ? error.cause.message : undefined,
+    });
+    return {
+      status: 503,
+      body: {
+        error: 'modes_unavailable',
+        detail: error.detail,
+        message: 'Published modes could not be read consistently; retry',
+      },
+    };
+  }
+  logger.error('admin_action', error, { action: 'get_mode_share_code', ...ctx });
+  return { status: 500, body: { error: 'Failed to compute mode share code' } };
 }
 
 /** This request's id: the forwarded X-Request-ID when well-formed, else a fresh one minted at the boundary. */
@@ -929,11 +967,10 @@ app.get('/api/v1/admin/orgs/:org/modes/:modeName/share-code', async (c) => {
   const homeOrg = c.req.query('home_org');
   const logger = createRequestLogger(requestIdFor(c.req.header('X-Request-ID')));
 
-  const nameError = validateModeName(modeName);
-  if (nameError) return c.json({ error: 'invalid_mode_name', message: nameError }, 400);
-  if (homeOrg === undefined || homeOrg === '') {
+  const inputError = shareCodeInputError(org, homeOrg, modeName);
+  if (inputError !== null || homeOrg === undefined) {
     return c.json(
-      { error: 'home_org_required', message: 'home_org query parameter is required' },
+      inputError ?? { error: 'home_org_required', message: 'home_org is required' },
       400
     );
   }
@@ -967,10 +1004,8 @@ app.get('/api/v1/admin/orgs/:org/modes/:modeName/share-code', async (c) => {
     });
     return c.json({ ...answer, home_has_modes: loaded.homeHasModes, worker_version: APP_VERSION });
   } catch (error) {
-    logger.error('admin_action', error, { action: 'get_mode_share_code', org, home_org: homeOrg });
-    if (error instanceof ShareCodeUnavailableError)
-      return c.json(shareCodeUnavailableBody(error), 503);
-    return c.json({ error: 'Failed to compute mode share code' }, 500);
+    const failure = shareCodeFailure(error, logger, { org, home_org: homeOrg });
+    return c.json(failure.body, failure.status);
   }
 });
 

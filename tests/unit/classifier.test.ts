@@ -3,6 +3,7 @@ import {
   classifyTriggers,
   ClassifierContext,
   AvailableOption,
+  resolveTriggerToken,
 } from '../../src/services/classifier/index.js';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
@@ -657,5 +658,36 @@ describe('classifyTriggers — qualified tokens get the cascade within the quali
     const result = classifyTriggers('@x/english hi', ctx());
     expect(result.languageName).toBeUndefined();
     expect(result.unmatchedTriggers.map((t) => t.rawToken)).toEqual(['x/english']);
+  });
+});
+
+describe('resolveTriggerToken — match provenance (admin-portal#345)', () => {
+  const options = [
+    { name: 'mast-methodology', label: 'MAST', aliases: ['mast-old'] },
+    { name: 'spoken', label: 'Spoken' },
+  ];
+
+  it('reports the tier that matched', () => {
+    expect(resolveTriggerToken('spoken', options)).toEqual({
+      kind: 'matched',
+      match: { name: 'spoken', tier: 'exact' },
+    });
+    expect(resolveTriggerToken('mast-old', options)).toEqual({
+      kind: 'matched',
+      match: { name: 'mast-methodology', tier: 'alias' },
+    });
+    expect(resolveTriggerToken('mast', options)).toEqual({
+      kind: 'matched',
+      match: { name: 'mast-methodology', tier: 'prefix' },
+    });
+    expect(resolveTriggerToken('spokne', options)).toEqual({
+      kind: 'matched',
+      match: { name: 'spoken', tier: 'fuzzy' },
+    });
+  });
+
+  it('clear tokens and misses', () => {
+    expect(resolveTriggerToken('Default', options)).toEqual({ kind: 'clear' });
+    expect(resolveTriggerToken('zzz-nothing', options)).toEqual({ kind: 'unmatched' });
   });
 });

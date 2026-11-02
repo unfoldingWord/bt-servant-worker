@@ -629,7 +629,9 @@ curl -s "http://localhost:$PORT/api/v1/admin/orgs/PBT/modes/obt-coach/share-code
   different mode by prefix or fuzzy match), or `not_found` (not in the chat
   pool, for example a malformed record).
 - `resolved_org`: the raw org name of the mode `#<code>` actually opens, when it
-  opens one. On `collision` it names the winning org.
+  opens one. It comes only from the classifier's actual match: on `collision`
+  it is the winning org when the winner's mode is visible in a private chat,
+  and absent when the winner's mode is hidden (for example `requires_group`).
 
 - `home_has_modes`: whether `<home_org>:modes` exists as a modes record. `false` is legal (the
   chat path treats it as an empty home org) but usually means a mistyped
@@ -646,6 +648,7 @@ admin keys are refused by the `/api/*` gate.
 | ------ | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 400    | `{"error":"home_org_required",...}`          | `home_org` is missing                                                                                                                                                                                            |
 | 400    | `{"error":"invalid_mode_name",...}`          | `:modeName` fails the slug pattern                                                                                                                                                                               |
+| 400    | `{"error":"invalid_org",...}`                | `:org` or `home_org` is empty, or `<org>:modes` would exceed the 512-byte KV key limit                                                                                                                           |
 | 404    | `{"error":"mode_not_found",...}`             | no such org or mode                                                                                                                                                                                              |
 | 500    | `{"error":"corrupt_modes_record",...}`       | `<org>:modes` is not valid JSON (permanent; fix the record)                                                                                                                                                      |
 | 503    | `{"error":"modes_unavailable","detail":...}` | a KV read failed or the listing lagged in a way that could change the answer; retry. `detail` is `list_failed`, `read_failed` or `listing_lag`. A corrupt foreign org is skipped, as on the chat path, not a 503 |

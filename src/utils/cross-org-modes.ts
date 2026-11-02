@@ -117,6 +117,48 @@ export function isModeRecord(mode: unknown): mode is PromptMode {
 }
 
 /**
+ * Make stored mode elements safe to dereference on the chat path. The home
+ * record reaches the DO unvalidated (only the container shape is checked), and
+ * a manual KV write can leave a null, a primitive, a non-string `name` or a
+ * non-array `aliases` there; `isModeVisible`, the classifier and
+ * `findModeBySlug` would then throw on every turn. Skips non-objects and
+ * elements without a string `name`; treats a non-array `aliases` (`null`
+ * included) as none and drops non-string alias entries. Never mutates the
+ * stored elements. Shared by the chat path's home read and the share-code
+ * endpoint, so both see the same list.
+ */
+export function sanitizeModeElements(elements: readonly unknown[]): {
+  modes: ChatMode[];
+  dropped: number;
+  aliasesReset: number;
+} {
+  const modes: ChatMode[] = [];
+  let dropped = 0;
+  let aliasesReset = 0;
+  for (const element of elements) {
+    if (!isModeRecord(element) || typeof element.name !== 'string') {
+      dropped++;
+      continue;
+    }
+    const { aliases, ...rest } = element as ChatMode;
+    if (Array.isArray(aliases)) {
+      const kept = aliases.filter((a: unknown): a is string => typeof a === 'string');
+      if (kept.length !== aliases.length) aliasesReset++;
+      modes.push({ ...rest, aliases: kept });
+    } else {
+      if (aliases !== undefined) aliasesReset++;
+      modes.push(rest);
+    }
+  }
+  return { modes, dropped, aliasesReset };
+}
+
+/** The merge's org order (first wins on a collision): plain code-unit order of raw org names. */
+export function compareOrgs(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
  * Why a published foreign element must not be merged, or null when it is
  * mergeable. An element that is an object is NOT enough: a manual KV write
  * can leave a shape the admin PUT (`validatePromptMode`) would have rejected,
@@ -247,7 +289,7 @@ export function mergeCrossOrgModesDetailed(
   // Home names are bare and MODE_NAME_PATTERN forbids `/`, so only qualified
   // names can ever collide with each other.
   const claimed: ClaimedNames = new Map();
-  const sorted = [...foreign].sort((a, b) => (a.org < b.org ? -1 : a.org > b.org ? 1 : 0));
+  const sorted = [...foreign].sort((a, b) => compareOrgs(a.org, b.org));
 
   for (const { org, modes: orgModes } of sorted) {
     const slug = orgSlug(org);
@@ -412,7 +454,15 @@ async function readHomeModes(
     logger.warn('org_modes_invalid_shape', { key: homeKey });
     return { modes: [] };
   }
-  return value;
+  const { modes, dropped, aliasesReset } = sanitizeModeElements(value.modes);
+  if (dropped > 0 || aliasesReset > 0) {
+    logger.warn('org_modes_invalid_elements', {
+      key: homeKey,
+      dropped,
+      aliases_reset: aliasesReset,
+    });
+  }
+  return { modes };
 }
 
 /** Everything the chat path read, before merging, plus how the read went. */
