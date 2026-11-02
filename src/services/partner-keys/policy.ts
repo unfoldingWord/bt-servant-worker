@@ -9,7 +9,7 @@
  * 2. applyPartnerChatPolicy — on those chat endpoints the body is locked to
  *    the key: org is the key's org, client_id is set by the server (so a
  *    partner can neither claim another platform nor put its own text in the
- *    prompt), identifiers are bounded, speaker is neutralised, and audio
+ *    prompt), identifiers are bounded single-line strings, and audio
  *    requests are refused (their replies are URLs under /api/v1/audio/*, which
  *    a partner key cannot fetch). progress_callback_url needs no rule here:
  *    validateChatBody already rejects it on /chat and /chat/stream, the only
@@ -21,7 +21,7 @@
 
 import type { PartnerKeyRecord } from '../../types/partner-keys.js';
 import type { ChatRequest } from '../../types/engine.js';
-import { stripControlChars } from '../../types/prompt-overrides.js';
+import { codePointLength, hasLineBreakOrControl } from '../../types/single-line.js';
 import { partnerClientId } from '../../utils/chat-validation.js';
 
 /** Who made an /api/* request, as established by the auth middleware. */
@@ -121,28 +121,17 @@ function checkAudio(body: Record<string, unknown>): PartnerPolicyResult | null {
   );
 }
 
-/** Max length of a partner-supplied identifier (user_id, chat_id, thread_id). */
+/** Max length of a partner-supplied identifier (user_id, chat_id, thread_id), in code points. */
 export const MAX_PARTNER_ID_LENGTH = 256;
-/** Max length of a partner-supplied speaker name after neutralising. */
-export const MAX_PARTNER_SPEAKER_LENGTH = 64;
 
 /**
- * C1 controls (U+0080–U+009F, which include NEL U+0085) and the Unicode line
- * and paragraph separators. Treated exactly like C0 controls and \r \n \t:
- * each can break a line in some renderer or model tokenizer.
+ * Group DO names are `group:<org>:<chat_id>[:<thread_id>]` (resolveDOId), so a
+ * ':' inside a partner's chat_id or thread_id could make two different
+ * (chat, thread) pairs produce the same name — `a:b` + `c` vs `a` + `b:c`.
+ * Partners may not use ':' there. (user_id is the last segment of its DO name,
+ * so it cannot collide that way.)
  */
-const C1_AND_LINE_SEPARATORS = /[\u0080-\u009f\u2028\u2029]/g;
-/** Same set, non-global, for `.test()` (a /g regex keeps lastIndex between calls). */
-const HAS_C1_OR_LINE_SEPARATOR = /[\u0080-\u009f\u2028\u2029]/;
-
-/** True when `value` contains a C0/C1 control or any line-break character. */
-function hasControlOrLineBreak(value: string): boolean {
-  return (
-    stripControlChars(value) !== value ||
-    /[\r\n\t]/.test(value) ||
-    HAS_C1_OR_LINE_SEPARATOR.test(value)
-  );
-}
+const COLON_FREE_FIELDS: ReadonlySet<string> = new Set(['chat_id', 'thread_id']);
 
 /** An identifier field: absent/null, or a bounded single-line non-empty string. */
 function checkIdentifier(
@@ -154,14 +143,19 @@ function checkIdentifier(
   const valid =
     typeof value === 'string' &&
     value.length > 0 &&
-    value.length <= MAX_PARTNER_ID_LENGTH &&
-    !hasControlOrLineBreak(value);
-  if (valid) return null;
-  return reject(
-    400,
-    `partner_${field}`,
-    `${field} ${required ? 'is required and ' : ''}must be a non-empty single-line string of at most ${MAX_PARTNER_ID_LENGTH} characters`
-  );
+    codePointLength(value) <= MAX_PARTNER_ID_LENGTH &&
+    !hasLineBreakOrControl(value);
+  if (!valid) {
+    return reject(
+      400,
+      `partner_${field}`,
+      `${field} ${required ? 'is required and ' : ''}must be a non-empty single-line string of at most ${MAX_PARTNER_ID_LENGTH} characters`
+    );
+  }
+  if (COLON_FREE_FIELDS.has(field) && value.includes(':')) {
+    return reject(400, `partner_${field}`, `${field} must not contain ':'`);
+  }
+  return null;
 }
 
 /**
@@ -178,27 +172,13 @@ function checkIdentifiers(body: Record<string, unknown>): PartnerPolicyResult | 
 }
 
 /**
- * A partner's speaker name reaches the system prompt and the history prefix.
- * Neutralise it: control characters removed, every whitespace run (newlines
- * included) collapsed to one space, capped. Non-strings and names that end up
- * empty are dropped. A name can therefore never start a new prompt line.
- */
-export function neutralizePartnerSpeaker(value: unknown): string | undefined {
-  if (typeof value !== 'string') return undefined;
-  const flat = stripControlChars(value)
-    .replace(C1_AND_LINE_SEPARATORS, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return flat.slice(0, MAX_PARTNER_SPEAKER_LENGTH).trim() || undefined;
-}
-
-/**
  * Apply the partner rules to a parsed chat body (already known to be a JSON
  * object: the chat handler rejects anything else for every caller). On
  * success returns a NEW body; the input is untouched:
  * - org forced to the key's org; client_id set by the server;
- * - user_id / chat_id namespaced; speaker neutralised;
- * - org_id, voice_format (no TTS for partners) and null chat_id/speaker dropped.
+ * - user_id / chat_id namespaced;
+ * - org_id, voice_format (no TTS for partners) and a null chat_id dropped.
+ * `speaker` is not special-cased: sanitizeSpeaker flattens it for every caller.
  */
 export function applyPartnerChatPolicy(
   raw: Record<string, unknown>,
@@ -207,21 +187,13 @@ export function applyPartnerChatPolicy(
   const failure = checkAudio(raw) ?? checkOrg(raw, key.org) ?? checkIdentifiers(raw);
   if (failure) return failure;
 
-  const {
-    org_id: _orgId,
-    voice_format: _voiceFormat,
-    chat_id: _chatId,
-    speaker: _speaker,
-    ...rest
-  } = raw;
-  const speaker = neutralizePartnerSpeaker(raw.speaker);
+  const { org_id: _orgId, voice_format: _voiceFormat, chat_id: _chatId, ...rest } = raw;
   const scoped: Record<string, unknown> = {
     ...rest,
     org: key.org,
     client_id: partnerClientId(key.userNamespace),
     user_id: scopePartnerSubject(key, raw.user_id as string),
     ...(typeof raw.chat_id === 'string' ? { chat_id: scopePartnerSubject(key, raw.chat_id) } : {}),
-    ...(speaker !== undefined ? { speaker } : {}),
   };
   return { ok: true, body: scoped as unknown as ChatRequest };
 }

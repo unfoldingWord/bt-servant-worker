@@ -19,11 +19,13 @@
  * Skipped on Windows (SQLite/workerd incompatibility). Runs in CI on Linux.
  */
 
-import { env, SELF } from 'cloudflare:test';
+import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { StoredIdentity } from '../../src/types/engine';
 import type { PublicPartnerKey } from '../../src/types/partner-keys';
 import { sha256Hex } from '../../src/utils/crypto';
+import { generatePartnerKeyMaterial } from '../../src/services/partner-keys/key-material';
+import { PARTNER_KEY_STORE_NAME } from '../../src/services/partner-keys/store';
 import { AUDIO_TOOL_NAMES } from '../../src/services/claude/tools';
 import {
   setupAnthropicFetchCapture,
@@ -37,6 +39,8 @@ vi.mock('@anthropic-ai/sdk', () => ({ default: vi.fn() }));
 const INTERNAL = { Authorization: 'Bearer test-api-key' };
 const JSON_INTERNAL = { ...INTERNAL, 'Content-Type': 'application/json' };
 const KEYS = 'https://worker/api/v1/admin/api-keys';
+/** Matches PARTNER_KEY_TAG_SECRET in vitest.config.ts. */
+const TAG_SECRET = 'test-partner-key-tag-secret';
 const CHAT = 'https://worker/api/v1/chat';
 
 type CreateBody = { key: PublicPartnerKey; apiKey: string };
@@ -75,9 +79,17 @@ const chatBody = (extra: Record<string, unknown> = {}) => ({
 const postChat = (apiKey: string, body: unknown, url = CHAT) =>
   SELF.fetch(url, { method: 'POST', headers: partnerHeaders(apiKey), body: JSON.stringify(body) });
 
+const storeStub = () =>
+  env.PARTNER_KEY_STORE.get(env.PARTNER_KEY_STORE.idFromName(PARTNER_KEY_STORE_NAME));
+
+/** Empty the KV projection AND the PartnerKeyStoreDO (storage is shared between tests). */
 async function clearNamespace(): Promise<void> {
   const { keys } = await env.API_KEYS.list();
   await Promise.all(keys.map((k) => env.API_KEYS.delete(k.name)));
+  await runInDurableObject(storeStub(), async (_instance, state) => {
+    await state.storage.deleteAlarm();
+    await state.storage.deleteAll();
+  });
 }
 
 /** First captured log record with this event name (helper keeps test callbacks shallow). */
@@ -137,7 +149,7 @@ describe('ENGINE_API_KEY is unchanged', () => {
 describe('admin CRUD: create and list', () => {
   it('create returns the plaintext once; list and get never do', async () => {
     const { key, apiKey } = await createKey('org-354-crud', { termsVersion: 'v1' });
-    expect(apiKey).toMatch(/^bts_[0-9a-f]{8}_[A-Za-z0-9_-]{43}$/);
+    expect(apiKey).toMatch(/^bts_[0-9a-f]{8}_[A-Za-z0-9_-]{43}_[A-Za-z0-9_-]{11}$/);
     expect(apiKey.startsWith(key.prefix)).toBe(true);
     expect(key).toMatchObject({
       org: 'org-354-crud',
@@ -187,8 +199,13 @@ describe('admin CRUD: storage and validation', () => {
     const hash = await sha256Hex(apiKey);
     const stored = await env.API_KEYS.get<PublicPartnerKey>(`key:${hash}`, 'json');
     expect(stored?.id).toBe(key.id);
-    expect(await env.API_KEYS.get(`ptr:${key.id}`)).toBe(hash);
-    expect(await env.API_KEYS.get(`id:org-354-hash:${key.id}`)).toBe(hash);
+    // KV holds only the auth projection; the DO holds the record and the hash.
+    expect(keys.map((k) => k.name)).toEqual([`key:${hash}`]);
+    const doDump = await runInDurableObject(storeStub(), async (_i, state) =>
+      JSON.stringify([...(await state.storage.list()).entries()])
+    );
+    expect(doDump).toContain(hash);
+    expect(doDump).not.toContain(apiKey);
   });
 
   it('validates create bodies and unknown ids', async () => {
@@ -246,13 +263,18 @@ const rotateKey = (keyId: string, body?: unknown) =>
   });
 
 /** Move a stored key's grace end into the past, as if the window had elapsed. */
-async function elapseGrace(apiKey: string): Promise<void> {
+async function elapseGrace(apiKey: string, keyId: string): Promise<void> {
+  const past = '2026-01-01T00:00:00.000Z';
   const name = `key:${await sha256Hex(apiKey)}`;
   const record = await env.API_KEYS.get<Record<string, unknown>>(name, 'json');
-  await env.API_KEYS.put(
-    name,
-    JSON.stringify({ ...record, expiresAt: '2026-01-01T00:00:00.000Z' })
-  );
+  await env.API_KEYS.put(name, JSON.stringify({ ...record, expiresAt: past }));
+  await runInDurableObject(storeStub(), async (_i, state) => {
+    const entry = await state.storage.get<{ record: Record<string, unknown> }>(`rec:${keyId}`);
+    await state.storage.put(`rec:${keyId}`, {
+      ...entry,
+      record: { ...entry?.record, expiresAt: past },
+    });
+  });
 }
 
 type RotateBody = CreateBody & { previous: PublicPartnerKey };
@@ -280,7 +302,7 @@ describe('admin CRUD: rotate with grace', () => {
     expect((await postChat(apiKey, chatBody())).status).toBe(200);
     expect((await postChat(rotated.apiKey, chatBody())).status).toBe(200);
 
-    await elapseGrace(apiKey);
+    await elapseGrace(apiKey, key.id);
     expect((await postChat(apiKey, chatBody())).status).toBe(403);
     expect(findLog(capture.warnLogs, 'auth_rejected')?.payload).toMatchObject({
       reason: 'expired_partner_key',
@@ -403,12 +425,23 @@ describe('partner key on chat: refusals', () => {
 });
 
 describe('partner key outside chat', () => {
-  it('unknown keys get 403', async () => {
-    const unknown = `bts_00000000_${'A'.repeat(43)}`;
+  it('unknown keys (validly tagged, never stored) get 403', async () => {
+    const { plaintext: unknown } = await generatePartnerKeyMaterial(TAG_SECRET);
     const res = await postChat(unknown, chatBody());
     expect(res.status).toBe(403);
     const rejected = findLog(capture.warnLogs, 'auth_rejected');
     expect(rejected?.payload).toMatchObject({ reason: 'unknown_partner_key' });
+  });
+
+  it('a partner-shaped token with a forged tag is refused before any KV read', async () => {
+    const forged = `bts_00000000_${'A'.repeat(43)}_${'A'.repeat(11)}`;
+    const res = await postChat(forged, chatBody());
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: 'Invalid API key' });
+    expect(findLog(capture.warnLogs, 'auth_rejected')?.payload).toMatchObject({
+      reason: 'invalid_partner_key_tag',
+      key_prefix: 'bts_00000000',
+    });
   });
 
   it.each([
@@ -588,7 +621,7 @@ describe('partner text never reaches the prompt raw', () => {
 
 describe('route check happens before the key lookup', () => {
   it('a partner-shaped token on an admin route is refused as not permitted, logged by prefix', async () => {
-    const token = `bts_0000abcd_${'A'.repeat(43)}`; // not a stored key
+    const token = `bts_0000abcd_${'A'.repeat(43)}_${'A'.repeat(11)}`; // not a stored key
     const res = await SELF.fetch(KEYS, { headers: { Authorization: `Bearer ${token}` } });
     expect(res.status).toBe(403);
     expect(await res.json()).toEqual({
@@ -630,5 +663,54 @@ describe('responses that carry a plaintext key are not cacheable', () => {
       await SELF.fetch(`${KEYS}?org=org-354-truncated`, { headers: INTERNAL })
     ).json()) as { truncated: boolean };
     expect(list.truncated).toBe(false);
+  });
+});
+
+describe('the PartnerKeyStoreDO serialises concurrent admin writes', () => {
+  const post = (path: string, body: unknown) =>
+    SELF.fetch(`${KEYS}/${path}`, {
+      method: 'POST',
+      headers: JSON_INTERNAL,
+      body: JSON.stringify(body),
+    });
+  const listOrg = async (org: string) =>
+    (
+      (await (await SELF.fetch(`${KEYS}?org=${org}`, { headers: INTERNAL })).json()) as {
+        keys: PublicPartnerKey[];
+      }
+    ).keys;
+
+  it('two rotates of one key: exactly one wins, the other gets 409, one replacement exists', async () => {
+    const { key } = await createKey('org-354-race-rotate');
+    const results = await Promise.all([
+      post(`${key.id}/_rotate`, { graceSeconds: 3600 }),
+      post(`${key.id}/_rotate`, { graceSeconds: 3600 }),
+    ]);
+    expect(results.map((r) => r.status).sort()).toEqual([200, 409]);
+    const keys = await listOrg('org-354-race-rotate');
+    expect(keys).toHaveLength(2);
+    const old = keys.find((k) => k.id === key.id);
+    expect(keys.find((k) => k.rotatedFrom === key.id)?.id).toBe(old?.rotatedTo);
+  });
+
+  it('a rotate racing a revoke: the old key ends revoked and the stored chain is consistent', async () => {
+    const { key } = await createKey('org-354-race-revoke');
+    const [rotate, revoke] = await Promise.all([
+      post(`${key.id}/_rotate`, { graceSeconds: 3600 }),
+      post(`${key.id}/_revoke`, {}),
+    ]);
+    expect(revoke.status).toBe(200);
+    const keys = await listOrg('org-354-race-revoke');
+    const old = keys.find((k) => k.id === key.id);
+    expect(old?.status).toBe('revoked');
+    if (rotate.status === 200) {
+      const replacement = keys.find((k) => k.rotatedFrom === key.id);
+      expect(keys).toHaveLength(2);
+      expect(old?.rotatedTo).toBe(replacement?.id);
+      expect(replacement?.status).toBe('active');
+    } else {
+      expect(rotate.status).toBe(409);
+      expect(keys).toHaveLength(1);
+    }
   });
 });

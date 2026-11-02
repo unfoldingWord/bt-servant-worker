@@ -56,3 +56,16 @@ export function bytesToBase64(bytes: Uint8Array): string {
 export function bytesToBase64Url(bytes: Uint8Array): string {
   return bytesToBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
+
+/** HMAC-SHA-256 of `data` (UTF-8) under `secret` (UTF-8), as raw bytes. */
+export async function hmacSha256(secret: string, data: string): Promise<Uint8Array> {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  return new Uint8Array(await crypto.subtle.sign('HMAC', key, encoder.encode(data)));
+}

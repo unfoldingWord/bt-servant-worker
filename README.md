@@ -164,7 +164,7 @@ All `/api/*` routes require a Bearer token in the `Authorization` header.
 
 - **`ENGINE_API_KEY`** — super-admin token, grants access to all orgs and all endpoints
 - **Org admin keys** — stored in the `ORG_ADMIN_KEYS` KV namespace, keyed by org name; grants admin access to that org only
-- **Partner API keys** (admin-portal#354) — named, revocable `bts_…` keys issued per partner app through `/api/v1/admin/api-keys`. Stored only as SHA-256 in the `API_KEYS` KV namespace. A partner key can call **only** `POST /api/v1/chat` and `POST /api/v1/chat/stream`, always for its own org, with its end users' ids namespaced per partner. A new or revoked key can take up to ~60s to take effect everywhere (KV edge caching), so replace keys by rotation with a grace period. See [docs/curl-examples.md](docs/curl-examples.md#admin-partner-api-keys).
+- **Partner API keys** (admin-portal#354) — named, revocable `bts_…` keys issued per partner app through `/api/v1/admin/api-keys`. Administered by one Durable Object (`PartnerKeyStoreDO`, the single writer and source of truth), which projects each key's record to the `API_KEYS` KV namespace under the SHA-256 of the key for auth. Keys carry an HMAC tag (`PARTNER_KEY_TAG_SECRET`), so a random token is rejected without a KV read. A partner key can call **only** `POST /api/v1/chat` and `POST /api/v1/chat/stream`, always for its own org, with its end users' ids namespaced per partner. A new or revoked key can take up to ~60s to take effect everywhere (KV edge caching), so replace keys by rotation with a grace period. See [docs/curl-examples.md](docs/curl-examples.md#admin-partner-api-keys).
 - **Webhook callbacks** — authenticated via `X-Engine-Token` header containing the `ENGINE_API_KEY`
 
 ```
@@ -617,15 +617,16 @@ Access control (who can reset a group, who counts as "addressed") is the **gatew
 
 ### Secrets (set via `wrangler secret put`)
 
-| Secret                        | Description                                                                                            |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `ANTHROPIC_API_KEY`           | API key for Claude                                                                                     |
-| `OPENROUTER_API_KEY`          | OpenRouter key for the two OpenRouter fallback tiers (#403). Unset ⇒ those tiers are absent (optional) |
-| `OPENAI_API_KEY`              | API key for OpenAI (TTS)                                                                               |
-| `ENGINE_API_KEY`              | Bearer token for API auth + super-admin access + webhook `X-Engine-Token`                              |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP base URL of the collector. Telemetry is a no-op unless this AND the token are set (optional) |
-| `OTEL_COLLECTOR_TOKEN`        | Bearer token the collector expects (optional)                                                          |
-| `TELEMETRY_USER_ID_SALT`      | HMAC key for the OTLP-path `user_hash` pseudonym; unset ⇒ no pseudonym egresses (optional)             |
+| Secret                        | Description                                                                                                                             |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `ANTHROPIC_API_KEY`           | API key for Claude                                                                                                                      |
+| `OPENROUTER_API_KEY`          | OpenRouter key for the two OpenRouter fallback tiers (#403). Unset ⇒ those tiers are absent (optional)                                  |
+| `OPENAI_API_KEY`              | API key for OpenAI (TTS)                                                                                                                |
+| `ENGINE_API_KEY`              | Bearer token for API auth + super-admin access + webhook `X-Engine-Token`                                                               |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP base URL of the collector. Telemetry is a no-op unless this AND the token are set (optional)                                  |
+| `OTEL_COLLECTOR_TOKEN`        | Bearer token the collector expects (optional)                                                                                           |
+| `TELEMETRY_USER_ID_SALT`      | HMAC key for the OTLP-path `user_hash` pseudonym; unset ⇒ no pseudonym egresses (optional)                                              |
+| `PARTNER_KEY_TAG_SECRET`      | HMAC key for the tag on partner API keys (#354). Unset ⇒ partner keys can't be issued or used; changing it invalidates every issued key |
 
 ### Required Environment Variables
 
@@ -680,17 +681,18 @@ Primary traffic never touches OpenRouter; it is a failover path only. OpenRouter
 
 ### Cloudflare Bindings
 
-| Binding            | Type           | Purpose                                                                   |
-| ------------------ | -------------- | ------------------------------------------------------------------------- |
-| `AI`               | Workers AI     | STT (Whisper)                                                             |
-| `USER_DO`          | Durable Object | Per-conversation chat, history, memory, queue (private, group, or thread) |
-| `AUDIO_BUCKET`     | R2 Bucket      | TTS audio + archived voice submissions                                    |
-| `PTXPRINT_BUCKET`  | R2 Bucket      | USFM sources, generated PDFs, fonts (served at `/public/ptxprint/*`)      |
-| `ORG_ADMIN_KEYS`   | KV Namespace   | Per-org admin Bearer tokens                                               |
-| `MCP_SERVERS`      | KV Namespace   | MCP server configurations — one global pool under key `__global__` (#278) |
-| `ORG_CONFIG`       | KV Namespace   | Org-level configuration (history limits, etc.)                            |
-| `PROMPT_OVERRIDES` | KV Namespace   | Org-level prompt overrides, modes, languages, scaffold, default language  |
-| `API_KEYS`         | KV Namespace   | Partner API keys, keyed by SHA-256 of the key (admin-portal#354)          |
+| Binding             | Type           | Purpose                                                                   |
+| ------------------- | -------------- | ------------------------------------------------------------------------- |
+| `AI`                | Workers AI     | STT (Whisper)                                                             |
+| `USER_DO`           | Durable Object | Per-conversation chat, history, memory, queue (private, group, or thread) |
+| `PARTNER_KEY_STORE` | Durable Object | Partner API key administration, single writer (admin-portal#354)          |
+| `AUDIO_BUCKET`      | R2 Bucket      | TTS audio + archived voice submissions                                    |
+| `PTXPRINT_BUCKET`   | R2 Bucket      | USFM sources, generated PDFs, fonts (served at `/public/ptxprint/*`)      |
+| `ORG_ADMIN_KEYS`    | KV Namespace   | Per-org admin Bearer tokens                                               |
+| `MCP_SERVERS`       | KV Namespace   | MCP server configurations — one global pool under key `__global__` (#278) |
+| `ORG_CONFIG`        | KV Namespace   | Org-level configuration (history limits, etc.)                            |
+| `PROMPT_OVERRIDES`  | KV Namespace   | Org-level prompt overrides, modes, languages, scaffold, default language  |
+| `API_KEYS`          | KV Namespace   | Partner API key auth projection, keyed by SHA-256 of the key (#354)       |
 
 The worker also declares **tail consumers** (`bt-servant-tail` for death detection and `bt-servant-telemetry-production` for log fanout; staging uses `bt-servant-tail-staging` and `bt-servant-telemetry-dev`), enables the `nodejs_compat` compatibility flag (AsyncLocalStorage for trace-context propagation), and raises the CPU limit to 300,000 ms for long ptxprint flows.
 

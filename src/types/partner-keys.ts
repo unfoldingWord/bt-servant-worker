@@ -5,12 +5,12 @@
  * app. It lets that app call the chat endpoints only (see
  * src/services/partner-keys/policy.ts), always for the key's own org. The
  * plaintext key is shown exactly once, in the create/rotate response; at rest
- * the store keeps only its SHA-256 (see src/services/partner-keys/store.ts).
+ * the store keeps only its SHA-256 (see src/durable-objects/partner-key-store-do.ts).
  *
  * Pure types + input validation; no internal dependencies.
  */
 
-import { stripControlChars } from './prompt-overrides.js';
+import { hasLineBreakOrControl } from './single-line.js';
 
 /** The only scope a partner key can hold today. */
 export const PARTNER_KEY_SCOPES = ['chat'] as const;
@@ -103,10 +103,9 @@ export interface PartnerKeyCreateInput {
 /** Org ids a key may be bound to: a conservative id shape, never a `__` reserved key. */
 const ORG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 /**
- * Field limits are UTF-8 bytes of the JSON-encoded value, not characters: the
- * whole record is also stored as KV list metadata (store.ts), which Cloudflare
- * caps at 1024 bytes. These caps keep a worst-case record under that limit
- * (asserted in tests/unit/partner-keys.test.ts and checked again at write).
+ * Field limits are UTF-8 bytes of the JSON-encoded value, not characters, so
+ * a record stays small however the labels are written (it is copied to the
+ * API_KEYS KV projection read on every partner request).
  */
 const MAX_LABEL_BYTES = 100;
 const MAX_ACTOR_BYTES = 120;
@@ -128,7 +127,12 @@ export function validatePartnerKeyOrg(org: unknown): string | null {
   return null;
 }
 
-/** Validate a required, single-line label. Returns the cleaned value or an error. */
+/**
+ * Validate a required, single-line label (name, app, createdBy, revokedBy,
+ * termsVersion). Controls and line breaks of every kind (C0, C1, U+2028/9 —
+ * see single-line.ts) are rejected, not silently stripped, so what is stored
+ * is exactly what the admin typed. Surrounding spaces are trimmed.
+ */
 function readLabel(
   value: unknown,
   field: string,
@@ -137,7 +141,13 @@ function readLabel(
   if (typeof value !== 'string') {
     return { ok: false, error: `${field} is required and must be a string` };
   }
-  const cleaned = stripControlChars(value).trim();
+  if (hasLineBreakOrControl(value)) {
+    return {
+      ok: false,
+      error: `${field} must be a single line (no control characters or line breaks)`,
+    };
+  }
+  const cleaned = value.trim();
   if (cleaned.length === 0) return { ok: false, error: `${field} must not be empty` };
   if (jsonByteLength(cleaned) > max) {
     return { ok: false, error: `${field} must be <= ${max} bytes (UTF-8, JSON-encoded)` };

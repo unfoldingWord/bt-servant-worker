@@ -81,17 +81,13 @@ import {
   principalKeyId,
   type Principal,
 } from './services/partner-keys/policy.js';
+import { lookupPartnerKeyByToken, partnerKeyStore } from './services/partner-keys/store.js';
 import {
-  createPartnerKey,
-  getPartnerKeyById,
-  listPartnerKeys,
-  lookupPartnerKeyByToken,
+  hasValidPartnerKeyTag,
   looksLikePartnerKey,
   partnerKeyPrefix,
-  revokePartnerKey,
-  rotatePartnerKey,
-  type RotateResult,
-} from './services/partner-keys/store.js';
+} from './services/partner-keys/key-material.js';
+import type { RotateOutcome } from './services/partner-keys/ledger.js';
 import { orgHasConfig } from './services/partner-keys/org-exists.js';
 import {
   type PartnerKeyRecord,
@@ -120,6 +116,8 @@ export { validateChatBody };
 // trace context, flushed from the DO fetch context where raw global fetch works.
 // No-op export until telemetry is configured (0% head sampler when unset).
 export const UserDO = instrumentDO(UserDOClass, resolveTelemetryConfig);
+// Single writer for partner API key administration (admin-portal#354).
+export { PartnerKeyStoreDO } from './durable-objects/index.js';
 
 /**
  * Hono env: bindings plus what the `/api/*` auth middleware sets per request:
@@ -244,6 +242,38 @@ async function authenticatePartner(
   return { ok: true, key };
 }
 
+/**
+ * Everything checked about a non-internal token BEFORE any KV read, so a junk
+ * token, a guessed one, or a real one on a route partners may never call
+ * costs no I/O: the shape, the route allowlist, then the keyed tag (an HMAC
+ * only PARTNER_KEY_TAG_SECRET can produce; see key-material.ts). The display
+ * prefix (`bts_<8 hex>`) is not secret and is logged for attribution.
+ * Returns the rejection, or null to go on to the lookup.
+ */
+async function partnerPreflight(c: Context<AppEnv>, token: string): Promise<Response | null> {
+  if (!looksLikePartnerKey(token)) return rejectAuth(c, 403, 'invalid_token');
+  const keyPrefix = { key_prefix: partnerKeyPrefix(token) };
+  if (!isPartnerRouteAllowed(c.req.method, c.req.path)) {
+    return rejectAuth(c, 403, 'partner_route_forbidden', keyPrefix);
+  }
+  const secret = c.env.PARTNER_KEY_TAG_SECRET;
+  if (!secret) {
+    c.get('logger').error(
+      'partner_key_tag_secret_missing',
+      new Error('PARTNER_KEY_TAG_SECRET unset')
+    );
+    countMetric('auth_rejections_total', {
+      reason: 'partner_tag_secret_missing',
+      status_code: 503,
+    });
+    return c.json({ error: 'Authentication temporarily unavailable' }, 503);
+  }
+  if (!(await hasValidPartnerKeyTag(token, secret))) {
+    return rejectAuth(c, 403, 'invalid_partner_key_tag', keyPrefix);
+  }
+  return null;
+}
+
 // Auth middleware for all /api routes.
 //
 // ENGINE_API_KEY (our own clients: web client, WhatsApp gateway, admin portal)
@@ -271,13 +301,8 @@ app.use('/api/*', async (c, next) => {
     return next();
   }
 
-  // Both checks below are pure, so a junk token or a partner-shaped token on a
-  // route partners may never call costs no KV read. The display prefix
-  // (`bts_<8 hex>`) is not secret and is logged for attribution.
-  if (!looksLikePartnerKey(token)) return rejectAuth(c, 403, 'invalid_token');
-  if (!isPartnerRouteAllowed(c.req.method, c.req.path)) {
-    return rejectAuth(c, 403, 'partner_route_forbidden', { key_prefix: partnerKeyPrefix(token) });
-  }
+  const refused = await partnerPreflight(c, token);
+  if (refused) return refused;
   const auth = await authenticatePartner(c, token);
   if (!auth.ok) return auth.response;
   c.set('principal', { kind: 'partner', key: auth.key });
@@ -1734,6 +1759,10 @@ function unknownOrgMessage(org: string): string {
   return `Org '${org}' has no configuration in this worker (check the spelling). Pass "allow_new_org": true to create a key for an org that is not configured yet.`;
 }
 
+/** The PartnerKeyStoreDO client for this request (shares its request id). */
+const keyStore = (c: Context<AppEnv>) =>
+  partnerKeyStore(c.env.PARTNER_KEY_STORE, c.get('requestId'));
+
 app.post(PARTNER_KEYS_BASE, async (c) => {
   const logger = c.get('logger');
   const parsed = await readJsonBody(c.req.raw, logger, { action: 'create_api_key' });
@@ -1747,17 +1776,20 @@ app.post(PARTNER_KEYS_BASE, async (c) => {
       logger.warn('admin_action', { action: 'create_api_key', org, rejected: 'unknown_org' });
       return c.json({ error: unknownOrgMessage(org), code: 'unknown_org' }, 400);
     }
-    const { record, plaintext } = await createPartnerKey(c.env.API_KEYS, validated.input, {
-      logger,
-    });
+    const { record, plaintext, warnings } = await keyStore(c).create(validated.input);
     logger.log('admin_action', {
       action: 'create_api_key',
       key_id: record.id,
       org: record.org,
       app: record.app,
       created_by: record.createdBy,
+      warnings,
     });
-    return c.json({ key: toPublicPartnerKey(record), apiKey: plaintext }, 201, NO_STORE_HEADERS);
+    return c.json(
+      { key: toPublicPartnerKey(record), warnings, apiKey: plaintext },
+      201,
+      NO_STORE_HEADERS
+    );
   } catch (error) {
     logger.error('admin_action', error, { action: 'create_api_key', org: validated.input.org });
     return c.json({ error: 'Failed to create API key' }, 500);
@@ -1772,18 +1804,18 @@ app.get(PARTNER_KEYS_BASE, async (c) => {
     if (orgError) return c.json({ error: orgError }, 400);
   }
   try {
-    const { records, truncated } = await listPartnerKeys(c.env.API_KEYS, org, logger);
+    const { records } = await keyStore(c).list(org);
     logger.log('admin_action', {
       action: 'list_api_keys',
       org: org ?? null,
       count: records.length,
-      truncated,
     });
-    // `truncated: true` = the index walk hit its page cap; narrow with ?org=.
+    // The DO list is always complete; `truncated` stays (always false) for
+    // contract stability with clients written against the KV-index list.
     return c.json({
       org: org ?? null,
       keys: records.map((r) => toPublicPartnerKey(r)),
-      truncated,
+      truncated: false,
     });
   } catch (error) {
     logger.error('admin_action', error, { action: 'list_api_keys', org: org ?? null });
@@ -1795,10 +1827,10 @@ app.get(`${PARTNER_KEYS_BASE}/:keyId`, async (c) => {
   const keyId = c.req.param('keyId');
   const logger = c.get('logger');
   try {
-    const found = await getPartnerKeyById(c.env.API_KEYS, keyId);
-    if (!found) return c.json({ error: 'API key not found' }, 404);
+    const record = await keyStore(c).get(keyId);
+    if (!record) return c.json({ error: 'API key not found' }, 404);
     logger.log('admin_action', { action: 'get_api_key', key_id: keyId });
-    return c.json({ key: toPublicPartnerKey(found.record) });
+    return c.json({ key: toPublicPartnerKey(record) });
   } catch (error) {
     logger.error('admin_action', error, { action: 'get_api_key', key_id: keyId });
     return c.json({ error: 'Failed to read API key' }, 500);
@@ -1815,10 +1847,7 @@ app.post(`${PARTNER_KEYS_BASE}/:keyId/_revoke`, async (c) => {
   if (!actor.ok) return c.json({ error: actor.error }, 400);
 
   try {
-    const result = await revokePartnerKey(c.env.API_KEYS, keyId, {
-      revokedBy: actor.revokedBy,
-      logger,
-    });
+    const result = await keyStore(c).revoke(keyId, actor.revokedBy);
     if (!result) return c.json({ error: 'API key not found' }, 404);
     logger.log('admin_action', {
       ...ctx,
@@ -1826,11 +1855,13 @@ app.post(`${PARTNER_KEYS_BASE}/:keyId/_revoke`, async (c) => {
       already_revoked: result.alreadyRevoked,
       revoked_ids: result.revokedIds,
       revoked_by: actor.revokedBy ?? null,
+      warnings: result.warnings,
     });
     return c.json({
       key: toPublicPartnerKey(result.record),
       alreadyRevoked: result.alreadyRevoked,
       revokedIds: result.revokedIds,
+      warnings: result.warnings,
     });
   } catch (error) {
     logger.error('admin_action', error, ctx);
@@ -1848,7 +1879,8 @@ app.post(`${PARTNER_KEYS_BASE}/:keyId/_rotate`, async (c) => {
   if (!body.ok) return c.json({ error: body.error }, 400);
 
   try {
-    const result = await rotatePartnerKey(c.env.API_KEYS, keyId, { ...body, logger });
+    const { ok: _ok, ...opts } = body;
+    const result = await keyStore(c).rotate(keyId, opts);
     if (result.status !== 'ok') return rotateRefusal(c, result);
     logger.log('admin_action', {
       ...ctx,
@@ -1877,19 +1909,20 @@ app.post(`${PARTNER_KEYS_BASE}/:keyId/_rotate`, async (c) => {
 });
 
 /** HTTP response for a rotation that did not happen. */
-function rotateRefusal(c: Context<AppEnv>, result: Exclude<RotateResult, { status: 'ok' }>) {
+function rotateRefusal(c: Context<AppEnv>, result: Exclude<RotateOutcome, { status: 'ok' }>) {
   switch (result.status) {
     case 'not_found':
       return c.json({ error: 'API key not found' }, 404);
     case 'revoked':
-      return c.json({ error: 'A revoked API key cannot be rotated; create a new key' }, 409);
+      return c.json(
+        { error: 'A revoked or expired API key cannot be rotated; create a new key' },
+        409
+      );
     case 'already_rotated':
       return c.json(
         { error: `This key was already rotated to ${result.rotatedTo}; rotate that key instead` },
         409
       );
-    case 'conflict':
-      return c.json({ error: 'This key was changed concurrently; reload it and retry' }, 409);
   }
 }
 

@@ -52,13 +52,23 @@ export interface Env {
   OPENAI_API_KEY: string;
   /** OpenRouter key for the two OpenRouter fallback tiers (#403). Unset ⇒ both tiers absent. */
   OPENROUTER_API_KEY?: string;
+  /**
+   * HMAC key for the tag on every partner API key (admin-portal#354; see
+   * src/services/partner-keys/key-material.ts). Lets auth reject a random
+   * token without a KV read. Unset ⇒ partner keys can be neither issued nor
+   * used. Changing it invalidates every issued key.
+   */
+  PARTNER_KEY_TAG_SECRET?: string;
 
   // KV Namespaces
   ORG_ADMIN_KEYS: KVNamespace;
   MCP_SERVERS: KVNamespace;
   ORG_CONFIG: KVNamespace;
   PROMPT_OVERRIDES: KVNamespace;
-  /** Partner API keys (admin-portal#354): SHA-256-keyed records; see src/services/partner-keys/store.ts. */
+  /**
+   * Partner API keys (admin-portal#354): the auth projection, `key:<sha256>` →
+   * record, written only by PARTNER_KEY_STORE; see src/services/partner-keys/.
+   */
   API_KEYS: KVNamespace;
 
   // AI binding
@@ -70,6 +80,8 @@ export interface Env {
 
   // Durable Object bindings
   USER_DO: DurableObjectNamespace;
+  /** Single writer for partner API key administration (admin-portal#354). */
+  PARTNER_KEY_STORE: DurableObjectNamespace;
 
   // OpenTelemetry (optional — telemetry is a no-op unless BOTH are set; see
   // src/services/telemetry). Set via `wrangler secret put`.

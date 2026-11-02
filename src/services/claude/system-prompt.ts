@@ -4,6 +4,7 @@
 
 import { ChatHistoryEntry } from '../../types/engine.js';
 import { PromptSlot } from '../../types/prompt-overrides.js';
+import { toSingleLine } from '../../types/single-line.js';
 import { UnmatchedTrigger } from '../classifier/index.js';
 import { generateToolCatalog, ToolCatalog } from '../mcp/index.js';
 
@@ -85,9 +86,16 @@ interface SystemPromptOptions {
 /** Max length for speaker names (prevents prompt bloat). */
 const MAX_SPEAKER_LENGTH = 64;
 
-/** Sanitize a speaker name: strip brackets, trim, and limit length. */
+/**
+ * Sanitize a speaker name for the prompt, for EVERY caller (Telegram and
+ * WhatsApp group names as much as partner apps): square brackets removed (the
+ * history prefix is `[name]:`), controls and line breaks of every kind
+ * (C0, C1, U+2028/U+2029) and whitespace runs flattened to one space, trimmed,
+ * and capped at 64 code points. A name can therefore never start a new prompt
+ * line or a heading. Empty → "Unknown".
+ */
 export function sanitizeSpeaker(name: string): string {
-  return name.replace(/[[\]]/g, '').trim().slice(0, MAX_SPEAKER_LENGTH) || 'Unknown';
+  return toSingleLine(name, MAX_SPEAKER_LENGTH, '[]') || 'Unknown';
 }
 
 /**

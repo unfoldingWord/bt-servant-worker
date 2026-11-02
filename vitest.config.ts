@@ -52,6 +52,8 @@ export default defineConfig({
           ANTHROPIC_API_KEY: anthropicKey,
           // #311: wa.me share number for first-contact welcome tests.
           WHATSAPP_NUMBER: '15558196461',
+          // admin-portal#354: HMAC key for the partner API key tag.
+          PARTNER_KEY_TAG_SECRET: 'test-partner-key-tag-secret',
         },
         kvNamespaces: [
           'ORG_ADMIN_KEYS',

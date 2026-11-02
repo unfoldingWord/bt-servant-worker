@@ -504,10 +504,23 @@ Named, revocable keys for partner apps (admin-portal#354). Our own clients
 (web client, WhatsApp gateway, admin portal) keep using `ENGINE_API_KEY`
 unchanged. These admin endpoints accept **only** `ENGINE_API_KEY`.
 
-- The plaintext key (`apiKey`, shape `bts_<8 hex>_<43 base64url>`) is returned
-  **once**, by create and rotate. It cannot be fetched again; only its SHA-256
-  is stored (`API_KEYS` KV: `key:<sha256>` → record, `ptr:<key id>` → hash,
-  and the list index `id:<org>:<key id>` carrying the record as metadata).
+- The plaintext key (`apiKey`, shape `bts_<8 hex>_<43 base64url>_<11 base64url tag>`)
+  is returned **once**, by create and rotate. It cannot be fetched again; only
+  its SHA-256 is stored.
+- **One writer.** Every admin operation goes to one Durable Object,
+  `PartnerKeyStoreDO` (binding `PARTNER_KEY_STORE`), which runs them one at a
+  time against its own transactional storage, the source of truth. Two admins
+  acting on the same key at the same moment are simply applied in order.
+- **Auth reads KV.** After each change the DO writes the key's record to
+  `API_KEYS` KV at `key:<sha256>` (one write per changed key), and the chat
+  auth reads only that. If the KV write fails, the change still stands, the
+  response carries `"warnings": ["auth_update_pending"]`, and the DO retries
+  the write from an alarm (every 30s) until it succeeds.
+- **Tag.** The last 11 characters are an HMAC tag made with the
+  `PARTNER_KEY_TAG_SECRET` secret. Auth checks it before any KV read, so a
+  random or guessed token never costs a lookup. Without that secret partner
+  keys can be neither issued nor used, and changing it invalidates every
+  issued key.
 - List and get return the record (`id`, `prefix`, `name`, `app`, `org`,
   `createdBy`, `createdAt`, `scopes`, `userNamespace`, `status`, and when set
   `revokedAt`, `revokedBy`, `rotatedFrom`, `rotatedTo`, `termsVersion`,
@@ -521,13 +534,9 @@ unchanged. These admin endpoints accept **only** `ENGINE_API_KEY`.
   (a location that looked the key up just before it existed keeps answering
   `403` until its cached miss expires). To replace a key without a gap,
   prefer rotation with a grace period over create-then-revoke.
-- The list is served from a KV listing alone (each index entry carries the
-  record as metadata), so a change made seconds ago may not show in it yet.
-  `GET …/api-keys/:keyId` reads the authoritative record. Revoked keys are kept
-  for audit; the list walks at most 20 pages (20,000 keys). Past that it
-  returns what it read with `"truncated": true` (and logs
-  `partner_key_list_truncated`); filter by `?org=` to see the rest. A complete
-  list has `"truncated": false`.
+- List and get read the Durable Object, so they are always current and the
+  list is always complete. Revoked keys are kept for audit. The list keeps a
+  `"truncated"` field for compatibility; it is always `false`.
 
 ### Create a Key
 
@@ -545,12 +554,13 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys" \
   }'
 ```
 
-**Response (201):** `{"key": {...record, "status": "active"}, "apiKey": "bts_1a2b3c4d_..."}`
+**Response (201):** `{"key": {...record, "status": "active"}, "warnings": [], "apiKey": "bts_1a2b3c4d_..."}`
 
 `org`, `name`, `app` and `createdBy` are required; `termsVersion` and
 `termsAcceptedAt` are optional. Size caps are UTF-8 bytes of the JSON-encoded
-value (so the record fits KV's 1024-byte metadata limit): `name` and `app` 100,
-`createdBy` (and `revokedBy`) 120, `termsVersion` 32. Any other field (for example `scopes` or
+value: `name` and `app` 100, `createdBy` (and `revokedBy`) 120,
+`termsVersion` 32. Labels must be a single line: a control character or line
+break of any kind is a `400`, not silently removed. Any other field (for example `scopes` or
 `limits`) is a `400`: every key has `scopes: ["chat"]`, and limits are not
 settable yet.
 
@@ -582,11 +592,10 @@ curl "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef" \
 Immediate, and **revoke kills the whole chain**: any predecessor of this key
 that is still working in its rotation grace window is revoked too, so revoking
 the current key really cuts the partner off. The response lists every key this
-call revoked in `revokedIds` (this key first, then its predecessors). If a
-rotation of this key ran at the same moment and its successor slipped
-through, that successor (and its chain forward) is revoked too and listed.
-Idempotent: revoking a revoked key returns it with `"alreadyRevoked": true`
-(its chain is still checked). The body is optional.
+call revoked in `revokedIds` (this key first, then its predecessors).
+Idempotent: revoking a revoked key returns it unchanged with
+`"alreadyRevoked": true` and `revokedIds: []` (its chain was already killed
+when it was revoked). The body is optional.
 
 ```bash
 curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_revoke" \
@@ -609,19 +618,13 @@ change it; `"graceSeconds": 0` revokes the old key at once ("rotate and kill
 now"), together with any older keys still in their own grace window, and the
 response lists them in `revokedIds`. An explicit `_revoke` is always immediate, also during a grace window.
 
-A revoked key, or one already rotated, cannot be rotated (`409`); create a new
-key or rotate the replacement instead. If a
-concurrent revoke or rotate of the same key wins, the response is also `409`
-(`changed concurrently`) and the key this call issued is revoked again; reload
-and retry. If the old key cannot be updated, the new key is revoked and the
-call returns `500` with the old key unchanged. Once the old key has been
-updated the rotation has happened, and the call always returns `200` with the
-new `apiKey`: if a follow-up step then fails it is logged
-(`partner_key_rotation_followup_failed`) and named in `warnings` —
-`rotation_unverified` (the re-read that checks for a concurrent writer
-failed; check the old key with `GET`) or `chain_revoke_incomplete` (with
-`graceSeconds: 0`, an older key still in its grace window could not be
-revoked; revoke it explicitly). The body is optional:
+A revoked or expired key, or one already rotated, cannot be rotated (`409`);
+create a new key or rotate the replacement instead. Two rotations of the same
+key sent together are applied in order: the first succeeds and the second
+gets `409` (already rotated). The new key, the retired old key and any chain
+revocations are written in one atomic step. `warnings` is `[]`, or
+`["auth_update_pending"]` when the KV write for auth is still being retried
+(see above). The body is optional:
 `{"createdBy": "...", "graceSeconds": 86400}`.
 
 ```bash
@@ -646,8 +649,12 @@ key is even looked up. On those two routes:
   prompt (which says only "a partner app").
 - `user_id`, `chat_id` and `thread_id` must be single-line strings of at most
   256 characters (`400` otherwise; `null` counts as absent for the optional
-  two). `speaker` is neutralised: control characters removed, line breaks
-  and other whitespace collapsed to one space, capped at 64 characters.
+  two). Single-line excludes all control characters (C0 and C1) and the
+  Unicode line/paragraph separators. `chat_id` and `thread_id` must not
+  contain `:` (the group conversation name joins them with `:`).
+- `speaker` gets the same treatment as for every other client: brackets
+  removed, line breaks and controls flattened to one space, capped at 64
+  characters, before it reaches the prompt.
 - `progress_callback_url` (and the other callback fields) are refused (`400`,
   the existing `/chat` and `/chat/stream` validation, worded for partners as
   "progress callbacks are not available with partner API keys").
@@ -676,9 +683,10 @@ curl -X POST "http://localhost:$PORT/api/v1/chat" \
   }'
 ```
 
-An unknown, revoked or expired key gets `403 {"error": "Invalid API key"}`
-(logged as `auth_rejected` with reason `unknown_partner_key`,
-`revoked_partner_key` or `expired_partner_key`).
+An unknown, revoked or expired key, or a token whose tag does not verify, gets
+`403 {"error": "Invalid API key"}` (logged as `auth_rejected` with reason
+`unknown_partner_key`, `revoked_partner_key`, `expired_partner_key` or
+`invalid_partner_key_tag`).
 Every chat request logs `key_id` on `request_received` (`"internal"` for
 `ENGINE_API_KEY`), which is how usage and "last used" per key are read from
 telemetry.

@@ -1,69 +1,21 @@
 /**
- * Minimal in-memory KVNamespace for store-level unit tests that need to inject
- * failures or interleavings the emulated KV in `cloudflare:test` cannot.
- *
- * Supports exactly what src/services/partner-keys/store.ts uses: `get` (text
- * or json), `put` (with metadata), `delete`, and a cursor-paged `list` by
- * prefix (`pageSize` keys per page; unlimited by default). `failPut` /
- * `failGet` make the next put / get of a key throw; `afterPut` runs a hook
- * after a successful put (to simulate a concurrent writer); `gets` counts reads.
+ * Minimal in-memory KVNamespace: what the partner key ledger writes (its auth
+ * projection, `put`) and what tests read back (`get`, text or json). Used so
+ * ledger tests do not share the emulated API_KEYS namespace with other suites
+ * (storage is not isolated between test files; see vitest.config.ts).
  */
-type Entry = { value: string; metadata?: unknown };
-
 export class FakeKV {
-  readonly store = new Map<string, Entry>();
-  gets = 0;
-  pageSize = Number.POSITIVE_INFINITY;
-  private failures = new Set<string>();
-  private getFailures = new Set<string>();
-  private hooks = new Map<string, () => void>();
-
-  failPut(key: string): void {
-    this.failures.add(key);
-  }
-
-  failGet(key: string): void {
-    this.getFailures.add(key);
-  }
-
-  afterPut(key: string, hook: () => void): void {
-    this.hooks.set(key, hook);
-  }
+  readonly store = new Map<string, string>();
 
   async get(key: string, type?: unknown): Promise<unknown> {
-    this.gets++;
-    if (this.getFailures.delete(key)) throw new Error(`injected get failure for ${key}`);
-    const entry = this.store.get(key);
-    if (!entry) return null;
+    const value = this.store.get(key);
+    if (value === undefined) return null;
     const wantsJson = type === 'json' || (type as { type?: string } | undefined)?.type === 'json';
-    return wantsJson ? JSON.parse(entry.value) : entry.value;
+    return wantsJson ? JSON.parse(value) : value;
   }
 
-  async put(key: string, value: string, opts?: { metadata?: unknown }): Promise<void> {
-    if (this.failures.delete(key)) throw new Error(`injected put failure for ${key}`);
-    this.store.set(key, { value, metadata: opts?.metadata });
-    const hook = this.hooks.get(key);
-    if (hook) {
-      this.hooks.delete(key);
-      hook();
-    }
-  }
-
-  async delete(key: string): Promise<void> {
-    this.store.delete(key);
-  }
-
-  async list(opts: { prefix?: string; cursor?: string } = {}) {
-    const prefix = opts.prefix ?? '';
-    const all = [...this.store.entries()]
-      .filter(([name]) => name.startsWith(prefix))
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([name, entry]) => ({ name, metadata: entry.metadata }));
-    const start = opts.cursor ? Number(opts.cursor) : 0;
-    const end = start + this.pageSize;
-    const keys = all.slice(start, end);
-    const complete = end >= all.length;
-    return { keys, list_complete: complete, cursor: complete ? undefined : String(end) };
+  async put(key: string, value: string): Promise<void> {
+    this.store.set(key, value);
   }
 
   /** Typed as the real binding for the code under test. */
