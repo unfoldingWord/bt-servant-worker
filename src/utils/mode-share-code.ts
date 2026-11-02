@@ -9,25 +9,21 @@
  * comparison, and the classifier's exact → prefix → fuzzy cascade. Rather than
  * have the portal re-implement those, this module RUNS them: the chat path's
  * read (`readCrossOrgModeSources`) and merge (`mergeCrossOrgModesDetailed`),
- * the shared element guard (`sanitizeModeElements`), the DO's option list
+ * the chat home crash guard (`sanitizeModeElements`), the DO's option list
  * (`chatTriggerModeOptions`), and the classifier itself (`classifyTriggers`
- * over the whole message `#<code>`, plus `resolveTriggerToken` for the tier).
+ * over the whole message `#<code>`, which also reports the cascade tier).
  *
- * `resolves` and `resolved_org` come ONLY from that actual match. The cap,
- * the shape guard and the merge's first-wins claims are consulted solely to
- * explain WHY this org's mode is not what the message opened.
+ * `resolves` and `resolved_org` come ONLY from that actual match. The foreign
+ * merge's strict shape check, the cap and the merge's first-wins claims are
+ * consulted solely to explain WHY this org's mode is not what it opened.
  *
  * The classifier partitions tokens by `/` (`matchToken`): a bare token only
  * ever sees bare (home) names and a qualified token only qualified (foreign)
  * names. So a home target is classified against the home record alone, with
  * no cross-org read, and the home record never affects a foreign answer.
  */
-import {
-  classifyTriggers,
-  type MatchTier,
-  resolveTriggerToken,
-} from '../services/classifier/index.js';
-import type { ChatMode, OrgModes, PromptMode } from '../types/prompt-overrides.js';
+import { classifyTriggers, type MatchTier } from '../services/classifier/index.js';
+import type { ChatMode, PromptMode } from '../types/prompt-overrides.js';
 import { chatTriggerModeOptions, findModeBySlug } from '../types/prompt-overrides.js';
 import {
   compareOrgs,
@@ -96,8 +92,14 @@ export interface ShareCodeTarget {
   org: string;
   /** The mode as stored in that org's record (canonical name). */
   mode: PromptMode;
-  /** The stored element passes the shared guard (`modeElementError`); if not, chat never sees it. */
+  /**
+   * The stored element passes the STRICT check (`modeElementError`). Only
+   * meaningful for a foreign target: the foreign merge drops elements that
+   * fail it, while the home crash guard serves them.
+   */
   wellShaped: boolean;
+  /** The target org's record after the chat home crash guard, computed once by the loader. */
+  targetModes: ChatMode[];
   /** The org a WhatsApp request will carry (gateway ENGINE_ORG). */
   homeOrg: string;
   /**
@@ -124,7 +126,10 @@ function codeFor(slug: string | null, name: string): string | null {
 }
 
 /** A reason decided from the stored mode alone, before any pool read. */
-function staticReason(mode: PromptMode): ShareCodeReason | null {
+function staticReason(target: ShareCodeTarget, isHome: boolean): ShareCodeReason | null {
+  const { mode } = target;
+  // The foreign merge drops a malformed element whatever its other flags.
+  if (!isHome && !target.wellShaped) return 'invalid_mode';
   if (mode.published !== true) return 'draft';
   // Hidden in the private chat a share link opens.
   if (mode.requires_group === true) return 'requires_group';
@@ -139,8 +144,8 @@ type ActualMatch =
 
 /**
  * Send the message `#<code>` through `classifyTriggers` (leading-token
- * extraction included) and report the mode it selected, its owner org,
- * whether the token consumed the whole message, and the cascade tier.
+ * extraction included) and report the mode it selected, the tier that
+ * selected it, whether the token consumed the whole message, and its owner.
  */
 function matchCode(code: string, pool: ChatMode[], homeOrg: string): ActualMatch {
   const options = chatTriggerModeOptions(pool, WHATSAPP_CHAT);
@@ -152,17 +157,11 @@ function matchCode(code: string, pool: ChatMode[], homeOrg: string): ActualMatch
   if (classified.modeName === undefined) return { kind: 'none' };
   const owner = pool.find((m) => m.name === classified.modeName);
   if (owner === undefined) return { kind: 'none' };
-  // The tier of the same raw token, when that token was the whole code.
-  const resolved = resolveTriggerToken(code, options);
-  const tier =
-    resolved.kind === 'matched' && resolved.match.name === owner.name
-      ? resolved.match.tier
-      : undefined;
   const whole = classified.strippedMessage === '' && classified.unmatchedTriggers.length === 0;
   // Only qualified (foreign) entries are stamped with `org` by the merge; a
   // bare name is always the home org's, whatever a stored record carries.
   const org = owner.name.includes('/') && owner.org !== undefined ? owner.org : homeOrg;
-  return { kind: 'mode', name: owner.name, tier, whole, org };
+  return { kind: 'mode', name: owner.name, tier: classified.modeMatchTier, whole, org };
 }
 
 /** The message opened this org's own mode, by its canonical name, on the exact tier, consuming it all. */
@@ -197,19 +196,20 @@ function answerFromMatch(
   return answer;
 }
 
-/** Home target: a bare token only matches bare names, so the home record is the whole pool. */
+/**
+ * Home target: a bare token only matches bare names, so the home record (as
+ * the chat crash guard serves it) is the whole pool. Chat serves every
+ * well-named home element, so a home miss is never `invalid_mode`.
+ */
 function resolveHome(target: ShareCodeTarget, code: string): ShareCodeAnswer {
-  const record = target.snapshot.get(modesKey(target.homeOrg)) as OrgModes;
-  const pool = sanitizeModeElements(record.modes).modes;
-  const match = matchCode(code, pool, target.homeOrg);
-  const whyMissing = target.wellShaped ? null : 'invalid_mode';
-  return answerFromMatch(code, match, { name: code, org: target.org }, whyMissing);
+  const match = matchCode(code, target.targetModes, target.homeOrg);
+  return answerFromMatch(code, match, { name: code, org: target.org }, null);
 }
 
 /**
- * Why this org's qualified name is absent from the pool, most basic cause
- * first: never read (cap), then rejected by the shared shape guard, then
- * claimed first by another org.
+ * Why this org's qualified name is absent from the pool: never read (cap),
+ * then claimed first by another org. (A malformed element is decided before
+ * any read, in `staticReason`.)
  */
 function whyForeignMissing(
   code: string,
@@ -218,16 +218,15 @@ function whyForeignMissing(
 ): ShareCodeReason | null {
   // Listed but beyond the per-turn cap, or past a truncated listing.
   if (!pool.sources.readKeys.includes(modesKey(target.org))) return 'capped';
-  if (!target.wellShaped) return 'invalid_mode';
   const claimedBy = pool.merged.claimed.get(code);
   if (claimedBy !== undefined && claimedBy !== target.org) return 'collision';
   return null;
 }
 
 /**
- * Whether a failed foreign get could change this answer. Anything short of an
- * exact match on this org's own mode could change: the failed org may hold the
- * mode the token would really open. (Narrowing this to orgs within fuzzy reach
+ * Whether a failed foreign get could change this answer. `capped` cannot: the
+ * cap is decided from the listing before any get. Any other miss could: the
+ * failed org may hold the mode the token would really open. (Narrowing this to orgs within fuzzy reach
  * of the slug would need a second edit-distance implementation, so the rule
  * stays broad.) An own exact match can only be pre-empted by a failed org that
  * the merge would have processed first (`compareOrgs`) with the same slug.
@@ -237,7 +236,7 @@ function failureCouldChange(
   target: { org: string; slug: string },
   sources: CrossOrgModeSources
 ): boolean {
-  if (sources.failedKeys.length === 0) return false;
+  if (sources.failedKeys.length === 0 || answer.reason === 'capped') return false;
   if (!answer.resolves) return true;
   return sources.failedKeys
     .map(orgFromModesKey)
@@ -285,16 +284,20 @@ export async function resolveModeShareCode(
   logger: RequestLogger
 ): Promise<ShareCodeAnswer> {
   const { org, mode } = target;
-  const isHome = org === target.homeOrg;
-  const slug = isHome ? null : orgSlug(org);
+  const slug = org === target.homeOrg ? null : orgSlug(org);
   const code = codeFor(slug, mode.name);
-  // The chat path never merges a skipped org (an empty slug cannot even form a code).
-  if (slug !== null && orgSkipReason(org, slug) !== null) {
+  if (slug === null) {
+    const early = staticReason(target, true);
+    return early === null
+      ? resolveHome(target, mode.name)
+      : { code, resolves: false, reason: early };
+  }
+  // The chat path never merges a skipped org; an empty slug cannot even form a code.
+  if (code === null || orgSkipReason(org, slug) !== null) {
     return { code, resolves: false, reason: 'org_skipped' };
   }
-  const early = staticReason(mode);
+  const early = staticReason(target, false);
   if (early !== null) return { code, resolves: false, reason: early };
-  if (slug === null || code === null) return resolveHome(target, mode.name);
   return resolveForeign(kv, target, { slug, code }, logger);
 }
 
@@ -330,30 +333,46 @@ async function readSnapshotValue(
 }
 
 /**
- * Find `slug` in a stored `modes[]`. Well-shaped elements match by name or
- * alias (`findModeBySlug`); an element the shared guard rejects can still be
- * found by its canonical name, so the answer can say `invalid_mode` instead
- * of pretending the mode does not exist.
+ * Find `slug` among the record's elements as chat serves them (`targetModes`,
+ * crash-guarded once), and judge the original stored element with the STRICT
+ * check the foreign merge applies.
  */
 function findStoredMode(
   elements: readonly unknown[],
+  targetModes: ChatMode[],
   slug: string
 ): { mode: PromptMode; wellShaped: boolean } | undefined {
-  const valid = findModeBySlug(sanitizeModeElements(elements).modes, slug);
-  if (valid !== undefined) return { mode: valid, wellShaped: true };
-  const raw = elements.find(
-    (e): e is PromptMode => isModeRecord(e) && (e as { name?: unknown }).name === slug
+  const mode = findModeBySlug(targetModes, slug);
+  if (mode === undefined) return undefined;
+  const stored = elements.find(
+    (e) => isModeRecord(e) && (e as { name?: unknown }).name === mode.name
   );
-  return raw === undefined ? undefined : { mode: raw, wellShaped: modeElementError(raw) === null };
+  return { mode, wellShaped: modeElementError(stored) === null };
+}
+
+/**
+ * For a FOREIGN target, a home record that is unreadable or corrupt is an
+ * empty home, exactly as the chat path's `readHomeModes` degrades (same
+ * event, tagged `source: 'share_code'`), and `home_has_modes` is unknown. A
+ * home record never affects a qualified token.
+ */
+function degradeHome(
+  snapshot: Map<string, unknown>,
+  home: { key: string; error: unknown },
+  logger: RequestLogger
+): undefined {
+  withLogContext(logger, SHARE_CODE_LOG_CONTEXT).error('org_modes_kv_read_error', home.error, {
+    key: home.key,
+  });
+  snapshot.set(home.key, null);
+  return undefined;
 }
 
 /**
  * Read `<org>:modes` and `<homeOrg>:modes` once (one get when they are the same
- * key) and find the mode; the answer is computed from this snapshot. An absent
- * or corrupt home record is an empty home, exactly as the chat path's
- * `readHomeModes` treats it, and so is a home TRANSPORT failure for a foreign
- * target (the home record cannot affect a qualified token). A transport
- * failure on the target, or on the home of a home target, is retryable.
+ * key) and find the mode; the answer is computed from this snapshot. For a
+ * home target an unreadable record is retryable and a corrupt one is
+ * reported; for a foreign target a bad home record degrades (`degradeHome`).
  */
 export async function loadShareCodeTarget(
   kv: KVNamespace,
@@ -372,23 +391,19 @@ export async function loadShareCodeTarget(
   }
   if (record === CORRUPT) return { kind: 'corrupt_record', key: orgKey };
 
-  let homeHasModes: boolean | undefined = isOrgModes(snapshot.get(homeKey));
-  if (snapshot.get(homeKey) === UNREADABLE) {
-    logger.warn('mode_share_code_home_unreadable', {
-      key: homeKey,
-      error: String(reads.at(1)?.error),
-    });
-    homeHasModes = undefined;
-  }
-  if (snapshot.get(homeKey) === CORRUPT || snapshot.get(homeKey) === UNREADABLE) {
-    snapshot.set(homeKey, null);
-  }
+  const homeValue = snapshot.get(homeKey);
+  const homeHasModes =
+    homeValue === UNREADABLE || homeValue === CORRUPT
+      ? degradeHome(snapshot, { key: homeKey, error: reads.at(1)?.error }, logger)
+      : isOrgModes(homeValue);
 
-  const found = isOrgModes(record) ? findStoredMode(record.modes, p.modeName) : undefined;
+  if (!isOrgModes(record)) return { kind: 'mode_not_found' };
+  const targetModes = sanitizeModeElements(record.modes).modes;
+  const found = findStoredMode(record.modes, targetModes, p.modeName);
   if (found === undefined) return { kind: 'mode_not_found' };
   return {
     kind: 'ok',
-    target: { org: p.org, homeOrg: p.homeOrg, snapshot, ...found },
+    target: { org: p.org, homeOrg: p.homeOrg, snapshot, targetModes, ...found },
     homeHasModes,
   };
 }

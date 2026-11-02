@@ -46,6 +46,8 @@ export interface UnmatchedTrigger {
 export interface ClassifierResult {
   /** Resolved mode name (slug), or undefined if no #mode token matched */
   modeName: string | undefined;
+  /** The cascade tier that resolved `modeName`; present exactly when `modeName` is. */
+  modeMatchTier?: MatchTier;
   /** Resolved language name (slug), or undefined if no @language token matched */
   languageName: string | undefined;
   /** User message with all leading trigger tokens stripped (matched or not) */
@@ -279,7 +281,7 @@ function matchToken(raw: string, options: AvailableOption[]): TokenMatch | null 
  */
 type TokenOutcome =
   | { kind: 'clear'; sigil: '#' | '@' }
-  | { kind: 'matched'; sigil: '#' | '@'; name: string }
+  | { kind: 'matched'; sigil: '#' | '@'; name: string; tier: MatchTier }
   | { kind: 'unmatched'; trigger: UnmatchedTrigger; tokenText: string };
 
 /** How one raw token (sigil stripped) resolves against an option list. */
@@ -308,7 +310,12 @@ function classifyToken(token: ParsedToken, ctx: ClassifierContext): TokenOutcome
     return { kind: 'clear', sigil: token.sigil };
   }
   if (resolved.kind === 'matched') {
-    return { kind: 'matched', sigil: token.sigil, name: resolved.match.name };
+    return {
+      kind: 'matched',
+      sigil: token.sigil,
+      name: resolved.match.name,
+      tier: resolved.match.tier,
+    };
   }
   const triggerKind: TriggerKind = isMode ? 'mode' : 'language';
   return {
@@ -333,6 +340,7 @@ export function classifyTriggers(messageText: string, ctx: ClassifierContext): C
   }
 
   let modeName: string | undefined;
+  let modeMatchTier: MatchTier | undefined;
   let languageName: string | undefined;
   let clearMode = false;
   let clearLanguage = false;
@@ -345,8 +353,12 @@ export function classifyTriggers(messageText: string, ctx: ClassifierContext): C
       if (outcome.sigil === '#') clearMode = true;
       else clearLanguage = true;
     } else if (outcome.kind === 'matched') {
-      if (outcome.sigil === '#') modeName = outcome.name;
-      else languageName = outcome.name;
+      if (outcome.sigil === '#') {
+        modeName = outcome.name;
+        modeMatchTier = outcome.tier;
+      } else {
+        languageName = outcome.name;
+      }
     } else {
       unmatchedTriggers.push(outcome.trigger);
       unmatchedTokenTexts.push(outcome.tokenText);
@@ -358,12 +370,9 @@ export function classifyTriggers(messageText: string, ctx: ClassifierContext): C
       ? postTokens
       : `${unmatchedTokenTexts.join(' ')}${postTokens.length > 0 ? ' ' + postTokens : ''}`;
 
-  return {
-    modeName,
-    languageName,
-    strippedMessage,
-    unmatchedTriggers,
-    clearMode,
-    clearLanguage,
-  };
+  const result = { modeName, languageName, strippedMessage, unmatchedTriggers };
+  const flags = { clearMode, clearLanguage };
+  return modeMatchTier === undefined
+    ? { ...result, ...flags }
+    : { ...result, ...flags, modeMatchTier };
 }

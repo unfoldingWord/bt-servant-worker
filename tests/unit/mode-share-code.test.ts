@@ -281,31 +281,26 @@ describe('resolveModeShareCode — capped and skipped orgs', () => {
 });
 
 describe('resolveModeShareCode — prefix/fuzzy stealing', () => {
-  it('prefix stealing: a malformed target reports invalid_mode and names the look-alike it opens', async () => {
+  it('a malformed foreign target is invalid_mode before any read (the merge drops it)', async () => {
     const kv = fakeKv({
       'PBT:modes': { modes: [published('obt-coach-v2')] },
-      // Published but malformed: the shared guard drops it, so `pbt/obt-coach`
-      // is missing and the classifier's prefix tier picks PBT's look-alike.
       'pbt:modes': { modes: [published('obt-coach', { welcome_message: 1 as unknown as string })] },
     });
     expect(await resolve(kv, 'pbt', 'obt-coach')).toEqual({
       code: 'pbt/obt-coach',
       resolves: false,
       reason: 'invalid_mode',
-      resolved_org: 'PBT',
     });
+    expect(kv.list).not.toHaveBeenCalled();
   });
 
-  it('fuzzy stealing is caught the same way', async () => {
+  it('a malformed foreign DRAFT reports invalid_mode, not draft (shape is checked first)', async () => {
     const kv = fakeKv({
-      'PBT:modes': { modes: [published('obt-coahc')] },
-      'pbt:modes': { modes: [published('obt-coach', { welcome_message: 1 as unknown as string })] },
+      'pbt:modes': {
+        modes: [{ name: 'x', overrides: null as unknown as Record<string, string> }],
+      },
     });
-    expect(await resolve(kv, 'pbt', 'obt-coach')).toMatchObject({
-      resolves: false,
-      reason: 'invalid_mode',
-      resolved_org: 'PBT',
-    });
+    expect(await resolve(kv, 'pbt', 'x')).toMatchObject({ reason: 'invalid_mode' });
   });
 
   it('a malformed target with no look-alike opens nothing (no resolved_org)', async () => {
@@ -354,7 +349,6 @@ describe('resolveModeShareCode — miss explanation order (cap, shape, then coll
       code: 'pbt/x',
       resolves: false,
       reason: 'invalid_mode',
-      resolved_org: 'pbt',
     });
   });
 });
@@ -364,10 +358,12 @@ describe('resolveModeShareCode — the whole message must be the token', () => {
     const kv = fakeKv({
       [`${HOME}:modes`]: { modes: [published('obt coach'), published('obt')] },
     });
+    // Chat serves the element (the crash guard keeps it), so this is not
+    // invalid_mode: the message simply opens a different mode.
     expect(await resolve(kv, HOME, 'obt coach')).toEqual({
       code: 'obt coach',
       resolves: false,
-      reason: 'invalid_mode',
+      reason: 'ambiguous',
       resolved_org: HOME,
     });
   });
@@ -387,7 +383,7 @@ describe('resolveModeShareCode — degraded reads', () => {
     expect(await unavailableDetail(resolve(kv, 'pbt', 'x'))).toBe('read_failed');
   });
 
-  it('a failed get could hide the look-alike behind a not_found (read_failed)', async () => {
+  it('a failed get cannot change a static invalid_mode', async () => {
     const kv = fakeKv(
       {
         'other:modes': { modes: [published('y')] },
@@ -395,7 +391,7 @@ describe('resolveModeShareCode — degraded reads', () => {
       },
       { failGet: ['other:modes'] }
     );
-    expect(await unavailableDetail(resolve(kv, 'pbt', 'x'))).toBe('read_failed');
+    expect(await resolve(kv, 'pbt', 'x')).toMatchObject({ reason: 'invalid_mode' });
   });
 
   it('a failed get of an unrelated org does not block a resolving answer', async () => {
@@ -479,13 +475,29 @@ describe('loadShareCodeTarget — corrupt records', () => {
       await env.PROMPT_OVERRIDES.delete('u345-corrupt:modes');
     }
   });
+});
 
-  it('a corrupt home record is an empty home, as the chat path reads it', async () => {
+describe('loadShareCodeTarget — corrupt home', () => {
+  const load = (kv: KVNamespace, org: string, modeName: string, homeOrg = HOME) =>
+    loadShareCodeTarget(kv, { org, homeOrg, modeName }, spyLogger());
+
+  it('a corrupt home record for a FOREIGN target is an empty home, logged as chat logs it, home_has_modes unknown', async () => {
     const kv = fakeKv(
       { 'pbt:modes': { modes: [published('x')] } },
       { noHome: true, rawText: { [`${HOME}:modes`]: '{not json' } }
     );
-    expect(await load(kv, 'pbt', 'x')).toMatchObject({ kind: 'ok', homeHasModes: false });
+    const logger = spyLogger();
+    const loaded = await loadShareCodeTarget(
+      kv,
+      { org: 'pbt', homeOrg: HOME, modeName: 'x' },
+      logger
+    );
+    expect(loaded).toMatchObject({ kind: 'ok', homeHasModes: undefined });
+    expect(logger.error).toHaveBeenCalledWith(
+      'org_modes_kv_read_error',
+      expect.anything(),
+      expect.objectContaining({ key: `${HOME}:modes`, source: 'share_code' })
+    );
     expect(await resolve(kv, 'pbt', 'x')).toMatchObject({ resolves: true });
   });
 
@@ -526,7 +538,7 @@ describe('resolveModeShareCode — malformed elements', () => {
     expect(await resolve(kv, HOME, 'x')).toMatchObject({ code: 'x', resolves: true });
   });
 
-  it('`aliases: null` fails the shared guard, so the mode is invalid_mode (chat never sees it)', async () => {
+  it('`aliases: null` on a home mode is normalized to none, so chat serves it and it resolves', async () => {
     const kv = fakeKv({
       [`${HOME}:modes`]: {
         modes: [
@@ -535,14 +547,10 @@ describe('resolveModeShareCode — malformed elements', () => {
         ],
       },
     });
-    expect(await resolve(kv, HOME, 'x')).toEqual({
-      code: 'x',
-      resolves: false,
-      reason: 'invalid_mode',
-    });
+    expect(await resolve(kv, HOME, 'x')).toEqual({ code: 'x', resolves: true, resolved_org: HOME });
   });
 
-  it('`overrides: null` on a home mode is invalid_mode; its neighbours still resolve', async () => {
+  it('`overrides: null` on a home mode is normalized, so chat serves it and it resolves', async () => {
     const kv = fakeKv({
       [`${HOME}:modes`]: {
         modes: [
@@ -551,7 +559,7 @@ describe('resolveModeShareCode — malformed elements', () => {
         ],
       },
     });
-    expect(await resolve(kv, HOME, 'x')).toMatchObject({ resolves: false, reason: 'invalid_mode' });
+    expect(await resolve(kv, HOME, 'x')).toMatchObject({ resolves: true });
     expect(await resolve(kv, HOME, 'y')).toMatchObject({ resolves: true });
   });
 
@@ -574,7 +582,7 @@ describe('resolveModeShareCode — failure impact is judged on the raw match', (
     expect(await resolve(kv, 'PBT', 'x')).toMatchObject({ resolves: true, resolved_org: 'PBT' });
   });
 
-  it('a capped target with a failed org is unavailable (the look-alike could be there)', async () => {
+  it('capped is firm even when another org failed to read (the cap comes from the listing)', async () => {
     const fillers = Object.fromEntries(
       Array.from({ length: MAX_FOREIGN_ORGS_PER_TURN }, (_, i) => [
         `a${String(i).padStart(2, '0')}:modes`,
@@ -585,7 +593,11 @@ describe('resolveModeShareCode — failure impact is judged on the raw match', (
       { ...fillers, 'zzz:modes': { modes: [published('x')] } },
       { failGet: ['a07:modes'] }
     );
-    expect(await unavailableDetail(resolve(kv, 'zzz', 'x'))).toBe('read_failed');
+    expect(await resolve(kv, 'zzz', 'x')).toEqual({
+      code: 'zzz/x',
+      resolves: false,
+      reason: 'capped',
+    });
   });
 
   it('any failed read makes a non-own-exact answer unavailable, even a collision loss', async () => {

@@ -117,46 +117,123 @@ export function isModeRecord(mode: unknown): mode is PromptMode {
 }
 
 /**
- * Why a stored `modes[]` element must not reach the chat path, or null when it
- * is well-shaped. ONE guard for home and foreign records: an object that
- * passes `modeShapeError` (the admin PUT's `validatePromptMode` plus a string
- * `name`). The DO, the classifier and `findModeBySlug` dereference these
- * elements without re-checking them.
+ * The STRICT shape check: why an element fails what the admin PUT enforces
+ * (`modeShapeError`: `validatePromptMode` plus a string `name`), or null. The
+ * foreign merge drops elements that fail it. The home read does NOT use it
+ * (see `sanitizeModeElements`); the share-code endpoint uses it to explain
+ * why a FOREIGN mode never reaches chat.
  */
 export function modeElementError(element: unknown): string | null {
   if (!isModeRecord(element)) return 'mode_not_object';
   return modeShapeError(element);
 }
 
-/** One dropped element: its index, its name when it has a string one, and why. */
-export interface DroppedModeElement {
+/** One home element the crash guard dropped or normalized. */
+export interface ModeElementIssue {
   index: number;
   name?: string;
-  reason: string;
+  /** `mode_not_object`, `name_not_string`, or `normalized:<fields>`. */
+  issue: string;
+  /** The element is not published (drafts are not logged, as in the foreign merge). */
+  draft: boolean;
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === 'string';
 }
 
 /**
- * Keep the well-shaped elements of a stored home `modes[]` (see
- * `modeElementError`) and report the rest. A record written through the admin
- * PUT is unchanged; only elements the PUT would have rejected are dropped.
- * Shared by the chat path's home read and the share-code endpoint.
+ * The fields of one well-named element that the DO would throw on, set to
+ * their absent form: `aliases` that is not an array of strings
+ * (`findModeBySlug` and the classifier call array/string methods on it),
+ * `overrides: null` (`getEffectiveOverrides` tests `!== undefined`, then
+ * `resolvePromptOverrides` indexes it), and a non-string `welcome_message`
+ * (`maybeBuildModeWelcome` calls `.trim()` on it). Returns the original
+ * object when nothing needed fixing.
+ */
+function normalizeModeElement(mode: ChatMode): { mode: ChatMode; fixed: string[] } {
+  const { aliases, overrides, welcome_message: welcome, ...rest } = mode;
+  const out: ChatMode = { ...rest };
+  const fixed = [
+    ...keepAliases(out, aliases),
+    ...keepOverrides(out, overrides),
+    ...keepWelcome(out, welcome),
+  ];
+  return fixed.length === 0 ? { mode, fixed } : { mode: out, fixed };
+}
+
+/** Copy `aliases` onto `out` keeping only strings; a non-array is dropped. Returns the fixed field, if any. */
+function keepAliases(out: ChatMode, aliases: unknown): string[] {
+  if (aliases === undefined) return [];
+  if (!Array.isArray(aliases)) return ['aliases'];
+  const kept = (aliases as unknown[]).filter(isString);
+  out.aliases = kept;
+  return kept.length === aliases.length ? [] : ['aliases'];
+}
+
+/** Copy `overrides` onto `out` unless it is `null`. */
+function keepOverrides(out: ChatMode, overrides: ChatMode['overrides'] | null): string[] {
+  if (overrides === null) return ['overrides'];
+  if (overrides !== undefined) out.overrides = overrides;
+  return [];
+}
+
+/** Copy `welcome_message` onto `out` unless it is a non-string (null and absent are harmless). */
+function keepWelcome(out: ChatMode, welcome: unknown): string[] {
+  if (welcome === undefined || welcome === null) return [];
+  if (!isString(welcome)) return ['welcome_message'];
+  out.welcome_message = welcome;
+  return [];
+}
+
+/**
+ * The chat path's home crash guard. Only what would make the DO throw is
+ * touched, so a working legacy mode keeps working even if the stricter admin
+ * PUT would now reject it: an element that is not an object or has no string
+ * `name` is dropped, and the fields in `normalizeModeElement` are set to their
+ * absent form. A clean element is passed through as the same object. Shared
+ * by the chat home read and the share-code endpoint, so both see what chat
+ * serves.
  */
 export function sanitizeModeElements(elements: readonly unknown[]): {
   modes: ChatMode[];
-  dropped: DroppedModeElement[];
+  issues: ModeElementIssue[];
 } {
   const modes: ChatMode[] = [];
-  const dropped: DroppedModeElement[] = [];
+  const issues: ModeElementIssue[] = [];
   elements.forEach((element, index) => {
-    const reason = modeElementError(element);
-    if (reason === null) {
-      modes.push(element as ChatMode);
+    if (!isModeRecord(element)) {
+      issues.push({ index, issue: 'mode_not_object', draft: false });
       return;
     }
-    const name = isModeRecord(element) ? (element as { name?: unknown }).name : undefined;
-    dropped.push(typeof name === 'string' ? { index, name, reason } : { index, reason });
+    const draft = element.published !== true;
+    if (typeof (element as { name?: unknown }).name !== 'string') {
+      issues.push({ index, issue: 'name_not_string', draft });
+      return;
+    }
+    const { mode, fixed } = normalizeModeElement(element as ChatMode);
+    modes.push(mode);
+    if (fixed.length > 0) {
+      issues.push({ index, name: mode.name, issue: `normalized:${fixed.join(',')}`, draft });
+    }
   });
-  return { modes, dropped };
+  return { modes, issues };
+}
+
+/** Home element issues already logged in this isolate, so a bad record warns once, not every turn. */
+const loggedHomeIssues = new Set<string>();
+const MAX_LOGGED_HOME_ISSUES = 1000;
+
+/** The issues not yet logged in this isolate (drafts exempt), marking them logged. */
+function freshHomeIssues(key: string, issues: ModeElementIssue[]): ModeElementIssue[] {
+  if (loggedHomeIssues.size > MAX_LOGGED_HOME_ISSUES) loggedHomeIssues.clear();
+  return issues.filter((issue) => {
+    if (issue.draft) return false;
+    const id = `${key}\u0000${issue.index}\u0000${issue.name ?? ''}\u0000${issue.issue}`;
+    if (loggedHomeIssues.has(id)) return false;
+    loggedHomeIssues.add(id);
+    return true;
+  });
 }
 
 /** The merge's org order (first wins on a collision): plain code-unit order of raw org names. */
@@ -460,12 +537,13 @@ async function readHomeModes(
     logger.warn('org_modes_invalid_shape', { key: homeKey });
     return { modes: [] };
   }
-  const { modes, dropped } = sanitizeModeElements(value.modes);
-  if (dropped.length > 0) {
+  const { modes, issues } = sanitizeModeElements(value.modes);
+  const fresh = freshHomeIssues(homeKey, issues);
+  if (fresh.length > 0) {
     logger.warn('org_modes_invalid_elements', {
       key: homeKey,
-      dropped_count: dropped.length,
-      dropped: dropped.slice(0, MAX_DROPPED_KEYS_LOGGED),
+      issue_count: fresh.length,
+      issues: fresh.slice(0, MAX_DROPPED_KEYS_LOGGED).map(({ draft: _draft, ...rest }) => rest),
     });
   }
   return { modes };

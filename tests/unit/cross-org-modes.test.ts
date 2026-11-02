@@ -742,38 +742,62 @@ describe('validateModeSelection', () => {
 
 // ─── Chat path: malformed home elements (admin-portal#345 round 3) ────────────
 
+const R5_CLEAN = { name: 'b', published: true, overrides: {}, aliases: ['old-b'] };
+
+/** A home record with every crash shape, a strict-only failure, a clean record and a draft. */
+const R5_HOME_ELEMENTS: unknown[] = [
+  null,
+  7,
+  { name: 5, published: true, overrides: {} },
+  { name: 'a', published: true, overrides: null },
+  { name: 'c', published: true, overrides: {}, aliases: null },
+  { name: 'w', published: true, overrides: {}, welcome_message: 1 },
+  // Over the admin PUT's label limit, but nothing in chat throws on it.
+  { name: 'legacy', published: true, overrides: {}, label: 'L'.repeat(5000) },
+  R5_CLEAN,
+  { name: 'd', overrides: null },
+];
+
 describe('readAllPublishedModes — malformed home elements are sanitized for chat', () => {
-  it('drops elements the shared guard rejects (null, primitive, non-string name, overrides: null, aliases: null), with a warn', async () => {
-    const kv = fakeKv({
-      'home:modes': {
-        modes: [
-          null,
-          7,
-          { name: 5, published: true, overrides: {} },
-          { name: 'a', published: true, overrides: null },
-          { name: 'c', published: true, overrides: {}, aliases: null },
-          { name: 'b', published: true, overrides: {}, aliases: ['old-b'] },
-          { name: 'd', overrides: {} },
-        ],
-      },
-    });
+  it('drops only what would crash the DO, normalizes the rest, and keeps clean records verbatim', async () => {
+    const kv = fakeKv({ 'home-r5a:modes': { modes: R5_HOME_ELEMENTS } });
     const logger = spyLogger();
-    const merged = await readAllPublishedModes(kv, 'home', logger);
-    // Valid records are kept verbatim, drafts included.
-    expect(merged.modes).toEqual([
-      { name: 'b', published: true, overrides: {}, aliases: ['old-b'] },
-      { name: 'd', overrides: {} },
-    ]);
-    expect(logger.warn).toHaveBeenCalledWith(
-      'org_modes_invalid_elements',
-      expect.objectContaining({ key: 'home:modes', dropped_count: 5 })
-    );
+    const merged = await readAllPublishedModes(kv, 'home-r5a', logger);
+    expect(merged.modes.map((m) => m.name)).toEqual(['a', 'c', 'w', 'legacy', 'b', 'd']);
+    expect(merged.modes[0]).toEqual({ name: 'a', published: true });
+    expect(merged.modes[1]).toEqual({ name: 'c', published: true, overrides: {} });
+    expect(merged.modes[2]).toEqual({ name: 'w', published: true, overrides: {} });
+    expect(merged.modes[4]).toEqual(R5_CLEAN);
+    expect(merged.modes[5]).toEqual({ name: 'd' });
+    // Drafts are not logged, as in the foreign merge.
+    expect(logger.warn).toHaveBeenCalledWith('org_modes_invalid_elements', {
+      key: 'home-r5a:modes',
+      issue_count: 6,
+      issues: [
+        { index: 0, issue: 'mode_not_object' },
+        { index: 1, issue: 'mode_not_object' },
+        { index: 2, issue: 'name_not_string' },
+        { index: 3, name: 'a', issue: 'normalized:overrides' },
+        { index: 4, name: 'c', issue: 'normalized:aliases' },
+        { index: 5, name: 'w', issue: 'normalized:welcome_message' },
+      ],
+    });
     // What the DO does next must not throw: visibility filter + classifier.
     const options = chatTriggerModeOptions(merged.modes, { isGroupChat: false, isAdmin: false });
     expect(resolveTriggerToken('old-b', options)).toEqual({
       kind: 'matched',
       match: { name: 'b', tier: 'alias' },
     });
+  });
+
+  it('warns about a malformed home element once per isolate, not every turn', async () => {
+    const kv = fakeKv({ 'home-r5b:modes': { modes: [null, published('h')] } });
+    const first = spyLogger();
+    await readAllPublishedModes(kv, 'home-r5b', first);
+    const second = spyLogger();
+    await readAllPublishedModes(kv, 'home-r5b', second);
+    expect(first.warn).toHaveBeenCalledWith('org_modes_invalid_elements', expect.anything());
+    expect(second.warn).not.toHaveBeenCalledWith('org_modes_invalid_elements', expect.anything());
   });
 
   it('a clean home record logs nothing extra', async () => {

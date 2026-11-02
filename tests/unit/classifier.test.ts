@@ -691,3 +691,13 @@ describe('resolveTriggerToken — match provenance (admin-portal#345)', () => {
     expect(resolveTriggerToken('zzz-nothing', options)).toEqual({ kind: 'unmatched' });
   });
 });
+
+describe('classifyTriggers — modeMatchTier (admin-portal#345)', () => {
+  it('reports the tier of the matched #mode token, and omits it when no mode matched', () => {
+    const ctx = { availableModes: modes, availableLanguages: [] };
+    expect(classifyTriggers('#spoken hi', ctx).modeMatchTier).toBe('exact');
+    expect(classifyTriggers('#mast hi', ctx).modeMatchTier).toBe('prefix');
+    expect(classifyTriggers('#spokne hi', ctx).modeMatchTier).toBe('fuzzy');
+    expect('modeMatchTier' in classifyTriggers('#zzz-nothing hi', ctx)).toBe(false);
+  });
+});

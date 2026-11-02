@@ -621,15 +621,15 @@ curl -s "http://localhost:$PORT/api/v1/admin/orgs/PBT/modes/obt-coach/share-code
   for another org's. `null` only when the org name slugs to nothing.
 - `resolves`: `true` only when sending `#<code>` from `home_org` selects exactly
   this org's mode.
-- `reason` (only when `resolves` is false): `draft`, `requires_group`,
-  `reserved` (a home slug that is a clear token, like `default`; `pbt/default`
-  is not one), `org_skipped`, `capped` (the org is past the per-turn
-  foreign-org cap, so the chat path never reads it), `invalid_mode` (the
-  stored mode fails the shape check the admin PUT enforces, so chat drops
-  it), `collision` (another org with the same slug claimed the name first),
-  `ambiguous` (the message opens a different mode), or `not_found` (it opens
-  nothing). `capped`, `invalid_mode` and `collision` are checked in that
-  order.
+- `reason` (only when `resolves` is false), checked in this order:
+  `org_skipped`; `invalid_mode` (another org's mode fails the shape check the
+  admin PUT enforces, so the cross-org merge drops it; never reported for a
+  home mode, which chat serves as long as it has a string name); `draft`;
+  `requires_group`; `reserved` (a home slug that is a clear token, like
+  `default`; `pbt/default` is not one); `capped` (the org is past the
+  per-turn foreign-org cap, so the chat path never reads it); `collision`
+  (another org with the same slug claimed the name first); `ambiguous` (the
+  message opens a different mode); `not_found` (it opens nothing).
 - `resolved_org`: the raw org name of the mode `#<code>` actually opens, when
   it opens one. It comes only from the classifier's actual match, run on the
   whole message `#<code>`: on `collision` it is the winning org when the
@@ -638,7 +638,7 @@ curl -s "http://localhost:$PORT/api/v1/admin/orgs/PBT/modes/obt-coach/share-code
 - `home_has_modes`: whether `<home_org>:modes` exists as a modes record.
   `false` is legal (the chat path treats it as an empty home org) but usually
   means a mistyped gateway org, so the portal can warn. Absent when the home
-  record could not be read for a foreign mode; the answer is then computed
+  record could not be read or is not valid JSON, for a foreign mode; the answer is then computed
   with an empty home, as the chat path would, because a home record never
   affects a `<orgslug>/<slug>` token.
 
