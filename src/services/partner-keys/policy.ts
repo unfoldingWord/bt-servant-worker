@@ -7,9 +7,11 @@
  *    endpoints. Everything else under /api/* (admin, callback transport,
  *    path-addressed user preferences/history, audio) is denied by default.
  * 2. applyPartnerChatPolicy — on those chat endpoints the body is locked to
- *    the key: org is the key's org, the admin client id is refused, and
- *    progress_callback_url is refused (the DO would send ENGINE_API_KEY to it;
- *    bt-servant-worker#40).
+ *    the key: org is the key's org, the admin client id is refused, and audio
+ *    requests are refused (their replies are URLs under /api/v1/audio/*, which
+ *    a partner key cannot fetch). progress_callback_url needs no rule here:
+ *    validateChatBody already rejects it on /chat and /chat/stream, the only
+ *    routes a partner key reaches (the DO would send ENGINE_API_KEY to it; #40).
  * 3. scopePartnerSubject — end-user ids are namespaced per partner so one
  *    partner can never address another tenant's (or a WhatsApp user's)
  *    Durable Object. PROPOSAL pending team answer (portal#354 question 6).
@@ -71,33 +73,47 @@ function reject(status: 400 | 403, reason: string, error: string): PartnerPolicy
  * that believes it is talking to org X never quietly gets org Y's config.
  */
 function checkOrg(body: Record<string, unknown>, keyOrg: string): PartnerPolicyResult | null {
-  for (const field of ['org', 'org_id'] as const) {
-    // eslint-disable-next-line security/detect-object-injection -- field is a fixed literal
-    const value = body[field];
-    if (value !== undefined && value !== keyOrg) {
-      return reject(
-        400,
-        'partner_org_mismatch',
-        `${field} must be omitted or equal this API key's org ('${keyOrg}')`
-      );
-    }
-  }
-  return null;
+  const mismatched =
+    body.org !== undefined && body.org !== keyOrg
+      ? 'org'
+      : body.org_id !== undefined && body.org_id !== keyOrg
+        ? 'org_id'
+        : null;
+  if (mismatched === null) return null;
+  return reject(
+    400,
+    'partner_org_mismatch',
+    `${mismatched} must be omitted or equal this API key's org ('${keyOrg}')`
+  );
+}
+
+/**
+ * Body fields that request audio in or audio out. A voice message is
+ * transcribed, archived under /api/v1/voice-submissions/* and answered with a
+ * TTS URL under /api/v1/audio/*; a partner key cannot fetch either route, so
+ * the request is refused up front instead of returning URLs that 403.
+ */
+const AUDIO_FIELDS = ['audio_base64', 'audio_format', 'voice_format'] as const;
+
+function checkAudio(body: Record<string, unknown>): PartnerPolicyResult | null {
+  const field =
+    body.message_type === 'audio'
+      ? 'message_type "audio"'
+      : AUDIO_FIELDS.find((f) => Object.prototype.hasOwnProperty.call(body, f));
+  if (field === undefined) return null;
+  return reject(
+    400,
+    'partner_audio',
+    `${field} is not available with partner API keys; send text messages (message_type "text")`
+  );
 }
 
 /** Refusals that do not depend on the key's identity. */
 function checkForbiddenFields(body: Record<string, unknown>): PartnerPolicyResult | null {
-  if (body.progress_callback_url !== undefined) {
-    return reject(
-      400,
-      'partner_callback_url',
-      'progress_callback_url is not available with partner API keys; use /api/v1/chat or /api/v1/chat/stream'
-    );
-  }
   if (isAdminClient(typeof body.client_id === 'string' ? body.client_id : undefined)) {
     return reject(403, 'partner_admin_client', `client_id '${String(body.client_id)}' is reserved`);
   }
-  return null;
+  return checkAudio(body);
 }
 
 /**

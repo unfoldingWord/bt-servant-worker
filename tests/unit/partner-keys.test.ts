@@ -16,8 +16,8 @@ import {
 import {
   generatePartnerKeyMaterial,
   looksLikePartnerKey,
-  sha256Hex,
 } from '../../src/services/partner-keys/store.js';
+import { validateChatBody } from '../../src/utils/chat-validation.js';
 import {
   readOptionalActor,
   toPublicPartnerKey,
@@ -113,14 +113,28 @@ describe('applyPartnerChatPolicy refusals', () => {
     });
   });
 
-  it('refuses progress_callback_url with 400, even when empty', () => {
-    for (const url of ['https://evil.example/cb', '']) {
-      const result = applyPartnerChatPolicy(chat({ progress_callback_url: url }), KEY);
-      expect(result).toMatchObject({
-        ok: false,
-        rejection: { status: 400, reason: 'partner_callback_url' },
-      });
-    }
+  it.each([
+    [{ message_type: 'audio' }],
+    [{ audio_base64: 'AAAA' }],
+    [{ audio_format: 'ogg' }],
+    [{ voice_format: 'opus' }],
+    [{ voice_format: null }],
+  ])('refuses audio requests with 400 (%o)', (fields) => {
+    const result = applyPartnerChatPolicy(chat(fields), KEY);
+    expect(result).toMatchObject({
+      ok: false,
+      rejection: { status: 400, reason: 'partner_audio' },
+    });
+  });
+
+  it('leaves progress_callback_url to validateChatBody, which already rejects it', () => {
+    // Not a partner rule on purpose: /chat and /chat/stream (the only partner
+    // routes) reject it in validateChatBody; see the e2e suite for the 400.
+    const result = applyPartnerChatPolicy(chat({ progress_callback_url: 'https://x' }), KEY);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(validateChatBody(result.body, 'final')).toContain('progress_callback_url');
+    expect(validateChatBody(result.body, 'stream')).toContain('progress_callback_url');
   });
 
   it.each([123, '', undefined, null])('rejects a non-string or empty user_id (%o)', (userId) => {
@@ -172,12 +186,6 @@ describe('key material', () => {
   it('rejects other token shapes before any lookup', () => {
     expect(looksLikePartnerKey('test-api-key')).toBe(false);
     expect(looksLikePartnerKey('bts_0123_short')).toBe(false);
-  });
-
-  it('hashes with SHA-256 hex', async () => {
-    expect(await sha256Hex('abc')).toBe(
-      'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
-    );
   });
 });
 

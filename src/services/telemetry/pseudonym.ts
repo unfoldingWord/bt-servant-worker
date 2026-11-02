@@ -33,6 +33,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { trace } from '@opentelemetry/api';
 import { Env } from '../../config/types.js';
+import { bytesToHex } from '../../utils/crypto.js';
 
 /**
  * The current request's pseudonym, scoped to its async call tree. Empty outside a
@@ -72,9 +73,7 @@ export async function hashUserId(salt: string, clientId: string, userId: string)
     ['sign']
   );
   const sig = await crypto.subtle.sign('HMAC', key, enc.encode(`${clientId}:${userId}`));
-  return Array.from(new Uint8Array(sig))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
+  return bytesToHex(new Uint8Array(sig));
 }
 
 /**

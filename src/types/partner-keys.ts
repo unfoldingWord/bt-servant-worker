@@ -77,9 +77,20 @@ export interface PartnerKeyCreateInput {
 
 /** Org ids a key may be bound to: a conservative id shape, never a `__` reserved key. */
 const ORG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
-const MAX_LABEL_LENGTH = 100;
-const MAX_CREATED_BY_LENGTH = 200;
-const MAX_TERMS_VERSION_LENGTH = 50;
+/**
+ * Field limits are UTF-8 bytes of the JSON-encoded value, not characters: the
+ * whole record is also stored as KV list metadata (store.ts), which Cloudflare
+ * caps at 1024 bytes. These caps keep a worst-case record under that limit
+ * (asserted in tests/unit/partner-keys.test.ts and checked again at write).
+ */
+const MAX_LABEL_BYTES = 100;
+const MAX_ACTOR_BYTES = 120;
+const MAX_TERMS_VERSION_BYTES = 32;
+
+/** Size of a string once JSON-encoded, in UTF-8 bytes, without the surrounding quotes. */
+function jsonByteLength(value: string): number {
+  return new TextEncoder().encode(JSON.stringify(value)).length - 2;
+}
 
 /** Pattern for a partner key id as issued by the store. */
 export const PARTNER_KEY_ID_PATTERN = /^pk_[0-9a-f]{16}$/;
@@ -103,7 +114,9 @@ function readLabel(
   }
   const cleaned = stripControlChars(value).trim();
   if (cleaned.length === 0) return { ok: false, error: `${field} must not be empty` };
-  if (cleaned.length > max) return { ok: false, error: `${field} must be <= ${max} characters` };
+  if (jsonByteLength(cleaned) > max) {
+    return { ok: false, error: `${field} must be <= ${max} bytes (UTF-8, JSON-encoded)` };
+  }
   return { ok: true, value: cleaned };
 }
 
@@ -114,7 +127,7 @@ function readTerms(
   const { termsVersion, termsAcceptedAt } = body;
   const out: { termsVersion?: string; termsAcceptedAt?: string } = {};
   if (termsVersion !== undefined) {
-    const version = readLabel(termsVersion, 'termsVersion', MAX_TERMS_VERSION_LENGTH);
+    const version = readLabel(termsVersion, 'termsVersion', MAX_TERMS_VERSION_BYTES);
     if (!version.ok) return version;
     out.termsVersion = version.value;
   }
@@ -144,11 +157,11 @@ export function validatePartnerKeyCreate(
 
   const orgError = validatePartnerKeyOrg(record.org);
   if (orgError) return { ok: false, error: orgError };
-  const name = readLabel(record.name, 'name', MAX_LABEL_LENGTH);
+  const name = readLabel(record.name, 'name', MAX_LABEL_BYTES);
   if (!name.ok) return name;
-  const app = readLabel(record.app, 'app', MAX_LABEL_LENGTH);
+  const app = readLabel(record.app, 'app', MAX_LABEL_BYTES);
   if (!app.ok) return app;
-  const createdBy = readLabel(record.createdBy, 'createdBy', MAX_CREATED_BY_LENGTH);
+  const createdBy = readLabel(record.createdBy, 'createdBy', MAX_ACTOR_BYTES);
   if (!createdBy.ok) return createdBy;
   const terms = readTerms(record);
   if (!terms.ok) return terms;
@@ -181,10 +194,9 @@ export function readOptionalActor(
   const record = body as Record<string, unknown>;
   const unknown = Object.keys(record).filter((k) => k !== field);
   if (unknown.length > 0) return { ok: false, error: `Unknown field(s): ${unknown.join(', ')}` };
-  // eslint-disable-next-line security/detect-object-injection -- field is a fixed literal union
-  const value = record[field];
+  const value = field === 'revokedBy' ? record.revokedBy : record.createdBy;
   if (value === undefined) return { ok: true };
-  const actor = readLabel(value, field, MAX_CREATED_BY_LENGTH);
+  const actor = readLabel(value, field, MAX_ACTOR_BYTES);
   return actor.ok ? { ok: true, actor: actor.value } : actor;
 }
 

@@ -116,8 +116,15 @@ export { validateChatBody };
 // No-op export until telemetry is configured (0% head sampler when unset).
 export const UserDO = instrumentDO(UserDOClass, resolveTelemetryConfig);
 
-/** Hono env: bindings plus the per-request principal set by the `/api/*` auth middleware. */
-type AppEnv = { Bindings: Env; Variables: { principal: Principal } };
+/**
+ * Hono env: bindings plus what the `/api/*` auth middleware sets per request:
+ * the principal, and the request id + logger that every downstream log line
+ * for that request (auth, admin routes, chat) shares for correlation.
+ */
+type AppEnv = {
+  Bindings: Env;
+  Variables: { principal: Principal; requestId: string; logger: RequestLogger };
+};
 
 const app = new Hono<AppEnv>();
 
@@ -172,7 +179,7 @@ function rejectAuth(
   reason: string,
   extra: Record<string, unknown> = {}
 ) {
-  createRequestLogger(crypto.randomUUID()).warn('auth_rejected', {
+  c.get('logger').warn('auth_rejected', {
     reason,
     status,
     path: c.req.path,
@@ -205,7 +212,7 @@ async function authenticatePartner(
   try {
     key = await lookupPartnerKeyByToken(c.env.API_KEYS, token);
   } catch (error) {
-    createRequestLogger(crypto.randomUUID()).error('partner_key_lookup_failed', error, {
+    c.get('logger').error('partner_key_lookup_failed', error, {
       path: c.req.path,
       method: c.req.method,
     });
@@ -231,6 +238,12 @@ async function authenticatePartner(
 // isPartnerRouteAllowed (the two chat endpoints). Every rejection is logged
 // (auth_rejected + reason) and counted.
 app.use('/api/*', async (c, next) => {
+  // The request's id and logger are minted HERE, once, and shared through the
+  // context by everything after auth (admin routes, chat), so an auth line and
+  // the handler lines for one request carry the same request_id.
+  const requestId = crypto.randomUUID();
+  c.set('requestId', requestId);
+  c.set('logger', createRequestLogger(requestId));
   const authHeader = c.req.header('Authorization');
   if (!authHeader?.startsWith('Bearer ')) {
     return rejectAuth(c, 401, 'missing_bearer');
@@ -263,6 +276,13 @@ app.use('/api/v1/admin/*', async (c, next) => {
   return next();
 });
 
+/** The per-request values a chat handler takes from the auth middleware. */
+type ChatRequestContext = { principal: Principal; requestId: string; logger: RequestLogger };
+
+function chatRequestContext(c: Context<AppEnv>): ChatRequestContext {
+  return { principal: c.get('principal'), requestId: c.get('requestId'), logger: c.get('logger') };
+}
+
 // Chat endpoints — explicit transport per route.
 //
 // - POST /api/v1/chat           → synchronous, final-only JSON response.
@@ -277,15 +297,15 @@ app.use('/api/v1/admin/*', async (c, next) => {
 // - POST /api/v1/chat/callback  → 202 + webhook delivery; requires
 //                                  progress_callback_url and message_key.
 app.post('/api/v1/chat', async (c) => {
-  return handleChatRequest(c.req.raw, c.env, 'final', c.get('principal'));
+  return handleChatRequest(c.req.raw, c.env, 'final', chatRequestContext(c));
 });
 
 app.post('/api/v1/chat/stream', async (c) => {
-  return handleChatRequest(c.req.raw, c.env, 'stream', c.get('principal'));
+  return handleChatRequest(c.req.raw, c.env, 'stream', chatRequestContext(c));
 });
 
 app.post('/api/v1/chat/callback', async (c) => {
-  return handleChatRequest(c.req.raw, c.env, 'callback', c.get('principal'));
+  return handleChatRequest(c.req.raw, c.env, 'callback', chatRequestContext(c));
 });
 
 // User endpoints with org scope (new paths)
@@ -1182,10 +1202,14 @@ app.post('/api/v1/admin/orgs/:org/modes/:modeName/_retire', async (c) => {
 async function readJsonBody(
   req: Request,
   logger: RequestLogger,
-  logContext: Record<string, unknown>
+  logContext: Record<string, unknown>,
+  options: { allowEmpty?: boolean } = {}
 ): Promise<{ ok: true; body: unknown } | { ok: false; error: string }> {
   try {
-    return { ok: true, body: await req.json() };
+    if (!options.allowEmpty) return { ok: true, body: await req.json() };
+    // allowEmpty: an absent body is `undefined`; a present one must be JSON.
+    const text = await req.text();
+    return { ok: true, body: text.trim() === '' ? undefined : JSON.parse(text) };
   } catch (error) {
     logger.warn('admin_action', {
       ...logContext,
@@ -1687,28 +1711,8 @@ app.get('/api/v1/admin/do/:hexId/snapshot', async (c) => {
 
 const PARTNER_KEYS_BASE = '/api/v1/admin/api-keys';
 
-/** Optional JSON body (revoke/rotate): an empty body is fine, malformed JSON is a 400. */
-async function readOptionalJsonBody(
-  req: Request,
-  logger: RequestLogger,
-  logContext: Record<string, unknown>
-): Promise<{ ok: true; body: unknown } | { ok: false; error: string }> {
-  const text = await req.text();
-  if (text.trim() === '') return { ok: true, body: undefined };
-  try {
-    return { ok: true, body: JSON.parse(text) };
-  } catch (error) {
-    logger.warn('admin_action', {
-      ...logContext,
-      rejected: 'invalid_json_body',
-      error: error instanceof Error ? error.message : String(error),
-    });
-    return { ok: false, error: 'Request body must be valid JSON' };
-  }
-}
-
 app.post(PARTNER_KEYS_BASE, async (c) => {
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
   const parsed = await readJsonBody(c.req.raw, logger, { action: 'create_api_key' });
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const validated = validatePartnerKeyCreate(parsed.body);
@@ -1731,7 +1735,7 @@ app.post(PARTNER_KEYS_BASE, async (c) => {
 });
 
 app.get(PARTNER_KEYS_BASE, async (c) => {
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
   const org = c.req.query('org');
   if (org !== undefined) {
     const orgError = validatePartnerKeyOrg(org);
@@ -1753,7 +1757,7 @@ app.get(PARTNER_KEYS_BASE, async (c) => {
 
 app.get(`${PARTNER_KEYS_BASE}/:keyId`, async (c) => {
   const keyId = c.req.param('keyId');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
   try {
     const found = await getPartnerKeyById(c.env.API_KEYS, keyId);
     if (!found) return c.json({ error: 'API key not found' }, 404);
@@ -1767,15 +1771,18 @@ app.get(`${PARTNER_KEYS_BASE}/:keyId`, async (c) => {
 
 app.post(`${PARTNER_KEYS_BASE}/:keyId/_revoke`, async (c) => {
   const keyId = c.req.param('keyId');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
   const ctx = { action: 'revoke_api_key', key_id: keyId };
-  const parsed = await readOptionalJsonBody(c.req.raw, logger, ctx);
+  const parsed = await readJsonBody(c.req.raw, logger, ctx, { allowEmpty: true });
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const actor = readOptionalActor(parsed.body, 'revokedBy');
   if (!actor.ok) return c.json({ error: actor.error }, 400);
 
   try {
-    const result = await revokePartnerKey(c.env.API_KEYS, keyId, actor.actor);
+    const result = await revokePartnerKey(c.env.API_KEYS, keyId, {
+      revokedBy: actor.actor,
+      logger,
+    });
     if (!result) return c.json({ error: 'API key not found' }, 404);
     logger.log('admin_action', {
       ...ctx,
@@ -1795,18 +1802,24 @@ app.post(`${PARTNER_KEYS_BASE}/:keyId/_revoke`, async (c) => {
 
 app.post(`${PARTNER_KEYS_BASE}/:keyId/_rotate`, async (c) => {
   const keyId = c.req.param('keyId');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
   const ctx = { action: 'rotate_api_key', key_id: keyId };
-  const parsed = await readOptionalJsonBody(c.req.raw, logger, ctx);
+  const parsed = await readJsonBody(c.req.raw, logger, ctx, { allowEmpty: true });
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
   const actor = readOptionalActor(parsed.body, 'createdBy');
   if (!actor.ok) return c.json({ error: actor.error }, 400);
 
   try {
-    const result = await rotatePartnerKey(c.env.API_KEYS, keyId, actor.actor);
+    const result = await rotatePartnerKey(c.env.API_KEYS, keyId, {
+      createdBy: actor.actor,
+      logger,
+    });
     if (result.status === 'not_found') return c.json({ error: 'API key not found' }, 404);
     if (result.status === 'revoked') {
       return c.json({ error: 'A revoked API key cannot be rotated; create a new key' }, 409);
+    }
+    if (result.status === 'conflict') {
+      return c.json({ error: 'This key was changed concurrently; reload it and retry' }, 409);
     }
     logger.log('admin_action', { ...ctx, org: result.record.org, new_key_id: result.record.id });
     return c.json({
@@ -2532,10 +2545,9 @@ async function handleChatRequest(
   request: Request,
   env: Env,
   transport: ChatTransport,
-  principal: Principal
+  context: ChatRequestContext
 ): Promise<Response> {
-  const requestId = crypto.randomUUID();
-  const logger = createRequestLogger(requestId);
+  const { principal, requestId, logger } = context;
   const timing = createTimingContext();
 
   let parsed: unknown;

@@ -2,8 +2,14 @@
  * Partner API key store (admin-portal#354), backed by the API_KEYS KV namespace.
  *
  * Layout:
- *   key:<sha256 hex of the plaintext key>  → JSON PartnerKeyRecord
- *   id:<key id>                            → <sha256 hex>, metadata { org }
+ *   key:<sha256 hex of the plaintext key>  → JSON PartnerKeyRecord (authoritative)
+ *   id:<key id>                            → <sha256 hex>, metadata = the record
+ *
+ * The `key:` entry is the source of truth (auth reads it; so do get/revoke/
+ * rotate, through the `id:` pointer). The `id:` entry's metadata is a copy of
+ * the record so the admin list is served by `kv.list()` alone, with no per-key
+ * reads. Record fields are size-capped (types/partner-keys.ts) so the copy
+ * always fits KV's 1024-byte metadata limit.
  *
  * The plaintext key never touches storage: only its SHA-256 is used, as the KV
  * key. A plain (unsalted, fast) hash is the right tool here because the key is
@@ -11,9 +17,9 @@
  * password — and it keeps the auth hot path to one KV read.
  *
  * Consistency: KV is eventually consistent and the auth lookup caches for
- * AUTH_LOOKUP_CACHE_TTL_SECONDS, so a revocation (or a brand-new key) can take
- * about a minute to be seen everywhere. That delay is a known, accepted trade
- * (portal#354 question 5).
+ * AUTH_LOOKUP_CACHE_TTL_SECONDS, so a revocation can take about a minute to
+ * be seen everywhere (portal#354 question 5). KV also has no compare-and-swap;
+ * see rotatePartnerKey for what that means for concurrent admin writes.
  */
 
 import {
@@ -21,29 +27,28 @@ import {
   type PartnerKeyRecord,
   PARTNER_KEY_ID_PATTERN,
 } from '../../types/partner-keys.js';
+import { bytesToHex, sha256Hex } from '../../utils/crypto.js';
 import type { RequestLogger } from '../../utils/logger.js';
 
 /** Cloudflare's minimum `cacheTtl` for KV reads; also the revocation-delay bound we document. */
 export const AUTH_LOOKUP_CACHE_TTL_SECONDS = 60;
+/** Cloudflare's limit on the serialized metadata of one KV key. */
+export const KV_METADATA_MAX_BYTES = 1024;
 
 const KEY_PREFIX = 'key:';
 const ID_PREFIX = 'id:';
 const PLAINTEXT_PREFIX = 'bts_';
 /** Plaintext shape: `bts_<8 hex prefix>_<43 base64url chars = 256 random bits>`. */
 const PLAINTEXT_PATTERN = /^bts_[0-9a-f]{8}_[A-Za-z0-9_-]{43}$/;
-/** Upper bound on index pages walked by a list, so a runaway namespace cannot pin a request. */
+/**
+ * Upper bound on index pages (1000 keys each) walked by a list. Revoked keys
+ * are kept for audit and never deleted, so the index only grows; past this
+ * bound the list is truncated and says so in the log.
+ */
 const MAX_LIST_PAGES = 20;
 
-interface IdIndexMetadata {
-  org: string;
-}
-
-function toHex(bytes: Uint8Array): string {
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-}
-
 function randomHex(byteCount: number): string {
-  return toHex(crypto.getRandomValues(new Uint8Array(byteCount)));
+  return bytesToHex(crypto.getRandomValues(new Uint8Array(byteCount)));
 }
 
 function randomBase64Url(byteCount: number): string {
@@ -51,12 +56,6 @@ function randomBase64Url(byteCount: number): string {
   let binary = '';
   for (const b of bytes) binary += String.fromCharCode(b);
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
-/** SHA-256 of a string, lowercase hex. */
-export async function sha256Hex(text: string): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
-  return toHex(new Uint8Array(digest));
 }
 
 /** Cheap shape check so garbage bearer tokens never cost a KV read. */
@@ -72,6 +71,16 @@ export function generatePartnerKeyMaterial(): { id: string; prefix: string; plai
     prefix: `${PLAINTEXT_PREFIX}${prefixHex}`,
     plaintext: `${PLAINTEXT_PREFIX}${prefixHex}_${randomBase64Url(32)}`,
   };
+}
+
+/** Serialized size of a record as index metadata. Throws if it would not fit. */
+export function assertFitsMetadata(record: PartnerKeyRecord): void {
+  const bytes = new TextEncoder().encode(JSON.stringify(record)).length;
+  if (bytes > KV_METADATA_MAX_BYTES) {
+    throw new Error(
+      `Partner key ${record.id} record is ${bytes} bytes; KV metadata allows ${KV_METADATA_MAX_BYTES}`
+    );
+  }
 }
 
 /**
@@ -102,8 +111,29 @@ export async function getPartnerKeyById(
   return record ? { record, hash } : null;
 }
 
-async function writeRecord(kv: KVNamespace, hash: string, record: PartnerKeyRecord) {
+async function putIndex(kv: KVNamespace, hash: string, record: PartnerKeyRecord): Promise<void> {
+  await kv.put(`${ID_PREFIX}${record.id}`, hash, { metadata: record });
+}
+
+/**
+ * Update an EXISTING key: the authoritative `key:` record first, then the
+ * index copy. An index failure after the record write is logged, not thrown:
+ * the change already took effect for auth and get-by-id, and throwing would
+ * report a revocation as failed when it happened. Only the list can be stale.
+ */
+async function updateRecord(
+  kv: KVNamespace,
+  hash: string,
+  record: PartnerKeyRecord,
+  logger: RequestLogger
+): Promise<void> {
+  assertFitsMetadata(record);
   await kv.put(`${KEY_PREFIX}${hash}`, JSON.stringify(record));
+  try {
+    await putIndex(kv, hash, record);
+  } catch (error) {
+    logger.error('partner_key_index_write_failed', error, { key_id: record.id });
+  }
 }
 
 /**
@@ -114,7 +144,7 @@ export async function createPartnerKey(
   kv: KVNamespace,
   input: PartnerKeyCreateInput,
   carry: { userNamespace?: string; rotatedFrom?: string } = {}
-): Promise<{ record: PartnerKeyRecord; plaintext: string }> {
+): Promise<{ record: PartnerKeyRecord; plaintext: string; hash: string }> {
   const { id, prefix, plaintext } = generatePartnerKeyMaterial();
   const hash = await sha256Hex(plaintext);
   const record: PartnerKeyRecord = {
@@ -131,14 +161,14 @@ export async function createPartnerKey(
     ...(input.termsVersion !== undefined ? { termsVersion: input.termsVersion } : {}),
     ...(input.termsAcceptedAt !== undefined ? { termsAcceptedAt: input.termsAcceptedAt } : {}),
   };
-  // Record first, index second: a crash between the two leaves an unlisted but
-  // unusable-by-anyone record (its plaintext was never returned), never an
-  // index entry pointing at nothing.
-  await writeRecord(kv, hash, record);
-  await kv.put(`${ID_PREFIX}${id}`, hash, {
-    metadata: { org: input.org } satisfies IdIndexMetadata,
-  });
-  return { record, plaintext };
+  assertFitsMetadata(record);
+  // Record first, index second, both fatal on failure: the `id:` entry is the
+  // only pointer to the hash, so a key without it could never be revoked by
+  // id. A crash between the two leaves an unlisted record whose plaintext was
+  // never returned, so nobody can use it.
+  await kv.put(`${KEY_PREFIX}${hash}`, JSON.stringify(record));
+  await putIndex(kv, hash, record);
+  return { record, plaintext, hash };
 }
 
 /**
@@ -148,7 +178,7 @@ export async function createPartnerKey(
 export async function revokePartnerKey(
   kv: KVNamespace,
   id: string,
-  revokedBy?: string
+  opts: { revokedBy?: string | undefined; logger: RequestLogger }
 ): Promise<{ record: PartnerKeyRecord; alreadyRevoked: boolean } | null> {
   const found = await getPartnerKeyById(kv, id);
   if (!found) return null;
@@ -156,34 +186,42 @@ export async function revokePartnerKey(
   const record: PartnerKeyRecord = {
     ...found.record,
     revokedAt: new Date().toISOString(),
-    ...(revokedBy !== undefined ? { revokedBy } : {}),
+    ...(opts.revokedBy !== undefined ? { revokedBy: opts.revokedBy } : {}),
   };
-  await writeRecord(kv, found.hash, record);
+  await updateRecord(kv, found.hash, record, opts.logger);
   return { record, alreadyRevoked: false };
 }
 
 export type RotateResult =
   | { status: 'not_found' }
   | { status: 'revoked' }
+  | { status: 'conflict' }
   | { status: 'ok'; previous: PartnerKeyRecord; record: PartnerKeyRecord; plaintext: string };
 
-/**
- * Rotate: issue a new key with the same metadata (and the same user namespace,
- * so the partner's users keep their history), then revoke the old one. The
- * new key is written first so a failure part-way never leaves the partner with
- * no usable key; the worst case is two active keys, and the thrown error names both.
- */
-export async function rotatePartnerKey(
-  kv: KVNamespace,
-  id: string,
-  createdBy?: string
-): Promise<RotateResult> {
-  const found = await getPartnerKeyById(kv, id);
-  if (!found) return { status: 'not_found' };
-  const old = found.record;
-  if (old.revokedAt !== undefined) return { status: 'revoked' };
+type Issued = { record: PartnerKeyRecord; hash: string };
 
-  const { record, plaintext } = await createPartnerKey(
+/**
+ * Compensation for a rotation that will not complete: revoke the key we just
+ * issued, whose plaintext the caller will never see. Logged either way; a
+ * failure here is the documented worst case (an orphaned active key that
+ * nobody holds), so the error names the key for manual revocation.
+ */
+async function revokeIssuedKey(kv: KVNamespace, issued: Issued, logger: RequestLogger) {
+  const record = { ...issued.record, revokedAt: new Date().toISOString(), revokedBy: 'rotation' };
+  try {
+    await updateRecord(kv, issued.hash, record, logger);
+    logger.warn('partner_key_rotation_compensated', { new_key_id: issued.record.id });
+  } catch (error) {
+    logger.error('partner_key_rotation_orphan', error, {
+      new_key_id: issued.record.id,
+      action_required: 'revoke this key id manually; its plaintext was never returned',
+    });
+  }
+}
+
+/** Issue the replacement for `old`, inheriting its metadata and user namespace. */
+function issueReplacement(kv: KVNamespace, old: PartnerKeyRecord, createdBy?: string) {
+  return createPartnerKey(
     kv,
     {
       org: old.org,
@@ -195,71 +233,113 @@ export async function rotatePartnerKey(
     },
     { userNamespace: old.userNamespace, rotatedFrom: old.id }
   );
-  const previous: PartnerKeyRecord = {
-    ...old,
-    revokedAt: record.createdAt,
-    rotatedTo: record.id,
-    ...(createdBy !== undefined ? { revokedBy: createdBy } : {}),
-  };
-  try {
-    await writeRecord(kv, found.hash, previous);
-  } catch (error) {
-    // Re-throw with both ids so the route's 500 log says exactly what to clean up.
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(
-      `Rotation incomplete: new key ${record.id} issued but ${old.id} not revoked: ${message}`,
-      { cause: error }
-    );
-  }
-  return { status: 'ok', previous, record, plaintext };
-}
-
-/** Walk the id index, optionally keeping only one org's entries (by index metadata). */
-async function listIndexHashes(
-  kv: KVNamespace,
-  org: string | undefined
-): Promise<{ hashes: string[]; truncated: boolean }> {
-  const hashes: string[] = [];
-  let cursor: string | undefined;
-  for (let page = 0; page < MAX_LIST_PAGES; page++) {
-    const result = await kv.list<IdIndexMetadata>({
-      prefix: ID_PREFIX,
-      ...(cursor ? { cursor } : {}),
-    });
-    const keys = result.keys.filter((k) => org === undefined || k.metadata?.org === org);
-    const values = await Promise.all(keys.map((k) => kv.get(k.name)));
-    for (const v of values) if (v) hashes.push(v);
-    if (result.list_complete) return { hashes, truncated: false };
-    cursor = result.cursor;
-  }
-  return { hashes, truncated: true };
 }
 
 /**
- * List keys, all orgs or one. Sorted newest first. The KV list index is
- * eventually consistent, so a key created seconds ago may be missing briefly.
- * An index entry whose record is gone is logged and skipped, never returned.
+ * Rotate: issue a new key with the same metadata (and the same user namespace,
+ * so the partner's users keep their history), then revoke the old one.
+ *
+ * Order and failure handling:
+ * - The new key is written first. If that fails, nothing changed.
+ * - Then the old key is marked revoked + `rotatedTo`. If THAT write fails, the
+ *   new key is revoked again (compensation) and the error is re-thrown: the
+ *   old key stays active and unchanged, and the rotation can simply be retried.
+ * - Worst case: the old-key write AND the compensation both fail. Then one
+ *   extra active key exists whose plaintext was never returned to anyone; it
+ *   is unusable in practice, and `partner_key_rotation_orphan` names it.
+ *
+ * Concurrency: KV has no compare-and-swap. After writing the old record we
+ * re-read it; if its `rotatedTo` is not our new key (a concurrent rotate or
+ * revoke wrote after us), we revoke our new key and report a conflict (409).
+ * RESIDUAL RACE: KV only guarantees read-your-writes in the location that
+ * wrote, so two admin requests served by different Cloudflare locations at
+ * the same moment can each re-read their own write and both "win" — leaving
+ * two active replacement keys, with the old record naming only one. Admin
+ * writes are rare and human-driven; closing this fully needs a single writer
+ * (a Durable Object), which is out of scope here.
+ */
+export async function rotatePartnerKey(
+  kv: KVNamespace,
+  id: string,
+  opts: { createdBy?: string | undefined; logger: RequestLogger }
+): Promise<RotateResult> {
+  const { createdBy, logger } = opts;
+  const found = await getPartnerKeyById(kv, id);
+  if (!found) return { status: 'not_found' };
+  const old = found.record;
+  if (old.revokedAt !== undefined) return { status: 'revoked' };
+
+  const issued = await issueReplacement(kv, old, createdBy);
+  const previous: PartnerKeyRecord = {
+    ...old,
+    revokedAt: issued.record.createdAt,
+    rotatedTo: issued.record.id,
+    ...(createdBy !== undefined ? { revokedBy: createdBy } : {}),
+  };
+  try {
+    await updateRecord(kv, found.hash, previous, logger);
+  } catch (error) {
+    logger.error('partner_key_rotation_failed', error, {
+      key_id: id,
+      new_key_id: issued.record.id,
+    });
+    await revokeIssuedKey(kv, issued, logger);
+    throw error;
+  }
+
+  const reread = await getPartnerKeyById(kv, id);
+  if (reread?.record.rotatedTo !== issued.record.id) {
+    logger.warn('partner_key_rotation_conflict', {
+      key_id: id,
+      new_key_id: issued.record.id,
+      stored_rotated_to: reread?.record.rotatedTo ?? null,
+    });
+    await revokeIssuedKey(kv, issued, logger);
+    return { status: 'conflict' };
+  }
+  return { status: 'ok', previous, record: issued.record, plaintext: issued.plaintext };
+}
+
+/** Walk the id index, collecting the records carried as metadata. */
+async function listIndex(
+  kv: KVNamespace,
+  org: string | undefined,
+  logger: RequestLogger
+): Promise<{ records: PartnerKeyRecord[]; truncated: boolean }> {
+  const records: PartnerKeyRecord[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < MAX_LIST_PAGES; page++) {
+    const result = await kv.list<PartnerKeyRecord>({
+      prefix: ID_PREFIX,
+      ...(cursor ? { cursor } : {}),
+    });
+    for (const entry of result.keys) {
+      if (!entry.metadata) {
+        logger.warn('partner_key_index_missing_metadata', { index_key: entry.name });
+      } else if (org === undefined || entry.metadata.org === org) {
+        records.push(entry.metadata);
+      }
+    }
+    if (result.list_complete) return { records, truncated: false };
+    cursor = result.cursor;
+  }
+  return { records, truncated: true };
+}
+
+/**
+ * List keys, all orgs or one, newest first — served by `kv.list()` alone (the
+ * record rides in each index entry's metadata; no per-key reads). The KV list
+ * is eventually consistent, so a change made seconds ago may not show yet;
+ * get-by-id reads the authoritative record.
  */
 export async function listPartnerKeys(
   kv: KVNamespace,
   org: string | undefined,
   logger: RequestLogger
 ): Promise<PartnerKeyRecord[]> {
-  const { hashes, truncated } = await listIndexHashes(kv, org);
+  const { records, truncated } = await listIndex(kv, org, logger);
   if (truncated) {
     logger.warn('partner_key_list_truncated', { org: org ?? null, max_pages: MAX_LIST_PAGES });
   }
-  const records = await Promise.all(
-    hashes.map((h) => kv.get<PartnerKeyRecord>(`${KEY_PREFIX}${h}`, 'json'))
-  );
-  const present: PartnerKeyRecord[] = [];
-  records.forEach((record, i) => {
-    if (record) {
-      present.push(record);
-    } else {
-      // eslint-disable-next-line security/detect-object-injection -- i is the forEach index
-      logger.warn('partner_key_index_orphan', { hash_prefix: hashes[i]?.slice(0, 8) });
-    }
-  });
-  return present.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  return records.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }

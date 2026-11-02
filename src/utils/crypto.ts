@@ -32,3 +32,15 @@ export function constantTimeCompare(a: string, b: string): boolean {
 
   return result === 0;
 }
+
+/** Lowercase hex encoding of a byte array. */
+export function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** SHA-256 digest, lowercase hex. Strings are hashed as their UTF-8 bytes. */
+export async function sha256Hex(data: string | Uint8Array): Promise<string> {
+  const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return bytesToHex(new Uint8Array(digest));
+}

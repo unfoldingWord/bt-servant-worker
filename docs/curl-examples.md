@@ -511,10 +511,13 @@ unchanged. These admin endpoints accept **only** `ENGINE_API_KEY`.
   `createdBy`, `createdAt`, `scopes`, `userNamespace`, `status`, and when set
   `revokedAt`, `revokedBy`, `rotatedFrom`, `rotatedTo`, `termsVersion`,
   `termsAcceptedAt`). Never the plaintext, never the hash.
-- Revocation (and a new key) can take **about a minute** to take effect
-  everywhere: KV is eventually consistent and the auth lookup caches for 60s.
-- The list is built from a KV listing, so a key created seconds ago may be
-  missing from it briefly. `GET …/api-keys/:keyId` reads it directly.
+- A revocation can take **about a minute** to take effect everywhere: KV is
+  eventually consistent and the auth lookup caches for 60s.
+- The list is served from a KV listing alone (each index entry carries the
+  record as metadata), so a change made seconds ago may not show in it yet.
+  `GET …/api-keys/:keyId` reads the authoritative record. Revoked keys are kept
+  for audit; the list walks at most 20 pages (20,000 keys) and logs
+  `partner_key_list_truncated` past that.
 
 ### Create a Key
 
@@ -535,7 +538,9 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys" \
 **Response (201):** `{"key": {...record, "status": "active"}, "apiKey": "bts_1a2b3c4d_..."}`
 
 `org`, `name`, `app` and `createdBy` are required; `termsVersion` and
-`termsAcceptedAt` are optional. Any other field (for example `scopes` or
+`termsAcceptedAt` are optional. Size caps are UTF-8 bytes of the JSON-encoded
+value (so the record fits KV's 1024-byte metadata limit): `name` and `app` 100,
+`createdBy` (and `revokedBy`) 120, `termsVersion` 32. Any other field (for example `scopes` or
 `limits`) is a `400`: every key has `scopes: ["chat"]`, and limits are not
 settable yet.
 
@@ -570,7 +575,11 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_
 Issues a new key with the same name, app, org, terms and `userNamespace` (so
 the partner's users keep their history), then revokes the old one. Returns
 `{"key": {...new}, "previous": {...old, revoked}, "apiKey": "bts_..."}`.
-A revoked key cannot be rotated (`409`); create a new one instead. The body
+A revoked key cannot be rotated (`409`); create a new one instead. If a
+concurrent revoke or rotate of the same key wins, the response is also `409`
+(`changed concurrently`) and the key this call issued is revoked again; reload
+and retry. If the old key cannot be updated, the new key is revoked and the
+call returns `500` with the old key unchanged. The body
 is optional (`{"createdBy": "..."}` records who rotated).
 
 ```bash
@@ -587,7 +596,11 @@ A partner key may call **only** `POST /api/v1/chat` and
 - `org` / `org_id` may be omitted (the key's org applies) or equal the key's
   org; any other value is a `400`.
 - `client_id: "admin-portal"` is refused (`403`).
-- `progress_callback_url` is refused (`400`).
+- `progress_callback_url` is refused (`400`, the existing `/chat` and
+  `/chat/stream` validation).
+- Audio is refused (`400`): `message_type: "audio"`, `audio_base64`,
+  `audio_format` and `voice_format`. Audio replies are URLs under
+  `/api/v1/audio/*`, which a partner key cannot fetch.
 - `user_id` must be a non-empty string. Inside the worker it becomes
   `partner:<userNamespace>:<user_id>` (and `chat_id` likewise), so a partner's
   users can never reach another app's or a WhatsApp user's conversation.
