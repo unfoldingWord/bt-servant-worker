@@ -1,0 +1,337 @@
+/**
+ * E2E tests for partner API keys (admin-portal#354), through the real worker
+ * (`SELF.fetch`) and the emulated API_KEYS namespace:
+ *
+ * - ENGINE_API_KEY behaves exactly as before (chat + admin).
+ * - Admin CRUD: create returns the plaintext once; list/get never return it or
+ *   the hash; revoke; rotate (old key dies, new key works, same user namespace).
+ * - Hash at rest: no stored value contains the plaintext; the record lives
+ *   under `key:<sha256(plaintext)>`.
+ * - A partner key reaches POST /api/v1/chat, is locked to its org, has its
+ *   user_id namespaced into its own DO, and is logged with its key id.
+ * - Unknown/revoked keys → 403; partner keys are blocked from every admin
+ *   route and every non-allowlisted route; admin-portal client_id and
+ *   progress_callback_url are refused.
+ *
+ * KV is shared between suites (`isolatedStorage: false`), so every test uses
+ * its own org and the namespace is emptied after each test.
+ *
+ * Skipped on Windows (SQLite/workerd incompatibility). Runs in CI on Linux.
+ */
+
+/* eslint-disable max-lines-per-function -- established pattern for e2e suites (see user-session.test.ts) */
+import { env, SELF } from 'cloudflare:test';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { StoredIdentity } from '../../src/types/engine';
+import type { PublicPartnerKey } from '../../src/types/partner-keys';
+import { sha256Hex } from '../../src/services/partner-keys/store';
+import {
+  setupAnthropicFetchCapture,
+  type AnthropicCapture,
+  type LogRecord,
+} from '../helpers/anthropic-capture.js';
+
+// The Anthropic call is intercepted at globalThis.fetch; see anthropic-capture.ts.
+vi.mock('@anthropic-ai/sdk', () => ({ default: vi.fn() }));
+
+const INTERNAL = { Authorization: 'Bearer test-api-key' };
+const JSON_INTERNAL = { ...INTERNAL, 'Content-Type': 'application/json' };
+const KEYS = 'https://worker/api/v1/admin/api-keys';
+const CHAT = 'https://worker/api/v1/chat';
+
+type CreateBody = { key: PublicPartnerKey; apiKey: string };
+
+const partnerHeaders = (apiKey: string) => ({
+  Authorization: `Bearer ${apiKey}`,
+  'Content-Type': 'application/json',
+});
+
+async function createKey(org: string, extra: Record<string, unknown> = {}): Promise<CreateBody> {
+  const res = await SELF.fetch(KEYS, {
+    method: 'POST',
+    headers: JSON_INTERNAL,
+    body: JSON.stringify({
+      org,
+      name: 'Test key',
+      app: 'Test app',
+      createdBy: 'tester@example.org',
+      ...extra,
+    }),
+  });
+  expect(res.status).toBe(201);
+  return (await res.json()) as CreateBody;
+}
+
+const chatBody = (extra: Record<string, unknown> = {}) => ({
+  client_id: 'partner-app',
+  user_id: 'alice',
+  message: 'hello',
+  message_type: 'text',
+  ...extra,
+});
+
+const postChat = (apiKey: string, body: unknown, url = CHAT) =>
+  SELF.fetch(url, { method: 'POST', headers: partnerHeaders(apiKey), body: JSON.stringify(body) });
+
+async function clearNamespace(): Promise<void> {
+  const { keys } = await env.API_KEYS.list();
+  await Promise.all(keys.map((k) => env.API_KEYS.delete(k.name)));
+}
+
+/** First captured log record with this event name (helper keeps test callbacks shallow). */
+function findLog(records: LogRecord[], event: string): LogRecord | undefined {
+  return records.find((l) => l.event === event);
+}
+
+const idsOf = (keys: PublicPartnerKey[]): string[] => keys.map((k) => k.id);
+
+async function identityOf(doName: string): Promise<StoredIdentity | null> {
+  const stub = env.USER_DO.get(env.USER_DO.idFromName(doName));
+  const res = await stub.fetch('http://fake-host/identity');
+  return ((await res.json()) as { identity: StoredIdentity | null }).identity;
+}
+
+describe('partner API keys', () => {
+  let capture: AnthropicCapture;
+
+  beforeEach(async () => {
+    await clearNamespace();
+    capture = setupAnthropicFetchCapture();
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await clearNamespace();
+  });
+
+  describe('ENGINE_API_KEY is unchanged', () => {
+    it('still reaches chat validation and admin routes', async () => {
+      const chat = await SELF.fetch(CHAT, {
+        method: 'POST',
+        headers: JSON_INTERNAL,
+        body: JSON.stringify({ client_id: 'web', message: 'x', message_type: 'text' }),
+      });
+      expect(chat.status).toBe(400);
+      expect(await chat.json()).toEqual({ error: 'user_id is required' });
+
+      const list = await SELF.fetch(KEYS, { headers: INTERNAL });
+      expect(list.status).toBe(200);
+    });
+
+    it('lets an internal caller use any org and admin-portal client_id', async () => {
+      const res = await SELF.fetch(CHAT, {
+        method: 'POST',
+        headers: JSON_INTERNAL,
+        body: JSON.stringify(
+          chatBody({ client_id: 'admin-portal', org: 'internal-354', user_id: 'bob' })
+        ),
+      });
+      expect(res.status).toBe(200);
+      expect(await identityOf('user:internal-354:bob')).toMatchObject({ user_id: 'bob' });
+      const received = findLog(capture.logs, 'request_received');
+      expect(received?.payload).toMatchObject({ key_id: 'internal', org: 'internal-354' });
+    });
+  });
+
+  describe('admin CRUD', () => {
+    it('create returns the plaintext once; list and get never do', async () => {
+      const { key, apiKey } = await createKey('org-354-crud', { termsVersion: 'v1' });
+      expect(apiKey).toMatch(/^bts_[0-9a-f]{8}_[A-Za-z0-9_-]{43}$/);
+      expect(apiKey.startsWith(key.prefix)).toBe(true);
+      expect(key).toMatchObject({
+        org: 'org-354-crud',
+        status: 'active',
+        scopes: ['chat'],
+        termsVersion: 'v1',
+        userNamespace: key.id,
+      });
+
+      const list = await SELF.fetch(`${KEYS}?org=org-354-crud`, { headers: INTERNAL });
+      const listText = await list.text();
+      expect(listText).not.toContain(apiKey);
+      expect(listText).not.toContain(await sha256Hex(apiKey));
+      const listed = JSON.parse(listText) as { keys: PublicPartnerKey[] };
+      expect(idsOf(listed.keys)).toEqual([key.id]);
+
+      const get = await SELF.fetch(`${KEYS}/${key.id}`, { headers: INTERNAL });
+      const getText = await get.text();
+      expect(get.status).toBe(200);
+      expect(getText).not.toContain(apiKey);
+      expect(getText).not.toContain(await sha256Hex(apiKey));
+      expect(Object.keys(JSON.parse(getText) as object)).toEqual(['key']);
+    });
+
+    it('lists all orgs or filters by org', async () => {
+      const a = await createKey('org-354-list-a');
+      const b = await createKey('org-354-list-b');
+      const all = (await (await SELF.fetch(KEYS, { headers: INTERNAL })).json()) as {
+        keys: PublicPartnerKey[];
+      };
+      expect(idsOf(all.keys).sort()).toEqual([a.key.id, b.key.id].sort());
+      const onlyB = (await (
+        await SELF.fetch(`${KEYS}?org=org-354-list-b`, { headers: INTERNAL })
+      ).json()) as { keys: PublicPartnerKey[] };
+      expect(idsOf(onlyB.keys)).toEqual([b.key.id]);
+    });
+
+    it('stores only the SHA-256 of the key (hash at rest)', async () => {
+      const { key, apiKey } = await createKey('org-354-hash');
+      const { keys } = await env.API_KEYS.list();
+      for (const k of keys) {
+        expect(k.name).not.toContain(apiKey);
+        expect((await env.API_KEYS.get(k.name)) ?? '').not.toContain(apiKey);
+      }
+      const hash = await sha256Hex(apiKey);
+      const stored = await env.API_KEYS.get<PublicPartnerKey>(`key:${hash}`, 'json');
+      expect(stored?.id).toBe(key.id);
+      expect(await env.API_KEYS.get(`id:${key.id}`)).toBe(hash);
+    });
+
+    it('validates create bodies and unknown ids', async () => {
+      const bad = await SELF.fetch(KEYS, {
+        method: 'POST',
+        headers: JSON_INTERNAL,
+        body: JSON.stringify({ org: 'x', name: 'n', app: 'a', createdBy: 'c', scopes: ['admin'] }),
+      });
+      expect(bad.status).toBe(400);
+      const missing = await SELF.fetch(`${KEYS}/pk_0000000000000000`, { headers: INTERNAL });
+      expect(missing.status).toBe(404);
+      const revokeMissing = await SELF.fetch(`${KEYS}/pk_0000000000000000/_revoke`, {
+        method: 'POST',
+        headers: INTERNAL,
+      });
+      expect(revokeMissing.status).toBe(404);
+    });
+
+    it('revoke makes the key fail with 403 and is idempotent', async () => {
+      const { key, apiKey } = await createKey('org-354-revoke');
+      expect((await postChat(apiKey, chatBody())).status).toBe(200);
+
+      const revoke = await SELF.fetch(`${KEYS}/${key.id}/_revoke`, {
+        method: 'POST',
+        headers: JSON_INTERNAL,
+        body: JSON.stringify({ revokedBy: 'ops@example.org' }),
+      });
+      expect(revoke.status).toBe(200);
+      expect(await revoke.json()).toMatchObject({
+        key: { status: 'revoked', revokedBy: 'ops@example.org' },
+        alreadyRevoked: false,
+      });
+
+      const denied = await postChat(apiKey, chatBody());
+      expect(denied.status).toBe(403);
+      expect(await denied.json()).toEqual({ error: 'Invalid API key' });
+      const rejected = findLog(capture.warnLogs, 'auth_rejected');
+      expect(rejected?.payload).toMatchObject({ reason: 'revoked_partner_key', key_id: key.id });
+
+      const again = await SELF.fetch(`${KEYS}/${key.id}/_revoke`, {
+        method: 'POST',
+        headers: INTERNAL,
+      });
+      expect(await again.json()).toMatchObject({ alreadyRevoked: true });
+    });
+
+    it('rotate revokes the old key, issues a new one, and keeps the user namespace', async () => {
+      const { key, apiKey } = await createKey('org-354-rotate');
+      const rotate = await SELF.fetch(`${KEYS}/${key.id}/_rotate`, {
+        method: 'POST',
+        headers: INTERNAL,
+      });
+      expect(rotate.status).toBe(200);
+      const rotated = (await rotate.json()) as CreateBody & { previous: PublicPartnerKey };
+      expect(rotated.apiKey).not.toBe(apiKey);
+      expect(rotated.key).toMatchObject({
+        status: 'active',
+        rotatedFrom: key.id,
+        userNamespace: key.userNamespace,
+        name: key.name,
+        org: key.org,
+      });
+      expect(rotated.previous).toMatchObject({ status: 'revoked', rotatedTo: rotated.key.id });
+
+      expect((await postChat(apiKey, chatBody())).status).toBe(403);
+      expect((await postChat(rotated.apiKey, chatBody())).status).toBe(200);
+
+      const again = await SELF.fetch(`${KEYS}/${key.id}/_rotate`, {
+        method: 'POST',
+        headers: INTERNAL,
+      });
+      expect(again.status).toBe(409);
+    });
+  });
+
+  describe('partner key on chat', () => {
+    it('reaches chat, locked to its org, in its own namespaced DO, logged by key id', async () => {
+      const { key, apiKey } = await createKey('org-354-chat');
+      const res = await postChat(apiKey, chatBody());
+      expect(res.status).toBe(200);
+
+      const doName = `user:org-354-chat:partner:${key.userNamespace}:alice`;
+      expect(await identityOf(doName)).toMatchObject({
+        do_name: doName,
+        org: 'org-354-chat',
+        user_id: `partner:${key.userNamespace}:alice`,
+      });
+      // The un-namespaced DO for the same raw user_id was never touched.
+      expect(await identityOf('user:org-354-chat:alice')).toBeNull();
+      const received = findLog(capture.logs, 'request_received');
+      expect(received?.payload).toMatchObject({ key_id: key.id, org: 'org-354-chat' });
+    });
+
+    it('rejects a mismatched org with 400', async () => {
+      const { apiKey } = await createKey('org-354-orgs');
+      const res = await postChat(apiKey, chatBody({ org: 'unfoldingWord' }));
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toContain("'org-354-orgs'");
+    });
+
+    it('refuses the admin-portal client_id', async () => {
+      const { apiKey } = await createKey('org-354-admin-client');
+      const res = await postChat(apiKey, chatBody({ client_id: 'admin-portal' }));
+      expect(res.status).toBe(403);
+    });
+
+    it('refuses progress_callback_url', async () => {
+      const { apiKey } = await createKey('org-354-callback');
+      const res = await postChat(
+        apiKey,
+        chatBody({ progress_callback_url: 'https://evil.example/cb' })
+      );
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toContain('partner API keys');
+      expect(capture.calls).toHaveLength(0);
+    });
+  });
+
+  describe('partner key outside chat', () => {
+    it('unknown keys get 403', async () => {
+      const unknown = `bts_00000000_${'A'.repeat(43)}`;
+      const res = await postChat(unknown, chatBody());
+      expect(res.status).toBe(403);
+      const rejected = findLog(capture.warnLogs, 'auth_rejected');
+      expect(rejected?.payload).toMatchObject({ reason: 'unknown_partner_key' });
+    });
+
+    it.each([
+      ['POST', '/api/v1/chat/callback'],
+      ['GET', '/api/v1/orgs/org-354-deny/users/alice/preferences'],
+      ['GET', '/api/v1/orgs/org-354-deny/users/alice/history'],
+      ['GET', '/api/v1/audio/audio/x.ogg'],
+      ['GET', '/api/v1/admin/api-keys'],
+      ['POST', '/api/v1/admin/api-keys'],
+      ['GET', '/api/v1/admin/orgs/org-354-deny/modes'],
+      ['GET', `/api/v1/admin/do/${'a'.repeat(64)}/snapshot`],
+    ])('is blocked from %s %s', async (method, path) => {
+      const { apiKey } = await createKey('org-354-deny');
+      const res = await SELF.fetch(`https://worker${path}`, {
+        method,
+        headers: partnerHeaders(apiKey),
+        ...(method === 'POST' ? { body: JSON.stringify(chatBody()) } : {}),
+      });
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({
+        error: 'This API key is not permitted to call this endpoint',
+      });
+    });
+  });
+});

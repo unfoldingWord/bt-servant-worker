@@ -164,6 +164,7 @@ All `/api/*` routes require a Bearer token in the `Authorization` header.
 
 - **`ENGINE_API_KEY`** — super-admin token, grants access to all orgs and all endpoints
 - **Org admin keys** — stored in the `ORG_ADMIN_KEYS` KV namespace, keyed by org name; grants admin access to that org only
+- **Partner API keys** (admin-portal#354) — named, revocable `bts_…` keys issued per partner app through `/api/v1/admin/api-keys`. Stored only as SHA-256 in the `API_KEYS` KV namespace. A partner key can call **only** `POST /api/v1/chat` and `POST /api/v1/chat/stream`, always for its own org, with its end users' ids namespaced per partner. See [docs/curl-examples.md](docs/curl-examples.md#admin-partner-api-keys).
 - **Webhook callbacks** — authenticated via `X-Engine-Token` header containing the `ENGINE_API_KEY`
 
 ```
@@ -230,6 +231,11 @@ All admin endpoints require Bearer token authentication with `ENGINE_API_KEY` (t
 | `/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/history`     | GET/DEL      | Thread chat history                                                                         |
 | `/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/memory`      | GET/DEL      | Thread shared memory                                                                        |
 | `/api/v1/admin/do/:hexId/snapshot`                                     | GET          | Open a DO by its 64-hex object id; returns its stored identity and history (`?limit=`, 100) |
+| `/api/v1/admin/api-keys`                                               | POST         | Create a partner API key; the plaintext `apiKey` is returned only here (#354)               |
+| `/api/v1/admin/api-keys`                                               | GET          | List partner keys, all orgs or `?org=`; never the plaintext or hash                         |
+| `/api/v1/admin/api-keys/:keyId`                                        | GET          | Get one partner key                                                                         |
+| `/api/v1/admin/api-keys/:keyId/_revoke`                                | POST         | Revoke a partner key (idempotent)                                                           |
+| `/api/v1/admin/api-keys/:keyId/_rotate`                                | POST         | Issue a replacement key (same metadata and user namespace) and revoke the old one           |
 
 The snapshot route is the only way into a DO whose `user:{org}:{user_id}` name is unknown (object ids from the Cloudflare REST listing are one-way), which is what makes the DO population enumerable after the fact. `identity` is `null` for DOs that predate identity persistence and have not chatted since.
 
@@ -684,6 +690,7 @@ Primary traffic never touches OpenRouter; it is a failover path only. OpenRouter
 | `MCP_SERVERS`      | KV Namespace   | MCP server configurations — one global pool under key `__global__` (#278) |
 | `ORG_CONFIG`       | KV Namespace   | Org-level configuration (history limits, etc.)                            |
 | `PROMPT_OVERRIDES` | KV Namespace   | Org-level prompt overrides, modes, languages, scaffold, default language  |
+| `API_KEYS`         | KV Namespace   | Partner API keys, keyed by SHA-256 of the key (admin-portal#354)          |
 
 The worker also declares **tail consumers** (`bt-servant-tail` for death detection and `bt-servant-telemetry-production` for log fanout; staging uses `bt-servant-tail-staging` and `bt-servant-telemetry-dev`), enables the `nodejs_compat` compatibility flag (AsyncLocalStorage for trace-context propagation), and raises the CPU limit to 300,000 ms for long ptxprint flows.
 

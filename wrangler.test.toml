@@ -39,6 +39,11 @@ id = "d7149c3d69f34cff87146557163f0a6c"
 binding = "PROMPT_OVERRIDES"
 id = "c1828624ab434f079776bddd171882d9"
 
+# Partner API keys (admin-portal#354) — emulated locally in tests; id unused.
+[[kv_namespaces]]
+binding = "API_KEYS"
+id = "api-keys-test"
+
 # R2 Object Storage (TTS audio) — local emulated bucket for tests
 [[r2_buckets]]
 binding = "AUDIO_BUCKET"

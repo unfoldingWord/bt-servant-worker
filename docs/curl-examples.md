@@ -498,6 +498,121 @@ curl -X DELETE "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-serve
 
 ---
 
+## Admin: Partner API Keys
+
+Named, revocable keys for partner apps (admin-portal#354). Our own clients
+(web client, WhatsApp gateway, admin portal) keep using `ENGINE_API_KEY`
+unchanged. These admin endpoints accept **only** `ENGINE_API_KEY`.
+
+- The plaintext key (`apiKey`, shape `bts_<8 hex>_<43 base64url>`) is returned
+  **once**, by create and rotate. It cannot be fetched again; only its SHA-256
+  is stored (`API_KEYS` KV, `key:<sha256>` → record, `id:<key id>` → hash).
+- List and get return the record (`id`, `prefix`, `name`, `app`, `org`,
+  `createdBy`, `createdAt`, `scopes`, `userNamespace`, `status`, and when set
+  `revokedAt`, `revokedBy`, `rotatedFrom`, `rotatedTo`, `termsVersion`,
+  `termsAcceptedAt`). Never the plaintext, never the hash.
+- Revocation (and a new key) can take **about a minute** to take effect
+  everywhere: KV is eventually consistent and the auth lookup caches for 60s.
+- The list is built from a KV listing, so a key created seconds ago may be
+  missing from it briefly. `GET …/api-keys/:keyId` reads it directly.
+
+### Create a Key
+
+```bash
+curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "org": "bcs",
+    "name": "BCS production",
+    "app": "BCS Translator App",
+    "createdBy": "ops@unfoldingword.org",
+    "termsVersion": "2026-11",
+    "termsAcceptedAt": "2026-11-02T15:00:00Z"
+  }'
+```
+
+**Response (201):** `{"key": {...record, "status": "active"}, "apiKey": "bts_1a2b3c4d_..."}`
+
+`org`, `name`, `app` and `createdBy` are required; `termsVersion` and
+`termsAcceptedAt` are optional. Any other field (for example `scopes` or
+`limits`) is a `400`: every key has `scopes: ["chat"]`, and limits are not
+settable yet.
+
+### List Keys (all orgs, or one)
+
+```bash
+curl "http://localhost:$PORT/api/v1/admin/api-keys" -H "Authorization: Bearer $API_KEY"
+curl "http://localhost:$PORT/api/v1/admin/api-keys?org=bcs" -H "Authorization: Bearer $API_KEY"
+```
+
+### Get One Key
+
+```bash
+curl "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+### Revoke a Key
+
+Idempotent: revoking a revoked key returns it with `"alreadyRevoked": true`.
+The body is optional.
+
+```bash
+curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_revoke" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"revokedBy": "ops@unfoldingword.org"}'
+```
+
+### Rotate a Key
+
+Issues a new key with the same name, app, org, terms and `userNamespace` (so
+the partner's users keep their history), then revokes the old one. Returns
+`{"key": {...new}, "previous": {...old, revoked}, "apiKey": "bts_..."}`.
+A revoked key cannot be rotated (`409`); create a new one instead. The body
+is optional (`{"createdBy": "..."}` records who rotated).
+
+```bash
+curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_rotate" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+### Calling Chat With a Partner Key
+
+A partner key may call **only** `POST /api/v1/chat` and
+`POST /api/v1/chat/stream`. Every other `/api/*` route answers `403`
+(`This API key is not permitted to call this endpoint`). On those two routes:
+
+- `org` / `org_id` may be omitted (the key's org applies) or equal the key's
+  org; any other value is a `400`.
+- `client_id: "admin-portal"` is refused (`403`).
+- `progress_callback_url` is refused (`400`).
+- `user_id` must be a non-empty string. Inside the worker it becomes
+  `partner:<userNamespace>:<user_id>` (and `chat_id` likewise), so a partner's
+  users can never reach another app's or a WhatsApp user's conversation.
+
+```bash
+export PARTNER_KEY="bts_..."   # from the create response
+curl -X POST "http://localhost:$PORT/api/v1/chat" \
+  -H "Authorization: Bearer $PARTNER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "client_id": "bcs-app",
+    "user_id": "user-42",
+    "message": "What is Genesis 1:1?",
+    "message_type": "text"
+  }'
+```
+
+An unknown or revoked key gets `403 {"error": "Invalid API key"}` (logged as
+`auth_rejected` with reason `unknown_partner_key` / `revoked_partner_key`).
+Every chat request logs `key_id` on `request_received` (`"internal"` for
+`ENGINE_API_KEY`), which is how usage and "last used" per key are read from
+telemetry.
+
+---
+
 ## Admin: Mode Management — `spoken-mode` (STAGING ONLY)
 
 > ⚠️ **STAGING ONLY.** The procedure below pushes the assembled

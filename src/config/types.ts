@@ -58,6 +58,8 @@ export interface Env {
   MCP_SERVERS: KVNamespace;
   ORG_CONFIG: KVNamespace;
   PROMPT_OVERRIDES: KVNamespace;
+  /** Partner API keys (admin-portal#354): SHA-256-keyed records; see src/services/partner-keys/store.ts. */
+  API_KEYS: KVNamespace;
 
   // AI binding
   AI: Ai;

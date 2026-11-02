@@ -53,7 +53,13 @@ export default defineConfig({
           // #311: wa.me share number for first-contact welcome tests.
           WHATSAPP_NUMBER: '15558196461',
         },
-        kvNamespaces: ['ORG_ADMIN_KEYS', 'MCP_SERVERS', 'ORG_CONFIG', 'PROMPT_OVERRIDES'],
+        kvNamespaces: [
+          'ORG_ADMIN_KEYS',
+          'MCP_SERVERS',
+          'ORG_CONFIG',
+          'PROMPT_OVERRIDES',
+          'API_KEYS',
+        ],
         r2Buckets: ['AUDIO_BUCKET', 'PTXPRINT_BUCKET'],
       },
       // Disable isolated storage to avoid issues with multi-request DO tests
