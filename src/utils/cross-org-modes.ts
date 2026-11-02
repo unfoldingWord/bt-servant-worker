@@ -152,6 +152,8 @@ function isString(value: unknown): value is string {
  * object when nothing needed fixing.
  */
 function normalizeModeElement(mode: ChatMode): { mode: ChatMode; fixed: string[] } {
+  // Hot path (every chat turn): a clean element is returned as-is, uncopied.
+  if (!needsNormalizing(mode)) return { mode, fixed: [] };
   const { aliases, overrides, welcome_message: welcome, ...rest } = mode;
   const out: ChatMode = { ...rest };
   const fixed = [
@@ -160,6 +162,22 @@ function normalizeModeElement(mode: ChatMode): { mode: ChatMode; fixed: string[]
     ...keepWelcome(out, welcome),
   ];
   return fixed.length === 0 ? { mode, fixed } : { mode: out, fixed };
+}
+
+/** Whether any field `normalizeModeElement` fixes is present in a harmful form. */
+function needsNormalizing(mode: ChatMode): boolean {
+  const {
+    aliases,
+    overrides,
+    welcome_message: welcome,
+  } = mode as {
+    aliases?: unknown;
+    overrides?: unknown;
+    welcome_message?: unknown;
+  };
+  if (aliases !== undefined && (!Array.isArray(aliases) || !aliases.every(isString))) return true;
+  if (overrides === null) return true;
+  return welcome !== undefined && welcome !== null && !isString(welcome);
 }
 
 /** Copy `aliases` onto `out` keeping only strings; a non-array is dropped. Returns the fixed field, if any. */
@@ -197,9 +215,12 @@ function keepWelcome(out: ChatMode, welcome: unknown): string[] {
  */
 export function sanitizeModeElements(elements: readonly unknown[]): {
   modes: ChatMode[];
+  /** For each entry of `modes`, the index of its source element. */
+  sourceIndexes: number[];
   issues: ModeElementIssue[];
 } {
   const modes: ChatMode[] = [];
+  const sourceIndexes: number[] = [];
   const issues: ModeElementIssue[] = [];
   elements.forEach((element, index) => {
     if (!isModeRecord(element)) {
@@ -213,11 +234,12 @@ export function sanitizeModeElements(elements: readonly unknown[]): {
     }
     const { mode, fixed } = normalizeModeElement(element as ChatMode);
     modes.push(mode);
+    sourceIndexes.push(index);
     if (fixed.length > 0) {
       issues.push({ index, name: mode.name, issue: `normalized:${fixed.join(',')}`, draft });
     }
   });
-  return { modes, issues };
+  return { modes, sourceIndexes, issues };
 }
 
 /** Home element issues already logged in this isolate, so a bad record warns once, not every turn. */
@@ -569,14 +591,35 @@ function logReadFailure(
   error: unknown,
   data: Record<string, unknown>
 ): void {
-  if (!ctx.shareCode) {
-    ctx.logger.error(event, error, data);
-    return;
-  }
-  ctx.logger.warn(event, {
+  if (ctx.shareCode) logShareCodeFailure(ctx.logger, event, error, data);
+  else ctx.logger.error(event, error, data);
+}
+
+/** The context every share-code (admin-portal#345) log line carries. */
+export const SHARE_CODE_LOG_CONTEXT = { source: 'share_code' } as const;
+
+/**
+ * The one way the share-code endpoint and the shared reader in share-code mode
+ * log a failure: at warn (admin traffic must not read as chat errors), tagged
+ * with SHARE_CODE_LOG_CONTEXT, and keeping the same error fields the request
+ * logger's `error()` records (`error`, `error_name`, `stack`).
+ */
+export function logShareCodeFailure(
+  logger: RequestLogger,
+  event: string,
+  error: unknown,
+  data: Record<string, unknown>
+): void {
+  const fields: Record<string, unknown> = {
     ...data,
+    ...SHARE_CODE_LOG_CONTEXT,
     error: error instanceof Error ? error.message : String(error),
-  });
+  };
+  if (error instanceof Error) {
+    fields.error_name = error.name;
+    if (error.stack !== undefined) fields.stack = error.stack;
+  }
+  logger.warn(event, fields);
 }
 
 /** Options for `readCrossOrgModeSources`; the chat path passes none. */
@@ -619,7 +662,7 @@ export async function readCrossOrgModeSources(
   const { prefetched } = opts;
   const shareCode = opts.source === 'share_code';
   const ctx: ReaderContext = {
-    logger: shareCode ? withLogContext(logger, { source: opts.source }) : logger,
+    logger: shareCode ? withLogContext(logger, SHARE_CODE_LOG_CONTEXT) : logger,
     shareCode,
   };
   const get: JsonGet = async (key) =>

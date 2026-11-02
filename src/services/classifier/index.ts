@@ -284,36 +284,16 @@ type TokenOutcome =
   | { kind: 'matched'; sigil: '#' | '@'; name: string; tier: MatchTier }
   | { kind: 'unmatched'; trigger: UnmatchedTrigger; tokenText: string };
 
-/** How one raw token (sigil stripped) resolves against an option list. */
-type TokenResolution =
-  { kind: 'clear' } | { kind: 'matched'; match: TokenMatch } | { kind: 'unmatched' };
-
-/**
- * Resolve one raw token (sigil stripped): reserved clear tokens first, then
- * the exact → prefix → fuzzy cascade, keeping the tier that matched so
- * `classifyTriggers` can report it as `modeMatchTier`.
- */
-function resolveTriggerToken(raw: string, options: AvailableOption[]): TokenResolution {
-  if (CLEAR_TOKENS.has(raw.toLowerCase())) return { kind: 'clear' };
-  const match = matchToken(raw, options);
-  return match === null ? { kind: 'unmatched' } : { kind: 'matched', match };
-}
-
 /** Classify a single leading token. Pure: no shared state. */
 function classifyToken(token: ParsedToken, ctx: ClassifierContext): TokenOutcome {
   const isMode = token.sigil === '#';
   const options = isMode ? ctx.availableModes : ctx.availableLanguages;
-  const resolved = resolveTriggerToken(token.raw, options);
-  if (resolved.kind === 'clear') {
+  if (CLEAR_TOKENS.has(token.raw.toLowerCase())) {
     return { kind: 'clear', sigil: token.sigil };
   }
-  if (resolved.kind === 'matched') {
-    return {
-      kind: 'matched',
-      sigil: token.sigil,
-      name: resolved.match.name,
-      tier: resolved.match.tier,
-    };
+  const match = matchToken(token.raw, options);
+  if (match !== null) {
+    return { kind: 'matched', sigil: token.sigil, name: match.name, tier: match.tier };
   }
   const triggerKind: TriggerKind = isMode ? 'mode' : 'language';
   return {

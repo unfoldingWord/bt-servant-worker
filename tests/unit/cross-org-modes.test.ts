@@ -18,6 +18,7 @@ import {
   orgSlug,
   readAllPublishedModes,
   readCrossOrgModeSources,
+  sanitizeModeElements,
 } from '../../src/utils/cross-org-modes.js';
 import type { RequestLogger } from '../../src/utils/logger.js';
 
@@ -816,6 +817,14 @@ describe('readAllPublishedModes — home-element warning dedup', () => {
     await readAllPublishedModes(kv, 'home-r5b', second);
     expect(first.warn).toHaveBeenCalledWith('org_modes_invalid_elements', expect.anything());
     expect(second.warn).not.toHaveBeenCalledWith('org_modes_invalid_elements', expect.anything());
+  });
+
+  it('returns a clean element as the same object (no copy on the hot path)', () => {
+    const clean = { name: 'h', published: true, overrides: {}, aliases: ['old-h'] };
+    const dirty = { name: 'd', published: true, overrides: null };
+    const { modes } = sanitizeModeElements([clean, dirty]);
+    expect(modes[0]).toBe(clean);
+    expect(modes[1]).not.toBe(dirty);
   });
 
   it('a clean home record logs nothing extra', async () => {

@@ -117,10 +117,14 @@ describe('GET …/modes/:modeName/share-code — errors', () => {
 describe('GET …/modes/:modeName/share-code — auth and home org', () => {
   it('an org or home_org too long for a KV key is a 400 invalid_org, not a 503', async () => {
     const long = 'a'.repeat(600);
-    for (const target of [url(long, 'u345-coach', HOME), url(HOME, 'u345-coach', long)]) {
+    const cases = [
+      { target: url(long, 'u345-coach', HOME), field: 'org' },
+      { target: url(HOME, 'u345-coach', long), field: 'home_org' },
+    ];
+    for (const { target, field } of cases) {
       const res = await SELF.fetch(target, { headers: AUTH });
       expect(res.status).toBe(400);
-      expect(await res.json()).toMatchObject({ error: 'invalid_org' });
+      expect(await res.json()).toMatchObject({ error: 'invalid_org', field });
     }
   });
 
@@ -151,7 +155,7 @@ describe('GET …/modes/:modeName/share-code — auth and home org', () => {
     await seed();
     const res = await SELF.fetch(url(HOME, 'u345-coach'), { headers: AUTH });
     expect(res.status).toBe(400);
-    expect(await res.json()).toMatchObject({ error: 'home_org_required' });
+    expect(await res.json()).toMatchObject({ error: 'home_org_required', field: 'home_org' });
   });
 
   it('an invalid mode name is a 400', async () => {

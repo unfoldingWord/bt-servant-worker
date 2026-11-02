@@ -24,14 +24,14 @@
  */
 import { classifyTriggers, type MatchTier } from '../services/classifier/index.js';
 import type { ChatMode, PromptMode } from '../types/prompt-overrides.js';
-import { chatTriggerModeOptions, findModeBySlug } from '../types/prompt-overrides.js';
+import { chatTriggerModeOptions } from '../types/prompt-overrides.js';
 import {
   compareOrgs,
   CorruptModesRecordError,
   type CrossOrgMergeDetail,
   type CrossOrgModeSources,
-  isModeRecord,
   isOrgModes,
+  logShareCodeFailure,
   mergeCrossOrgModesDetailed,
   modeElementError,
   modesKey,
@@ -41,6 +41,7 @@ import {
   readCrossOrgModeSources,
   readModesJson,
   sanitizeModeElements,
+  SHARE_CODE_LOG_CONTEXT,
 } from './cross-org-modes.js';
 import { type RequestLogger, withLogContext } from './logger.js';
 
@@ -119,9 +120,6 @@ export interface ShareCodeTarget {
 
 /** A WhatsApp share link opens a private chat with a non-admin user. */
 const WHATSAPP_CHAT = { isGroupChat: false, isAdmin: false } as const;
-
-/** Tag the shared reader's events so admin traffic is distinguishable from chat turns. */
-const SHARE_CODE_LOG_CONTEXT = { source: 'share_code' } as const;
 
 /**
  * The one place a code is spelled: the bare name for a home mode (`slug`
@@ -225,8 +223,9 @@ function whyForeignMissing(
 ): ShareCodeReason | null {
   // Listed but beyond the per-turn cap, or past a truncated listing.
   if (!pool.sources.readKeys.includes(modesKey(target.org))) return 'capped';
-  const claimedBy = pool.merged.claimed.get(code);
-  if (claimedBy !== undefined && claimedBy !== target.org) return 'collision';
+  // Claimed by another org first, or by another mode of THIS org whose alias
+  // took the qualified name (the merge drops the later claim either way).
+  if (pool.merged.claimed.has(code)) return 'collision';
   return null;
 }
 
@@ -345,46 +344,49 @@ async function readSnapshotValue(
   }
 }
 
+/** The element chat would serve among `candidates` (indexes into the sanitized list), or the first. */
+function preferServed(
+  candidates: number[],
+  served: (index: number) => boolean
+): number | undefined {
+  return candidates.find(served) ?? candidates.at(0);
+}
+
 /**
- * Find `slug` among the record's elements as chat serves them (`targetModes`,
- * crash-guarded once), and judge the original stored element with the STRICT
- * check the foreign merge applies.
+ * Select the target the way chat resolves `slug`: a canonical-name match
+ * beats an alias match (the classifier's exact tier checks names first), and
+ * among duplicates the element chat actually serves wins. For a home org that
+ * is the first one a private WhatsApp chat can see (the classifier's option
+ * order); for a foreign org, the first published element that passes the
+ * strict check (the one the merge keeps). The strict verdict is computed on
+ * the original stored element.
  */
-function findStoredMode(
+function selectTarget(
   elements: readonly unknown[],
-  targetModes: ChatMode[],
-  slug: string
-): { mode: PromptMode; wellShaped: boolean } | undefined {
-  const mode = findModeBySlug(targetModes, slug);
-  if (mode === undefined) return undefined;
-  const stored = elements.find(
-    (e) => isModeRecord(e) && (e as { name?: unknown }).name === mode.name
-  );
-  return { mode, wellShaped: modeElementError(stored) === null };
-}
-
-/**
- * For a FOREIGN target, a home record that is unreadable or corrupt is an
- * empty home, exactly as the chat path's `readHomeModes` degrades (same
- * event, tagged `source: 'share_code'`), and `home_has_modes` is unknown. A
- * home record never affects a qualified token.
- */
-function degradeHome(
-  snapshot: Map<string, unknown>,
-  home: { key: string; error: unknown },
-  logger: RequestLogger
-): undefined {
-  logHomeReadError(home, logger);
-  snapshot.set(home.key, null);
-  return undefined;
-}
-
-/** The chat path's home-read event, at warn and tagged, as the shared reader logs it in share-code mode. */
-function logHomeReadError(home: { key: string; error: unknown }, logger: RequestLogger): void {
-  withLogContext(logger, SHARE_CODE_LOG_CONTEXT).warn('org_modes_kv_read_error', {
-    key: home.key,
-    error: home.error instanceof Error ? home.error.message : String(home.error),
-  });
+  slug: string,
+  isHome: boolean
+): { mode: PromptMode; wellShaped: boolean; targetModes: ChatMode[] } | undefined {
+  const { modes, sourceIndexes } = sanitizeModeElements(elements);
+  const strictOk = (k: number): boolean =>
+    modeElementError(elements.at(sourceIndexes.at(k) ?? -1)) === null;
+  const served = (k: number): boolean => {
+    const mode = modes.at(k);
+    if (mode === undefined || mode.published !== true) return false;
+    return isHome ? mode.requires_group !== true : strictOk(k);
+  };
+  const indexesWhere = (test: (m: ChatMode) => boolean): number[] =>
+    modes.flatMap((m, k) => (test(m) ? [k] : []));
+  const byName = indexesWhere((m) => m.name === slug);
+  const chosen =
+    byName.length > 0
+      ? preferServed(byName, served)
+      : preferServed(
+          indexesWhere((m) => m.aliases?.includes(slug) === true),
+          served
+        );
+  const mode = chosen === undefined ? undefined : modes.at(chosen);
+  if (chosen === undefined || mode === undefined) return undefined;
+  return { mode, wellShaped: strictOk(chosen), targetModes: modes };
 }
 
 /** The home read's failure, when the home is a separate key that could not be used. */
@@ -398,27 +400,30 @@ function homeReadFailure(
 }
 
 /**
- * The outcome for a target record that could not be used: 500 for corrupt
- * data, a retryable 503 for a transport error (thrown). `beforeOutcome` runs
- * first so the home failure, if any, is still logged. Undefined when the
- * record is usable data.
+ * The outcome for a target record that is not usable data: 500 for a value
+ * that is not JSON or is JSON of the wrong shape, a retryable 503 for a
+ * transport error (thrown). Undefined when the record is missing or usable.
  */
 function badTargetOutcome(
   record: unknown,
-  target: { key: string; error: unknown },
-  beforeOutcome: () => void
+  target: { key: string; error: unknown }
 ): ShareCodeLoad | undefined {
-  if (record !== UNREADABLE && record !== CORRUPT) return undefined;
-  beforeOutcome();
-  if (record === CORRUPT) return { kind: 'corrupt_record', key: target.key };
-  throw new ShareCodeUnavailableError('read_failed', { key: target.key, cause: target.error });
+  if (record === UNREADABLE) {
+    throw new ShareCodeUnavailableError('read_failed', { key: target.key, cause: target.error });
+  }
+  if (record === CORRUPT || (record !== null && !isOrgModes(record))) {
+    return { kind: 'corrupt_record', key: target.key };
+  }
+  return undefined;
 }
 
 /**
  * Read `<org>:modes` and `<homeOrg>:modes` once (one get when they are the same
- * key) and find the mode; the answer is computed from this snapshot. For a
- * home target an unreadable record is retryable and a corrupt one is
- * reported; for a foreign target a bad home record degrades (`degradeHome`).
+ * key) and select the mode; the answer is computed from this snapshot. A home
+ * record that cannot be used (a separate key) is logged at warn as
+ * `mode_share_code_home_read_failed` on every path, 404 included, and then
+ * treated as an empty home with `home_has_modes` unknown, exactly as the chat
+ * path degrades; a home record never affects a qualified token.
  */
 export async function loadShareCodeTarget(
   kv: KVNamespace,
@@ -431,28 +436,26 @@ export async function loadShareCodeTarget(
   const reads = await Promise.all(keys.map((key) => readSnapshotValue(kv, key)));
   const snapshot = new Map<string, unknown>(keys.map((key, i) => [key, reads.at(i)?.value]));
 
-  const record = snapshot.get(orgKey);
   const homeFailure =
     orgKey === homeKey ? undefined : homeReadFailure(snapshot, homeKey, reads.at(1)?.error);
-  // The target decides first. A bad home is only logged once the request is
-  // going somewhere: a 404 never emits a home-read event.
-  const badTarget = badTargetOutcome(record, { key: orgKey, error: reads.at(0)?.error }, () => {
-    if (homeFailure !== undefined) logHomeReadError(homeFailure, logger);
-  });
-  if (badTarget !== undefined) return badTarget;
-  if (!isOrgModes(record)) return { kind: 'mode_not_found' };
-  const targetModes = sanitizeModeElements(record.modes).modes;
-  const found = findStoredMode(record.modes, targetModes, p.modeName);
-  if (found === undefined) return { kind: 'mode_not_found' };
+  if (homeFailure !== undefined) {
+    logShareCodeFailure(logger, 'mode_share_code_home_read_failed', homeFailure.error, {
+      key: homeKey,
+    });
+    snapshot.set(homeKey, null);
+  }
 
-  const homeHasModes =
-    homeFailure === undefined
-      ? isOrgModes(snapshot.get(homeKey))
-      : degradeHome(snapshot, homeFailure, logger);
+  const record = snapshot.get(orgKey);
+  const bad = badTargetOutcome(record, { key: orgKey, error: reads.at(0)?.error });
+  if (bad !== undefined) return bad;
+  const found = isOrgModes(record)
+    ? selectTarget(record.modes, p.modeName, orgKey === homeKey)
+    : undefined;
+  if (found === undefined) return { kind: 'mode_not_found' };
   return {
     kind: 'ok',
-    target: { org: p.org, homeOrg: p.homeOrg, snapshot, targetModes, ...found },
-    homeHasModes,
+    target: { org: p.org, homeOrg: p.homeOrg, snapshot, ...found },
+    homeHasModes: homeFailure === undefined ? isOrgModes(snapshot.get(homeKey)) : undefined,
   };
 }
 

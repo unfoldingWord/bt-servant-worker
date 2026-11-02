@@ -494,8 +494,13 @@ describe('loadShareCodeTarget — corrupt home', () => {
     );
     expect(loaded).toMatchObject({ kind: 'ok', homeHasModes: undefined });
     expect(logger.warn).toHaveBeenCalledWith(
-      'org_modes_kv_read_error',
-      expect.objectContaining({ key: `${HOME}:modes`, source: 'share_code' })
+      'mode_share_code_home_read_failed',
+      expect.objectContaining({
+        key: `${HOME}:modes`,
+        source: 'share_code',
+        error_name: 'CorruptModesRecordError',
+        stack: expect.any(String),
+      })
     );
     expect(logger.error).not.toHaveBeenCalled();
     expect(await resolve(kv, 'pbt', 'x')).toMatchObject({ resolves: true });
@@ -681,7 +686,7 @@ describe('invalidOrgError', () => {
 });
 
 describe('share-code logging (round 6)', () => {
-  it('a 404 never emits a home-read event, even when the home record is bad', async () => {
+  it('a 404 still logs a bad home at warn, under the share-code event, never the chat error event', async () => {
     const kv = fakeKv({}, { noHome: true, rawText: { [`${HOME}:modes`]: '{not json' } });
     const logger = spyLogger();
     const loaded = await loadShareCodeTarget(
@@ -690,7 +695,11 @@ describe('share-code logging (round 6)', () => {
       logger
     );
     expect(loaded).toEqual({ kind: 'mode_not_found' });
-    expect(logger.warn).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(
+      'mode_share_code_home_read_failed',
+      expect.objectContaining({ key: `${HOME}:modes`, source: 'share_code' })
+    );
+    expect(logger.warn).not.toHaveBeenCalledWith('org_modes_kv_read_error', expect.anything());
     expect(logger.error).not.toHaveBeenCalled();
   });
 
@@ -707,7 +716,7 @@ describe('share-code logging (round 6)', () => {
     );
     expect(loaded).toEqual({ kind: 'corrupt_record', key: 'pbt:modes' });
     const homeEvents = (logger.warn as ReturnType<typeof vi.fn>).mock.calls.filter(
-      ([event]) => event === 'org_modes_kv_read_error'
+      ([event]) => event === 'mode_share_code_home_read_failed'
     );
     expect(homeEvents).toHaveLength(1);
     expect(homeEvents[0]?.[1]).toMatchObject({ key: `${HOME}:modes`, source: 'share_code' });
@@ -733,6 +742,58 @@ describe('share-code logging — shared reader', () => {
       expect.objectContaining({ key: 'other:modes', source: 'share_code' })
     );
     expect(logger.error).not.toHaveBeenCalled();
+  });
+});
+
+describe('loadShareCodeTarget — target selection follows chat (round 7)', () => {
+  it('[draft x, published x] on a home org selects the published one chat serves', async () => {
+    const kv = fakeKv({
+      [`${HOME}:modes`]: { modes: [{ name: 'x', overrides: {} }, published('x')] },
+    });
+    expect(await resolve(kv, HOME, 'x')).toEqual({ code: 'x', resolves: true, resolved_org: HOME });
+  });
+
+  it('[draft x, published x] on a foreign org selects the one the merge keeps', async () => {
+    const kv = fakeKv({ 'pbt:modes': { modes: [{ name: 'x', overrides: {} }, published('x')] } });
+    expect(await resolve(kv, 'pbt', 'x')).toMatchObject({ code: 'pbt/x', resolves: true });
+  });
+
+  it('[a with alias b, b]: asking for b selects the mode NAMED b, not the alias owner', async () => {
+    const kv = fakeKv({
+      [`${HOME}:modes`]: { modes: [published('a', { aliases: ['b'] }), published('b')] },
+    });
+    expect(await resolve(kv, HOME, 'b')).toEqual({ code: 'b', resolves: true, resolved_org: HOME });
+  });
+
+  it('an alias still selects its mode when no mode has that name', async () => {
+    const kv = fakeKv({ [`${HOME}:modes`]: { modes: [published('a', { aliases: ['old-a'] })] } });
+    expect(await resolve(kv, HOME, 'old-a')).toMatchObject({ code: 'a', resolves: true });
+  });
+});
+
+describe('resolveModeShareCode — same-org alias claim (round 7)', () => {
+  it('another mode of THIS org claiming the qualified name by alias is a collision naming this org', async () => {
+    const kv = fakeKv({
+      'pbt:modes': { modes: [published('y', { aliases: ['x'] }), published('x')] },
+    });
+    expect(await resolve(kv, 'pbt', 'x')).toEqual({
+      code: 'pbt/x',
+      resolves: false,
+      reason: 'collision',
+      resolved_org: 'pbt',
+    });
+  });
+});
+
+describe('loadShareCodeTarget — wrong-shape target (round 7)', () => {
+  it('valid JSON that is not a modes record is corrupt_record, not a 404', async () => {
+    const kv = fakeKv({ 'pbt:modes': { not: 'modes' } });
+    const loaded = await loadShareCodeTarget(
+      kv,
+      { org: 'pbt', homeOrg: HOME, modeName: 'x' },
+      spyLogger()
+    );
+    expect(loaded).toEqual({ kind: 'corrupt_record', key: 'pbt:modes' });
   });
 });
 

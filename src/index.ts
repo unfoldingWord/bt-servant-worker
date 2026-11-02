@@ -901,23 +901,33 @@ app.get('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
 /** Incoming X-Request-ID the BFF may forward, so its logs and ours correlate. */
 const FORWARDED_REQUEST_ID = /^[\w.:-]{1,128}$/;
 
+/** A 400 body for share-code input; `field` names the offending query/path field when there is one. */
+interface ShareCodeInputError {
+  error: string;
+  message: string;
+  field?: 'org' | 'home_org';
+}
+
 /** Validated share-code input, or the 400 body that rejects it. */
 function shareCodeInput(
   org: string,
   homeOrg: string | undefined,
   modeName: string
-): { ok: true; homeOrg: string } | { ok: false; body: { error: string; message: string } } {
+): { ok: true; homeOrg: string } | { ok: false; body: ShareCodeInputError } {
   const nameError = validateModeName(modeName);
   if (nameError) return { ok: false, body: { error: 'invalid_mode_name', message: nameError } };
   if (homeOrg === undefined || homeOrg === '') {
-    return {
-      ok: false,
-      body: { error: 'home_org_required', message: 'home_org query parameter is required' },
-    };
+    const message = 'home_org query parameter is required';
+    return { ok: false, body: { error: 'home_org_required', message, field: 'home_org' } };
   }
   // A key KV would reject is caller input, not a transient failure.
-  const orgError = invalidOrgError(org) ?? invalidOrgError(homeOrg);
-  if (orgError !== null) return { ok: false, body: { error: 'invalid_org', message: orgError } };
+  for (const [field, value] of [
+    ['org', org],
+    ['home_org', homeOrg],
+  ] as const) {
+    const message = invalidOrgError(value);
+    if (message !== null) return { ok: false, body: { error: 'invalid_org', message, field } };
+  }
   return { ok: true, homeOrg };
 }
 
@@ -989,7 +999,10 @@ app.get('/api/v1/admin/orgs/:org/modes/:modeName/share-code', async (c) => {
         key: loaded.key,
       });
       return c.json(
-        { error: 'corrupt_modes_record', message: `Stored modes for '${org}' are not valid JSON` },
+        {
+          error: 'corrupt_modes_record',
+          message: `Stored modes for '${org}' are not a valid modes record`,
+        },
         500
       );
     }
