@@ -51,6 +51,7 @@ describe('GET …/modes/:modeName/share-code', () => {
       code: 'u345-coach',
       resolves: true,
       resolved_org: HOME,
+      home_has_modes: true,
       worker_version: APP_VERSION,
     });
   });
@@ -63,6 +64,7 @@ describe('GET …/modes/:modeName/share-code', () => {
       code: 'u345-partner/u345-coach',
       resolves: true,
       resolved_org: PARTNER,
+      home_has_modes: true,
       worker_version: APP_VERSION,
     });
   });
@@ -74,6 +76,7 @@ describe('GET …/modes/:modeName/share-code', () => {
       code: 'u345-partner/u345-draft',
       resolves: false,
       reason: 'draft',
+      home_has_modes: true,
       worker_version: APP_VERSION,
     });
   });
@@ -99,11 +102,30 @@ describe('GET …/modes/:modeName/share-code — errors', () => {
     expect(text).not.toContain('mode_not_found');
   });
 
-  it('a home_org with no modes record is a 400 unknown_home_org', async () => {
+  it('a home_org with no modes record is an empty home: 200 with home_has_modes false', async () => {
     await seed();
     const res = await SELF.fetch(url(PARTNER, 'u345-coach', 'u345-typo'), { headers: AUTH });
-    expect(res.status).toBe(400);
-    expect(await res.json()).toMatchObject({ error: 'unknown_home_org' });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      code: 'u345-partner/u345-coach',
+      resolves: true,
+      home_has_modes: false,
+    });
+  });
+});
+
+describe('GET …/modes/:modeName/share-code — auth and home org', () => {
+  it('an org-scoped admin key cannot reach the route (super admin only)', async () => {
+    await seed();
+    await env.ORG_ADMIN_KEYS.put(PARTNER, 'u345-org-key');
+    try {
+      const res = await SELF.fetch(url(PARTNER, 'u345-coach', HOME), {
+        headers: { Authorization: 'Bearer u345-org-key' },
+      });
+      expect(res.status).toBe(403);
+    } finally {
+      await env.ORG_ADMIN_KEYS.delete(PARTNER);
+    }
   });
 
   it('a record with null elements answers instead of a 500', async () => {

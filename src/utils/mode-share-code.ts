@@ -23,6 +23,7 @@ import { classifyTriggers } from '../services/classifier/index.js';
 import type { ChatMode, OrgModes, PromptMode } from '../types/prompt-overrides.js';
 import { chatTriggerModeOptions, findModeBySlug } from '../types/prompt-overrides.js';
 import {
+  CorruptModesRecordError,
   type CrossOrgMergeDetail,
   type CrossOrgModeSources,
   isModeRecord,
@@ -33,6 +34,7 @@ import {
   orgSkipReason,
   orgSlug,
   readCrossOrgModeSources,
+  readModesJson,
 } from './cross-org-modes.js';
 import type { RequestLogger } from './logger.js';
 
@@ -78,7 +80,7 @@ export interface ShareCodeTarget {
   /** The org a WhatsApp request will carry (gateway ENGINE_ORG). */
   homeOrg: string;
   /**
-   * The raw `kv.get(key, 'json')` values the caller already read, keyed by
+   * The parsed values the caller already read, keyed by
    * modes key: at least `<org>:modes` and `<homeOrg>:modes`. The answer is
    * computed from this snapshot; those keys are not read again.
    */
@@ -103,6 +105,27 @@ function staticReason(target: ShareCodeTarget): ShareCodeReason | null {
   return null;
 }
 
+/**
+ * The one sanitizer for every record this endpoint looks up or matches against.
+ * The home record reaches the chat path unvalidated, and a manual KV write can
+ * leave anything in `modes[]`. Skips non-objects and elements without a string
+ * `name`; `aliases` that is not an array (`null` included) counts as none, and
+ * non-string alias entries are dropped. Never mutates the stored elements.
+ */
+export function matcherSafeModes(modes: readonly unknown[]): ChatMode[] {
+  const safe: ChatMode[] = [];
+  for (const mode of modes) {
+    if (!isModeRecord(mode) || typeof mode.name !== 'string') continue;
+    const { aliases, ...rest } = mode as ChatMode;
+    safe.push(
+      Array.isArray(aliases)
+        ? { ...rest, aliases: aliases.filter((a: unknown): a is string => typeof a === 'string') }
+        : rest
+    );
+  }
+  return safe;
+}
+
 /** What `#<code>` selects: a clear, a mode (name + raw org), or nothing. */
 type MatchOutcome = 'clear' | { name: string; org: string } | null;
 
@@ -110,14 +133,15 @@ type MatchOutcome = 'clear' | { name: string; org: string } | null;
  * Send `#<code>` through the real classifier over the pool a WhatsApp
  * recipient (non-admin, private chat) sees.
  */
-function runChatMatcher(code: string, modes: ChatMode[], homeOrg: string): MatchOutcome {
+function runChatMatcher(code: string, modes: readonly unknown[], homeOrg: string): MatchOutcome {
+  const pool = matcherSafeModes(modes);
   const classified = classifyTriggers(`#${code}`, {
-    availableModes: chatTriggerModeOptions(modes, { isGroupChat: false, isAdmin: false }),
+    availableModes: chatTriggerModeOptions(pool, { isGroupChat: false, isAdmin: false }),
     availableLanguages: [],
   });
   if (classified.clearMode) return 'clear';
   if (classified.modeName === undefined) return null;
-  const winner = modes.find((m) => m.name === classified.modeName);
+  const winner = pool.find((m) => m.name === classified.modeName);
   if (winner === undefined) return null;
   // Only qualified (foreign) entries are stamped with `org` by the merge; a
   // bare name is always the home org's, whatever a stored record carries.
@@ -145,8 +169,7 @@ function answerFromMatch(
  */
 function resolveHome(target: ShareCodeTarget, code: string): ShareCodeAnswer {
   const record = target.snapshot.get(modesKey(target.homeOrg)) as OrgModes;
-  const modes = record.modes.filter(isModeRecord);
-  const match = runChatMatcher(code, modes, target.homeOrg);
+  const match = runChatMatcher(code, record.modes, target.homeOrg);
   return answerFromMatch(code, { name: target.mode.name, org: target.org }, match);
 }
 
@@ -171,18 +194,26 @@ function explainForeignMiss(
 }
 
 /**
- * Whether a failed foreign get could have changed this answer. A failed org
- * with the target's slug could hold (or win) the same qualified name; any
- * failed org could hold the look-alike behind an `ambiguous`/`not_found`.
+ * Whether a failed foreign get could have changed the RAW match result (before
+ * any reason is refined). The merge is first-wins in sorted org order, so an
+ * exact owner of `code` (the target, or a collision winner) can only be
+ * pre-empted by a failed org with the same slug that sorts BEFORE it. Without
+ * an exact owner the classifier fell through to prefix/fuzzy (or nothing), and
+ * a look-alike could sit in any failed org.
  */
 function failureCouldChange(
-  answer: ShareCodeAnswer,
-  slug: string,
-  sources: CrossOrgModeSources
+  raw: ShareCodeAnswer,
+  target: { code: string; org: string },
+  pool: { sources: CrossOrgModeSources; merged: CrossOrgMergeDetail }
 ): boolean {
-  if (sources.failedKeys.length === 0) return false;
-  if (answer.reason === 'ambiguous' || answer.reason === 'not_found') return true;
-  return sources.failedKeys.some((key) => orgSlug(orgFromModesKey(key)) === slug);
+  const failedOrgs = pool.sources.failedKeys.map(orgFromModesKey);
+  if (failedOrgs.length === 0) return false;
+  const slug = orgSlug(target.org);
+  const canPreempt = (owner: string): boolean =>
+    failedOrgs.some((failed) => orgSlug(failed) === slug && failed < owner);
+  if (raw.resolves) return canPreempt(target.org);
+  const claimedBy = pool.merged.claimed.get(target.code);
+  return claimedBy === undefined ? true : canPreempt(claimedBy);
 }
 
 async function resolveForeign(
@@ -200,13 +231,16 @@ async function resolveForeign(
     throw new ShareCodeUnavailableError('listing_lag');
   }
   const merged = mergeCrossOrgModesDetailed(sources.home, sources.foreign, logger);
-  const match = runChatMatcher(code, merged.modes, homeOrg);
-  const first = answerFromMatch(code, { name: code, org }, match);
-  const answer = first.resolves ? first : explainForeignMiss(first, code, org, { sources, merged });
-  if (failureCouldChange(answer, orgSlug(org), sources)) {
+  const pool = { sources, merged };
+  const raw = answerFromMatch(
+    code,
+    { name: code, org },
+    runChatMatcher(code, merged.modes, homeOrg)
+  );
+  if (failureCouldChange(raw, { code, org }, pool)) {
     throw new ShareCodeUnavailableError('read_failed');
   }
-  return answer;
+  return raw.resolves ? raw : explainForeignMiss(raw, code, org, pool);
 }
 
 /**
@@ -235,48 +269,67 @@ export async function resolveModeShareCode(
 
 /** Outcome of loading the records a share-code answer is computed from. */
 export type ShareCodeLoad =
-  | { kind: 'ok'; target: ShareCodeTarget }
+  | {
+      kind: 'ok';
+      target: ShareCodeTarget;
+      /** `<homeOrg>:modes` exists and is a modes record (false is legal: empty home). */
+      homeHasModes: boolean;
+    }
   | { kind: 'mode_not_found' }
-  | { kind: 'unknown_home_org' };
+  | { kind: 'corrupt_record'; key: string };
 
 /**
- * A stored element `findModeBySlug` can safely dereference: an object whose
- * `aliases`, if present, is an array (a manual KV write can leave null or a
- * primitive in `modes[]`, the same hazard `isModeRecord` guards in the merge).
+ * Read one snapshot key. A transport error is logged and becomes the retryable
+ * ShareCodeUnavailableError('read_failed'); a value that is not JSON is
+ * permanent and comes back as `'corrupt'`.
  */
-function isLookupSafe(mode: unknown): mode is PromptMode {
-  return isModeRecord(mode) && (mode.aliases === undefined || Array.isArray(mode.aliases));
+async function readSnapshotValue(
+  kv: KVNamespace,
+  key: string,
+  logger: RequestLogger
+): Promise<unknown> {
+  try {
+    return await readModesJson(kv, key);
+  } catch (error) {
+    if (error instanceof CorruptModesRecordError) {
+      logger.warn('mode_share_code_corrupt_record', { key });
+      return CORRUPT;
+    }
+    logger.error('mode_share_code_read_failed', error, { key });
+    throw new ShareCodeUnavailableError('read_failed');
+  }
 }
+
+/** Marker for a stored value that is not JSON. */
+const CORRUPT: unique symbol = Symbol('corrupt');
 
 /**
  * Read `<org>:modes` and `<homeOrg>:modes` once (one get when they are the same
  * key) and find the mode. The returned snapshot is what the answer is computed
- * from. A failed get is logged and throws ShareCodeUnavailableError('read_failed').
+ * from. An absent or corrupt home record is an empty home, exactly as the chat
+ * path's `readHomeModes` treats it; a corrupt TARGET record is reported.
  */
 export async function loadShareCodeTarget(
   kv: KVNamespace,
   p: { org: string; homeOrg: string; modeName: string },
   logger: RequestLogger
 ): Promise<ShareCodeLoad> {
-  const keys = [...new Set([modesKey(p.org), modesKey(p.homeOrg)])];
-  const snapshot = new Map<string, unknown>();
-  await Promise.all(
-    keys.map(async (key) => {
-      try {
-        snapshot.set(key, await kv.get(key, 'json'));
-      } catch (error) {
-        logger.error('mode_share_code_read_failed', error, { key });
-        throw new ShareCodeUnavailableError('read_failed');
-      }
-    })
-  );
-  const record = snapshot.get(modesKey(p.org));
+  const orgKey = modesKey(p.org);
+  const homeKey = modesKey(p.homeOrg);
+  const keys = [...new Set([orgKey, homeKey])];
+  const values = await Promise.all(keys.map((key) => readSnapshotValue(kv, key, logger)));
+  const snapshot = new Map<string, unknown>(keys.map((key, i) => [key, values.at(i)]));
+  const record = snapshot.get(orgKey);
+  if (record === CORRUPT) return { kind: 'corrupt_record', key: orgKey };
+  if (snapshot.get(homeKey) === CORRUPT) snapshot.set(homeKey, null);
+
   const mode = isOrgModes(record)
-    ? findModeBySlug(record.modes.filter(isLookupSafe), p.modeName)
+    ? findModeBySlug(matcherSafeModes(record.modes), p.modeName)
     : undefined;
   if (mode === undefined) return { kind: 'mode_not_found' };
-  // A mistyped gateway org has no modes record; answering from it would give
-  // plausible but wrong codes (every org would look foreign).
-  if (snapshot.get(modesKey(p.homeOrg)) === null) return { kind: 'unknown_home_org' };
-  return { kind: 'ok', target: { org: p.org, mode, homeOrg: p.homeOrg, snapshot } };
+  return {
+    kind: 'ok',
+    target: { org: p.org, mode, homeOrg: p.homeOrg, snapshot },
+    homeHasModes: isOrgModes(snapshot.get(homeKey)),
+  };
 }

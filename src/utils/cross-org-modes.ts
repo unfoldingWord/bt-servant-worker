@@ -331,6 +331,37 @@ async function listForeignModesKeys(
 type JsonGet = (key: string) => Promise<unknown>;
 
 /**
+ * A stored value that is not JSON. Unlike a KV transport error it is
+ * permanent: retrying returns the same bytes. Kept distinct so callers that
+ * must tell "retry" from "broken data" (the share-code endpoint) can.
+ */
+export class CorruptModesRecordError extends Error {
+  readonly key: string;
+  constructor(key: string, cause: unknown) {
+    super(`Stored value at ${key} is not valid JSON`, { cause });
+    this.name = 'CorruptModesRecordError';
+    this.key = key;
+  }
+}
+
+/**
+ * `kv.get(key, 'json')` with the two failure kinds separated. KV parses the
+ * stored text with JSON.parse, so a value that is not JSON surfaces as a
+ * SyntaxError; that is rethrown as CorruptModesRecordError. Every other error
+ * (transport, limits) propagates unchanged. A missing key yields null.
+ */
+export async function readModesJson(kv: KVNamespace, key: string): Promise<unknown> {
+  try {
+    return await kv.get(key, 'json');
+  } catch (error) {
+    if (error instanceof Error && error.name === 'SyntaxError') {
+      throw new CorruptModesRecordError(key, error);
+    }
+    throw error;
+  }
+}
+
+/**
  * Read one foreign `<org>:modes` key. A bad shape is logged and yields null; a
  * failed get is logged and yields `'read_failed'`, so a caller that needs an
  * authoritative answer can tell a transient failure from an absent record.
@@ -345,7 +376,9 @@ async function readForeignModes(
     value = await get(key);
   } catch (error) {
     logger.error('cross_org_modes_read_failed', error, { key });
-    return 'read_failed';
+    // Corrupt JSON is permanent bad data, skipped like any record that is not
+    // a modes shape; only a transport failure is reported as retryable.
+    return error instanceof CorruptModesRecordError ? null : 'read_failed';
   }
   if (value === null) {
     // Listed a moment ago but gone now, or the stored value is JSON null.
@@ -413,7 +446,7 @@ export async function readCrossOrgModeSources(
   prefetched?: ReadonlyMap<string, unknown>
 ): Promise<CrossOrgModeSources> {
   const get: JsonGet = async (key) =>
-    prefetched?.has(key) === true ? prefetched.get(key) : kv.get(key, 'json');
+    prefetched?.has(key) === true ? prefetched.get(key) : readModesJson(kv, key);
   const homeKey = modesKey(homeOrg);
   const [home, listing] = await Promise.all([
     readHomeModes(get, homeKey, logger),

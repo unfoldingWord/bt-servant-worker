@@ -5,6 +5,7 @@
  * so these tests seed a fake KV (deterministic listing, no keys from other
  * test files) and assert what `#<code>` really opens from the home org.
  */
+import { env } from 'cloudflare:test';
 import { describe, expect, it, vi } from 'vitest';
 import type { PromptMode } from '../../src/types/prompt-overrides.js';
 import { chatTriggerModeOptions } from '../../src/types/prompt-overrides.js';
@@ -36,18 +37,22 @@ interface FakeKvOptions {
   failGet?: string[];
   /** Keys present in the store but missing from the listing (list lag). */
   hideFromList?: string[];
+  /** Keys stored as raw, non-JSON text (corrupt records). */
+  rawText?: Record<string, string>;
+  /** Do not seed an empty home record. */
+  noHome?: boolean;
 }
 
 type FakeKv = KVNamespace & { get: ReturnType<typeof vi.fn>; list: ReturnType<typeof vi.fn> };
 
 /**
  * Values are stored as JSON text, exactly as KV holds them. The home org gets
- * an empty modes record unless the test seeds one, since the route refuses an
- * unknown home org.
+ * an empty modes record unless the test seeds one or passes `noHome`.
  */
 function fakeKv(entries: Record<string, unknown>, opts: FakeKvOptions = {}): FakeKv {
-  const seeded = { [`${HOME}:modes`]: { modes: [] }, ...entries };
+  const seeded = opts.noHome === true ? entries : { [`${HOME}:modes`]: { modes: [] }, ...entries };
   const store = new Map(Object.entries(seeded).map(([k, v]) => [k, JSON.stringify(v)]));
+  for (const [k, raw] of Object.entries(opts.rawText ?? {})) store.set(k, raw);
   return {
     get: vi.fn(async (key: string, type?: string) => {
       if (opts.failGet?.includes(key) === true) throw new Error(`kv get down: ${key}`);
@@ -370,9 +375,49 @@ describe('loadShareCodeTarget', () => {
     expect(await unavailableDetail(load(home, 'pbt', 'x'))).toBe('read_failed');
   });
 
-  it('a home_org with no modes record is unknown_home_org', async () => {
+  it('an absent home record is an empty home, as on the chat path (home_has_modes false)', async () => {
+    const kv = fakeKv({ 'pbt:modes': { modes: [published('x')] } }, { noHome: true });
+    const loaded = await load(kv, 'pbt', 'x');
+    expect(loaded).toMatchObject({ kind: 'ok', homeHasModes: false });
+    expect(await resolve(kv, 'pbt', 'x')).toMatchObject({ code: 'pbt/x', resolves: true });
+  });
+
+  it('home_has_modes is true when the home record exists', async () => {
     const kv = fakeKv({ 'pbt:modes': { modes: [published('x')] } });
-    expect(await load(kv, 'pbt', 'x', 'unfoldingWorld')).toEqual({ kind: 'unknown_home_org' });
+    expect(await load(kv, 'pbt', 'x')).toMatchObject({ kind: 'ok', homeHasModes: true });
+  });
+});
+
+describe('loadShareCodeTarget — corrupt records', () => {
+  const load = (kv: KVNamespace, org: string, modeName: string, homeOrg = HOME) =>
+    loadShareCodeTarget(kv, { org, homeOrg, modeName }, spyLogger());
+
+  it('a corrupt (non-JSON) target record is corrupt_record, not a retryable failure', async () => {
+    const kv = fakeKv({}, { rawText: { 'pbt:modes': '{not json' } });
+    expect(await load(kv, 'pbt', 'x')).toEqual({ kind: 'corrupt_record', key: 'pbt:modes' });
+  });
+
+  it('real KV: a non-JSON value is told apart from a transport error', async () => {
+    await env.PROMPT_OVERRIDES.put('u345-corrupt:modes', '{not json');
+    try {
+      const loaded = await loadShareCodeTarget(
+        env.PROMPT_OVERRIDES,
+        { org: 'u345-corrupt', homeOrg: 'u345-corrupt', modeName: 'x' },
+        spyLogger()
+      );
+      expect(loaded).toEqual({ kind: 'corrupt_record', key: 'u345-corrupt:modes' });
+    } finally {
+      await env.PROMPT_OVERRIDES.delete('u345-corrupt:modes');
+    }
+  });
+
+  it('a corrupt home record is an empty home, as the chat path reads it', async () => {
+    const kv = fakeKv(
+      { 'pbt:modes': { modes: [published('x')] } },
+      { noHome: true, rawText: { [`${HOME}:modes`]: '{not json' } }
+    );
+    expect(await load(kv, 'pbt', 'x')).toMatchObject({ kind: 'ok', homeHasModes: false });
+    expect(await resolve(kv, 'pbt', 'x')).toMatchObject({ resolves: true });
   });
 
   it('an unknown org or mode is mode_not_found', async () => {
@@ -393,6 +438,81 @@ describe('loadShareCodeTarget', () => {
   it('a home record with a null element still resolves a home target', async () => {
     const kv = fakeKv({ [`${HOME}:modes`]: { modes: [null, published('x')] } });
     expect(await resolve(kv, HOME, 'x')).toMatchObject({ code: 'x', resolves: true });
+  });
+});
+
+describe('resolveModeShareCode — malformed elements', () => {
+  it('a null home element does not crash a FOREIGN target', async () => {
+    const kv = fakeKv({
+      [`${HOME}:modes`]: { modes: [null, published('h')] },
+      'pbt:modes': { modes: [published('x')] },
+    });
+    expect(await resolve(kv, 'pbt', 'x')).toMatchObject({ code: 'pbt/x', resolves: true });
+  });
+
+  it('an element without a string name is skipped', async () => {
+    const kv = fakeKv({
+      [`${HOME}:modes`]: { modes: [{ name: 5, published: true }, published('x')] },
+    });
+    expect(await resolve(kv, HOME, 'x')).toMatchObject({ code: 'x', resolves: true });
+  });
+
+  it('`aliases: null` counts as no aliases', async () => {
+    const kv = fakeKv({
+      [`${HOME}:modes`]: {
+        modes: [published('x', { aliases: null as unknown as string[] }), published('y')],
+      },
+    });
+    expect(await resolve(kv, HOME, 'x')).toMatchObject({ code: 'x', resolves: true });
+  });
+
+  it('a corrupt foreign org is skipped like on the chat path, not a read failure', async () => {
+    const kv = fakeKv(
+      { 'pbt:modes': { modes: [published('x')] } },
+      { rawText: { 'PBT:modes': '{not json' } }
+    );
+    expect(await resolve(kv, 'pbt', 'x')).toMatchObject({ resolves: true, resolved_org: 'pbt' });
+  });
+});
+
+describe('resolveModeShareCode — failure impact is judged on the raw match', () => {
+  it('a same-slug failure that sorts AFTER the target cannot pre-empt it', async () => {
+    const kv = fakeKv(
+      { 'PBT:modes': { modes: [published('x')] }, 'pbt:modes': { modes: [published('x')] } },
+      { failGet: ['pbt:modes'] }
+    );
+    // 'PBT' < 'pbt': PBT claims `pbt/x` first even if pbt had been read.
+    expect(await resolve(kv, 'PBT', 'x')).toMatchObject({ resolves: true, resolved_org: 'PBT' });
+  });
+
+  it('a capped target with a failed org is unavailable (the look-alike could be there)', async () => {
+    const fillers = Object.fromEntries(
+      Array.from({ length: MAX_FOREIGN_ORGS_PER_TURN }, (_, i) => [
+        `a${String(i).padStart(2, '0')}:modes`,
+        { modes: [] },
+      ])
+    );
+    const kv = fakeKv(
+      { ...fillers, 'zzz:modes': { modes: [published('x')] } },
+      { failGet: ['a07:modes'] }
+    );
+    expect(await unavailableDetail(resolve(kv, 'zzz', 'x'))).toBe('read_failed');
+  });
+
+  it('a collision loser is firm when the failed org sorts after the winner', async () => {
+    const kv = fakeKv(
+      {
+        'PBT:modes': { modes: [published('x')] },
+        'pbt:modes': { modes: [published('x')] },
+        'pbt.:modes': { modes: [published('x')] },
+      },
+      { failGet: ['pbt.:modes'] }
+    );
+    expect(await resolve(kv, 'pbt', 'x')).toMatchObject({
+      resolves: false,
+      reason: 'collision',
+      resolved_org: 'PBT',
+    });
   });
 });
 

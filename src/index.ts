@@ -944,10 +944,14 @@ app.get('/api/v1/admin/orgs/:org/modes/:modeName/share-code', async (c) => {
     if (loaded.kind === 'mode_not_found') {
       return c.json({ error: 'mode_not_found', message: `Mode '${modeName}' not found` }, 404);
     }
-    if (loaded.kind === 'unknown_home_org') {
+    if (loaded.kind === 'corrupt_record') {
+      logger.error('admin_action', new Error('corrupt_modes_record'), {
+        action: 'get_mode_share_code',
+        key: loaded.key,
+      });
       return c.json(
-        { error: 'unknown_home_org', message: `home_org '${homeOrg}' has no modes record` },
-        400
+        { error: 'corrupt_modes_record', message: `Stored modes for '${org}' are not valid JSON` },
+        500
       );
     }
 
@@ -961,7 +965,7 @@ app.get('/api/v1/admin/orgs/:org/modes/:modeName/share-code', async (c) => {
       resolves: answer.resolves,
       reason: answer.reason,
     });
-    return c.json({ ...answer, worker_version: APP_VERSION });
+    return c.json({ ...answer, home_has_modes: loaded.homeHasModes, worker_version: APP_VERSION });
   } catch (error) {
     logger.error('admin_action', error, { action: 'get_mode_share_code', org, home_org: homeOrg });
     if (error instanceof ShareCodeUnavailableError)

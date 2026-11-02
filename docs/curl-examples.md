@@ -612,6 +612,7 @@ curl -s "http://localhost:$PORT/api/v1/admin/orgs/PBT/modes/obt-coach/share-code
   "code": "pbt/obt-coach",
   "resolves": true,
   "resolved_org": "PBT",
+  "home_has_modes": true,
   "worker_version": "2.59.0"
 }
 ```
@@ -630,17 +631,24 @@ curl -s "http://localhost:$PORT/api/v1/admin/orgs/PBT/modes/obt-coach/share-code
 - `resolved_org`: the raw org name of the mode `#<code>` actually opens, when it
   opens one. On `collision` it names the winning org.
 
+- `home_has_modes`: whether `<home_org>:modes` exists as a modes record. `false` is legal (the
+  chat path treats it as an empty home org) but usually means a mistyped
+  gateway org, so the portal can warn.
+
 Draft and `requires_group` modes still return the would-be `code`.
+
+Only the super-admin key (`ENGINE_API_KEY`) reaches this route; org-scoped
+admin keys are refused by the `/api/*` gate.
 
 **Errors:**
 
-| Status | Body                                         | When                                                                                                                            |
-| ------ | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| 400    | `{"error":"home_org_required",...}`          | `home_org` is missing                                                                                                           |
-| 400    | `{"error":"unknown_home_org",...}`           | `<home_org>:modes` does not exist (a mistyped gateway org)                                                                      |
-| 400    | `{"error":"invalid_mode_name",...}`          | `:modeName` fails the slug pattern                                                                                              |
-| 404    | `{"error":"mode_not_found",...}`             | no such org or mode                                                                                                             |
-| 503    | `{"error":"modes_unavailable","detail":...}` | a read failed or lagged in a way that could change the answer; retry. `detail` is `list_failed`, `read_failed` or `listing_lag` |
+| Status | Body                                         | When                                                                                                                                                                                                             |
+| ------ | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 400    | `{"error":"home_org_required",...}`          | `home_org` is missing                                                                                                                                                                                            |
+| 400    | `{"error":"invalid_mode_name",...}`          | `:modeName` fails the slug pattern                                                                                                                                                                               |
+| 404    | `{"error":"mode_not_found",...}`             | no such org or mode                                                                                                                                                                                              |
+| 500    | `{"error":"corrupt_modes_record",...}`       | `<org>:modes` is not valid JSON (permanent; fix the record)                                                                                                                                                      |
+| 503    | `{"error":"modes_unavailable","detail":...}` | a KV read failed or the listing lagged in a way that could change the answer; retry. `detail` is `list_failed`, `read_failed` or `listing_lag`. A corrupt foreign org is skipped, as on the chat path, not a 503 |
 
 A 404 without `"error":"mode_not_found"` means the route itself is missing (a
 worker older than 2.59.0).
