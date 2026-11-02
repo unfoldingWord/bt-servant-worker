@@ -20,7 +20,7 @@
  * - A published foreign ELEMENT is held to the same shape rules the admin PUT
  *   enforces (`validatePromptMode`); one that fails is logged and skipped,
  *   never merged, because the DO dereferences it downstream (see
- *   `foreignModeShapeError`).
+ *   `modeShapeError`).
  * - At most `MAX_FOREIGN_ORGS_PER_TURN` foreign keys are read per turn, taken
  *   in sorted key order BEFORE any key is read. An org whose key sorts beyond
  *   that window is INVISIBLE on the chat path — its published modes are never
@@ -117,40 +117,46 @@ export function isModeRecord(mode: unknown): mode is PromptMode {
 }
 
 /**
- * Make stored mode elements safe to dereference on the chat path. The home
- * record reaches the DO unvalidated (only the container shape is checked), and
- * a manual KV write can leave a null, a primitive, a non-string `name` or a
- * non-array `aliases` there; `isModeVisible`, the classifier and
- * `findModeBySlug` would then throw on every turn. Skips non-objects and
- * elements without a string `name`; treats a non-array `aliases` (`null`
- * included) as none and drops non-string alias entries. Never mutates the
- * stored elements. Shared by the chat path's home read and the share-code
- * endpoint, so both see the same list.
+ * Why a stored `modes[]` element must not reach the chat path, or null when it
+ * is well-shaped. ONE guard for home and foreign records: an object that
+ * passes `modeShapeError` (the admin PUT's `validatePromptMode` plus a string
+ * `name`). The DO, the classifier and `findModeBySlug` dereference these
+ * elements without re-checking them.
+ */
+export function modeElementError(element: unknown): string | null {
+  if (!isModeRecord(element)) return 'mode_not_object';
+  return modeShapeError(element);
+}
+
+/** One dropped element: its index, its name when it has a string one, and why. */
+export interface DroppedModeElement {
+  index: number;
+  name?: string;
+  reason: string;
+}
+
+/**
+ * Keep the well-shaped elements of a stored home `modes[]` (see
+ * `modeElementError`) and report the rest. A record written through the admin
+ * PUT is unchanged; only elements the PUT would have rejected are dropped.
+ * Shared by the chat path's home read and the share-code endpoint.
  */
 export function sanitizeModeElements(elements: readonly unknown[]): {
   modes: ChatMode[];
-  dropped: number;
-  aliasesReset: number;
+  dropped: DroppedModeElement[];
 } {
   const modes: ChatMode[] = [];
-  let dropped = 0;
-  let aliasesReset = 0;
-  for (const element of elements) {
-    if (!isModeRecord(element) || typeof element.name !== 'string') {
-      dropped++;
-      continue;
+  const dropped: DroppedModeElement[] = [];
+  elements.forEach((element, index) => {
+    const reason = modeElementError(element);
+    if (reason === null) {
+      modes.push(element as ChatMode);
+      return;
     }
-    const { aliases, ...rest } = element as ChatMode;
-    if (Array.isArray(aliases)) {
-      const kept = aliases.filter((a: unknown): a is string => typeof a === 'string');
-      if (kept.length !== aliases.length) aliasesReset++;
-      modes.push({ ...rest, aliases: kept });
-    } else {
-      if (aliases !== undefined) aliasesReset++;
-      modes.push(rest);
-    }
-  }
-  return { modes, dropped, aliasesReset };
+    const name = isModeRecord(element) ? (element as { name?: unknown }).name : undefined;
+    dropped.push(typeof name === 'string' ? { index, name, reason } : { index, reason });
+  });
+  return { modes, dropped };
 }
 
 /** The merge's org order (first wins on a collision): plain code-unit order of raw org names. */
@@ -172,7 +178,7 @@ export function compareOrgs(a: string, b: string): number {
  * `overrides` / string `document`), plus an explicit `name` check because
  * `validatePromptMode` only validates `name` when the key is present.
  */
-function foreignModeShapeError(mode: PromptMode): string | null {
+function modeShapeError(mode: PromptMode): string | null {
   if (typeof mode.name !== 'string') return 'Mode name must be a string';
   return validatePromptMode(mode);
 }
@@ -227,7 +233,7 @@ function qualifyForeignMode(
  * Append one foreign org's PUBLISHED, well-shaped modes to `modes`, qualified.
  * Drafts are dropped before the shape check (they never reach the chat path,
  * so a malformed draft is not worth a log line); a published element that
- * fails `foreignModeShapeError` is logged and skipped.
+ * fails `modeShapeError` is logged and skipped.
  */
 function mergeForeignOrg(
   entry: { org: string; slug: string; modes: PromptMode[] },
@@ -242,7 +248,7 @@ function mergeForeignOrg(
       continue;
     }
     if (mode.published !== true) continue;
-    const shapeError = foreignModeShapeError(mode);
+    const shapeError = modeShapeError(mode);
     if (shapeError !== null) {
       logger.warn('cross_org_modes_invalid_shape', {
         org,
@@ -454,12 +460,12 @@ async function readHomeModes(
     logger.warn('org_modes_invalid_shape', { key: homeKey });
     return { modes: [] };
   }
-  const { modes, dropped, aliasesReset } = sanitizeModeElements(value.modes);
-  if (dropped > 0 || aliasesReset > 0) {
+  const { modes, dropped } = sanitizeModeElements(value.modes);
+  if (dropped.length > 0) {
     logger.warn('org_modes_invalid_elements', {
       key: homeKey,
-      dropped,
-      aliases_reset: aliasesReset,
+      dropped_count: dropped.length,
+      dropped: dropped.slice(0, MAX_DROPPED_KEYS_LOGGED),
     });
   }
   return { modes };

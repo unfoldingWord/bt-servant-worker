@@ -623,19 +623,24 @@ curl -s "http://localhost:$PORT/api/v1/admin/orgs/PBT/modes/obt-coach/share-code
   this org's mode.
 - `reason` (only when `resolves` is false): `draft`, `requires_group`,
   `reserved` (a home slug that is a clear token, like `default`; `pbt/default`
-  is not one), `collision` (another org with the same slug claimed the name
-  first), `capped` (the org is past the per-turn foreign-org cap, so the chat
-  path never reads it), `org_skipped`, `ambiguous` (the token would open a
-  different mode by prefix or fuzzy match), or `not_found` (not in the chat
-  pool, for example a malformed record).
-- `resolved_org`: the raw org name of the mode `#<code>` actually opens, when it
-  opens one. It comes only from the classifier's actual match: on `collision`
-  it is the winning org when the winner's mode is visible in a private chat,
-  and absent when the winner's mode is hidden (for example `requires_group`).
-
-- `home_has_modes`: whether `<home_org>:modes` exists as a modes record. `false` is legal (the
-  chat path treats it as an empty home org) but usually means a mistyped
-  gateway org, so the portal can warn.
+  is not one), `org_skipped`, `capped` (the org is past the per-turn
+  foreign-org cap, so the chat path never reads it), `invalid_mode` (the
+  stored mode fails the shape check the admin PUT enforces, so chat drops
+  it), `collision` (another org with the same slug claimed the name first),
+  `ambiguous` (the message opens a different mode), or `not_found` (it opens
+  nothing). `capped`, `invalid_mode` and `collision` are checked in that
+  order.
+- `resolved_org`: the raw org name of the mode `#<code>` actually opens, when
+  it opens one. It comes only from the classifier's actual match, run on the
+  whole message `#<code>`: on `collision` it is the winning org when the
+  winner's mode is visible in a private chat, and absent when it is hidden
+  (for example `requires_group`).
+- `home_has_modes`: whether `<home_org>:modes` exists as a modes record.
+  `false` is legal (the chat path treats it as an empty home org) but usually
+  means a mistyped gateway org, so the portal can warn. Absent when the home
+  record could not be read for a foreign mode; the answer is then computed
+  with an empty home, as the chat path would, because a home record never
+  affects a `<orgslug>/<slug>` token.
 
 Draft and `requires_group` modes still return the would-be `code`.
 
@@ -644,14 +649,14 @@ admin keys are refused by the `/api/*` gate.
 
 **Errors:**
 
-| Status | Body                                         | When                                                                                                                                                                                                             |
-| ------ | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 400    | `{"error":"home_org_required",...}`          | `home_org` is missing                                                                                                                                                                                            |
-| 400    | `{"error":"invalid_mode_name",...}`          | `:modeName` fails the slug pattern                                                                                                                                                                               |
-| 400    | `{"error":"invalid_org",...}`                | `:org` or `home_org` is empty, or `<org>:modes` would exceed the 512-byte KV key limit                                                                                                                           |
-| 404    | `{"error":"mode_not_found",...}`             | no such org or mode                                                                                                                                                                                              |
-| 500    | `{"error":"corrupt_modes_record",...}`       | `<org>:modes` is not valid JSON (permanent; fix the record)                                                                                                                                                      |
-| 503    | `{"error":"modes_unavailable","detail":...}` | a KV read failed or the listing lagged in a way that could change the answer; retry. `detail` is `list_failed`, `read_failed` or `listing_lag`. A corrupt foreign org is skipped, as on the chat path, not a 503 |
+| Status | Body                                         | When                                                                                                                                                                                                                                                             |
+| ------ | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 400    | `{"error":"home_org_required",...}`          | `home_org` is missing or empty                                                                                                                                                                                                                                   |
+| 400    | `{"error":"invalid_mode_name",...}`          | `:modeName` fails the slug pattern                                                                                                                                                                                                                               |
+| 400    | `{"error":"invalid_org",...}`                | `<org>:modes` or `<home_org>:modes` would exceed the 512-byte KV key limit                                                                                                                                                                                       |
+| 404    | `{"error":"mode_not_found",...}`             | no such org or mode                                                                                                                                                                                                                                              |
+| 500    | `{"error":"corrupt_modes_record",...}`       | `<org>:modes` is not valid JSON (permanent; fix the record)                                                                                                                                                                                                      |
+| 503    | `{"error":"modes_unavailable","detail":...}` | a KV transport error or a lagging listing could change the answer; retry. `detail` is `list_failed`, `read_failed` or `listing_lag`. A corrupt foreign org is skipped, as on the chat path, not a 503; a failed home read for a foreign mode is not a 503 either |
 
 A 404 without `"error":"mode_not_found"` means the route itself is missing (a
 worker older than 2.59.0).

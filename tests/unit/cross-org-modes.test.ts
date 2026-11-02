@@ -743,28 +743,31 @@ describe('validateModeSelection', () => {
 // ─── Chat path: malformed home elements (admin-portal#345 round 3) ────────────
 
 describe('readAllPublishedModes — malformed home elements are sanitized for chat', () => {
-  it('drops null / primitive / non-string-name elements and resets bad aliases, with a warn', async () => {
+  it('drops elements the shared guard rejects (null, primitive, non-string name, overrides: null, aliases: null), with a warn', async () => {
     const kv = fakeKv({
       'home:modes': {
         modes: [
           null,
           7,
-          { name: 5, published: true },
-          { name: 'a', published: true, overrides: {}, aliases: null },
-          { name: 'b', published: true, overrides: {}, aliases: ['old-b', 3] },
-          { name: 'c', published: true, overrides: {}, aliases: 'c-old' },
+          { name: 5, published: true, overrides: {} },
+          { name: 'a', published: true, overrides: null },
+          { name: 'c', published: true, overrides: {}, aliases: null },
+          { name: 'b', published: true, overrides: {}, aliases: ['old-b'] },
+          { name: 'd', overrides: {} },
         ],
       },
     });
     const logger = spyLogger();
     const merged = await readAllPublishedModes(kv, 'home', logger);
-    expect(merged.modes.map((m) => m.name)).toEqual(['a', 'b', 'c']);
-    expect(merged.modes.map((m) => m.aliases)).toEqual([undefined, ['old-b'], undefined]);
-    expect(logger.warn).toHaveBeenCalledWith('org_modes_invalid_elements', {
-      key: 'home:modes',
-      dropped: 3,
-      aliases_reset: 3,
-    });
+    // Valid records are kept verbatim, drafts included.
+    expect(merged.modes).toEqual([
+      { name: 'b', published: true, overrides: {}, aliases: ['old-b'] },
+      { name: 'd', overrides: {} },
+    ]);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'org_modes_invalid_elements',
+      expect.objectContaining({ key: 'home:modes', dropped_count: 5 })
+    );
     // What the DO does next must not throw: visibility filter + classifier.
     const options = chatTriggerModeOptions(merged.modes, { isGroupChat: false, isAdmin: false });
     expect(resolveTriggerToken('old-b', options)).toEqual({

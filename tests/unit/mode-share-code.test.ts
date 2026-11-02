@@ -281,17 +281,17 @@ describe('resolveModeShareCode — capped and skipped orgs', () => {
 });
 
 describe('resolveModeShareCode — prefix/fuzzy stealing', () => {
-  it('prefix stealing: a mode missing from the pool must not report the look-alike as a hit', async () => {
+  it('prefix stealing: a malformed target reports invalid_mode and names the look-alike it opens', async () => {
     const kv = fakeKv({
       'PBT:modes': { modes: [published('obt-coach-v2')] },
-      // Published but malformed: the merge drops it, so `pbt/obt-coach` is
-      // missing and the classifier's prefix tier picks PBT's look-alike.
+      // Published but malformed: the shared guard drops it, so `pbt/obt-coach`
+      // is missing and the classifier's prefix tier picks PBT's look-alike.
       'pbt:modes': { modes: [published('obt-coach', { welcome_message: 1 as unknown as string })] },
     });
     expect(await resolve(kv, 'pbt', 'obt-coach')).toEqual({
       code: 'pbt/obt-coach',
       resolves: false,
-      reason: 'ambiguous',
+      reason: 'invalid_mode',
       resolved_org: 'PBT',
     });
   });
@@ -303,19 +303,72 @@ describe('resolveModeShareCode — prefix/fuzzy stealing', () => {
     });
     expect(await resolve(kv, 'pbt', 'obt-coach')).toMatchObject({
       resolves: false,
-      reason: 'ambiguous',
+      reason: 'invalid_mode',
       resolved_org: 'PBT',
     });
   });
 
-  it('a foreign mode absent from the pool with no look-alike is not_found', async () => {
+  it('a malformed target with no look-alike opens nothing (no resolved_org)', async () => {
     const kv = fakeKv({
       'pbt:modes': { modes: [published('obt-coach', { welcome_message: 1 as unknown as string })] },
     });
     expect(await resolve(kv, 'pbt', 'obt-coach')).toEqual({
       code: 'pbt/obt-coach',
       resolves: false,
-      reason: 'not_found',
+      reason: 'invalid_mode',
+    });
+  });
+});
+
+describe('resolveModeShareCode — miss explanation order (cap, shape, then collision)', () => {
+  it('a capped target whose name another org also claims is capped, not collision', async () => {
+    const fillers = Object.fromEntries(
+      Array.from({ length: MAX_FOREIGN_ORGS_PER_TURN }, (_, i) => [
+        `Q${String(i).padStart(2, '0')}:modes`,
+        { modes: [] },
+      ])
+    );
+    const kv = fakeKv({
+      ...fillers,
+      'PBT:modes': { modes: [published('x')] },
+      'pbt:modes': { modes: [published('x')] },
+    });
+    expect(await resolve(kv, 'pbt', 'x')).toEqual({
+      code: 'pbt/x',
+      resolves: false,
+      reason: 'capped',
+      resolved_org: 'PBT',
+    });
+  });
+
+  it('a malformed target whose name a LATER org claims is invalid_mode, not collision', async () => {
+    const kv = fakeKv({
+      // PBT sorts first but its element fails the guard, so it claims nothing;
+      // pbt then claims `pbt/x`.
+      'PBT:modes': {
+        modes: [published('x', { overrides: null as unknown as Record<string, string> })],
+      },
+      'pbt:modes': { modes: [published('x')] },
+    });
+    expect(await resolve(kv, 'PBT', 'x')).toEqual({
+      code: 'pbt/x',
+      resolves: false,
+      reason: 'invalid_mode',
+      resolved_org: 'pbt',
+    });
+  });
+});
+
+describe('resolveModeShareCode — the whole message must be the token', () => {
+  it('a stored name with a space never resolves: `#obt coach` selects `obt` and leaves `coach`', async () => {
+    const kv = fakeKv({
+      [`${HOME}:modes`]: { modes: [published('obt coach'), published('obt')] },
+    });
+    expect(await resolve(kv, HOME, 'obt coach')).toEqual({
+      code: 'obt coach',
+      resolves: false,
+      reason: 'invalid_mode',
+      resolved_org: HOME,
     });
   });
 });
@@ -366,14 +419,29 @@ describe('loadShareCodeTarget', () => {
   const load = (kv: KVNamespace, org: string, modeName: string, homeOrg = HOME) =>
     loadShareCodeTarget(kv, { org, homeOrg, modeName }, spyLogger());
 
-  it('a failed get of the target or home record is read_failed', async () => {
+  it('a failed get of the target record is read_failed', async () => {
     const target = fakeKv({ 'pbt:modes': { modes: [published('x')] } }, { failGet: ['pbt:modes'] });
     expect(await unavailableDetail(load(target, 'pbt', 'x'))).toBe('read_failed');
-    const home = fakeKv(
-      { 'pbt:modes': { modes: [published('x')] } },
+  });
+
+  it('a failed home get is read_failed for a HOME target', async () => {
+    const kv = fakeKv(
+      { [`${HOME}:modes`]: { modes: [published('x')] } },
       { failGet: [`${HOME}:modes`] }
     );
-    expect(await unavailableDetail(load(home, 'pbt', 'x'))).toBe('read_failed');
+    expect(await unavailableDetail(load(kv, HOME, 'x'))).toBe('read_failed');
+  });
+
+  it('a failed home get degrades to an empty home for a FOREIGN target (home_has_modes unknown)', async () => {
+    const kv = fakeKv({ 'pbt:modes': { modes: [published('x')] } }, { failGet: [`${HOME}:modes`] });
+    const loaded = await load(kv, 'pbt', 'x');
+    expect(loaded.kind).toBe('ok');
+    if (loaded.kind !== 'ok') return;
+    expect(loaded.homeHasModes).toBeUndefined();
+    expect(await resolveModeShareCode(kv, loaded.target, spyLogger())).toMatchObject({
+      code: 'pbt/x',
+      resolves: true,
+    });
   });
 
   it('an absent home record is an empty home, as on the chat path (home_has_modes false)', async () => {
@@ -458,13 +526,33 @@ describe('resolveModeShareCode — malformed elements', () => {
     expect(await resolve(kv, HOME, 'x')).toMatchObject({ code: 'x', resolves: true });
   });
 
-  it('`aliases: null` counts as no aliases', async () => {
+  it('`aliases: null` fails the shared guard, so the mode is invalid_mode (chat never sees it)', async () => {
     const kv = fakeKv({
       [`${HOME}:modes`]: {
-        modes: [published('x', { aliases: null as unknown as string[] }), published('y')],
+        modes: [
+          published('x', { aliases: null as unknown as string[] }),
+          published('far-away-mode'),
+        ],
       },
     });
-    expect(await resolve(kv, HOME, 'x')).toMatchObject({ code: 'x', resolves: true });
+    expect(await resolve(kv, HOME, 'x')).toEqual({
+      code: 'x',
+      resolves: false,
+      reason: 'invalid_mode',
+    });
+  });
+
+  it('`overrides: null` on a home mode is invalid_mode; its neighbours still resolve', async () => {
+    const kv = fakeKv({
+      [`${HOME}:modes`]: {
+        modes: [
+          published('x', { overrides: null as unknown as Record<string, string> }),
+          published('y'),
+        ],
+      },
+    });
+    expect(await resolve(kv, HOME, 'x')).toMatchObject({ resolves: false, reason: 'invalid_mode' });
+    expect(await resolve(kv, HOME, 'y')).toMatchObject({ resolves: true });
   });
 
   it('a corrupt foreign org is skipped like on the chat path, not a read failure', async () => {

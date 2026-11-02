@@ -901,20 +901,24 @@ app.get('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
 /** Incoming X-Request-ID the BFF may forward, so its logs and ours correlate. */
 const FORWARDED_REQUEST_ID = /^[\w.:-]{1,128}$/;
 
-/** 400 body for bad share-code input, or null when the input is usable. */
-function shareCodeInputError(
+/** Validated share-code input, or the 400 body that rejects it. */
+function shareCodeInput(
   org: string,
   homeOrg: string | undefined,
   modeName: string
-): { error: string; message: string } | null {
+): { ok: true; homeOrg: string } | { ok: false; body: { error: string; message: string } } {
   const nameError = validateModeName(modeName);
-  if (nameError) return { error: 'invalid_mode_name', message: nameError };
+  if (nameError) return { ok: false, body: { error: 'invalid_mode_name', message: nameError } };
   if (homeOrg === undefined || homeOrg === '') {
-    return { error: 'home_org_required', message: 'home_org query parameter is required' };
+    return {
+      ok: false,
+      body: { error: 'home_org_required', message: 'home_org query parameter is required' },
+    };
   }
   // A key KV would reject is caller input, not a transient failure.
   const orgError = invalidOrgError(org) ?? invalidOrgError(homeOrg);
-  return orgError === null ? null : { error: 'invalid_org', message: orgError };
+  if (orgError !== null) return { ok: false, body: { error: 'invalid_org', message: orgError } };
+  return { ok: true, homeOrg };
 }
 
 /**
@@ -964,16 +968,11 @@ function requestIdFor(forwarded: string | undefined): string {
 app.get('/api/v1/admin/orgs/:org/modes/:modeName/share-code', async (c) => {
   const org = c.req.param('org');
   const modeName = c.req.param('modeName');
-  const homeOrg = c.req.query('home_org');
   const logger = createRequestLogger(requestIdFor(c.req.header('X-Request-ID')));
 
-  const inputError = shareCodeInputError(org, homeOrg, modeName);
-  if (inputError !== null || homeOrg === undefined) {
-    return c.json(
-      inputError ?? { error: 'home_org_required', message: 'home_org is required' },
-      400
-    );
-  }
+  const input = shareCodeInput(org, c.req.query('home_org'), modeName);
+  if (!input.ok) return c.json(input.body, 400);
+  const { homeOrg } = input;
 
   try {
     const kv = c.env.PROMPT_OVERRIDES;
@@ -982,8 +981,11 @@ app.get('/api/v1/admin/orgs/:org/modes/:modeName/share-code', async (c) => {
       return c.json({ error: 'mode_not_found', message: `Mode '${modeName}' not found` }, 404);
     }
     if (loaded.kind === 'corrupt_record') {
+      // The only log line for this case (the loader does not log it).
       logger.error('admin_action', new Error('corrupt_modes_record'), {
         action: 'get_mode_share_code',
+        org,
+        home_org: homeOrg,
         key: loaded.key,
       });
       return c.json(
