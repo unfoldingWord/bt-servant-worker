@@ -68,6 +68,7 @@ import {
 } from './system-prompt.js';
 import { applyResourcePriority } from './resource-priority.js';
 import {
+  AUDIO_TOOL_NAMES,
   buildAllTools,
   getToolDefinitions,
   isR2KeyInput,
@@ -195,6 +196,13 @@ interface OrchestratorOptions {
    * memory tools together, so the model is never told memory exists.
    */
   memoryEnabled?: boolean | undefined;
+  /**
+   * Whether audio is available this turn. Default true. `false` (partner API
+   * keys are text-only, admin-portal#354) removes the audio tools, their prompt
+   * guidance, and refuses them at dispatch should the model name one anyway.
+   * The DO derives it from `callerAllowsAudio(body._caller)`.
+   */
+  audioEnabled?: boolean | undefined;
   modeContext?: ModeContext | undefined;
   audioContext?: AudioContext | undefined;
   attachmentsContext?: AttachmentsContext | undefined;
@@ -362,6 +370,8 @@ interface OrchestrationContext {
   modeContext: ModeContext | undefined;
   audioContext: AudioContext | undefined;
   attachmentsContext: AttachmentsContext | undefined;
+  /** False for text-only callers (partner API keys); see OrchestratorOptions.audioEnabled. */
+  audioEnabled: boolean;
   workerOrigin: string;
   /** The org scope for this request. Used by `read_r2_object` / `attach_audio` to
    *  enforce that requested R2 keys belong to this org. */
@@ -2138,6 +2148,7 @@ function turnTools(catalog: ToolCatalog, options: OrchestratorOptions): Anthropi
   return buildAllTools(catalog, {
     hasModes: (options.modeContext?.availableModes.length ?? 0) > 0,
     hasMemory: hasMemoryForTurn(options),
+    hasAudio: options.audioEnabled !== false,
   });
 }
 
@@ -2189,7 +2200,7 @@ function createOrchestrationContext(
   const llmMax = orgConfig?.max_history_llm ?? DEFAULT_ORG_CONFIG.max_history_llm;
 
   // prettier-ignore
-  const systemBlocks = buildSystemPromptBlocks(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, memoryEnabled: hasMemoryForTurn(options), clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument, triggerOnly: options.triggerOnly, unmatchedTriggers: options.unmatchedTriggers, addressedToBot: options.addressedToBot, inboundVoiceKey: options.inboundVoiceKey });
+  const systemBlocks = buildSystemPromptBlocks(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, memoryEnabled: hasMemoryForTurn(options), audioEnabled: options.audioEnabled !== false, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument, triggerOnly: options.triggerOnly, unmatchedTriggers: options.unmatchedTriggers, addressedToBot: options.addressedToBot, inboundVoiceKey: options.inboundVoiceKey });
 
   return {
     client: new Anthropic({ apiKey: env.ANTHROPIC_API_KEY }),
@@ -2217,6 +2228,7 @@ function createOrchestrationContext(
     modeContext: options.modeContext,
     audioContext: options.audioContext,
     attachmentsContext: options.attachmentsContext,
+    audioEnabled: options.audioEnabled !== false,
     workerOrigin: options.workerOrigin ?? '',
     org: options.org ?? options.env.DEFAULT_ORG,
     env: options.env,
@@ -2483,6 +2495,12 @@ function dispatchSimpleInternalTool(
   toolCall: ToolUseBlock,
   ctx: OrchestrationContext
 ): Promise<unknown> | unknown | null {
+  // Defense in depth: the audio tools are not offered to text-only callers, so
+  // a call here means the model named one anyway. Refuse it, observably.
+  if (!ctx.audioEnabled && AUDIO_TOOL_NAMES.has(toolCall.name)) {
+    ctx.logger.warn('audio_tool_refused_text_only', { tool: toolCall.name });
+    return { error: 'Audio is not available for this session; reply in text only.' };
+  }
   if (toolCall.name === 'read_memory') return handleReadMemory(toolCall.input, ctx);
   if (toolCall.name === 'update_memory') return handleUpdateMemory(toolCall.input, ctx);
   if (toolCall.name === 'request_audio') return handleRequestAudio(ctx);

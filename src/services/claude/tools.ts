@@ -24,19 +24,39 @@ import { JSONSchema, ToolCatalog } from '../mcp/types.js';
 export interface BuildToolsOptions {
   hasModes?: boolean;
   hasMemory?: boolean;
+  /**
+   * Default true. When false (partner API keys are text-only, admin-portal#354)
+   * the tools that yield audio — `request_audio` (TTS reply URL),
+   * `attach_audio` (AudioAttachment) and `read_r2_object` (a voice-submission
+   * URL) — are not registered and `execute_code`'s guidance stops naming them.
+   */
+  hasAudio?: boolean;
 }
 
+/** The built-in tools whose result is, or produces, an audio URL. */
+export const AUDIO_TOOL_NAMES: ReadonlySet<string> = new Set([
+  'request_audio',
+  'attach_audio',
+  'read_r2_object',
+]);
+
 /** Internal tool names `execute_code` must never be asked to call from inside the sandbox. */
-function internalToolNamesForGuidance(hasMemory: boolean): string {
+function internalToolNamesForGuidance(hasMemory: boolean, hasAudio: boolean): string {
   const memory = hasMemory ? ['update_memory', 'read_memory'] : [];
-  return [...memory, 'attach_audio', 'request_audio', 'read_r2_object'].join(', ');
+  const audio = hasAudio ? ['attach_audio', 'request_audio', 'read_r2_object'] : [];
+  return [...memory, ...audio].join(', ');
 }
 
 /**
  * Build execute_code tool definition
  */
-export function buildExecuteCodeTool(opts?: Pick<BuildToolsOptions, 'hasMemory'>): Anthropic.Tool {
-  const internalTools = internalToolNamesForGuidance(opts?.hasMemory ?? true);
+export function buildExecuteCodeTool(
+  opts?: Pick<BuildToolsOptions, 'hasMemory' | 'hasAudio'>
+): Anthropic.Tool {
+  const internalTools = internalToolNamesForGuidance(
+    opts?.hasMemory ?? true,
+    opts?.hasAudio ?? true
+  );
   return {
     name: 'execute_code',
     description: `Execute JavaScript code in a sandboxed QuickJS environment.
@@ -358,18 +378,21 @@ export function buildSwitchModeTool(): Anthropic.Tool {
  */
 export function buildAllTools(_catalog: ToolCatalog, opts?: BuildToolsOptions): Anthropic.Tool[] {
   const hasMemory = opts?.hasMemory ?? true;
+  const hasAudio = opts?.hasAudio ?? true;
   const tools: Anthropic.Tool[] = [
-    buildExecuteCodeTool({ hasMemory }),
+    buildExecuteCodeTool({ hasMemory, hasAudio }),
     buildGetToolDefinitionsTool(),
     // #392: omitted entirely when the request suppressed memory — the handlers
     // would only answer "Memory is not available", so exposing them wastes an
     // iteration and contradicts the (also omitted) memory_instructions slot.
     ...(hasMemory ? [buildReadMemoryTool(), buildUpdateMemoryTool()] : []),
-    buildRequestAudioTool(), // Always available — TTS is a platform capability, not org-gated
+    // Audio tools: platform capabilities, not org-gated, but absent for
+    // text-only callers (partner API keys). read_r2_object and attach_audio are
+    // scope-guarded to the request's org.
+    ...(hasAudio ? [buildRequestAudioTool()] : []),
     buildGenerateScripturePdfTool(), // Always available — short-circuits to error if ptxprint-mcp not registered for the org
     buildPrepareUsfmSourceTool(),
-    buildReadR2ObjectTool(), // Always available — scope-guarded to the request's org
-    buildAttachAudioTool(), // Always available — scope-guarded to the request's org
+    ...(hasAudio ? [buildReadR2ObjectTool(), buildAttachAudioTool()] : []),
   ];
 
   if (opts?.hasModes) {

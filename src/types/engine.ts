@@ -155,7 +155,18 @@ export interface ChatRequest {
    * client).
    */
   _transport?: ChatTransport;
+
+  /**
+   * Internal: who authenticated the request — `internal` (ENGINE_API_KEY) or
+   * `partner` (a partner API key, admin-portal#354). Set by the worker AFTER
+   * spreading the client body, so a client value never survives. Partner
+   * requests are text-only: see `callerAllowsAudio` in utils/chat-validation.
+   */
+  _caller?: ChatCaller;
 }
+
+/** Who authenticated a chat request; see `ChatRequest._caller`. */
+export type ChatCaller = 'internal' | 'partner';
 
 /**
  * Identity persisted by the DO on each chat turn under the `identity` storage

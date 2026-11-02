@@ -108,7 +108,12 @@ import {
   DetectedLanguage,
   UNDETERMINED_LANGUAGE,
 } from '../services/language/index.js';
-import { isAdminClient, isValidLanguageCode, validateChatBody } from '../utils/chat-validation.js';
+import {
+  callerAllowsAudio,
+  isAdminClient,
+  isValidLanguageCode,
+  validateChatBody,
+} from '../utils/chat-validation.js';
 import { hasClientHistory, sanitizeClientHistory } from '../utils/history-validation.js';
 import { OrgLanguages, resolveEffectiveLanguage } from '../types/languages.js';
 import { InternalQueueEntry } from '../types/queue.js';
@@ -3536,7 +3541,10 @@ export class UserDO {
     emit?: StatusEmitter
   ): Promise<{ audioKey: string } | null> {
     const ttsFlowStart = Date.now();
-    const shouldGenerate = body.message_type === 'audio' || audioContext.audioRequested;
+    // Text-only callers (partner keys) never get TTS, whatever the turn did.
+    const shouldGenerate =
+      callerAllowsAudio(body._caller) &&
+      (body.message_type === 'audio' || audioContext.audioRequested);
     const combinedText = responses.join('\n\n');
     const org = body.org ?? this.env.DEFAULT_ORG;
     const userId = body.user_id;
@@ -3763,6 +3771,7 @@ export class UserDO {
       modeContext: this.buildModeContext(orgModes, activeModeName, body),
       audioContext,
       attachmentsContext,
+      audioEnabled: callerAllowsAudio(body._caller),
       workerOrigin,
       clientId: body.client_id,
       groupContext,

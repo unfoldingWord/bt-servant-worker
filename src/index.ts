@@ -12,7 +12,7 @@ import { UserDO as UserDOClass } from './durable-objects/index.js';
 import { discoverAllTools, listOrgResources } from './services/mcp/index.js';
 import { readDoSnapshot } from './services/admin/do-snapshot.js';
 import { MCPServerWrite } from './types/mcp.js';
-import { ChatRequest, ChatTransport, ChatType } from './types/engine.js';
+import { ChatCaller, ChatRequest, ChatTransport, ChatType } from './types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig, validateOrgConfig } from './types/org-config.js';
 import {
   checkModeSlugUniqueness,
@@ -2466,6 +2466,7 @@ async function buildDOChatRequest(
     transport: ChatTransport;
     logger: ReturnType<typeof createRequestLogger>;
     requestId?: string;
+    caller: ChatCaller;
   }
 ): Promise<{ stub: DurableObjectStub; doRequest: Request }> {
   const { body, org, transport, logger } = opts;
@@ -2511,6 +2512,9 @@ async function buildDOChatRequest(
       // AFTER the spread, so a client-supplied `_edge_country` in the inbound
       // body is always overwritten and can never reach telemetry.
       _edge_country: (request.cf as { country?: string } | undefined)?.country,
+      // Who authenticated (#354). Also set AFTER the spread, so it always comes
+      // from the auth middleware's principal, never from the client body.
+      _caller: opts.caller,
     }),
   });
 
@@ -2586,6 +2590,7 @@ async function handleChatRequest(
           timing,
           requestId,
           keyId: principalKeyId(principal),
+          caller: principal.kind,
         });
       } catch (error) {
         return respondToChatRequestError(error, transport, timing, logger);
@@ -2611,6 +2616,8 @@ type ChatDispatchParams = {
   requestId: string;
   /** Partner key id, or "internal" for ENGINE_API_KEY — for usage attribution in telemetry. */
   keyId: string;
+  /** From the auth principal; the single source of the partner text-only rule downstream. */
+  caller: ChatCaller;
 };
 
 /**
@@ -2619,8 +2626,10 @@ type ChatDispatchParams = {
  * scope a callback boundary; the behavior is unchanged.
  */
 async function dispatchChatRequest(params: ChatDispatchParams): Promise<Response> {
-  const { request, env, transport, body, logger, timing, requestId, keyId } = params;
-  const validationError = validateChatBody(body, transport);
+  const { request, env, transport, body, logger, timing, requestId, keyId, caller } = params;
+  const validationError = validateChatBody(body, transport, {
+    callbackAvailable: caller !== 'partner',
+  });
   if (validationError) {
     logger.warn('chat_validation_failed', {
       transport,
@@ -2637,7 +2646,7 @@ async function dispatchChatRequest(params: ChatDispatchParams): Promise<Response
   logger.log('request_received', { user_id: body.user_id, client_id: body.client_id, key_id: keyId, org, transport, chat_type: body.chat_type ?? 'private', chat_id: body.chat_id, thread_id: body.thread_id });
 
   const { stub, doRequest } = await timePhase(timing, 'kv_and_routing', () =>
-    buildDOChatRequest(request, env, { body, org, transport, logger, requestId })
+    buildDOChatRequest(request, env, { body, org, transport, logger, requestId, caller })
   );
   const response = await timePhase(timing, 'do_fetch', () => stub.fetch(doRequest));
 

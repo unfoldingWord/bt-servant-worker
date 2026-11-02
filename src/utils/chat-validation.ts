@@ -8,7 +8,7 @@
  * dispatch relies on.
  */
 
-import type { ChatRequest, ChatTransport } from '../types/engine.js';
+import type { ChatCaller, ChatRequest, ChatTransport } from '../types/engine.js';
 import { hasClientHistory, validateClientHistory } from './history-validation.js';
 
 const VALID_CHAT_TYPES: ReadonlySet<string> = new Set(['private', 'group', 'supergroup']);
@@ -46,6 +46,28 @@ export function isAdminClient(clientId: string | undefined): boolean {
   return clientId !== undefined && ADMIN_CLIENT_IDS.has(clientId);
 }
 
+/**
+ * Partner API keys are text-only (decided 2026-11-02, admin-portal#354): no
+ * audio in, no audio out, and no tool that yields an audio URL. The ONE place
+ * that decision is read from the request; the DO and orchestrator only ask
+ * this function. Absent `_caller` (direct DO calls, older queued entries)
+ * means internal, i.e. today's behaviour.
+ */
+export function callerAllowsAudio(caller: ChatCaller | undefined): boolean {
+  return caller !== 'partner';
+}
+
+/** Options for {@link validateChatBody}. */
+export interface ChatValidationOptions {
+  /**
+   * Whether the caller may use `/api/v1/chat/callback`. Only changes the
+   * wording of the callback-field rejection on /chat and /chat/stream, so a
+   * partner (who cannot use the callback transport) is not pointed at it.
+   * Default true.
+   */
+  callbackAvailable?: boolean;
+}
+
 /** Validate an optional ISO 639-1 language code. */
 function validateLanguageHint(hint: unknown): string | null {
   if (hint === undefined) return null;
@@ -64,18 +86,25 @@ function validateLanguageHint(hint: unknown): string | null {
  * self-contained response (JSON or SSE) and have no use for a callback
  * URL, correlation key, or progress-mode tuning.
  */
-function forbidCallbackFields(body: ChatRequest, endpoint: string): string | null {
+function forbidCallbackFields(
+  body: ChatRequest,
+  endpoint: string,
+  callbackAvailable: boolean
+): string | null {
+  const hint = callbackAvailable
+    ? 'use /api/v1/chat/callback'
+    : 'progress callbacks are not available with partner API keys';
   if (body.progress_callback_url !== undefined) {
-    return `progress_callback_url is not valid on ${endpoint} — use /api/v1/chat/callback`;
+    return `progress_callback_url is not valid on ${endpoint} — ${hint}`;
   }
   if (body.progress_mode !== undefined) {
-    return `progress_mode is not valid on ${endpoint} — use /api/v1/chat/callback`;
+    return `progress_mode is not valid on ${endpoint} — ${hint}`;
   }
   if (body.progress_throttle_seconds !== undefined) {
-    return `progress_throttle_seconds is not valid on ${endpoint} — use /api/v1/chat/callback`;
+    return `progress_throttle_seconds is not valid on ${endpoint} — ${hint}`;
   }
   if (body.message_key !== undefined) {
-    return `message_key is not valid on ${endpoint} — use /api/v1/chat/callback`;
+    return `message_key is not valid on ${endpoint} — ${hint}`;
   }
   return null;
 }
@@ -97,9 +126,15 @@ function requireCallbackFields(body: ChatRequest): string | null {
 }
 
 /** Per-transport field-presence rules. */
-function validateTransportFields(body: ChatRequest, transport: ChatTransport): string | null {
-  if (transport === 'final') return forbidCallbackFields(body, '/api/v1/chat');
-  if (transport === 'stream') return forbidCallbackFields(body, '/api/v1/chat/stream');
+function validateTransportFields(
+  body: ChatRequest,
+  transport: ChatTransport,
+  callbackAvailable: boolean
+): string | null {
+  if (transport === 'final') return forbidCallbackFields(body, '/api/v1/chat', callbackAvailable);
+  if (transport === 'stream') {
+    return forbidCallbackFields(body, '/api/v1/chat/stream', callbackAvailable);
+  }
   if (transport === 'callback') return requireCallbackFields(body);
   return null;
 }
@@ -183,11 +218,19 @@ function validateCoreFields(body: ChatRequest): string | null {
 }
 
 /** Validate chat request fields, returning an error string or null if valid. */
-export function validateChatBody(body: ChatRequest, transport: ChatTransport): string | null {
+export function validateChatBody(
+  body: ChatRequest,
+  transport: ChatTransport,
+  options: ChatValidationOptions = {}
+): string | null {
   const coreError = validateCoreFields(body);
   if (coreError) return coreError;
 
-  const transportError = validateTransportFields(body, transport);
+  const transportError = validateTransportFields(
+    body,
+    transport,
+    options.callbackAvailable ?? true
+  );
   if (transportError) return transportError;
 
   return validateLanguageHint(body.response_language_hint);

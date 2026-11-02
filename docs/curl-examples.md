@@ -596,11 +596,15 @@ A partner key may call **only** `POST /api/v1/chat` and
 - `org` / `org_id` may be omitted (the key's org applies) or equal the key's
   org; any other value is a `400`.
 - `client_id: "admin-portal"` is refused (`403`).
-- `progress_callback_url` is refused (`400`, the existing `/chat` and
-  `/chat/stream` validation).
-- Audio is refused (`400`): `message_type: "audio"`, `audio_base64`,
-  `audio_format` and `voice_format`. Audio replies are URLs under
-  `/api/v1/audio/*`, which a partner key cannot fetch.
+- `progress_callback_url` (and the other callback fields) are refused (`400`,
+  the existing `/chat` and `/chat/stream` validation, worded for partners as
+  "progress callbacks are not available with partner API keys").
+- Partner keys are **text-only** (decided 2026-11-02). Audio input is refused
+  (`400`): `message_type: "audio"`, `audio_base64`, `audio_format` and
+  `voice_format`. The model is not offered the audio tools (`request_audio`,
+  `attach_audio`, `read_r2_object`) or the audio prompt guidance, and a call
+  to one of them is refused, so a partner response never carries an audio
+  URL.
 - `user_id` must be a non-empty string. Inside the worker it becomes
   `partner:<userNamespace>:<user_id>` (and `chat_id` likewise), so a partner's
   users can never reach another app's or a WhatsApp user's conversation.

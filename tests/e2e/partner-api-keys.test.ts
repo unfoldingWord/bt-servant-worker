@@ -24,6 +24,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { StoredIdentity } from '../../src/types/engine';
 import type { PublicPartnerKey } from '../../src/types/partner-keys';
 import { sha256Hex } from '../../src/utils/crypto';
+import { AUDIO_TOOL_NAMES } from '../../src/services/claude/tools';
 import {
   setupAnthropicFetchCapture,
   type AnthropicCapture,
@@ -297,7 +298,7 @@ describe('partner key on chat: refusals', () => {
     expect(res.status).toBe(403);
   });
 
-  it('refuses progress_callback_url (existing chat validation, before any model call)', async () => {
+  it('refuses progress_callback_url without pointing partners at /chat/callback', async () => {
     const { apiKey } = await createKey('org-354-callback');
     for (const url of [CHAT, `${CHAT}/stream`]) {
       const res = await postChat(
@@ -306,7 +307,10 @@ describe('partner key on chat: refusals', () => {
         url
       );
       expect(res.status).toBe(400);
-      expect(((await res.json()) as { error: string }).error).toContain('progress_callback_url');
+      const { error } = (await res.json()) as { error: string };
+      expect(error).toContain('progress_callback_url');
+      expect(error).toContain('not available with partner API keys');
+      expect(error).not.toContain('/api/v1/chat/callback');
     }
     expect(capture.calls).toHaveLength(0);
   });
@@ -353,6 +357,71 @@ describe('partner key outside chat', () => {
     expect(res.status).toBe(403);
     expect(await res.json()).toEqual({
       error: 'This API key is not permitted to call this endpoint',
+    });
+  });
+});
+
+/** Tool names in the first captured model request. */
+function offeredTools(): string[] {
+  const tools = (capture.calls[0]?.body.tools ?? []) as { name: string }[];
+  return tools.map((t) => t.name);
+}
+
+const audioToolsIn = (names: string[]): string[] => names.filter((n) => AUDIO_TOOL_NAMES.has(n));
+
+/** A model reply that calls one tool, then (second call) a plain text answer. */
+function modelCallsToolOnce(toolName: string): void {
+  let call = 0;
+  vi.mocked(globalThis.fetch).mockImplementation(async (input) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    if (!url.includes('api.anthropic.com')) throw new Error(`unexpected fetch to ${url}`);
+    call++;
+    const content =
+      call === 1
+        ? [{ type: 'tool_use', id: 'toolu_audio', name: toolName, input: {} }]
+        : [{ type: 'text', text: 'text only' }];
+    return Response.json({
+      id: `msg_${call}`,
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-sonnet-test',
+      stop_reason: call === 1 ? 'tool_use' : 'end_turn',
+      stop_sequence: null,
+      usage: { input_tokens: 1, output_tokens: 1 },
+      content,
+    });
+  });
+}
+
+describe('partner keys are text-only (decided 2026-11-02)', () => {
+  it('a partner request is not offered any audio tool or audio guidance', async () => {
+    const { apiKey } = await createKey('org-354-text-only');
+    expect((await postChat(apiKey, chatBody())).status).toBe(200);
+    expect(offeredTools()).toContain('execute_code');
+    expect(audioToolsIn(offeredTools())).toEqual([]);
+    expect(capture.calls[0]?.system).not.toContain('request_audio');
+  });
+
+  it('an internal request is unchanged: audio tools and guidance present', async () => {
+    const res = await SELF.fetch(CHAT, {
+      method: 'POST',
+      headers: JSON_INTERNAL,
+      body: JSON.stringify(chatBody({ org: 'internal-354-audio', user_id: 'carol' })),
+    });
+    expect(res.status).toBe(200);
+    expect(audioToolsIn(offeredTools()).sort()).toEqual([...AUDIO_TOOL_NAMES].sort());
+    expect(capture.calls[0]?.system).toContain('request_audio');
+  });
+
+  it('refuses an audio tool the model names anyway, and returns no audio', async () => {
+    const { apiKey } = await createKey('org-354-refuse-tool');
+    modelCallsToolOnce('request_audio');
+    const res = await postChat(apiKey, chatBody());
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { voice_audio_url: string | null };
+    expect(body.voice_audio_url).toBeNull();
+    expect(findLog(capture.warnLogs, 'audio_tool_refused_text_only')?.payload).toMatchObject({
+      tool: 'request_audio',
     });
   });
 });

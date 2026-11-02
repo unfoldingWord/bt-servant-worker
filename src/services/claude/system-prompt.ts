@@ -52,6 +52,12 @@ interface SystemPromptOptions {
   clientId?: string | undefined;
   groupContext?: GroupChatContext | undefined;
   isVoiceMessage?: boolean | undefined;
+  /**
+   * Whether audio replies are available this turn. Default true. `false`
+   * (partner API keys, text-only — admin-portal#354) drops the
+   * `request_audio` guidance, matching the tools omitted by buildAllTools.
+   */
+  audioEnabled?: boolean | undefined;
   /** Per-turn language document to inject into the system prompt */
   languageDocument?: string | undefined;
   /** Set when the user's whole message was routing triggers. */
@@ -326,7 +332,7 @@ function pushMiddleSections(
   sections: string[],
   resolvedPromptValues: Required<Record<PromptSlot, string>>,
   catalog: ToolCatalog,
-  opts: Pick<SystemPromptOptions, 'memoryTOC' | 'isVoiceMessage' | 'memoryEnabled'>
+  opts: Pick<SystemPromptOptions, 'memoryTOC' | 'isVoiceMessage' | 'memoryEnabled' | 'audioEnabled'>
 ): void {
   const { memoryTOC, isVoiceMessage } = opts;
   // #392: with memory suppressed, the model is told nothing about memory —
@@ -336,7 +342,8 @@ function pushMiddleSections(
     sections.push(resolvedPromptValues.memory_instructions);
     if (memoryTOC) sections.push(memoryTOC);
   }
-  sections.push(AUDIO_GUIDANCE);
+  // Text-only callers are never told audio exists (the tool is not registered).
+  if (opts.audioEnabled !== false) sections.push(AUDIO_GUIDANCE);
   if (catalog.tools.some((t) => t.serverId === 'ptxprint-mcp')) {
     sections.push(PTXPRINT_FLOW_GUIDANCE);
   }
@@ -424,7 +431,8 @@ export function buildSystemPromptBlocks(
   resolvedPromptValues: Required<Record<PromptSlot, string>>,
   options?: SystemPromptOptions
 ): SystemPromptBlocks {
-  const { memoryTOC, memoryEnabled, clientId, groupContext, isVoiceMessage } = options ?? {};
+  const { memoryTOC, memoryEnabled, clientId, groupContext, isVoiceMessage, audioEnabled } =
+    options ?? {};
 
   // ── Cacheable: derived only from org/mode config and the MCP catalog ──
   const stableSections: string[] = [
@@ -457,6 +465,7 @@ export function buildSystemPromptBlocks(
     memoryTOC,
     isVoiceMessage,
     memoryEnabled,
+    audioEnabled,
   });
   sections.push(...buildConditionalSections(preferences, history));
   sections.push(RESOURCE_AVAILABILITY_RULES);
