@@ -3,12 +3,14 @@
  *
  * Layout:
  *   key:<sha256 hex of the plaintext key>  → JSON PartnerKeyRecord (authoritative)
- *   id:<key id>                            → <sha256 hex>, metadata = the record
+ *   ptr:<key id>                           → <sha256 hex> (immutable pointer)
+ *   id:<org>:<key id>                      → <sha256 hex>, metadata = the record
  *
  * The `key:` entry is the source of truth (auth reads it; so do get/revoke/
- * rotate, through the `id:` pointer). The `id:` entry's metadata is a copy of
- * the record so the admin list is served by `kv.list()` alone, with no per-key
- * reads. Record fields are size-capped (types/partner-keys.ts) so the copy
+ * rotate, through the `ptr:` pointer). The `id:` entry is the list index: its
+ * metadata is a copy of the record, so a list is served by `kv.list()` alone,
+ * with no per-key reads, and an org-scoped list is a prefix list of
+ * `id:<org>:` (org ids cannot contain ":"; see ORG_PATTERN). Record fields are size-capped (types/partner-keys.ts) so the copy
  * always fits KV's 1024-byte metadata limit.
  *
  * The plaintext key never touches storage: only its SHA-256 is used, as the KV
@@ -39,7 +41,13 @@ export const AUTH_LOOKUP_CACHE_TTL_SECONDS = 60;
 export const KV_METADATA_MAX_BYTES = 1024;
 
 const KEY_PREFIX = 'key:';
+const PTR_PREFIX = 'ptr:';
 const ID_PREFIX = 'id:';
+
+/** List-index key for a record: `id:<org>:<keyId>`. */
+function indexKey(record: Pick<PartnerKeyRecord, 'org' | 'id'>): string {
+  return `${ID_PREFIX}${record.org}:${record.id}`;
+}
 const PLAINTEXT_PREFIX = 'bts_';
 /** Plaintext shape: `bts_<8 hex prefix>_<43 base64url chars = 256 random bits>`. */
 const PLAINTEXT_PATTERN = /^bts_[0-9a-f]{8}_[A-Za-z0-9_-]{43}$/;
@@ -59,6 +67,11 @@ function randomBase64Url(byteCount: number): string {
   let binary = '';
   for (const b of bytes) binary += String.fromCharCode(b);
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/** The non-secret display prefix (`bts_<8 hex>`) of a partner-shaped token. */
+export function partnerKeyPrefix(token: string): string {
+  return token.slice(0, PLAINTEXT_PREFIX.length + 8);
 }
 
 /** Cheap shape check so garbage bearer tokens never cost a KV read. */
@@ -108,14 +121,14 @@ export async function getPartnerKeyById(
   id: string
 ): Promise<{ record: PartnerKeyRecord; hash: string } | null> {
   if (!PARTNER_KEY_ID_PATTERN.test(id)) return null;
-  const hash = await kv.get(`${ID_PREFIX}${id}`);
+  const hash = await kv.get(`${PTR_PREFIX}${id}`);
   if (!hash) return null;
   const record = await kv.get<PartnerKeyRecord>(`${KEY_PREFIX}${hash}`, 'json');
   return record ? { record, hash } : null;
 }
 
 async function putIndex(kv: KVNamespace, hash: string, record: PartnerKeyRecord): Promise<void> {
-  await kv.put(`${ID_PREFIX}${record.id}`, hash, { metadata: record });
+  await kv.put(indexKey(record), hash, { metadata: record });
 }
 
 /**
@@ -140,10 +153,11 @@ async function updateRecord(
 }
 
 /**
- * The `id:` index write for a brand-new key. Without it the key could never be
- * found by id (so never revoked), so a failure is fatal for the create. The
- * `key:` record already written is deleted first (its plaintext was never
- * returned); if even that fails, `partner_key_rotation_orphan` names the key.
+ * The pointer + list-index writes for a brand-new key. Without the pointer the
+ * key could never be found by id (so never revoked), so a failure is fatal.
+ * What was already written is deleted first (the plaintext was never
+ * returned); if even that fails, an orphan log names the key —
+ * `partner_key_create_orphan` or `partner_key_rotation_orphan` by path.
  */
 async function indexNewKey(
   kv: KVNamespace,
@@ -151,16 +165,19 @@ async function indexNewKey(
   record: PartnerKeyRecord,
   logger: RequestLogger
 ): Promise<void> {
+  const phase = record.rotatedFrom === undefined ? 'create' : 'rotation';
   try {
+    await kv.put(`${PTR_PREFIX}${record.id}`, hash);
     await putIndex(kv, hash, record);
   } catch (error) {
-    logger.error('partner_key_index_write_failed', error, { key_id: record.id, phase: 'create' });
+    logger.error('partner_key_index_write_failed', error, { key_id: record.id, phase });
     try {
       await kv.delete(`${KEY_PREFIX}${hash}`);
+      await kv.delete(`${PTR_PREFIX}${record.id}`);
     } catch (cleanupError) {
-      logger.error('partner_key_rotation_orphan', cleanupError, {
+      logger.error(`partner_key_${phase}_orphan`, cleanupError, {
         new_key_id: record.id,
-        action_required: 'unindexed key record left behind; its plaintext was never returned',
+        action_required: 'partly written key left behind; its plaintext was never returned',
       });
     }
     throw error;
@@ -205,17 +222,19 @@ export async function createPartnerKey(
 /** Upper bound on predecessors walked by a cascading revoke (guards against cycles). */
 const MAX_CHAIN_DEPTH = 50;
 
+type RevocationStamp = { revokedAt: string; revokedBy?: string | undefined };
+
 /**
  * Write `revokedAt` onto a key, then re-read: if a concurrent writer (a rotate
  * built from a stale read) clobbered it, apply it again on top of what is now
- * stored. Returns the stored record.
+ * stored. Returns the stored record and whether it had to re-apply.
  */
 async function writeRevocation(
   kv: KVNamespace,
   found: { record: PartnerKeyRecord; hash: string },
-  stamp: { revokedAt: string; revokedBy?: string | undefined },
+  stamp: RevocationStamp,
   logger: RequestLogger
-): Promise<PartnerKeyRecord> {
+): Promise<{ record: PartnerKeyRecord; reapplied: boolean }> {
   const fields = {
     revokedAt: stamp.revokedAt,
     ...(stamp.revokedBy !== undefined ? { revokedBy: stamp.revokedBy } : {}),
@@ -223,11 +242,39 @@ async function writeRevocation(
   const record: PartnerKeyRecord = { ...found.record, ...fields };
   await updateRecord(kv, found.hash, record, logger);
   const reread = await getPartnerKeyById(kv, found.record.id);
-  if (!reread || reread.record.revokedAt !== undefined) return reread?.record ?? record;
+  if (!reread || reread.record.revokedAt !== undefined) {
+    return { record: reread?.record ?? record, reapplied: false };
+  }
   logger.warn('partner_key_revoke_reapplied', { key_id: found.record.id });
   const merged: PartnerKeyRecord = { ...reread.record, ...fields };
   await updateRecord(kv, reread.hash, merged, logger);
-  return merged;
+  return { record: merged, reapplied: true };
+}
+
+/**
+ * Revoke the successors of `key` forward along `rotatedTo` (each link checked
+ * via the successor's `rotatedFrom`). Used only when a revoke had to re-apply
+ * itself: the rotation that clobbered it issued a successor in the race, and
+ * the admin's intent was to cut the partner off. Returns the ids it revoked.
+ */
+async function revokeRaceSuccessors(
+  kv: KVNamespace,
+  key: PartnerKeyRecord,
+  stamp: RevocationStamp,
+  logger: RequestLogger
+): Promise<string[]> {
+  const revoked: string[] = [];
+  let predecessor = key;
+  for (let depth = 0; depth < MAX_CHAIN_DEPTH && predecessor.rotatedTo; depth++) {
+    const found = await getPartnerKeyById(kv, predecessor.rotatedTo);
+    if (!found || found.record.rotatedFrom !== predecessor.id) break;
+    if (found.record.revokedAt === undefined) {
+      const { record } = await writeRevocation(kv, found, stamp, logger);
+      revoked.push(record.id);
+    }
+    predecessor = found.record;
+  }
+  return revoked;
 }
 
 /**
@@ -238,7 +285,7 @@ async function writeRevocation(
 async function revokeGracePredecessors(
   kv: KVNamespace,
   key: PartnerKeyRecord,
-  stamp: { revokedAt: string; revokedBy?: string | undefined },
+  stamp: RevocationStamp,
   logger: RequestLogger
 ): Promise<string[]> {
   const revoked: string[] = [];
@@ -258,7 +305,9 @@ async function revokeGracePredecessors(
 /**
  * Revoke by id — and the whole rotation chain behind it: any predecessor
  * still working in its grace window is revoked too, so revoking the current
- * key really cuts the partner off. Idempotent: revoking a revoked key returns
+ * key really cuts the partner off. If the revocation had to be re-applied
+ * because a concurrent rotate clobbered it, the successor that rotate issued
+ * (and its chain forward) is revoked as well. Idempotent: revoking a revoked key returns
  * it with `alreadyRevoked: true` (the chain is still checked). Returns null
  * when no such key exists. `revokedIds` lists every key this call revoked.
  */
@@ -271,12 +320,16 @@ export async function revokePartnerKey(
   if (!found) return null;
   const stamp = { revokedAt: new Date().toISOString(), revokedBy: opts.revokedBy };
   const alreadyRevoked = found.record.revokedAt !== undefined;
-  const record = alreadyRevoked
-    ? found.record
+  const written = alreadyRevoked
+    ? { record: found.record, reapplied: false }
     : await writeRevocation(kv, found, stamp, opts.logger);
+  const { record } = written;
   const predecessors = await revokeGracePredecessors(kv, record, stamp, opts.logger);
-  const revokedIds = alreadyRevoked ? predecessors : [record.id, ...predecessors];
-  return { record, alreadyRevoked, revokedIds };
+  const successors = written.reapplied
+    ? await revokeRaceSuccessors(kv, record, stamp, opts.logger)
+    : [];
+  const self = alreadyRevoked ? [] : [record.id];
+  return { record, alreadyRevoked, revokedIds: [...self, ...predecessors, ...successors] };
 }
 
 export type RotateResult =
@@ -284,7 +337,14 @@ export type RotateResult =
   | { status: 'revoked' }
   | { status: 'already_rotated'; rotatedTo: string }
   | { status: 'conflict' }
-  | { status: 'ok'; previous: PartnerKeyRecord; record: PartnerKeyRecord; plaintext: string };
+  | {
+      status: 'ok';
+      previous: PartnerKeyRecord;
+      record: PartnerKeyRecord;
+      plaintext: string;
+      /** Keys this rotation killed: with grace 0, the rotated key and its in-grace predecessors. */
+      revokedIds: string[];
+    };
 
 type Issued = { record: PartnerKeyRecord; hash: string };
 
@@ -421,7 +481,24 @@ export async function rotatePartnerKey(
   if (!rotationHeld(reread?.record, previous, issued.record.id)) {
     return abortRotation(kv, issued, { key_id: id, phase: 'post_write' }, logger);
   }
-  return { status: 'ok', previous, record: issued.record, plaintext: issued.plaintext };
+  const revokedIds = await killChainIfImmediate(kv, previous, logger);
+  const { record, plaintext } = issued;
+  return { status: 'ok', previous, record, plaintext, revokedIds };
+}
+
+/**
+ * `graceSeconds: 0` means "rotate and kill now" for the whole chain, same as
+ * revoke: the rotated key is already revoked by retiredRecord; this also
+ * revokes its predecessors still in their grace window. Returns all killed ids.
+ */
+async function killChainIfImmediate(
+  kv: KVNamespace,
+  previous: PartnerKeyRecord,
+  logger: RequestLogger
+): Promise<string[]> {
+  if (previous.revokedAt === undefined) return [];
+  const stamp = { revokedAt: previous.revokedAt, revokedBy: previous.revokedBy };
+  return [previous.id, ...(await revokeGracePredecessors(kv, previous, stamp, logger))];
 }
 
 /** Why `record` cannot be rotated now, or null when it can. */
@@ -469,13 +546,13 @@ async function listIndex(
   let cursor: string | undefined;
   for (let page = 0; page < MAX_LIST_PAGES; page++) {
     const result = await kv.list<PartnerKeyRecord>({
-      prefix: ID_PREFIX,
+      prefix: org === undefined ? ID_PREFIX : `${ID_PREFIX}${org}:`,
       ...(cursor ? { cursor } : {}),
     });
     for (const entry of result.keys) {
       if (!entry.metadata) {
         logger.warn('partner_key_index_missing_metadata', { index_key: entry.name });
-      } else if (org === undefined || entry.metadata.org === org) {
+      } else {
         records.push(entry.metadata);
       }
     }

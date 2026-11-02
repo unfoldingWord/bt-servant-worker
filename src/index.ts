@@ -87,6 +87,7 @@ import {
   listPartnerKeys,
   lookupPartnerKeyByToken,
   looksLikePartnerKey,
+  partnerKeyPrefix,
   revokePartnerKey,
   rotatePartnerKey,
   type RotateResult,
@@ -211,17 +212,14 @@ function rejectAuth(
 }
 
 /**
- * Resolve a non-ENGINE_API_KEY bearer token to an active partner key, or an
- * auth rejection. Unknown and revoked keys get the SAME 403 body (a caller
+ * Resolve a partner-shaped bearer token to an active partner key, or an auth
+ * rejection. Unknown, revoked and expired keys get the SAME 403 body (a caller
  * learns nothing about which keys exist); only the log reason differs.
  */
 async function authenticatePartner(
   c: Context<AppEnv>,
   token: string
 ): Promise<{ ok: true; key: PartnerKeyRecord } | { ok: false; response: Response }> {
-  if (!looksLikePartnerKey(token)) {
-    return { ok: false, response: rejectAuth(c, 403, 'invalid_token') };
-  }
   let key: PartnerKeyRecord | null;
   try {
     key = await lookupPartnerKeyByToken(c.env.API_KEYS, token);
@@ -273,11 +271,15 @@ app.use('/api/*', async (c, next) => {
     return next();
   }
 
+  // Both checks below are pure, so a junk token or a partner-shaped token on a
+  // route partners may never call costs no KV read. The display prefix
+  // (`bts_<8 hex>`) is not secret and is logged for attribution.
+  if (!looksLikePartnerKey(token)) return rejectAuth(c, 403, 'invalid_token');
+  if (!isPartnerRouteAllowed(c.req.method, c.req.path)) {
+    return rejectAuth(c, 403, 'partner_route_forbidden', { key_prefix: partnerKeyPrefix(token) });
+  }
   const auth = await authenticatePartner(c, token);
   if (!auth.ok) return auth.response;
-  if (!isPartnerRouteAllowed(c.req.method, c.req.path)) {
-    return rejectAuth(c, 403, 'partner_route_forbidden', { key_id: auth.key.id });
-  }
   c.set('principal', { kind: 'partner', key: auth.key });
   return next();
 });
@@ -1845,10 +1847,12 @@ app.post(`${PARTNER_KEYS_BASE}/:keyId/_rotate`, async (c) => {
       new_key_id: result.record.id,
       grace_seconds: body.graceSeconds,
       old_expires_at: result.previous.expiresAt ?? null,
+      revoked_ids: result.revokedIds,
     });
     return c.json({
       key: toPublicPartnerKey(result.record),
       previous: toPublicPartnerKey(result.previous),
+      revokedIds: result.revokedIds,
       apiKey: result.plaintext,
     });
   } catch (error) {
@@ -2568,12 +2572,12 @@ async function buildDOChatRequest(
  * to dispatch, or the rejection response (already logged and counted).
  */
 function scopeChatBodyForPrincipal(
-  body: unknown,
+  body: Record<string, unknown>,
   principal: Principal,
   transport: ChatTransport,
   logger: RequestLogger
 ): { ok: true; body: ChatRequest } | { ok: false; response: Response } {
-  if (principal.kind !== 'partner') return { ok: true, body: body as ChatRequest };
+  if (principal.kind !== 'partner') return { ok: true, body: body as unknown as ChatRequest };
   const result = applyPartnerChatPolicy(body, principal.key);
   if (result.ok) return result;
   const { status, reason, error } = result.rejection;
@@ -2586,6 +2590,19 @@ function scopeChatBodyForPrincipal(
   return { ok: false, response: Response.json({ error }, { status }) };
 }
 
+/**
+ * Parse a chat body. Malformed JSON throws SyntaxError; valid JSON that is not
+ * an object (`null`, arrays, scalars) throws ValidationError — for every
+ * caller, before anything dereferences a field. Both map to 400.
+ */
+async function readChatBodyObject(request: Request): Promise<Record<string, unknown>> {
+  const parsed: unknown = await request.clone().json();
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new ValidationError('Request body must be a JSON object');
+  }
+  return parsed as Record<string, unknown>;
+}
+
 async function handleChatRequest(
   request: Request,
   env: Env,
@@ -2595,17 +2612,11 @@ async function handleChatRequest(
   const { principal, requestId, logger } = context;
   const timing = createTimingContext();
 
-  let parsed: unknown;
+  let parsed: Record<string, unknown>;
   try {
-    parsed = await request.clone().json();
+    parsed = await readChatBodyObject(request);
   } catch (error) {
     // A malformed body has no identifiers to hash, so there is no scope to be inside.
-    return respondToChatRequestError(error, transport, timing, logger);
-  }
-  // `null`, arrays and scalars are valid JSON but not a chat body; reject them
-  // here, for every caller, before anything dereferences a field.
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    const error = new ValidationError('Request body must be a JSON object');
     return respondToChatRequestError(error, transport, timing, logger);
   }
   // Partner bodies are rewritten (org forced, user_id namespaced) BEFORE the

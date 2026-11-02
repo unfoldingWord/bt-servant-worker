@@ -506,7 +506,8 @@ unchanged. These admin endpoints accept **only** `ENGINE_API_KEY`.
 
 - The plaintext key (`apiKey`, shape `bts_<8 hex>_<43 base64url>`) is returned
   **once**, by create and rotate. It cannot be fetched again; only its SHA-256
-  is stored (`API_KEYS` KV, `key:<sha256>` → record, `id:<key id>` → hash).
+  is stored (`API_KEYS` KV: `key:<sha256>` → record, `ptr:<key id>` → hash,
+  and the list index `id:<org>:<key id>` carrying the record as metadata).
 - List and get return the record (`id`, `prefix`, `name`, `app`, `org`,
   `createdBy`, `createdAt`, `scopes`, `userNamespace`, `status`, and when set
   `revokedAt`, `revokedBy`, `rotatedFrom`, `rotatedTo`, `termsVersion`,
@@ -570,7 +571,9 @@ curl "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef" \
 Immediate, and **revoke kills the whole chain**: any predecessor of this key
 that is still working in its rotation grace window is revoked too, so revoking
 the current key really cuts the partner off. The response lists every key this
-call revoked in `revokedIds` (this key first, then its predecessors).
+call revoked in `revokedIds` (this key first, then its predecessors). If a
+rotation of this key ran at the same moment and its successor slipped
+through, that successor (and its chain forward) is revoked too and listed.
 Idempotent: revoking a revoked key returns it with `"alreadyRevoked": true`
 (its chain is still checked). The body is optional.
 
@@ -592,7 +595,8 @@ the partner's users keep their history), then retires the old one. Returns
 outage; after that it gets `403` (reason `expired_partner_key`) and shows
 `status: "expired"`. Set `graceSeconds` (integer, 0 to 2592000 = 30 days) to
 change it; `"graceSeconds": 0` revokes the old key at once ("rotate and kill
-now"). An explicit `_revoke` is always immediate, also during a grace window.
+now"), together with any older keys still in their own grace window, and the
+response lists them in `revokedIds`. An explicit `_revoke` is always immediate, also during a grace window.
 
 A revoked key, or one already rotated, cannot be rotated (`409`); create a new
 key or rotate the replacement instead. If a
@@ -613,11 +617,19 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_
 
 A partner key may call **only** `POST /api/v1/chat` and
 `POST /api/v1/chat/stream`. Every other `/api/*` route answers `403`
-(`This API key is not permitted to call this endpoint`). On those two routes:
+(`This API key is not permitted to call this endpoint`), checked before the
+key is even looked up. On those two routes:
 
 - `org` / `org_id` may be omitted or `null` (the key's org applies) or equal
   the key's org; any other value is a `400`.
-- `client_id: "admin-portal"` is refused (`403`).
+- `client_id` is **set by the server** to `partner:<userNamespace>`; whatever
+  the body sends is discarded. A partner can therefore not pose as
+  `whatsapp`, `web` or `admin-portal`, and none of its text reaches the
+  prompt (which says only "a partner app").
+- `user_id`, `chat_id` and `thread_id` must be single-line strings of at most
+  256 characters (`400` otherwise; `null` counts as absent for the optional
+  two). `speaker` is neutralised: control characters removed, line breaks
+  and other whitespace collapsed to one space, capped at 64 characters.
 - `progress_callback_url` (and the other callback fields) are refused (`400`,
   the existing `/chat` and `/chat/stream` validation, worded for partners as
   "progress callbacks are not available with partner API keys").
@@ -629,7 +641,7 @@ A partner key may call **only** `POST /api/v1/chat` and
   `attach_audio`, `read_r2_object`) or the audio prompt guidance, and a call
   to one of them is refused, so a partner response never carries an audio
   URL.
-- `user_id` must be a non-empty string. Inside the worker it becomes
+- Inside the worker `user_id` becomes
   `partner:<userNamespace>:<user_id>` (and `chat_id` likewise), so a partner's
   users can never reach another app's or a WhatsApp user's conversation.
 

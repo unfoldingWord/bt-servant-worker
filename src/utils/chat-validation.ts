@@ -57,6 +57,23 @@ export function callerIsAdmin(body: Pick<ChatRequest, '_caller' | 'client_id'>):
 }
 
 /**
+ * client_id of every partner-key request (admin-portal#354). The SERVER sets
+ * it from the key's user namespace (`pk_<hex>`, stable across rotation); the
+ * partner's own client_id is discarded, so a partner can neither pose as
+ * `whatsapp`/`web`/`admin-portal` nor put its own text into the prompt.
+ */
+const PARTNER_CLIENT_ID_PREFIX = 'partner:';
+
+export function partnerClientId(userNamespace: string): string {
+  return `${PARTNER_CLIENT_ID_PREFIX}${userNamespace}`;
+}
+
+/** True for a server-set partner client_id. */
+export function isPartnerClientId(clientId: string | undefined): boolean {
+  return clientId?.startsWith(PARTNER_CLIENT_ID_PREFIX) ?? false;
+}
+
+/**
  * Partner API keys are text-only (decided 2026-11-02, admin-portal#354): no
  * audio in, no audio out, and no tool that yields an audio URL. The ONE place
  * that decision is read from the request; the DO and orchestrator only ask

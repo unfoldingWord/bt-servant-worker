@@ -6,6 +6,7 @@ import { ChatHistoryEntry } from '../../types/engine.js';
 import { PromptSlot } from '../../types/prompt-overrides.js';
 import { UnmatchedTrigger } from '../classifier/index.js';
 import { generateToolCatalog, ToolCatalog } from '../mcp/index.js';
+import { isPartnerClientId } from '../../utils/chat-validation.js';
 
 /**
  * Orchestration preferences (subset of full user preferences)
@@ -200,7 +201,10 @@ const RESOURCE_AVAILABILITY_RULES =
 function buildClientSection(clientId: string | undefined, clientInstructions: string): string {
   const parts: string[] = [];
   if (clientId) {
-    parts.push(`## Client Platform\nThe user is communicating via: ${clientId}`);
+    // Partner requests carry a server-set id (`partner:<ns>`); the model is told
+    // only that it is a partner app — no partner-controlled text is interpolated.
+    const platform = isPartnerClientId(clientId) ? 'a partner app (text chat)' : clientId;
+    parts.push(`## Client Platform\nThe user is communicating via: ${platform}`);
   }
   parts.push(clientInstructions);
   return parts.join('\n\n');

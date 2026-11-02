@@ -7,7 +7,9 @@
  *    endpoints. Everything else under /api/* (admin, callback transport,
  *    path-addressed user preferences/history, audio) is denied by default.
  * 2. applyPartnerChatPolicy — on those chat endpoints the body is locked to
- *    the key: org is the key's org, the admin client id is refused, and audio
+ *    the key: org is the key's org, client_id is set by the server (so a
+ *    partner can neither claim another platform nor put its own text in the
+ *    prompt), identifiers are bounded, speaker is neutralised, and audio
  *    requests are refused (their replies are URLs under /api/v1/audio/*, which
  *    a partner key cannot fetch). progress_callback_url needs no rule here:
  *    validateChatBody already rejects it on /chat and /chat/stream, the only
@@ -19,7 +21,8 @@
 
 import type { PartnerKeyRecord } from '../../types/partner-keys.js';
 import type { ChatRequest } from '../../types/engine.js';
-import { isAdminClient } from '../../utils/chat-validation.js';
+import { stripControlChars } from '../../types/prompt-overrides.js';
+import { partnerClientId } from '../../utils/chat-validation.js';
 
 /** Who made an /api/* request, as established by the auth middleware. */
 export type Principal = { kind: 'internal' } | { kind: 'partner'; key: PartnerKeyRecord };
@@ -118,51 +121,91 @@ function checkAudio(body: Record<string, unknown>): PartnerPolicyResult | null {
   );
 }
 
-/** Refusals that do not depend on the key's identity. */
-function checkForbiddenFields(body: Record<string, unknown>): PartnerPolicyResult | null {
-  if (isAdminClient(typeof body.client_id === 'string' ? body.client_id : undefined)) {
-    return reject(403, 'partner_admin_client', `client_id '${String(body.client_id)}' is reserved`);
-  }
-  return checkAudio(body);
+/** Max length of a partner-supplied identifier (user_id, chat_id, thread_id). */
+export const MAX_PARTNER_ID_LENGTH = 256;
+/** Max length of a partner-supplied speaker name after neutralising. */
+export const MAX_PARTNER_SPEAKER_LENGTH = 64;
+
+/** True when `value` contains a control or line-break character. */
+function hasControlOrLineBreak(value: string): boolean {
+  return stripControlChars(value) !== value || /[\r\n\t\u2028\u2029]/.test(value);
+}
+
+/** An identifier field: absent/null, or a bounded single-line non-empty string. */
+function checkIdentifier(
+  value: unknown,
+  field: 'user_id' | 'chat_id' | 'thread_id',
+  required: boolean
+): PartnerPolicyResult | null {
+  if (!isPresent(value) && !required) return null;
+  const valid =
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= MAX_PARTNER_ID_LENGTH &&
+    !hasControlOrLineBreak(value);
+  if (valid) return null;
+  return reject(
+    400,
+    `partner_${field}`,
+    `${field} ${required ? 'is required and ' : ''}must be a non-empty single-line string of at most ${MAX_PARTNER_ID_LENGTH} characters`
+  );
 }
 
 /**
- * Subject ids must be non-empty strings for partners so the namespacing in
- * applyPartnerChatPolicy always applies (internal callers keep today's looser
- * truthiness check in validateChatBody).
+ * Identifiers must be bounded single-line strings for partners: user_id and
+ * chat_id so the namespacing below always applies, and all three because they
+ * reach DO names and logs. (Internal callers keep validateChatBody's rules.)
  */
-function checkSubjectTypes(body: Record<string, unknown>): PartnerPolicyResult | null {
-  if (typeof body.user_id !== 'string' || body.user_id.length === 0) {
-    return reject(400, 'partner_user_id', 'user_id is required and must be a non-empty string');
-  }
-  if (isPresent(body.chat_id) && (typeof body.chat_id !== 'string' || !body.chat_id)) {
-    return reject(400, 'partner_chat_id', 'chat_id must be a non-empty string');
-  }
-  return null;
+function checkIdentifiers(body: Record<string, unknown>): PartnerPolicyResult | null {
+  return (
+    checkIdentifier(body.user_id, 'user_id', true) ??
+    checkIdentifier(body.chat_id, 'chat_id', false) ??
+    checkIdentifier(body.thread_id, 'thread_id', false)
+  );
 }
 
 /**
- * Apply the partner rules to a parsed chat body. On success returns a NEW
- * body with org forced and user_id/chat_id namespaced; the input is untouched.
+ * A partner's speaker name reaches the system prompt and the history prefix.
+ * Neutralise it: control characters removed, every whitespace run (newlines
+ * included) collapsed to one space, capped. Non-strings and names that end up
+ * empty are dropped. A name can therefore never start a new prompt line.
  */
-export function applyPartnerChatPolicy(body: unknown, key: PartnerKeyRecord): PartnerPolicyResult {
-  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
-    return reject(400, 'partner_body_shape', 'Request body must be a JSON object');
-  }
-  const raw = body as Record<string, unknown>;
-  const failure = checkForbiddenFields(raw) ?? checkOrg(raw, key.org) ?? checkSubjectTypes(raw);
+export function neutralizePartnerSpeaker(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const flat = stripControlChars(value).replace(/\s+/g, ' ').trim();
+  return flat.slice(0, MAX_PARTNER_SPEAKER_LENGTH).trim() || undefined;
+}
+
+/**
+ * Apply the partner rules to a parsed chat body (already known to be a JSON
+ * object: the chat handler rejects anything else for every caller). On
+ * success returns a NEW body; the input is untouched:
+ * - org forced to the key's org; client_id set by the server;
+ * - user_id / chat_id namespaced; speaker neutralised;
+ * - org_id, voice_format (no TTS for partners) and null chat_id/speaker dropped.
+ */
+export function applyPartnerChatPolicy(
+  raw: Record<string, unknown>,
+  key: PartnerKeyRecord
+): PartnerPolicyResult {
+  const failure = checkAudio(raw) ?? checkOrg(raw, key.org) ?? checkIdentifiers(raw);
   if (failure) return failure;
 
-  // org_id is replaced by the forced org; voice_format is ignored (no TTS for
-  // partners); chat_id is re-added below only when present (null = absent).
-  const { org_id: _orgId, voice_format: _voiceFormat, chat_id: _chatId, ...rest } = raw;
+  const {
+    org_id: _orgId,
+    voice_format: _voiceFormat,
+    chat_id: _chatId,
+    speaker: _speaker,
+    ...rest
+  } = raw;
+  const speaker = neutralizePartnerSpeaker(raw.speaker);
   const scoped: Record<string, unknown> = {
     ...rest,
     org: key.org,
+    client_id: partnerClientId(key.userNamespace),
     user_id: scopePartnerSubject(key, raw.user_id as string),
+    ...(typeof raw.chat_id === 'string' ? { chat_id: scopePartnerSubject(key, raw.chat_id) } : {}),
+    ...(speaker !== undefined ? { speaker } : {}),
   };
-  if (typeof raw.chat_id === 'string') {
-    scoped.chat_id = scopePartnerSubject(key, raw.chat_id);
-  }
   return { ok: true, body: scoped as unknown as ChatRequest };
 }

@@ -195,9 +195,8 @@ function readCreateLabels(
 export function validatePartnerKeyCreate(
   body: unknown
 ): { ok: true; input: PartnerKeyCreateInput; allowNewOrg: boolean } | { ok: false; error: string } {
-  if (body === null || body === undefined) {
-    return { ok: false, error: 'Request body must be a JSON object' };
-  }
+  // One rule for every body reader here (readBodyObject): an absent or null
+  // body is an empty object, so a create without a body fails on `org`.
   const parsed = readBodyObject(body, CREATE_FIELDS);
   if (!parsed.ok) return parsed;
   const { record } = parsed;
