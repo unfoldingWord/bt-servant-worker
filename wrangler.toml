@@ -67,12 +67,9 @@ binding = "PROMPT_OVERRIDES"
 id = "c1828624ab434f079776bddd171882d9"
 
 # Partner API keys (admin-portal#354). SHA-256-keyed records, never plaintext.
-# DEPLOY NOTE: Create this namespace before deploying:
-#   wrangler kv namespace create API_KEYS
-# Then replace the placeholder ID below with the real one.
 [[kv_namespaces]]
 binding = "API_KEYS"
-id = "PLACEHOLDER_CREATE_VIA_WRANGLER"
+id = "db5c2236e33d41f3a95e550de2011da1"
 
 # Workers AI
 [ai]
@@ -153,12 +150,9 @@ binding = "PROMPT_OVERRIDES"
 id = "1416f321fbda450095214111d38d211a"
 
 # Partner API keys (admin-portal#354).
-# DEPLOY NOTE: Create this namespace before deploying:
-#   wrangler kv namespace create API_KEYS --env staging
-# Then replace the placeholder ID below with the real one.
 [[env.staging.kv_namespaces]]
 binding = "API_KEYS"
-id = "PLACEHOLDER_CREATE_VIA_WRANGLER"
+id = "dca367a5e27445a79223f9c599d2394f"
 
 [env.staging.ai]
 binding = "AI"
