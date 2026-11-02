@@ -323,8 +323,10 @@ describe('admin CRUD: org check on create', () => {
       expect((await post('org-354-known')).status).toBe(201);
       expect((await post('org-354-known-modes-only')).status).toBe(201);
       expect((await post('unfoldingWord')).status).toBe(201);
-      // A prefix match is not an org: 'org-354-kno' has no keys of its own.
+      // Prefix neighbours are not the org: 'org-354-kno' has no keys of its own,
+      // and 'org-354-known-modes' only shares the start of another org's id.
       expect((await post('org-354-kno')).status).toBe(400);
+      expect((await post('org-354-known-modes')).status).toBe(400);
     } finally {
       await env.ORG_CONFIG.delete('org-354-known');
       await env.PROMPT_OVERRIDES.delete('org-354-known-modes-only:modes');
@@ -488,5 +490,62 @@ describe('partner keys are text-only (decided 2026-11-02)', () => {
     expect(findLog(capture.warnLogs, 'audio_tool_refused_text_only')?.payload).toMatchObject({
       tool: 'request_audio',
     });
+  });
+});
+
+describe('chat bodies that are valid JSON but not objects', () => {
+  it.each(['null', '[]', '"text"', '42'])(
+    'returns 400 for %s, for internal and partner callers',
+    async (raw) => {
+      const { apiKey } = await createKey('org-354-null-body');
+      for (const headers of [JSON_INTERNAL, partnerHeaders(apiKey)]) {
+        const res = await SELF.fetch(CHAT, { method: 'POST', headers, body: raw });
+        expect(res.status).toBe(400);
+        expect(await res.json()).toEqual({ error: 'Request body must be a JSON object' });
+      }
+      expect(capture.calls).toHaveLength(0);
+    }
+  );
+});
+
+describe('admin bypass requires an internal caller (DO level)', () => {
+  /** POST straight to a DO, as the worker would, with one unpublished (draft) mode. */
+  async function chatWithDraftMode(caller: 'partner' | 'internal'): Promise<string[]> {
+    const stub = env.USER_DO.get(env.USER_DO.idFromName(`user:org-354-admin:${caller}`));
+    const res = await stub.fetch('http://fake-host/chat/final', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...chatBody({ client_id: 'admin-portal', org: 'org-354-admin', user_id: caller }),
+        _caller: caller,
+        _org_modes: { modes: [{ name: 'draft-mode', published: false }] },
+      }),
+    });
+    expect(res.status).toBe(200);
+    return offeredTools();
+  }
+
+  it('a partner body with client_id admin-portal does not see draft modes', async () => {
+    expect(await chatWithDraftMode('partner')).not.toContain('list_modes');
+  });
+
+  it('an internal admin-portal body still does', async () => {
+    expect(await chatWithDraftMode('internal')).toContain('list_modes');
+  });
+});
+
+describe('revoke kills the rotation chain (e2e)', () => {
+  it('revoking the replacement also kills the old key still in its grace window', async () => {
+    const { key, apiKey } = await createKey('org-354-chain');
+    const rotated = (await (await rotateKey(key.id)).json()) as RotateBody;
+    expect((await postChat(apiKey, chatBody())).status).toBe(200);
+
+    const revoke = await SELF.fetch(`${KEYS}/${rotated.key.id}/_revoke`, {
+      method: 'POST',
+      headers: INTERNAL,
+    });
+    expect(await revoke.json()).toMatchObject({ revokedIds: [rotated.key.id, key.id] });
+    expect((await postChat(apiKey, chatBody())).status).toBe(403);
+    expect((await postChat(rotated.apiKey, chatBody())).status).toBe(403);
   });
 });

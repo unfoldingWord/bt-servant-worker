@@ -567,8 +567,12 @@ curl "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef" \
 
 ### Revoke a Key
 
-Idempotent: revoking a revoked key returns it with `"alreadyRevoked": true`.
-The body is optional.
+Immediate, and **revoke kills the whole chain**: any predecessor of this key
+that is still working in its rotation grace window is revoked too, so revoking
+the current key really cuts the partner off. The response lists every key this
+call revoked in `revokedIds` (this key first, then its predecessors).
+Idempotent: revoking a revoked key returns it with `"alreadyRevoked": true`
+(its chain is still checked). The body is optional.
 
 ```bash
 curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_revoke" \

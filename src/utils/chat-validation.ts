@@ -32,18 +32,28 @@ export function isValidLanguageCode(code: string): boolean {
  *
  * These client_ids are hardcoded in the corresponding caller's server-side
  * source (e.g. bt-servant-admin-portal/worker/baruch.ts sets
- * `client_id: "admin-portal"` on every chat relay). Because the bearer-token
- * auth middleware already gates `/api/*`, the set of callers that can reach
- * this code path is bounded to internal services holding ENGINE_API_KEY;
- * deriving the admin bit from client_id — rather than from a self-asserted
- * body flag — ties the signal to which caller it came from rather than what
- * the caller chose to write in JSON.
+ * `client_id: "admin-portal"` on every chat relay). client_id is still
+ * self-asserted body data: since partner API keys (admin-portal#354) the
+ * callers that reach the chat routes are no longer only internal services
+ * holding ENGINE_API_KEY. So the admin bit must never be derived from
+ * client_id alone — use {@link callerIsAdmin}, which also requires the
+ * request to come from an internal caller. (Partner requests that name an
+ * admin client_id are additionally refused at the worker boundary.)
  */
 const ADMIN_CLIENT_IDS: ReadonlySet<string> = new Set(['admin-portal']);
 
-/** True when the incoming request originated from an admin-capable client. */
+/** True when `clientId` names an admin-capable client. Not sufficient on its own; see callerIsAdmin. */
 export function isAdminClient(clientId: string | undefined): boolean {
   return clientId !== undefined && ADMIN_CLIENT_IDS.has(clientId);
+}
+
+/**
+ * The admin bit for a chat request: an admin client_id AND an internal caller.
+ * A partner-authenticated body (`_caller: 'partner'`, stamped by the worker
+ * after the client spread) is never admin, whatever client_id it carries.
+ */
+export function callerIsAdmin(body: Pick<ChatRequest, '_caller' | 'client_id'>): boolean {
+  return body._caller !== 'partner' && isAdminClient(body.client_id);
 }
 
 /**

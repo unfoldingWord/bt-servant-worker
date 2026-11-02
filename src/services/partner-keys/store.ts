@@ -28,6 +28,7 @@ import {
   type PartnerKeyCreateInput,
   type PartnerKeyRecord,
   PARTNER_KEY_ID_PATTERN,
+  partnerKeyStatus,
 } from '../../types/partner-keys.js';
 import { bytesToHex, sha256Hex } from '../../utils/crypto.js';
 import type { RequestLogger } from '../../utils/logger.js';
@@ -139,14 +140,43 @@ async function updateRecord(
 }
 
 /**
+ * The `id:` index write for a brand-new key. Without it the key could never be
+ * found by id (so never revoked), so a failure is fatal for the create. The
+ * `key:` record already written is deleted first (its plaintext was never
+ * returned); if even that fails, `partner_key_rotation_orphan` names the key.
+ */
+async function indexNewKey(
+  kv: KVNamespace,
+  hash: string,
+  record: PartnerKeyRecord,
+  logger: RequestLogger
+): Promise<void> {
+  try {
+    await putIndex(kv, hash, record);
+  } catch (error) {
+    logger.error('partner_key_index_write_failed', error, { key_id: record.id, phase: 'create' });
+    try {
+      await kv.delete(`${KEY_PREFIX}${hash}`);
+    } catch (cleanupError) {
+      logger.error('partner_key_rotation_orphan', cleanupError, {
+        new_key_id: record.id,
+        action_required: 'unindexed key record left behind; its plaintext was never returned',
+      });
+    }
+    throw error;
+  }
+}
+
+/**
  * Issue a new key. `carry` is used by rotation to keep the user namespace and
  * link the two records. Returns the stored record and the one-time plaintext.
  */
 export async function createPartnerKey(
   kv: KVNamespace,
   input: PartnerKeyCreateInput,
-  carry: { userNamespace?: string; rotatedFrom?: string } = {}
+  opts: { logger: RequestLogger; carry?: { userNamespace?: string; rotatedFrom?: string } }
 ): Promise<{ record: PartnerKeyRecord; plaintext: string; hash: string }> {
+  const carry = opts.carry ?? {};
   const { id, prefix, plaintext } = generatePartnerKeyMaterial();
   const hash = await sha256Hex(plaintext);
   const record: PartnerKeyRecord = {
@@ -164,34 +194,89 @@ export async function createPartnerKey(
     ...(input.termsAcceptedAt !== undefined ? { termsAcceptedAt: input.termsAcceptedAt } : {}),
   };
   assertFitsMetadata(record);
-  // Record first, index second, both fatal on failure: the `id:` entry is the
-  // only pointer to the hash, so a key without it could never be revoked by
-  // id. A crash between the two leaves an unlisted record whose plaintext was
-  // never returned, so nobody can use it.
+  // Record first, then index (compensated on failure; see indexNewKey). A crash
+  // between the two leaves an unlisted record whose plaintext was never
+  // returned, so nobody can use it.
   await kv.put(`${KEY_PREFIX}${hash}`, JSON.stringify(record));
-  await putIndex(kv, hash, record);
+  await indexNewKey(kv, hash, record, opts.logger);
   return { record, plaintext, hash };
 }
 
+/** Upper bound on predecessors walked by a cascading revoke (guards against cycles). */
+const MAX_CHAIN_DEPTH = 50;
+
 /**
- * Revoke by id. Idempotent: revoking a revoked key returns it unchanged with
- * `alreadyRevoked: true`. Returns null when no such key exists.
+ * Write `revokedAt` onto a key, then re-read: if a concurrent writer (a rotate
+ * built from a stale read) clobbered it, apply it again on top of what is now
+ * stored. Returns the stored record.
+ */
+async function writeRevocation(
+  kv: KVNamespace,
+  found: { record: PartnerKeyRecord; hash: string },
+  stamp: { revokedAt: string; revokedBy?: string | undefined },
+  logger: RequestLogger
+): Promise<PartnerKeyRecord> {
+  const fields = {
+    revokedAt: stamp.revokedAt,
+    ...(stamp.revokedBy !== undefined ? { revokedBy: stamp.revokedBy } : {}),
+  };
+  const record: PartnerKeyRecord = { ...found.record, ...fields };
+  await updateRecord(kv, found.hash, record, logger);
+  const reread = await getPartnerKeyById(kv, found.record.id);
+  if (!reread || reread.record.revokedAt !== undefined) return reread?.record ?? record;
+  logger.warn('partner_key_revoke_reapplied', { key_id: found.record.id });
+  const merged: PartnerKeyRecord = { ...reread.record, ...fields };
+  await updateRecord(kv, reread.hash, merged, logger);
+  return merged;
+}
+
+/**
+ * Revoke every predecessor of `key` that is still in its rotation grace
+ * window (walks `rotatedFrom`; a predecessor counts only if its `rotatedTo`
+ * is the key that replaced it). Returns the ids it revoked.
+ */
+async function revokeGracePredecessors(
+  kv: KVNamespace,
+  key: PartnerKeyRecord,
+  stamp: { revokedAt: string; revokedBy?: string | undefined },
+  logger: RequestLogger
+): Promise<string[]> {
+  const revoked: string[] = [];
+  let successor = key;
+  for (let depth = 0; depth < MAX_CHAIN_DEPTH && successor.rotatedFrom; depth++) {
+    const found = await getPartnerKeyById(kv, successor.rotatedFrom);
+    if (!found || found.record.rotatedTo !== successor.id) break;
+    if (partnerKeyStatus(found.record, Date.parse(stamp.revokedAt)) === 'active') {
+      await writeRevocation(kv, found, stamp, logger);
+      revoked.push(found.record.id);
+    }
+    successor = found.record;
+  }
+  return revoked;
+}
+
+/**
+ * Revoke by id — and the whole rotation chain behind it: any predecessor
+ * still working in its grace window is revoked too, so revoking the current
+ * key really cuts the partner off. Idempotent: revoking a revoked key returns
+ * it with `alreadyRevoked: true` (the chain is still checked). Returns null
+ * when no such key exists. `revokedIds` lists every key this call revoked.
  */
 export async function revokePartnerKey(
   kv: KVNamespace,
   id: string,
   opts: { revokedBy?: string | undefined; logger: RequestLogger }
-): Promise<{ record: PartnerKeyRecord; alreadyRevoked: boolean } | null> {
+): Promise<{ record: PartnerKeyRecord; alreadyRevoked: boolean; revokedIds: string[] } | null> {
   const found = await getPartnerKeyById(kv, id);
   if (!found) return null;
-  if (found.record.revokedAt !== undefined) return { record: found.record, alreadyRevoked: true };
-  const record: PartnerKeyRecord = {
-    ...found.record,
-    revokedAt: new Date().toISOString(),
-    ...(opts.revokedBy !== undefined ? { revokedBy: opts.revokedBy } : {}),
-  };
-  await updateRecord(kv, found.hash, record, opts.logger);
-  return { record, alreadyRevoked: false };
+  const stamp = { revokedAt: new Date().toISOString(), revokedBy: opts.revokedBy };
+  const alreadyRevoked = found.record.revokedAt !== undefined;
+  const record = alreadyRevoked
+    ? found.record
+    : await writeRevocation(kv, found, stamp, opts.logger);
+  const predecessors = await revokeGracePredecessors(kv, record, stamp, opts.logger);
+  const revokedIds = alreadyRevoked ? predecessors : [record.id, ...predecessors];
+  return { record, alreadyRevoked, revokedIds };
 }
 
 export type RotateResult =
@@ -247,7 +332,12 @@ function retiredRecord(
 }
 
 /** Issue the replacement for `old`, inheriting its metadata and user namespace. */
-function issueReplacement(kv: KVNamespace, old: PartnerKeyRecord, createdBy?: string) {
+function issueReplacement(
+  kv: KVNamespace,
+  old: PartnerKeyRecord,
+  createdBy: string | undefined,
+  logger: RequestLogger
+) {
   return createPartnerKey(
     kv,
     {
@@ -258,7 +348,7 @@ function issueReplacement(kv: KVNamespace, old: PartnerKeyRecord, createdBy?: st
       ...(old.termsVersion !== undefined ? { termsVersion: old.termsVersion } : {}),
       ...(old.termsAcceptedAt !== undefined ? { termsAcceptedAt: old.termsAcceptedAt } : {}),
     },
-    { userNamespace: old.userNamespace, rotatedFrom: old.id }
+    { logger, carry: { userNamespace: old.userNamespace, rotatedFrom: old.id } }
   );
 }
 
@@ -281,9 +371,15 @@ function issueReplacement(kv: KVNamespace, old: PartnerKeyRecord, createdBy?: st
  *   extra active key exists whose plaintext was never returned to anyone; it
  *   is unusable in practice, and `partner_key_rotation_orphan` names it.
  *
- * Concurrency: KV has no compare-and-swap. After writing the old record we
- * re-read it; if its `rotatedTo` is not our new key (a concurrent rotate or
- * revoke wrote after us), we revoke our new key and report a conflict (409).
+ * Concurrency: KV has no compare-and-swap, so rotate checks twice:
+ * - just before writing, it re-reads the old record; if it is no longer active
+ *   or was rotated meanwhile, it revokes its new key and reports 409;
+ * - after writing, it re-reads again; if `rotatedTo` is not its key (another
+ *   rotate won) or a revocation it did not write is now present, it revokes
+ *   its new key and reports 409.
+ * A revoke that lands between the pre-write read and the write would be
+ * clobbered by it; revokePartnerKey closes that by re-reading after its own
+ * write and re-applying revokedAt if it was lost.
  * RESIDUAL RACE: KV only guarantees read-your-writes in the location that
  * wrote, so two admin requests served by different Cloudflare locations at
  * the same moment can each re-read their own write and both "win" — leaving
@@ -296,17 +392,22 @@ export async function rotatePartnerKey(
   id: string,
   opts: { createdBy?: string | undefined; graceSeconds: number; logger: RequestLogger }
 ): Promise<RotateResult> {
-  const { createdBy, logger } = opts;
+  const { logger } = opts;
   const found = await getPartnerKeyById(kv, id);
   if (!found) return { status: 'not_found' };
-  const old = found.record;
-  if (old.revokedAt !== undefined) return { status: 'revoked' };
-  if (old.rotatedTo !== undefined) return { status: 'already_rotated', rotatedTo: old.rotatedTo };
+  const refusal = rotationRefusal(found.record);
+  if (refusal) return refusal;
 
-  const issued = await issueReplacement(kv, old, createdBy);
-  const previous = retiredRecord(old, issued.record, opts);
+  const issued = await issueReplacement(kv, found.record, opts.createdBy, logger);
+  // Re-read just before writing so a revoke/rotate that landed while the new
+  // key was being issued is not silently overwritten by our stale copy.
+  const fresh = await getPartnerKeyById(kv, id);
+  if (!fresh || rotationRefusal(fresh.record)) {
+    return abortRotation(kv, issued, { key_id: id, phase: 'pre_write' }, logger);
+  }
+  const previous = retiredRecord(fresh.record, issued.record, opts);
   try {
-    await updateRecord(kv, found.hash, previous, logger);
+    await updateRecord(kv, fresh.hash, previous, logger);
   } catch (error) {
     logger.error('partner_key_rotation_failed', error, {
       key_id: id,
@@ -317,16 +418,45 @@ export async function rotatePartnerKey(
   }
 
   const reread = await getPartnerKeyById(kv, id);
-  if (reread?.record.rotatedTo !== issued.record.id) {
-    logger.warn('partner_key_rotation_conflict', {
-      key_id: id,
-      new_key_id: issued.record.id,
-      stored_rotated_to: reread?.record.rotatedTo ?? null,
-    });
-    await revokeIssuedKey(kv, issued, logger);
-    return { status: 'conflict' };
+  if (!rotationHeld(reread?.record, previous, issued.record.id)) {
+    return abortRotation(kv, issued, { key_id: id, phase: 'post_write' }, logger);
   }
   return { status: 'ok', previous, record: issued.record, plaintext: issued.plaintext };
+}
+
+/** Why `record` cannot be rotated now, or null when it can. */
+function rotationRefusal(record: PartnerKeyRecord): RotateResult | null {
+  if (record.rotatedTo !== undefined) {
+    return { status: 'already_rotated', rotatedTo: record.rotatedTo };
+  }
+  if (partnerKeyStatus(record, Date.now()) !== 'active') return { status: 'revoked' };
+  return null;
+}
+
+/**
+ * Our write survived: the stored old record names our key AND carries no
+ * revocation we did not write ourselves (a concurrent revoke that read after
+ * our write keeps rotatedTo but adds revokedAt — that revoke wins).
+ */
+function rotationHeld(
+  stored: PartnerKeyRecord | undefined,
+  written: PartnerKeyRecord,
+  newKeyId: string
+): boolean {
+  if (stored?.rotatedTo !== newKeyId) return false;
+  return stored.revokedAt === undefined || written.revokedAt !== undefined;
+}
+
+/** A concurrent writer won: revoke the key we issued and report a conflict. */
+async function abortRotation(
+  kv: KVNamespace,
+  issued: Issued,
+  context: { key_id: string; phase: string },
+  logger: RequestLogger
+): Promise<RotateResult> {
+  logger.warn('partner_key_rotation_conflict', { ...context, new_key_id: issued.record.id });
+  await revokeIssuedKey(kv, issued, logger);
+  return { status: 'conflict' };
 }
 
 /** Walk the id index, collecting the records carried as metadata. */

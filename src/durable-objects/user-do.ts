@@ -110,7 +110,7 @@ import {
 } from '../services/language/index.js';
 import {
   callerAllowsAudio,
-  isAdminClient,
+  callerIsAdmin,
   isValidLanguageCode,
   validateChatBody,
 } from '../utils/chat-validation.js';
@@ -3359,7 +3359,7 @@ export class UserDO {
   }
 
   private async resolvePrompts(body: ChatRequest, logger: RequestLogger) {
-    const isAdmin = isAdminClient(body.client_id);
+    const isAdmin = callerIsAdmin(body);
     const orgOverrides = body._org_prompt_overrides ?? {};
     const orgModes = body._org_modes ?? { modes: [] };
     const userSelectedMode = await this.getSelectedMode();
@@ -3858,7 +3858,7 @@ export class UserDO {
     activeModeName: string | undefined,
     body: ChatRequest
   ): ModeContext {
-    const isAdmin = isAdminClient(body.client_id);
+    const isAdmin = callerIsAdmin(body);
     const isGroupChat = this.isGroupChatType(body);
     return {
       availableModes: orgModes.modes.filter((m) => isModeVisible(m, { isGroupChat, isAdmin })),

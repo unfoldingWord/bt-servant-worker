@@ -295,11 +295,7 @@ app.use('/api/v1/admin/*', async (c, next) => {
 });
 
 /** The per-request values a chat handler takes from the auth middleware. */
-type ChatRequestContext = { principal: Principal; requestId: string; logger: RequestLogger };
-
-function chatRequestContext(c: Context<AppEnv>): ChatRequestContext {
-  return { principal: c.get('principal'), requestId: c.get('requestId'), logger: c.get('logger') };
-}
+type ChatRequestContext = AppEnv['Variables'];
 
 // Chat endpoints — explicit transport per route.
 //
@@ -315,15 +311,15 @@ function chatRequestContext(c: Context<AppEnv>): ChatRequestContext {
 // - POST /api/v1/chat/callback  → 202 + webhook delivery; requires
 //                                  progress_callback_url and message_key.
 app.post('/api/v1/chat', async (c) => {
-  return handleChatRequest(c.req.raw, c.env, 'final', chatRequestContext(c));
+  return handleChatRequest(c.req.raw, c.env, 'final', c.var);
 });
 
 app.post('/api/v1/chat/stream', async (c) => {
-  return handleChatRequest(c.req.raw, c.env, 'stream', chatRequestContext(c));
+  return handleChatRequest(c.req.raw, c.env, 'stream', c.var);
 });
 
 app.post('/api/v1/chat/callback', async (c) => {
-  return handleChatRequest(c.req.raw, c.env, 'callback', chatRequestContext(c));
+  return handleChatRequest(c.req.raw, c.env, 'callback', c.var);
 });
 
 // User endpoints with org scope (new paths)
@@ -1746,7 +1742,9 @@ app.post(PARTNER_KEYS_BASE, async (c) => {
       logger.warn('admin_action', { action: 'create_api_key', org, rejected: 'unknown_org' });
       return c.json({ error: unknownOrgMessage(org), code: 'unknown_org' }, 400);
     }
-    const { record, plaintext } = await createPartnerKey(c.env.API_KEYS, validated.input);
+    const { record, plaintext } = await createPartnerKey(c.env.API_KEYS, validated.input, {
+      logger,
+    });
     logger.log('admin_action', {
       action: 'create_api_key',
       key_id: record.id,
@@ -1815,11 +1813,13 @@ app.post(`${PARTNER_KEYS_BASE}/:keyId/_revoke`, async (c) => {
       ...ctx,
       org: result.record.org,
       already_revoked: result.alreadyRevoked,
+      revoked_ids: result.revokedIds,
       revoked_by: actor.revokedBy ?? null,
     });
     return c.json({
       key: toPublicPartnerKey(result.record),
       alreadyRevoked: result.alreadyRevoked,
+      revokedIds: result.revokedIds,
     });
   } catch (error) {
     logger.error('admin_action', error, ctx);
@@ -2602,6 +2602,12 @@ async function handleChatRequest(
     // A malformed body has no identifiers to hash, so there is no scope to be inside.
     return respondToChatRequestError(error, transport, timing, logger);
   }
+  // `null`, arrays and scalars are valid JSON but not a chat body; reject them
+  // here, for every caller, before anything dereferences a field.
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    const error = new ValidationError('Request body must be a JSON object');
+    return respondToChatRequestError(error, transport, timing, logger);
+  }
   // Partner bodies are rewritten (org forced, user_id namespaced) BEFORE the
   // pseudonym scope so telemetry hashes the namespaced id, not the raw one.
   const scoped = scopeChatBodyForPrincipal(parsed, principal, transport, logger);
@@ -2630,8 +2636,7 @@ async function handleChatRequest(
           logger,
           timing,
           requestId,
-          keyId: principalKeyId(principal),
-          caller: principal.kind,
+          principal,
         });
       } catch (error) {
         return respondToChatRequestError(error, transport, timing, logger);
@@ -2655,10 +2660,8 @@ type ChatDispatchParams = {
   logger: RequestLogger;
   timing: TimingContext;
   requestId: string;
-  /** Partner key id, or "internal" for ENGINE_API_KEY — for usage attribution in telemetry. */
-  keyId: string;
-  /** From the auth principal; the single source of the partner text-only rule downstream. */
-  caller: ChatCaller;
+  /** The auth principal: source of key_id (telemetry) and of `_caller` (partner rules downstream). */
+  principal: Principal;
 };
 
 /**
@@ -2667,7 +2670,9 @@ type ChatDispatchParams = {
  * scope a callback boundary; the behavior is unchanged.
  */
 async function dispatchChatRequest(params: ChatDispatchParams): Promise<Response> {
-  const { request, env, transport, body, logger, timing, requestId, keyId, caller } = params;
+  const { request, env, transport, body, logger, timing, requestId, principal } = params;
+  const caller: ChatCaller = principal.kind;
+  const keyId = principalKeyId(principal);
   const validationError = validateChatBody(body, transport, {
     callbackAvailable: caller !== 'partner',
   });

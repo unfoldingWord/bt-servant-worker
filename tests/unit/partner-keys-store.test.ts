@@ -30,7 +30,7 @@ import { createMockLogger } from '../helpers/mock-logger.js';
 const INPUT = { org: 'bcs', name: 'BCS prod', app: 'BCS app', createdBy: 'a@b.org' };
 
 async function seed(kv: FakeKV, org = 'bcs') {
-  return createPartnerKey(kv.asKV(), { ...INPUT, org });
+  return createPartnerKey(kv.asKV(), { ...INPUT, org }, { logger: createMockLogger() });
 }
 
 const allKeyIds = (records: PartnerKeyRecord[]): string[] => records.map((r) => r.id).sort();
@@ -205,5 +205,157 @@ describe('rotatePartnerKey grace window', () => {
       status: 'already_rotated',
       rotatedTo: first.status === 'ok' ? first.record.id : '',
     });
+  });
+});
+
+/** Read a stored record straight from the fake KV. */
+function stored(kv: FakeKV, hash: string): PartnerKeyRecord {
+  return JSON.parse(kv.store.get(`key:${hash}`)!.value) as PartnerKeyRecord;
+}
+
+/** Run `hook` once, right after the first put whose key matches `match`. */
+function afterFirstPut(kv: FakeKV, match: (key: string) => boolean, hook: () => void): void {
+  const realPut = kv.put.bind(kv);
+  let fired = false;
+  kv.put = async (key, value, opts) => {
+    await realPut(key, value, opts);
+    if (!fired && match(key)) {
+      fired = true;
+      hook();
+    }
+  };
+}
+
+const replacementOf = async (kv: FakeKV, oldId: string) =>
+  (await listPartnerKeys(kv.asKV(), 'bcs', createMockLogger())).find(
+    (r) => r.rotatedFrom === oldId
+  );
+
+describe('rotate vs concurrent revoke', () => {
+  it('aborts (409) when the old key is revoked while the new key is being issued', async () => {
+    const kv = new FakeKV();
+    const old = await seed(kv);
+    // The concurrent revoke lands right after the new key's index write.
+    afterFirstPut(
+      kv,
+      (key) => key.startsWith('id:') && key !== `id:${old.record.id}`,
+      () => {
+        const revoked = { ...stored(kv, old.hash), revokedAt: '2026-11-02T00:00:00.000Z' };
+        kv.store.set(`key:${old.hash}`, { value: JSON.stringify(revoked) });
+      }
+    );
+    const result = await rotatePartnerKey(kv.asKV(), old.record.id, {
+      graceSeconds: 3600,
+      logger: createMockLogger(),
+    });
+    expect(result.status).toBe('conflict');
+    expect(stored(kv, old.hash).revokedAt).toBeDefined();
+    expect(stored(kv, old.hash).rotatedTo).toBeUndefined();
+    expect((await replacementOf(kv, old.record.id))?.revokedAt).toBeDefined();
+  });
+
+  it('aborts (409) when a revoke lands after its write (rotatedTo kept, revokedAt added)', async () => {
+    const kv = new FakeKV();
+    const old = await seed(kv);
+    kv.afterPut(`key:${old.hash}`, () => {
+      const revoked = { ...stored(kv, old.hash), revokedAt: '2026-11-02T00:00:00.000Z' };
+      kv.store.set(`key:${old.hash}`, { value: JSON.stringify(revoked) });
+    });
+    const result = await rotatePartnerKey(kv.asKV(), old.record.id, {
+      graceSeconds: 3600,
+      logger: createMockLogger(),
+    });
+    expect(result.status).toBe('conflict');
+    expect(stored(kv, old.hash).revokedAt).toBeDefined();
+    expect((await replacementOf(kv, old.record.id))?.revokedAt).toBeDefined();
+  });
+});
+
+describe('revoke vs concurrent rotate', () => {
+  it('revoke re-applies revokedAt when a stale rotate write clobbers it', async () => {
+    const kv = new FakeKV();
+    const old = await seed(kv);
+    const beforeRevoke = stored(kv, old.hash);
+    const logger = createMockLogger();
+    // A rotate built from the pre-revoke read writes right after the revoke.
+    kv.afterPut(`key:${old.hash}`, () => {
+      const clobber = { ...beforeRevoke, rotatedTo: 'pk_00000000000000aa' };
+      kv.store.set(`key:${old.hash}`, { value: JSON.stringify(clobber) });
+    });
+    await revokePartnerKey(kv.asKV(), old.record.id, { logger });
+    expect(stored(kv, old.hash)).toMatchObject({
+      rotatedTo: 'pk_00000000000000aa',
+      revokedAt: expect.any(String),
+    });
+    expect(logger.warn).toHaveBeenCalledWith(
+      'partner_key_revoke_reapplied',
+      expect.objectContaining({ key_id: old.record.id })
+    );
+  });
+});
+
+describe('revoke kills the whole rotation chain', () => {
+  it('revoking the newest key also revokes every predecessor still in grace', async () => {
+    const kv = new FakeKV();
+    const a = await seed(kv);
+    const opts = { graceSeconds: 3600, logger: createMockLogger() };
+    const toB = await rotatePartnerKey(kv.asKV(), a.record.id, opts);
+    if (toB.status !== 'ok') throw new Error('rotate A failed');
+    const toC = await rotatePartnerKey(kv.asKV(), toB.record.id, opts);
+    if (toC.status !== 'ok') throw new Error('rotate B failed');
+
+    const result = await revokePartnerKey(kv.asKV(), toC.record.id, { logger: opts.logger });
+    expect(result?.revokedIds).toEqual([toC.record.id, toB.record.id, a.record.id]);
+    const now = Date.now();
+    for (const id of [a.record.id, toB.record.id, toC.record.id]) {
+      const found = await getPartnerKeyById(kv.asKV(), id);
+      expect(partnerKeyStatus(found!.record, now)).toBe('revoked');
+    }
+  });
+
+  it('leaves an already-dead predecessor alone', async () => {
+    const kv = new FakeKV();
+    const a = await seed(kv);
+    const toB = await rotatePartnerKey(kv.asKV(), a.record.id, {
+      graceSeconds: 0,
+      logger: createMockLogger(),
+    });
+    if (toB.status !== 'ok') throw new Error('rotate failed');
+    const result = await revokePartnerKey(kv.asKV(), toB.record.id, { logger: createMockLogger() });
+    expect(result?.revokedIds).toEqual([toB.record.id]);
+  });
+});
+
+describe('createPartnerKey index-write failure', () => {
+  const failIndexPuts = (kv: FakeKV) => {
+    const realPut = kv.put.bind(kv);
+    kv.put = async (key, value, opts) => {
+      if (key.startsWith('id:')) throw new Error('index down');
+      return realPut(key, value, opts);
+    };
+  };
+
+  it('deletes the unindexed key: record and rethrows', async () => {
+    const kv = new FakeKV();
+    failIndexPuts(kv);
+    await expect(
+      createPartnerKey(kv.asKV(), INPUT, { logger: createMockLogger() })
+    ).rejects.toThrow('index down');
+    expect([...kv.store.keys()]).toEqual([]);
+  });
+
+  it('logs partner_key_rotation_orphan when the cleanup delete also fails', async () => {
+    const kv = new FakeKV();
+    failIndexPuts(kv);
+    kv.delete = async () => {
+      throw new Error('delete down');
+    };
+    const logger = createMockLogger();
+    await expect(createPartnerKey(kv.asKV(), INPUT, { logger })).rejects.toThrow('index down');
+    expect(logger.error).toHaveBeenCalledWith(
+      'partner_key_rotation_orphan',
+      expect.any(Error),
+      expect.objectContaining({ new_key_id: expect.stringMatching(/^pk_/) })
+    );
   });
 });

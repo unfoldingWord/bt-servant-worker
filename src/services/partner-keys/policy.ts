@@ -109,11 +109,7 @@ function checkAudio(body: Record<string, unknown>): PartnerPolicyResult | null {
   const field =
     body.message_type === 'audio'
       ? 'message_type "audio"'
-      : isPresent(body.audio_base64)
-        ? AUDIO_INPUT_FIELDS[0]
-        : isPresent(body.audio_format)
-          ? AUDIO_INPUT_FIELDS[1]
-          : undefined;
+      : AUDIO_INPUT_FIELDS.find((name) => isPresent(Reflect.get(body, name)));
   if (field === undefined) return null;
   return reject(
     400,
@@ -139,7 +135,7 @@ function checkSubjectTypes(body: Record<string, unknown>): PartnerPolicyResult |
   if (typeof body.user_id !== 'string' || body.user_id.length === 0) {
     return reject(400, 'partner_user_id', 'user_id is required and must be a non-empty string');
   }
-  if (body.chat_id !== undefined && (typeof body.chat_id !== 'string' || !body.chat_id)) {
+  if (isPresent(body.chat_id) && (typeof body.chat_id !== 'string' || !body.chat_id)) {
     return reject(400, 'partner_chat_id', 'chat_id must be a non-empty string');
   }
   return null;
@@ -157,8 +153,9 @@ export function applyPartnerChatPolicy(body: unknown, key: PartnerKeyRecord): Pa
   const failure = checkForbiddenFields(raw) ?? checkOrg(raw, key.org) ?? checkSubjectTypes(raw);
   if (failure) return failure;
 
-  // org_id is replaced by the forced org; voice_format is ignored (no TTS for partners).
-  const { org_id: _orgId, voice_format: _voiceFormat, ...rest } = raw;
+  // org_id is replaced by the forced org; voice_format is ignored (no TTS for
+  // partners); chat_id is re-added below only when present (null = absent).
+  const { org_id: _orgId, voice_format: _voiceFormat, chat_id: _chatId, ...rest } = raw;
   const scoped: Record<string, unknown> = {
     ...rest,
     org: key.org,

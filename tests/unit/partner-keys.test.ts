@@ -178,6 +178,13 @@ describe('applyPartnerChatPolicy namespacing', () => {
     expect(result.body.chat_id).toBe(`partner:${KEY.userNamespace}:g1`);
   });
 
+  it('treats chat_id: null as absent (dropped, not namespaced, not refused)', () => {
+    const result = applyPartnerChatPolicy(chat({ chat_id: null }), KEY);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.body).not.toHaveProperty('chat_id');
+  });
+
   it('rejects a non-object body', () => {
     for (const body of [null, [], 'x']) {
       expect(applyPartnerChatPolicy(body, KEY)).toMatchObject({
