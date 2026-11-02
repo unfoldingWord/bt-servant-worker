@@ -132,13 +132,15 @@ export const MAX_PARTNER_SPEAKER_LENGTH = 64;
  * each can break a line in some renderer or model tokenizer.
  */
 const C1_AND_LINE_SEPARATORS = /[\u0080-\u009f\u2028\u2029]/g;
+/** Same set, non-global, for `.test()` (a /g regex keeps lastIndex between calls). */
+const HAS_C1_OR_LINE_SEPARATOR = /[\u0080-\u009f\u2028\u2029]/;
 
 /** True when `value` contains a C0/C1 control or any line-break character. */
 function hasControlOrLineBreak(value: string): boolean {
   return (
     stripControlChars(value) !== value ||
     /[\r\n\t]/.test(value) ||
-    new RegExp(C1_AND_LINE_SEPARATORS.source).test(value)
+    HAS_C1_OR_LINE_SEPARATOR.test(value)
   );
 }
 
