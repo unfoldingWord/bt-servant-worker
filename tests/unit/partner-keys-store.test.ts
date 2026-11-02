@@ -19,7 +19,11 @@ import {
   revokePartnerKey,
   rotatePartnerKey,
 } from '../../src/services/partner-keys/store.js';
-import { validatePartnerKeyCreate, type PartnerKeyRecord } from '../../src/types/partner-keys.js';
+import {
+  partnerKeyStatus,
+  validatePartnerKeyCreate,
+  type PartnerKeyRecord,
+} from '../../src/types/partner-keys.js';
 import { FakeKV } from '../helpers/fake-kv.js';
 import { createMockLogger } from '../helpers/mock-logger.js';
 
@@ -75,6 +79,7 @@ describe('metadata size', () => {
       scopes: ['chat'],
       userNamespace: 'pk_0123456789abcdef',
       revokedAt: '2026-11-02T00:00:00.000Z',
+      expiresAt: '2026-11-09T00:00:00.000Z',
       revokedBy: fill(120),
       rotatedFrom: 'pk_0123456789abcdef',
       rotatedTo: 'pk_0123456789abcdef',
@@ -97,9 +102,9 @@ describe('rotatePartnerKey failure handling', () => {
     const old = await seed(kv);
     kv.failPut(`key:${old.hash}`);
     const logger = createMockLogger();
-    await expect(rotatePartnerKey(kv.asKV(), old.record.id, { logger })).rejects.toThrow(
-      'injected put failure'
-    );
+    await expect(
+      rotatePartnerKey(kv.asKV(), old.record.id, { graceSeconds: 0, logger })
+    ).rejects.toThrow('injected put failure');
 
     const stillOld = await getPartnerKeyById(kv.asKV(), old.record.id);
     expect(stillOld?.record.revokedAt).toBeUndefined();
@@ -125,7 +130,9 @@ describe('rotatePartnerKey failure handling', () => {
       return realPut(key, value, opts);
     };
     const logger = createMockLogger();
-    await expect(rotatePartnerKey(kv.asKV(), old.record.id, { logger })).rejects.toThrow();
+    await expect(
+      rotatePartnerKey(kv.asKV(), old.record.id, { graceSeconds: 0, logger })
+    ).rejects.toThrow();
     expect(logger.error).toHaveBeenCalledWith(
       'partner_key_rotation_orphan',
       expect.any(Error),
@@ -145,11 +152,58 @@ describe('rotatePartnerKey concurrency', () => {
       kv.store.set(`key:${old.hash}`, { value: JSON.stringify({ ...rest, revokedBy: 'other' }) });
     });
     const result = await rotatePartnerKey(kv.asKV(), old.record.id, {
+      graceSeconds: 0,
       logger: createMockLogger(),
     });
     expect(result.status).toBe('conflict');
     const all = await listPartnerKeys(kv.asKV(), 'bcs', createMockLogger());
     const replacement = all.find((r) => r.rotatedFrom === old.record.id);
     expect(replacement?.revokedAt).toBeDefined();
+  });
+});
+
+describe('rotatePartnerKey grace window', () => {
+  it('keeps the old key active until expiresAt = now + grace, then it is expired', async () => {
+    const kv = new FakeKV();
+    const old = await seed(kv);
+    const result = await rotatePartnerKey(kv.asKV(), old.record.id, {
+      graceSeconds: 3600,
+      logger: createMockLogger(),
+    });
+    expect(result.status).toBe('ok');
+    if (result.status !== 'ok') return;
+    const { previous } = result;
+    expect(previous.revokedAt).toBeUndefined();
+    expect(previous.rotatedTo).toBe(result.record.id);
+    const expiresAt = Date.parse(previous.expiresAt ?? '');
+    expect(expiresAt - Date.parse(result.record.createdAt)).toBe(3600 * 1000);
+    expect(partnerKeyStatus(previous, expiresAt - 1)).toBe('active');
+    expect(partnerKeyStatus(previous, expiresAt)).toBe('expired');
+  });
+
+  it('grace 0 revokes the old key immediately', async () => {
+    const kv = new FakeKV();
+    const old = await seed(kv);
+    const result = await rotatePartnerKey(kv.asKV(), old.record.id, {
+      graceSeconds: 0,
+      createdBy: 'ops@b.org',
+      logger: createMockLogger(),
+    });
+    expect(result).toMatchObject({ status: 'ok', previous: { revokedBy: 'ops@b.org' } });
+    if (result.status !== 'ok') return;
+    expect(result.previous.expiresAt).toBeUndefined();
+    expect(partnerKeyStatus(result.previous, Date.now())).toBe('revoked');
+  });
+
+  it('refuses to rotate a key that was already rotated (still in grace)', async () => {
+    const kv = new FakeKV();
+    const old = await seed(kv);
+    const opts = { graceSeconds: 3600, logger: createMockLogger() };
+    const first = await rotatePartnerKey(kv.asKV(), old.record.id, opts);
+    const second = await rotatePartnerKey(kv.asKV(), old.record.id, opts);
+    expect(second).toEqual({
+      status: 'already_rotated',
+      rotatedTo: first.status === 'ok' ? first.record.id : '',
+    });
   });
 });

@@ -68,15 +68,23 @@ function reject(status: 400 | 403, reason: string, error: string): PartnerPolicy
 }
 
 /**
+ * True when a body field is present with a value. `null` counts as absent,
+ * matching resolveOrgFromBody (`??`) and validateVoiceFormat (null = default).
+ */
+function isPresent(value: unknown): boolean {
+  return value !== undefined && value !== null;
+}
+
+/**
  * Org forcing. A body may omit org (the key's org applies) or name the key's
  * org; any other value is a 400 rather than a silent override, so a partner
  * that believes it is talking to org X never quietly gets org Y's config.
  */
 function checkOrg(body: Record<string, unknown>, keyOrg: string): PartnerPolicyResult | null {
   const mismatched =
-    body.org !== undefined && body.org !== keyOrg
+    isPresent(body.org) && body.org !== keyOrg
       ? 'org'
-      : body.org_id !== undefined && body.org_id !== keyOrg
+      : isPresent(body.org_id) && body.org_id !== keyOrg
         ? 'org_id'
         : null;
   if (mismatched === null) return null;
@@ -88,18 +96,24 @@ function checkOrg(body: Record<string, unknown>, keyOrg: string): PartnerPolicyR
 }
 
 /**
- * Body fields that request audio in or audio out. A voice message is
- * transcribed, archived under /api/v1/voice-submissions/* and answered with a
- * TTS URL under /api/v1/audio/*; a partner key cannot fetch either route, so
- * the request is refused up front instead of returning URLs that 403.
+ * Body fields that send audio IN. Partner keys are text-only (by default,
+ * 2026-11-02): a voice message would be transcribed, archived under
+ * /api/v1/voice-submissions/* and answered with TTS, none of which a partner
+ * key can use, so the request is refused up front. `voice_format` only shapes
+ * audio OUT, which partners never get (callerAllowsAudio), so it is dropped
+ * rather than refused — see applyPartnerChatPolicy.
  */
-const AUDIO_FIELDS = ['audio_base64', 'audio_format', 'voice_format'] as const;
+const AUDIO_INPUT_FIELDS = ['audio_base64', 'audio_format'] as const;
 
 function checkAudio(body: Record<string, unknown>): PartnerPolicyResult | null {
   const field =
     body.message_type === 'audio'
       ? 'message_type "audio"'
-      : AUDIO_FIELDS.find((f) => Object.prototype.hasOwnProperty.call(body, f));
+      : isPresent(body.audio_base64)
+        ? AUDIO_INPUT_FIELDS[0]
+        : isPresent(body.audio_format)
+          ? AUDIO_INPUT_FIELDS[1]
+          : undefined;
   if (field === undefined) return null;
   return reject(
     400,
@@ -143,7 +157,8 @@ export function applyPartnerChatPolicy(body: unknown, key: PartnerKeyRecord): Pa
   const failure = checkForbiddenFields(raw) ?? checkOrg(raw, key.org) ?? checkSubjectTypes(raw);
   if (failure) return failure;
 
-  const { org_id: _orgId, ...rest } = raw;
+  // org_id is replaced by the forced org; voice_format is ignored (no TTS for partners).
+  const { org_id: _orgId, voice_format: _voiceFormat, ...rest } = raw;
   const scoped: Record<string, unknown> = {
     ...rest,
     org: key.org,

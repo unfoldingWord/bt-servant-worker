@@ -18,7 +18,9 @@
  *
  * Consistency: KV is eventually consistent and the auth lookup caches for
  * AUTH_LOOKUP_CACHE_TTL_SECONDS, so a revocation can take about a minute to
- * be seen everywhere (portal#354 question 5). KV also has no compare-and-swap;
+ * be seen everywhere (portal#354 question 5). Rotation-grace expiry is exact,
+ * not delayed: the record is unchanged at `expiresAt`, and auth compares it
+ * with the clock on every request. KV also has no compare-and-swap;
  * see rotatePartnerKey for what that means for concurrent admin writes.
  */
 
@@ -195,6 +197,7 @@ export async function revokePartnerKey(
 export type RotateResult =
   | { status: 'not_found' }
   | { status: 'revoked' }
+  | { status: 'already_rotated'; rotatedTo: string }
   | { status: 'conflict' }
   | { status: 'ok'; previous: PartnerKeyRecord; record: PartnerKeyRecord; plaintext: string };
 
@@ -219,6 +222,30 @@ async function revokeIssuedKey(kv: KVNamespace, issued: Issued, logger: RequestL
   }
 }
 
+/**
+ * The old key's record after rotation: linked to its replacement and either
+ * expiring after the grace window or revoked now (grace 0).
+ */
+function retiredRecord(
+  old: PartnerKeyRecord,
+  replacement: PartnerKeyRecord,
+  opts: { createdBy?: string | undefined; graceSeconds: number }
+): PartnerKeyRecord {
+  const now = Date.parse(replacement.createdAt);
+  const end =
+    opts.graceSeconds === 0
+      ? { revokedAt: replacement.createdAt }
+      : { expiresAt: new Date(now + opts.graceSeconds * 1000).toISOString() };
+  return {
+    ...old,
+    ...end,
+    rotatedTo: replacement.id,
+    ...(opts.graceSeconds === 0 && opts.createdBy !== undefined
+      ? { revokedBy: opts.createdBy }
+      : {}),
+  };
+}
+
 /** Issue the replacement for `old`, inheriting its metadata and user namespace. */
 function issueReplacement(kv: KVNamespace, old: PartnerKeyRecord, createdBy?: string) {
   return createPartnerKey(
@@ -237,11 +264,17 @@ function issueReplacement(kv: KVNamespace, old: PartnerKeyRecord, createdBy?: st
 
 /**
  * Rotate: issue a new key with the same metadata (and the same user namespace,
- * so the partner's users keep their history), then revoke the old one.
+ * so the partner's users keep their history), then retire the old one.
+ *
+ * Grace: with `graceSeconds > 0` the old key gets `expiresAt = now + grace`
+ * and keeps working until then, so the partner can ship the new key without
+ * an outage; auth treats it as expired afterwards (partnerKeyStatus). With
+ * `graceSeconds === 0` the old key is revoked at once ("rotate and kill now").
+ * A key that was already rotated cannot be rotated again (409).
  *
  * Order and failure handling:
  * - The new key is written first. If that fails, nothing changed.
- * - Then the old key is marked revoked + `rotatedTo`. If THAT write fails, the
+ * - Then the old key is marked retired + `rotatedTo`. If THAT write fails, the
  *   new key is revoked again (compensation) and the error is re-thrown: the
  *   old key stays active and unchanged, and the rotation can simply be retried.
  * - Worst case: the old-key write AND the compensation both fail. Then one
@@ -261,21 +294,17 @@ function issueReplacement(kv: KVNamespace, old: PartnerKeyRecord, createdBy?: st
 export async function rotatePartnerKey(
   kv: KVNamespace,
   id: string,
-  opts: { createdBy?: string | undefined; logger: RequestLogger }
+  opts: { createdBy?: string | undefined; graceSeconds: number; logger: RequestLogger }
 ): Promise<RotateResult> {
   const { createdBy, logger } = opts;
   const found = await getPartnerKeyById(kv, id);
   if (!found) return { status: 'not_found' };
   const old = found.record;
   if (old.revokedAt !== undefined) return { status: 'revoked' };
+  if (old.rotatedTo !== undefined) return { status: 'already_rotated', rotatedTo: old.rotatedTo };
 
   const issued = await issueReplacement(kv, old, createdBy);
-  const previous: PartnerKeyRecord = {
-    ...old,
-    revokedAt: issued.record.createdAt,
-    rotatedTo: issued.record.id,
-    ...(createdBy !== undefined ? { revokedBy: createdBy } : {}),
-  };
+  const previous = retiredRecord(old, issued.record, opts);
   try {
     await updateRecord(kv, found.hash, previous, logger);
   } catch (error) {

@@ -89,10 +89,14 @@ import {
   looksLikePartnerKey,
   revokePartnerKey,
   rotatePartnerKey,
+  type RotateResult,
 } from './services/partner-keys/store.js';
+import { orgHasConfig } from './services/partner-keys/org-exists.js';
 import {
   type PartnerKeyRecord,
-  readOptionalActor,
+  partnerKeyStatus,
+  readRevokeBody,
+  readRotateBody,
   toPublicPartnerKey,
   validatePartnerKeyCreate,
   validatePartnerKeyOrg,
@@ -118,8 +122,9 @@ export const UserDO = instrumentDO(UserDOClass, resolveTelemetryConfig);
 
 /**
  * Hono env: bindings plus what the `/api/*` auth middleware sets per request:
- * the principal, and the request id + logger that every downstream log line
- * for that request (auth, admin routes, chat) shares for correlation.
+ * the principal, and a request id + logger. Today only the auth path, the
+ * `/api/v1/admin/api-keys` routes and the chat handler use that logger; the
+ * other admin handlers still mint their own (to be converted, see PR #475).
  */
 type AppEnv = {
   Bindings: Env;
@@ -172,6 +177,15 @@ app.get('/health', (c) => c.json({ status: 'healthy', version: APP_VERSION }));
 // Bucket: PTXPRINT_BUCKET (defined in wrangler.toml).
 app.get('/public/ptxprint/*', async (c) => servePublicPtxprintObject(c.req.path, c.env));
 
+/**
+ * Rejections of a VALID partner key that is used outside its scope: the key
+ * is real, so "Invalid API key" would be misleading.
+ */
+const NOT_PERMITTED_REASONS: ReadonlySet<string> = new Set([
+  'partner_route_forbidden',
+  'partner_admin_forbidden',
+]);
+
 /** Observable auth rejection: one log line + one counter, never the token value. */
 function rejectAuth(
   c: Context<AppEnv>,
@@ -190,7 +204,7 @@ function rejectAuth(
   const error =
     status === 401
       ? 'Authorization header with Bearer token required'
-      : reason === 'partner_route_forbidden'
+      : NOT_PERMITTED_REASONS.has(reason)
         ? 'This API key is not permitted to call this endpoint'
         : 'Invalid API key';
   return c.json({ error }, status);
@@ -223,8 +237,11 @@ async function authenticatePartner(
     };
   }
   if (!key) return { ok: false, response: rejectAuth(c, 403, 'unknown_partner_key') };
-  if (key.revokedAt !== undefined) {
-    return { ok: false, response: rejectAuth(c, 403, 'revoked_partner_key', { key_id: key.id }) };
+  const status = partnerKeyStatus(key, Date.now());
+  if (status !== 'active') {
+    // revoked_partner_key | expired_partner_key (past its rotation grace)
+    const reason = `${status}_partner_key`;
+    return { ok: false, response: rejectAuth(c, 403, reason, { key_id: key.id }) };
   }
   return { ok: true, key };
 }
@@ -239,8 +256,9 @@ async function authenticatePartner(
 // (auth_rejected + reason) and counted.
 app.use('/api/*', async (c, next) => {
   // The request's id and logger are minted HERE, once, and shared through the
-  // context by everything after auth (admin routes, chat), so an auth line and
-  // the handler lines for one request carry the same request_id.
+  // context with the auth path, the /api/v1/admin/api-keys routes and the chat
+  // handler, so their lines for one request carry the same request_id. Other
+  // admin handlers still create their own logger (pre-existing; follow-up).
   const requestId = crypto.randomUUID();
   c.set('requestId', requestId);
   c.set('logger', createRequestLogger(requestId));
@@ -1711,6 +1729,10 @@ app.get('/api/v1/admin/do/:hexId/snapshot', async (c) => {
 
 const PARTNER_KEYS_BASE = '/api/v1/admin/api-keys';
 
+function unknownOrgMessage(org: string): string {
+  return `Org '${org}' has no configuration in this worker (check the spelling). Pass "allow_new_org": true to create a key for an org that is not configured yet.`;
+}
+
 app.post(PARTNER_KEYS_BASE, async (c) => {
   const logger = c.get('logger');
   const parsed = await readJsonBody(c.req.raw, logger, { action: 'create_api_key' });
@@ -1719,6 +1741,11 @@ app.post(PARTNER_KEYS_BASE, async (c) => {
   if (!validated.ok) return c.json({ error: validated.error }, 400);
 
   try {
+    const { org } = validated.input;
+    if (!validated.allowNewOrg && !(await orgHasConfig(c.env, org))) {
+      logger.warn('admin_action', { action: 'create_api_key', org, rejected: 'unknown_org' });
+      return c.json({ error: unknownOrgMessage(org), code: 'unknown_org' }, 400);
+    }
     const { record, plaintext } = await createPartnerKey(c.env.API_KEYS, validated.input);
     logger.log('admin_action', {
       action: 'create_api_key',
@@ -1748,7 +1775,7 @@ app.get(PARTNER_KEYS_BASE, async (c) => {
       org: org ?? null,
       count: records.length,
     });
-    return c.json({ org: org ?? null, keys: records.map(toPublicPartnerKey) });
+    return c.json({ org: org ?? null, keys: records.map((r) => toPublicPartnerKey(r)) });
   } catch (error) {
     logger.error('admin_action', error, { action: 'list_api_keys', org: org ?? null });
     return c.json({ error: 'Failed to list API keys' }, 500);
@@ -1775,12 +1802,12 @@ app.post(`${PARTNER_KEYS_BASE}/:keyId/_revoke`, async (c) => {
   const ctx = { action: 'revoke_api_key', key_id: keyId };
   const parsed = await readJsonBody(c.req.raw, logger, ctx, { allowEmpty: true });
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
-  const actor = readOptionalActor(parsed.body, 'revokedBy');
+  const actor = readRevokeBody(parsed.body);
   if (!actor.ok) return c.json({ error: actor.error }, 400);
 
   try {
     const result = await revokePartnerKey(c.env.API_KEYS, keyId, {
-      revokedBy: actor.actor,
+      revokedBy: actor.revokedBy,
       logger,
     });
     if (!result) return c.json({ error: 'API key not found' }, 404);
@@ -1788,7 +1815,7 @@ app.post(`${PARTNER_KEYS_BASE}/:keyId/_revoke`, async (c) => {
       ...ctx,
       org: result.record.org,
       already_revoked: result.alreadyRevoked,
-      revoked_by: actor.actor ?? null,
+      revoked_by: actor.revokedBy ?? null,
     });
     return c.json({
       key: toPublicPartnerKey(result.record),
@@ -1806,22 +1833,19 @@ app.post(`${PARTNER_KEYS_BASE}/:keyId/_rotate`, async (c) => {
   const ctx = { action: 'rotate_api_key', key_id: keyId };
   const parsed = await readJsonBody(c.req.raw, logger, ctx, { allowEmpty: true });
   if (!parsed.ok) return c.json({ error: parsed.error }, 400);
-  const actor = readOptionalActor(parsed.body, 'createdBy');
-  if (!actor.ok) return c.json({ error: actor.error }, 400);
+  const body = readRotateBody(parsed.body);
+  if (!body.ok) return c.json({ error: body.error }, 400);
 
   try {
-    const result = await rotatePartnerKey(c.env.API_KEYS, keyId, {
-      createdBy: actor.actor,
-      logger,
+    const result = await rotatePartnerKey(c.env.API_KEYS, keyId, { ...body, logger });
+    if (result.status !== 'ok') return rotateRefusal(c, result);
+    logger.log('admin_action', {
+      ...ctx,
+      org: result.record.org,
+      new_key_id: result.record.id,
+      grace_seconds: body.graceSeconds,
+      old_expires_at: result.previous.expiresAt ?? null,
     });
-    if (result.status === 'not_found') return c.json({ error: 'API key not found' }, 404);
-    if (result.status === 'revoked') {
-      return c.json({ error: 'A revoked API key cannot be rotated; create a new key' }, 409);
-    }
-    if (result.status === 'conflict') {
-      return c.json({ error: 'This key was changed concurrently; reload it and retry' }, 409);
-    }
-    logger.log('admin_action', { ...ctx, org: result.record.org, new_key_id: result.record.id });
     return c.json({
       key: toPublicPartnerKey(result.record),
       previous: toPublicPartnerKey(result.previous),
@@ -1832,6 +1856,23 @@ app.post(`${PARTNER_KEYS_BASE}/:keyId/_rotate`, async (c) => {
     return c.json({ error: 'Failed to rotate API key' }, 500);
   }
 });
+
+/** HTTP response for a rotation that did not happen. */
+function rotateRefusal(c: Context<AppEnv>, result: Exclude<RotateResult, { status: 'ok' }>) {
+  switch (result.status) {
+    case 'not_found':
+      return c.json({ error: 'API key not found' }, 404);
+    case 'revoked':
+      return c.json({ error: 'A revoked API key cannot be rotated; create a new key' }, 409);
+    case 'already_rotated':
+      return c.json(
+        { error: `This key was already rotated to ${result.rotatedTo}; rotate that key instead` },
+        409
+      );
+    case 'conflict':
+      return c.json({ error: 'This key was changed concurrently; reload it and retry' }, 409);
+  }
+}
 
 // ── Group/thread admin helpers ──────────────────────────────────────────────────
 

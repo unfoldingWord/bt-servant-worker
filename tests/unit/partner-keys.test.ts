@@ -19,7 +19,11 @@ import {
 } from '../../src/services/partner-keys/store.js';
 import { validateChatBody } from '../../src/utils/chat-validation.js';
 import {
-  readOptionalActor,
+  DEFAULT_ROTATION_GRACE_SECONDS,
+  MAX_ROTATION_GRACE_SECONDS,
+  partnerKeyStatus,
+  readRevokeBody,
+  readRotateBody,
   toPublicPartnerKey,
   validatePartnerKeyCreate,
   type PartnerKeyRecord,
@@ -102,6 +106,14 @@ describe('applyPartnerChatPolicy', () => {
       expect(result.rejection.reason).toBe('partner_org_mismatch');
     }
   );
+
+  it('treats org: null and org_id: null as absent (key org applies)', () => {
+    const result = applyPartnerChatPolicy(chat({ org: null, org_id: null }), KEY);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.body.org).toBe('bcs');
+    expect(result.body.org_id).toBeUndefined();
+  });
 });
 
 describe('applyPartnerChatPolicy refusals', () => {
@@ -113,19 +125,34 @@ describe('applyPartnerChatPolicy refusals', () => {
     });
   });
 
-  it.each([
-    [{ message_type: 'audio' }],
-    [{ audio_base64: 'AAAA' }],
-    [{ audio_format: 'ogg' }],
-    [{ voice_format: 'opus' }],
-    [{ voice_format: null }],
-  ])('refuses audio requests with 400 (%o)', (fields) => {
-    const result = applyPartnerChatPolicy(chat(fields), KEY);
-    expect(result).toMatchObject({
-      ok: false,
-      rejection: { status: 400, reason: 'partner_audio' },
-    });
-  });
+  it.each([[{ message_type: 'audio' }], [{ audio_base64: 'AAAA' }], [{ audio_format: 'ogg' }]])(
+    'refuses audio input with 400 (%o)',
+    (fields) => {
+      const result = applyPartnerChatPolicy(chat(fields), KEY);
+      expect(result).toMatchObject({
+        ok: false,
+        rejection: { status: 400, reason: 'partner_audio' },
+      });
+    }
+  );
+
+  it.each([{ audio_format: null }, { audio_base64: null }])(
+    'treats a null audio input field as absent (%o)',
+    (fields) => {
+      expect(applyPartnerChatPolicy(chat(fields), KEY).ok).toBe(true);
+    }
+  );
+
+  it.each(['opus', 'aac', 'not-a-format', null])(
+    'ignores voice_format (%o): dropped, not refused, since partners get no TTS',
+    (voiceFormat) => {
+      const result = applyPartnerChatPolicy(chat({ voice_format: voiceFormat }), KEY);
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.body).not.toHaveProperty('voice_format');
+      expect(validateChatBody(result.body, 'final')).toBeNull();
+    }
+  );
 
   it('leaves progress_callback_url to validateChatBody, which already rejects it', () => {
     // Not a partner rule on purpose: /chat and /chat/stream (the only partner
@@ -196,8 +223,17 @@ describe('validatePartnerKeyCreate', () => {
     const result = validatePartnerKeyCreate(valid);
     expect(result).toEqual({
       ok: true,
+      allowNewOrg: false,
       input: { org: 'bcs', name: 'BCS prod', app: 'BCS app', createdBy: 'a@b.org' },
     });
+  });
+
+  it('reads allow_new_org as a boolean only', () => {
+    expect(validatePartnerKeyCreate({ ...valid, allow_new_org: true })).toMatchObject({
+      ok: true,
+      allowNewOrg: true,
+    });
+    expect(validatePartnerKeyCreate({ ...valid, allow_new_org: 'yes' }).ok).toBe(false);
   });
 
   it('normalises termsAcceptedAt and keeps termsVersion', () => {
@@ -229,14 +265,49 @@ describe('validatePartnerKeyCreate', () => {
   });
 });
 
-describe('readOptionalActor', () => {
-  it('accepts an empty body or the named actor, rejects others', () => {
-    expect(readOptionalActor(undefined, 'revokedBy')).toEqual({ ok: true });
-    expect(readOptionalActor({ revokedBy: 'x@y.org' }, 'revokedBy')).toEqual({
+describe('readRevokeBody / readRotateBody', () => {
+  it('revoke: empty body or revokedBy; anything else is rejected', () => {
+    expect(readRevokeBody(undefined)).toEqual({ ok: true });
+    expect(readRevokeBody({ revokedBy: 'x@y.org' })).toEqual({ ok: true, revokedBy: 'x@y.org' });
+    expect(readRevokeBody({ other: 1 }).ok).toBe(false);
+  });
+
+  it('rotate: grace defaults to 7 days, allows 0, bounds the max', () => {
+    expect(readRotateBody(undefined)).toEqual({
       ok: true,
-      actor: 'x@y.org',
+      graceSeconds: DEFAULT_ROTATION_GRACE_SECONDS,
     });
-    expect(readOptionalActor({ other: 1 }, 'revokedBy').ok).toBe(false);
+    expect(DEFAULT_ROTATION_GRACE_SECONDS).toBe(604800);
+    expect(readRotateBody({ graceSeconds: 0, createdBy: 'a@b.org' })).toEqual({
+      ok: true,
+      graceSeconds: 0,
+      createdBy: 'a@b.org',
+    });
+    expect(readRotateBody({ graceSeconds: MAX_ROTATION_GRACE_SECONDS }).ok).toBe(true);
+    // null means "use the default", like the other optional fields.
+    expect(readRotateBody({ graceSeconds: null })).toMatchObject({
+      ok: true,
+      graceSeconds: DEFAULT_ROTATION_GRACE_SECONDS,
+    });
+    for (const bad of [MAX_ROTATION_GRACE_SECONDS + 1, -1, 1.5, '60']) {
+      expect(readRotateBody({ graceSeconds: bad }).ok).toBe(false);
+    }
+  });
+});
+
+describe('partnerKeyStatus', () => {
+  const now = Date.parse('2026-11-02T12:00:00.000Z');
+  it('is active before expiresAt, expired from it, revoked whenever revokedAt is set', () => {
+    expect(partnerKeyStatus({ ...KEY, expiresAt: '2026-11-02T12:00:01.000Z' }, now)).toBe('active');
+    expect(partnerKeyStatus({ ...KEY, expiresAt: '2026-11-02T12:00:00.000Z' }, now)).toBe(
+      'expired'
+    );
+    expect(
+      partnerKeyStatus(
+        { ...KEY, expiresAt: '2026-11-03T00:00:00.000Z', revokedAt: '2026-11-02T00:00:00.000Z' },
+        now
+      )
+    ).toBe('revoked');
   });
 });
 
@@ -250,5 +321,7 @@ describe('toPublicPartnerKey', () => {
     expect(toPublicPartnerKey({ ...KEY, revokedAt: '2026-11-03T00:00:00.000Z' }).status).toBe(
       'revoked'
     );
+    const expired = toPublicPartnerKey({ ...KEY, expiresAt: '2026-01-01T00:00:00.000Z' });
+    expect(expired).toMatchObject({ status: 'expired', expiresAt: '2026-01-01T00:00:00.000Z' });
   });
 });

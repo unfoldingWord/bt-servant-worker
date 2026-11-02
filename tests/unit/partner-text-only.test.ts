@@ -51,6 +51,14 @@ describe('audio tools for text-only callers', () => {
     expect(names).toEqual(expected);
   });
 
+  it('leaves out the internal-tools parenthetical when no internal tool remains', () => {
+    // Text-only caller + suppress_memory: nothing left to name.
+    const description = buildExecuteCodeTool({ hasAudio: false, hasMemory: false }).description;
+    expect(description).toContain('Function constructor, internal tools\n');
+    expect(description).not.toContain('( —');
+    expect(description).not.toContain('call these directly');
+  });
+
   it('execute_code guidance stops naming the audio tools', () => {
     const textOnly = buildExecuteCodeTool({ hasAudio: false }).description ?? '';
     for (const audioTool of AUDIO_TOOL_NAMES) expect(textOnly).not.toContain(audioTool);

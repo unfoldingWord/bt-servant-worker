@@ -55,6 +55,8 @@ async function createKey(org: string, extra: Record<string, unknown> = {}): Prom
       name: 'Test key',
       app: 'Test app',
       createdBy: 'tester@example.org',
+      // Test orgs have no config; the unknown-org check has its own suite below.
+      allow_new_org: true,
       ...extra,
     }),
   });
@@ -235,15 +237,31 @@ describe('admin CRUD: revoke', () => {
   });
 });
 
-describe('admin CRUD: rotate', () => {
-  it('rotate revokes the old key, issues a new one, and keeps the user namespace', async () => {
+const rotateKey = (keyId: string, body?: unknown) =>
+  SELF.fetch(`${KEYS}/${keyId}/_rotate`, {
+    method: 'POST',
+    headers: JSON_INTERNAL,
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+
+/** Move a stored key's grace end into the past, as if the window had elapsed. */
+async function elapseGrace(apiKey: string): Promise<void> {
+  const name = `key:${await sha256Hex(apiKey)}`;
+  const record = await env.API_KEYS.get<Record<string, unknown>>(name, 'json');
+  await env.API_KEYS.put(
+    name,
+    JSON.stringify({ ...record, expiresAt: '2026-01-01T00:00:00.000Z' })
+  );
+}
+
+type RotateBody = CreateBody & { previous: PublicPartnerKey };
+
+describe('admin CRUD: rotate with grace', () => {
+  it('issues a new key with the same metadata; the old key works until its grace ends', async () => {
     const { key, apiKey } = await createKey('org-354-rotate');
-    const rotate = await SELF.fetch(`${KEYS}/${key.id}/_rotate`, {
-      method: 'POST',
-      headers: INTERNAL,
-    });
+    const rotate = await rotateKey(key.id);
     expect(rotate.status).toBe(200);
-    const rotated = (await rotate.json()) as CreateBody & { previous: PublicPartnerKey };
+    const rotated = (await rotate.json()) as RotateBody;
     expect(rotated.apiKey).not.toBe(apiKey);
     expect(rotated.key).toMatchObject({
       status: 'active',
@@ -252,16 +270,65 @@ describe('admin CRUD: rotate', () => {
       name: key.name,
       org: key.org,
     });
-    expect(rotated.previous).toMatchObject({ status: 'revoked', rotatedTo: rotated.key.id });
+    // Default grace: 7 days.
+    const graceMs =
+      Date.parse(rotated.previous.expiresAt ?? '') - Date.parse(rotated.key.createdAt);
+    expect(graceMs).toBe(7 * 24 * 60 * 60 * 1000);
+    expect(rotated.previous).toMatchObject({ status: 'active', rotatedTo: rotated.key.id });
 
-    expect((await postChat(apiKey, chatBody())).status).toBe(403);
+    expect((await postChat(apiKey, chatBody())).status).toBe(200);
     expect((await postChat(rotated.apiKey, chatBody())).status).toBe(200);
 
-    const again = await SELF.fetch(`${KEYS}/${key.id}/_rotate`, {
-      method: 'POST',
-      headers: INTERNAL,
+    await elapseGrace(apiKey);
+    expect((await postChat(apiKey, chatBody())).status).toBe(403);
+    expect(findLog(capture.warnLogs, 'auth_rejected')?.payload).toMatchObject({
+      reason: 'expired_partner_key',
+      key_id: key.id,
     });
-    expect(again.status).toBe(409);
+    expect((await postChat(rotated.apiKey, chatBody())).status).toBe(200);
+  });
+
+  it('graceSeconds 0 kills the old key immediately; a rotated key cannot be rotated again', async () => {
+    const { key, apiKey } = await createKey('org-354-rotate-now');
+    const rotate = await rotateKey(key.id, { graceSeconds: 0 });
+    expect(rotate.status).toBe(200);
+    const rotated = (await rotate.json()) as RotateBody;
+    expect(rotated.previous).toMatchObject({ status: 'revoked' });
+    expect((await postChat(apiKey, chatBody())).status).toBe(403);
+    expect((await postChat(rotated.apiKey, chatBody())).status).toBe(200);
+    expect((await rotateKey(key.id)).status).toBe(409);
+    expect((await rotateKey(rotated.key.id, { graceSeconds: 31 * 24 * 3600 })).status).toBe(400);
+  });
+});
+
+describe('admin CRUD: org check on create', () => {
+  const post = (org: string, extra: Record<string, unknown> = {}) =>
+    SELF.fetch(KEYS, {
+      method: 'POST',
+      headers: JSON_INTERNAL,
+      body: JSON.stringify({ org, name: 'n', app: 'a', createdBy: 'c@d.org', ...extra }),
+    });
+
+  it('refuses an org with no configuration unless allow_new_org is true', async () => {
+    const res = await post('org-354-typo');
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ code: 'unknown_org' });
+    expect((await post('org-354-typo', { allow_new_org: true })).status).toBe(201);
+  });
+
+  it('accepts a configured org and the default org', async () => {
+    await env.ORG_CONFIG.put('org-354-known', JSON.stringify({}));
+    await env.PROMPT_OVERRIDES.put('org-354-known-modes-only:modes', JSON.stringify({ modes: [] }));
+    try {
+      expect((await post('org-354-known')).status).toBe(201);
+      expect((await post('org-354-known-modes-only')).status).toBe(201);
+      expect((await post('unfoldingWord')).status).toBe(201);
+      // A prefix match is not an org: 'org-354-kno' has no keys of its own.
+      expect((await post('org-354-kno')).status).toBe(400);
+    } finally {
+      await env.ORG_CONFIG.delete('org-354-known');
+      await env.PROMPT_OVERRIDES.delete('org-354-known-modes-only:modes');
+    }
   });
 });
 
@@ -315,17 +382,15 @@ describe('partner key on chat: refusals', () => {
     expect(capture.calls).toHaveLength(0);
   });
 
-  it('refuses audio requests up front (their reply URLs are not reachable)', async () => {
+  it('refuses audio input up front; ignores voice_format and null audio fields', async () => {
     const { apiKey } = await createKey('org-354-audio');
-    for (const fields of [
-      { message_type: 'audio', audio_base64: 'AAAA' },
-      { voice_format: 'aac' },
-    ]) {
-      const res = await postChat(apiKey, chatBody(fields));
-      expect(res.status).toBe(400);
-      expect(((await res.json()) as { error: string }).error).toContain('partner API keys');
-    }
+    const res = await postChat(apiKey, chatBody({ message_type: 'audio', audio_base64: 'AAAA' }));
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toContain('partner API keys');
     expect(capture.calls).toHaveLength(0);
+
+    const ignored = chatBody({ voice_format: 'aac', audio_format: null, org: null });
+    expect((await postChat(apiKey, ignored)).status).toBe(200);
   });
 });
 

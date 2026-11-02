@@ -544,6 +544,13 @@ value (so the record fits KV's 1024-byte metadata limit): `name` and `app` 100,
 `limits`) is a `400`: every key has `scopes: ["chat"]`, and limits are not
 settable yet.
 
+**Unknown org.** The worker has no org registry, so an org counts as known
+when it has any stored configuration (an `ORG_CONFIG` key `<org>`, or a
+`PROMPT_OVERRIDES` key `<org>` / `<org>:*` such as `<org>:modes`), or is the
+default org. Otherwise create returns `400 {"code": "unknown_org"}`, which
+catches typos that would silently serve the defaults. For an org that will be
+configured later, send `"allow_new_org": true`.
+
 ### List Keys (all orgs, or one)
 
 ```bash
@@ -573,18 +580,29 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_
 ### Rotate a Key
 
 Issues a new key with the same name, app, org, terms and `userNamespace` (so
-the partner's users keep their history), then revokes the old one. Returns
-`{"key": {...new}, "previous": {...old, revoked}, "apiKey": "bts_..."}`.
-A revoked key cannot be rotated (`409`); create a new one instead. If a
+the partner's users keep their history), then retires the old one. Returns
+`{"key": {...new}, "previous": {...old}, "apiKey": "bts_..."}`.
+
+**Grace window.** By default the old key keeps working for 7 days
+(`previous.expiresAt`), so the partner can ship the new key without an
+outage; after that it gets `403` (reason `expired_partner_key`) and shows
+`status: "expired"`. Set `graceSeconds` (integer, 0 to 2592000 = 30 days) to
+change it; `"graceSeconds": 0` revokes the old key at once ("rotate and kill
+now"). An explicit `_revoke` is always immediate, also during a grace window.
+
+A revoked key, or one already rotated, cannot be rotated (`409`); create a new
+key or rotate the replacement instead. If a
 concurrent revoke or rotate of the same key wins, the response is also `409`
 (`changed concurrently`) and the key this call issued is revoked again; reload
 and retry. If the old key cannot be updated, the new key is revoked and the
-call returns `500` with the old key unchanged. The body
-is optional (`{"createdBy": "..."}` records who rotated).
+call returns `500` with the old key unchanged. The body is optional:
+`{"createdBy": "...", "graceSeconds": 86400}`.
 
 ```bash
 curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_rotate" \
-  -H "Authorization: Bearer $API_KEY"
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"createdBy": "ops@unfoldingword.org", "graceSeconds": 86400}'
 ```
 
 ### Calling Chat With a Partner Key
@@ -593,15 +611,17 @@ A partner key may call **only** `POST /api/v1/chat` and
 `POST /api/v1/chat/stream`. Every other `/api/*` route answers `403`
 (`This API key is not permitted to call this endpoint`). On those two routes:
 
-- `org` / `org_id` may be omitted (the key's org applies) or equal the key's
-  org; any other value is a `400`.
+- `org` / `org_id` may be omitted or `null` (the key's org applies) or equal
+  the key's org; any other value is a `400`.
 - `client_id: "admin-portal"` is refused (`403`).
 - `progress_callback_url` (and the other callback fields) are refused (`400`,
   the existing `/chat` and `/chat/stream` validation, worded for partners as
   "progress callbacks are not available with partner API keys").
-- Partner keys are **text-only** (decided 2026-11-02). Audio input is refused
-  (`400`): `message_type: "audio"`, `audio_base64`, `audio_format` and
-  `voice_format`. The model is not offered the audio tools (`request_audio`,
+- Partner keys are **text-only by default** (2026-11-02, pending confirmation
+  on admin-portal#354). Audio input is refused (`400`): `message_type:
+"audio"`, `audio_base64` and `audio_format` (`null` counts as absent).
+  `voice_format` only shapes audio output, which partners never get, so it is
+  ignored (dropped), not refused. The model is not offered the audio tools (`request_audio`,
   `attach_audio`, `read_r2_object`) or the audio prompt guidance, and a call
   to one of them is refused, so a partner response never carries an audio
   URL.
@@ -622,8 +642,9 @@ curl -X POST "http://localhost:$PORT/api/v1/chat" \
   }'
 ```
 
-An unknown or revoked key gets `403 {"error": "Invalid API key"}` (logged as
-`auth_rejected` with reason `unknown_partner_key` / `revoked_partner_key`).
+An unknown, revoked or expired key gets `403 {"error": "Invalid API key"}`
+(logged as `auth_rejected` with reason `unknown_partner_key`,
+`revoked_partner_key` or `expired_partner_key`).
 Every chat request logs `key_id` on `request_received` (`"internal"` for
 `ENGINE_API_KEY`), which is how usage and "last used" per key are read from
 telemetry.

@@ -33,18 +33,33 @@ export interface BuildToolsOptions {
   hasAudio?: boolean;
 }
 
-/** The built-in tools whose result is, or produces, an audio URL. */
+/**
+ * The built-in tools whose result is, or produces, an audio URL. Insertion
+ * order is the order execute_code's guidance names them in (kept identical to
+ * the pre-#354 text so the prompt does not change for internal callers).
+ */
 export const AUDIO_TOOL_NAMES: ReadonlySet<string> = new Set([
-  'request_audio',
   'attach_audio',
+  'request_audio',
   'read_r2_object',
 ]);
 
 /** Internal tool names `execute_code` must never be asked to call from inside the sandbox. */
 function internalToolNamesForGuidance(hasMemory: boolean, hasAudio: boolean): string {
   const memory = hasMemory ? ['update_memory', 'read_memory'] : [];
-  const audio = hasAudio ? ['attach_audio', 'request_audio', 'read_r2_object'] : [];
+  const audio = hasAudio ? [...AUDIO_TOOL_NAMES] : [];
   return [...memory, ...audio].join(', ');
+}
+
+/**
+ * The "internal tools" clause of execute_code's NOT AVAILABLE line. With no
+ * internal tools to name (text-only caller + suppress_memory) the
+ * parenthetical is left out rather than rendered empty.
+ */
+function internalToolsClause(names: string): string {
+  return names
+    ? `internal tools (${names} — call these directly as tool calls, never from inside execute_code)`
+    : 'internal tools';
 }
 
 /**
@@ -53,9 +68,8 @@ function internalToolNamesForGuidance(hasMemory: boolean, hasAudio: boolean): st
 export function buildExecuteCodeTool(
   opts?: Pick<BuildToolsOptions, 'hasMemory' | 'hasAudio'>
 ): Anthropic.Tool {
-  const internalTools = internalToolNamesForGuidance(
-    opts?.hasMemory ?? true,
-    opts?.hasAudio ?? true
+  const internalTools = internalToolsClause(
+    internalToolNamesForGuidance(opts?.hasMemory ?? true, opts?.hasAudio ?? true)
   );
   return {
     name: 'execute_code',
@@ -68,7 +82,7 @@ const result = await tool_name({ param: "value" });
 __result__ = result;
 
 AVAILABLE: console.log/info/warn/error, JSON, all MCP tool functions (e.g. fetch_scripture, search_resources)
-NOT AVAILABLE: fetch, require, import, process, eval, Function constructor, internal tools (${internalTools} — call these directly as tool calls, never from inside execute_code)
+NOT AVAILABLE: fetch, require, import, process, eval, Function constructor, ${internalTools}
 
 RESOURCE LIMITS:
 - Maximum 10 MCP tool calls per execute_code invocation (hard limit - execution fails if exceeded)
@@ -386,14 +400,12 @@ export function buildAllTools(_catalog: ToolCatalog, opts?: BuildToolsOptions): 
     // would only answer "Memory is not available", so exposing them wastes an
     // iteration and contradicts the (also omitted) memory_instructions slot.
     ...(hasMemory ? [buildReadMemoryTool(), buildUpdateMemoryTool()] : []),
-    // Audio tools: platform capabilities, not org-gated, but absent for
-    // text-only callers (partner API keys). read_r2_object and attach_audio are
-    // scope-guarded to the request's org.
-    ...(hasAudio ? [buildRequestAudioTool()] : []),
+    buildRequestAudioTool(), // Platform capability, not org-gated
     buildGenerateScripturePdfTool(), // Always available — short-circuits to error if ptxprint-mcp not registered for the org
     buildPrepareUsfmSourceTool(),
-    ...(hasAudio ? [buildReadR2ObjectTool(), buildAttachAudioTool()] : []),
-  ];
+    buildReadR2ObjectTool(), // Scope-guarded to the request's org
+    buildAttachAudioTool(), // Scope-guarded to the request's org
+  ].filter((tool) => hasAudio || !AUDIO_TOOL_NAMES.has(tool.name)); // text-only callers: AUDIO_TOOL_NAMES gate
 
   if (opts?.hasModes) {
     tools.push(buildListModesTool(), buildSwitchModeTool());

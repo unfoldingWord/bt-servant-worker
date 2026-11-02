@@ -50,6 +50,12 @@ export interface PartnerKeyRecord {
   rotatedFrom?: string;
   /** Id of the key that replaced this one (rotation). */
   rotatedTo?: string;
+  /**
+   * ISO-8601 end of a rotation grace window. Set on the OLD key when it is
+   * rotated with a non-zero grace, so a partner's live app keeps working while
+   * it ships the new key; from this instant auth treats the key as expired.
+   */
+  expiresAt?: string;
   /** Version of the partner terms of use accepted when the key was issued. */
   termsVersion?: string;
   /** ISO-8601 time the terms were accepted. */
@@ -62,8 +68,27 @@ export interface PartnerKeyRecord {
   limits?: Record<string, number>;
 }
 
+/** Lifecycle state of a key at a given instant. */
+export type PartnerKeyStatus = 'active' | 'revoked' | 'expired';
+
 /** What the admin endpoints return for a key: the record plus a derived status. */
-export type PublicPartnerKey = PartnerKeyRecord & { status: 'active' | 'revoked' };
+export type PublicPartnerKey = PartnerKeyRecord & { status: PartnerKeyStatus };
+
+/**
+ * The one definition of whether a key works at `now` (ms). Explicit revocation
+ * wins; otherwise a key past its rotation grace (`expiresAt`) is expired.
+ * Used by the auth middleware and by every admin response.
+ */
+export function partnerKeyStatus(record: PartnerKeyRecord, now: number): PartnerKeyStatus {
+  if (record.revokedAt !== undefined) return 'revoked';
+  if (record.expiresAt !== undefined && Date.parse(record.expiresAt) <= now) return 'expired';
+  return 'active';
+}
+
+/** Default rotation grace: 7 days for the partner to deploy the new key. */
+export const DEFAULT_ROTATION_GRACE_SECONDS = 7 * 24 * 60 * 60;
+/** Upper bound on rotation grace: 30 days. */
+export const MAX_ROTATION_GRACE_SECONDS = 30 * 24 * 60 * 60;
 
 /** Validated body of `POST /api/v1/admin/api-keys`. */
 export interface PartnerKeyCreateInput {
@@ -144,73 +169,153 @@ function readTerms(
  * Validate a create body. Unknown fields are rejected so a caller cannot
  * believe it set something (scopes, limits) the API does not honour.
  */
-export function validatePartnerKeyCreate(
-  body: unknown
-): { ok: true; input: PartnerKeyCreateInput } | { ok: false; error: string } {
-  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
-    return { ok: false, error: 'Request body must be a JSON object' };
-  }
-  const record = body as Record<string, unknown>;
-  const allowed = new Set(['org', 'name', 'app', 'createdBy', 'termsVersion', 'termsAcceptedAt']);
-  const unknown = Object.keys(record).filter((k) => !allowed.has(k));
-  if (unknown.length > 0) return { ok: false, error: `Unknown field(s): ${unknown.join(', ')}` };
+const CREATE_FIELDS: ReadonlySet<string> = new Set([
+  'org',
+  'name',
+  'app',
+  'createdBy',
+  'termsVersion',
+  'termsAcceptedAt',
+  'allow_new_org',
+]);
 
-  const orgError = validatePartnerKeyOrg(record.org);
-  if (orgError) return { ok: false, error: orgError };
+/** The three required labels of a create body. */
+function readCreateLabels(
+  record: Record<string, unknown>
+): { ok: true; name: string; app: string; createdBy: string } | { ok: false; error: string } {
   const name = readLabel(record.name, 'name', MAX_LABEL_BYTES);
   if (!name.ok) return name;
   const app = readLabel(record.app, 'app', MAX_LABEL_BYTES);
   if (!app.ok) return app;
   const createdBy = readLabel(record.createdBy, 'createdBy', MAX_ACTOR_BYTES);
   if (!createdBy.ok) return createdBy;
+  return { ok: true, name: name.value, app: app.value, createdBy: createdBy.value };
+}
+
+export function validatePartnerKeyCreate(
+  body: unknown
+): { ok: true; input: PartnerKeyCreateInput; allowNewOrg: boolean } | { ok: false; error: string } {
+  if (body === null || body === undefined) {
+    return { ok: false, error: 'Request body must be a JSON object' };
+  }
+  const parsed = readBodyObject(body, CREATE_FIELDS);
+  if (!parsed.ok) return parsed;
+  const { record } = parsed;
+
+  const orgError = validatePartnerKeyOrg(record.org);
+  if (orgError) return { ok: false, error: orgError };
+  const labels = readCreateLabels(record);
+  if (!labels.ok) return labels;
   const terms = readTerms(record);
   if (!terms.ok) return terms;
+  if (record.allow_new_org !== undefined && typeof record.allow_new_org !== 'boolean') {
+    return { ok: false, error: 'allow_new_org must be a boolean' };
+  }
 
   const { ok: _ok, ...termsFields } = terms;
+  const { ok: _labelsOk, ...labelFields } = labels;
   return {
     ok: true,
-    input: {
-      org: record.org as string,
-      name: name.value,
-      app: app.value,
-      createdBy: createdBy.value,
-      ...termsFields,
-    },
+    allowNewOrg: record.allow_new_org === true,
+    input: { org: record.org as string, ...labelFields, ...termsFields },
   };
 }
 
-/**
- * Validate the optional actor field on revoke/rotate bodies (`revokedBy` /
- * `createdBy`). An absent or empty body is fine. Returns the actor or an error.
- */
-export function readOptionalActor(
+/** Reject a non-object body and any key outside `allowed`. Absent/null body → `{}`. */
+function readBodyObject(
   body: unknown,
-  field: 'revokedBy' | 'createdBy'
-): { ok: true; actor?: string } | { ok: false; error: string } {
-  if (body === undefined || body === null) return { ok: true };
+  allowed: ReadonlySet<string>
+): { ok: true; record: Record<string, unknown> } | { ok: false; error: string } {
+  if (body === undefined || body === null) return { ok: true, record: {} };
   if (typeof body !== 'object' || Array.isArray(body)) {
     return { ok: false, error: 'Request body must be a JSON object' };
   }
   const record = body as Record<string, unknown>;
-  const unknown = Object.keys(record).filter((k) => k !== field);
+  const unknown = Object.keys(record).filter((k) => !allowed.has(k));
   if (unknown.length > 0) return { ok: false, error: `Unknown field(s): ${unknown.join(', ')}` };
-  const value = field === 'revokedBy' ? record.revokedBy : record.createdBy;
+  return { ok: true, record };
+}
+
+/** Optional actor label (undefined → absent). */
+function readActor(
+  value: unknown,
+  field: string
+): { ok: true; actor?: string } | { ok: false; error: string } {
   if (value === undefined) return { ok: true };
   const actor = readLabel(value, field, MAX_ACTOR_BYTES);
   return actor.ok ? { ok: true, actor: actor.value } : actor;
 }
 
-/** Explicit allow-list projection: never spreads unknown stored fields into a response. */
-export function toPublicPartnerKey(record: PartnerKeyRecord): PublicPartnerKey {
-  const optional = {
+/** Validate the optional revoke body: `{ revokedBy? }`. */
+export function readRevokeBody(
+  body: unknown
+): { ok: true; revokedBy?: string } | { ok: false; error: string } {
+  const parsed = readBodyObject(body, new Set(['revokedBy']));
+  if (!parsed.ok) return parsed;
+  const actor = readActor(parsed.record.revokedBy, 'revokedBy');
+  if (!actor.ok) return actor;
+  return actor.actor === undefined ? { ok: true } : { ok: true, revokedBy: actor.actor };
+}
+
+/**
+ * Validate the optional rotate body: `{ createdBy?, graceSeconds? }`.
+ * `graceSeconds` is an integer in [0, MAX_ROTATION_GRACE_SECONDS]; default
+ * DEFAULT_ROTATION_GRACE_SECONDS. 0 means "rotate and kill the old key now".
+ */
+export function readRotateBody(
+  body: unknown
+): { ok: true; createdBy?: string; graceSeconds: number } | { ok: false; error: string } {
+  const parsed = readBodyObject(body, new Set(['createdBy', 'graceSeconds']));
+  if (!parsed.ok) return parsed;
+  const actor = readActor(parsed.record.createdBy, 'createdBy');
+  if (!actor.ok) return actor;
+  const grace = parsed.record.graceSeconds ?? DEFAULT_ROTATION_GRACE_SECONDS;
+  if (
+    typeof grace !== 'number' ||
+    !Number.isInteger(grace) ||
+    grace < 0 ||
+    grace > MAX_ROTATION_GRACE_SECONDS
+  ) {
+    return {
+      ok: false,
+      error: `graceSeconds must be an integer from 0 to ${MAX_ROTATION_GRACE_SECONDS}`,
+    };
+  }
+  return {
+    ok: true,
+    graceSeconds: grace,
+    ...(actor.actor !== undefined ? { createdBy: actor.actor } : {}),
+  };
+}
+
+/** Optional lifecycle fields, copied only when present. */
+function lifecycleFields(record: PartnerKeyRecord): Partial<PartnerKeyRecord> {
+  return {
     ...(record.revokedAt !== undefined ? { revokedAt: record.revokedAt } : {}),
     ...(record.revokedBy !== undefined ? { revokedBy: record.revokedBy } : {}),
     ...(record.rotatedFrom !== undefined ? { rotatedFrom: record.rotatedFrom } : {}),
     ...(record.rotatedTo !== undefined ? { rotatedTo: record.rotatedTo } : {}),
+    ...(record.expiresAt !== undefined ? { expiresAt: record.expiresAt } : {}),
+  };
+}
+
+/** Optional descriptive fields, copied only when present. */
+function termsAndLimitFields(record: PartnerKeyRecord): Partial<PartnerKeyRecord> {
+  return {
     ...(record.termsVersion !== undefined ? { termsVersion: record.termsVersion } : {}),
     ...(record.termsAcceptedAt !== undefined ? { termsAcceptedAt: record.termsAcceptedAt } : {}),
     ...(record.limits !== undefined ? { limits: record.limits } : {}),
   };
+}
+
+/**
+ * Explicit allow-list projection: never spreads unknown stored fields into a
+ * response. `status` is derived at `now` (ms; default the current time).
+ */
+export function toPublicPartnerKey(
+  record: PartnerKeyRecord,
+  now: number = Date.now()
+): PublicPartnerKey {
   return {
     id: record.id,
     prefix: record.prefix,
@@ -221,7 +326,8 @@ export function toPublicPartnerKey(record: PartnerKeyRecord): PublicPartnerKey {
     createdAt: record.createdAt,
     scopes: [...record.scopes],
     userNamespace: record.userNamespace,
-    ...optional,
-    status: record.revokedAt === undefined ? 'active' : 'revoked',
+    ...lifecycleFields(record),
+    ...termsAndLimitFields(record),
+    status: partnerKeyStatus(record, now),
   };
 }
