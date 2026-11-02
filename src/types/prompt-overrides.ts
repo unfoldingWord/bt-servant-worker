@@ -503,6 +503,28 @@ export function isModeVisible(
   return mode.requires_group !== true || opts.isGroupChat;
 }
 
+/** The slice of a mode the `#`-trigger classifier matches against. */
+export interface TriggerModeOption {
+  name: string;
+  label: string | undefined;
+  aliases: string[] | undefined;
+}
+
+/**
+ * The mode options the `#`-trigger classifier sees in one chat context: the
+ * visible modes (`isModeVisible`), reduced to name/label/aliases. The DO's
+ * trigger classification, its mode-resolution log and the admin share-code
+ * endpoint (admin-portal#345) all build the list here, so they cannot drift.
+ */
+export function chatTriggerModeOptions(
+  modes: PromptMode[],
+  ctx: { isGroupChat: boolean; isAdmin: boolean }
+): TriggerModeOption[] {
+  return modes
+    .filter((m) => isModeVisible(m, ctx))
+    .map((m) => ({ name: m.name, label: m.label, aliases: m.aliases }));
+}
+
 // ─── Mode resolution ───────────────────────────────────────────────────────────
 
 /**

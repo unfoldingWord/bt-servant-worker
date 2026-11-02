@@ -99,6 +99,23 @@ describe('GET …/modes/:modeName/share-code — errors', () => {
     expect(text).not.toContain('mode_not_found');
   });
 
+  it('a home_org with no modes record is a 400 unknown_home_org', async () => {
+    await seed();
+    const res = await SELF.fetch(url(PARTNER, 'u345-coach', 'u345-typo'), { headers: AUTH });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: 'unknown_home_org' });
+  });
+
+  it('a record with null elements answers instead of a 500', async () => {
+    await env.PROMPT_OVERRIDES.put(
+      `${HOME}:modes`,
+      JSON.stringify({ modes: [null, { name: 'u345-coach', published: true, overrides: {} }] })
+    );
+    const res = await SELF.fetch(url(HOME, 'u345-coach', HOME), { headers: AUTH });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ code: 'u345-coach', resolves: true });
+  });
+
   it('home_org is required', async () => {
     await seed();
     const res = await SELF.fetch(url(HOME, 'u345-coach'), { headers: AUTH });

@@ -89,7 +89,7 @@ export function modesKey(org: string): string {
 }
 
 /** Structural check for a stored `{ modes: [...] }` record. */
-function isOrgModes(value: unknown): value is OrgModes {
+export function isOrgModes(value: unknown): value is OrgModes {
   return (
     value !== null &&
     typeof value === 'object' &&
@@ -112,7 +112,7 @@ type ClaimedNames = Map<string, string>;
  * the container, not its elements, and a manual KV write can leave a null or
  * primitive there. Such an element must be skipped, never dereferenced.
  */
-function isModeRecord(mode: unknown): mode is PromptMode {
+export function isModeRecord(mode: unknown): mode is PromptMode {
   return mode !== null && typeof mode === 'object';
 }
 
@@ -216,16 +216,13 @@ function mergeForeignOrg(
 }
 
 /**
- * The merged list plus what the merge decided along the way: which org claimed
- * each qualified name/alias (first in sorted org order) and which enumerated
- * orgs were skipped. The share-code endpoint (admin-portal#345) reads these to
- * explain WHY a mode does not resolve; the chat path only needs `modes`.
+ * The merged list plus which org claimed each qualified name/alias (first in
+ * sorted org order). The share-code endpoint (admin-portal#345) reads `claimed`
+ * to name a collision winner; the chat path only needs `modes`.
  */
 export interface CrossOrgMergeDetail extends ChatOrgModes {
   /** Qualified name or alias → raw org name that claimed it. */
   claimed: ReadonlyMap<string, string>;
-  /** Raw org name → why it was not merged. */
-  skippedOrgs: ReadonlyMap<string, 'reserved' | 'empty_slug'>;
 }
 
 /**
@@ -240,14 +237,13 @@ export function mergeCrossOrgModes(
   return { modes: mergeCrossOrgModesDetailed(home, foreign, logger).modes };
 }
 
-/** `mergeCrossOrgModes` with its claim and skip decisions exposed. Same code path. */
+/** `mergeCrossOrgModes` with its claim decisions exposed. Same code path. */
 export function mergeCrossOrgModesDetailed(
   home: OrgModes,
   foreign: ForeignOrgModes[],
   logger: RequestLogger
 ): CrossOrgMergeDetail {
   const modes: ChatMode[] = [...home.modes];
-  const skippedOrgs = new Map<string, 'reserved' | 'empty_slug'>();
   // Home names are bare and MODE_NAME_PATTERN forbids `/`, so only qualified
   // names can ever collide with each other.
   const claimed: ClaimedNames = new Map();
@@ -258,12 +254,11 @@ export function mergeCrossOrgModesDetailed(
     const reason = orgSkipReason(org, slug);
     if (reason !== null) {
       logger.warn('cross_org_modes_org_skipped', { org, reason });
-      skippedOrgs.set(org, reason);
       continue;
     }
     mergeForeignOrg({ org, slug, modes: orgModes }, modes, claimed, logger);
   }
-  return { modes, claimed, skippedOrgs };
+  return { modes, claimed };
 }
 
 /**
@@ -332,18 +327,25 @@ async function listForeignModesKeys(
   }
 }
 
-/** Read one foreign `<org>:modes` key; any failure or bad shape is logged and yields null. */
+/** Reads one KV key as JSON. */
+type JsonGet = (key: string) => Promise<unknown>;
+
+/**
+ * Read one foreign `<org>:modes` key. A bad shape is logged and yields null; a
+ * failed get is logged and yields `'read_failed'`, so a caller that needs an
+ * authoritative answer can tell a transient failure from an absent record.
+ */
 async function readForeignModes(
-  kv: KVNamespace,
+  get: JsonGet,
   key: string,
   logger: RequestLogger
-): Promise<ForeignOrgModes | null> {
+): Promise<ForeignOrgModes | 'read_failed' | null> {
   let value: unknown;
   try {
-    value = await kv.get(key, 'json');
+    value = await get(key);
   } catch (error) {
     logger.error('cross_org_modes_read_failed', error, { key });
-    return null;
+    return 'read_failed';
   }
   if (value === null) {
     // Listed a moment ago but gone now, or the stored value is JSON null.
@@ -356,18 +358,18 @@ async function readForeignModes(
     logger.warn('cross_org_modes_invalid_shape', { key, reason: 'not_modes_record' });
     return null;
   }
-  return { org: key.slice(0, -MODES_KEY_SUFFIX.length), modes: value.modes };
+  return { org: orgFromModesKey(key), modes: value.modes };
 }
 
 /** Read the home org's modes; a failure or bad shape is logged and yields an empty list. */
 async function readHomeModes(
-  kv: KVNamespace,
+  get: JsonGet,
   homeKey: string,
   logger: RequestLogger
 ): Promise<OrgModes> {
   let value: unknown;
   try {
-    value = await kv.get(homeKey, 'json');
+    value = await get(homeKey);
   } catch (error) {
     logger.error('org_modes_kv_read_error', error, { key: homeKey });
     return { modes: [] };
@@ -389,6 +391,8 @@ export interface CrossOrgModeSources {
   listedKeys: string[];
   /** The subset of `listedKeys` inside the per-turn cap — the only foreign keys read. */
   readKeys: string[];
+  /** Keys in `readKeys` whose get threw (the chat path treats them as absent). */
+  failedKeys: string[];
   listFailed: boolean;
   listTruncated: boolean;
 }
@@ -396,27 +400,49 @@ export interface CrossOrgModeSources {
 /**
  * The chat path's raw read: the home get and the key listing in parallel, then
  * the capped foreign gets in parallel. Never throws.
+ *
+ * `prefetched` holds raw JSON values (as `kv.get(key, 'json')` returned them)
+ * that the caller has already read; those keys are not read again, so a caller
+ * that inspected a record answers from that same snapshot. The chat path
+ * passes nothing.
  */
 export async function readCrossOrgModeSources(
   kv: KVNamespace,
   homeOrg: string,
-  logger: RequestLogger
+  logger: RequestLogger,
+  prefetched?: ReadonlyMap<string, unknown>
 ): Promise<CrossOrgModeSources> {
+  const get: JsonGet = async (key) =>
+    prefetched?.has(key) === true ? prefetched.get(key) : kv.get(key, 'json');
   const homeKey = modesKey(homeOrg);
   const [home, listing] = await Promise.all([
-    readHomeModes(kv, homeKey, logger),
+    readHomeModes(get, homeKey, logger),
     listForeignModesKeys(kv, homeKey, logger),
   ]);
   const readKeys = capForeignKeys(listing.keys, logger);
-  const foreign = await Promise.all(readKeys.map((key) => readForeignModes(kv, key, logger)));
+  const results = await Promise.all(
+    readKeys.map(async (key) => ({ key, result: await readForeignModes(get, key, logger) }))
+  );
+  const foreign: ForeignOrgModes[] = [];
+  const failedKeys: string[] = [];
+  for (const { key, result } of results) {
+    if (result === 'read_failed') failedKeys.push(key);
+    else if (result !== null) foreign.push(result);
+  }
   return {
     home,
-    foreign: foreign.filter((entry): entry is ForeignOrgModes => entry !== null),
+    foreign,
     listedKeys: listing.keys,
     readKeys,
+    failedKeys,
     listFailed: listing.failed,
     listTruncated: listing.truncated,
   };
+}
+
+/** The raw org name a `<org>:modes` key belongs to. */
+export function orgFromModesKey(key: string): string {
+  return key.slice(0, -MODES_KEY_SUFFIX.length);
 }
 
 /**

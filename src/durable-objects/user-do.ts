@@ -51,6 +51,7 @@ import { DEFAULT_ORG_CONFIG, OrgConfig } from '../types/org-config.js';
 import {
   DEFAULT_PROMPT_VALUES,
   isModeVisible,
+  chatTriggerModeOptions,
   ModeContext,
   mergePromptOverrides,
   PROMPT_OVERRIDE_SLOTS,
@@ -64,7 +65,6 @@ import {
 import { resolveEffectiveMode } from '../types/mode-markdown.js';
 import { buildModeWelcomeText } from '../utils/mode-welcome.js';
 import { WA_ME_ORIGIN } from '../utils/mode-share-link.js';
-import { chatTriggerModeOptions } from '../utils/mode-share-code.js';
 import {
   transcribeAudio,
   synthesizeSpeech,
@@ -2300,7 +2300,6 @@ export class UserDO {
   ) {
     const isGroupChat = this.isGroupChatType(body);
     const classified = classifyTriggers(loaded.messageText, {
-      // Shared with the admin share-code endpoint (admin-portal#345) so both see one list.
       availableModes: chatTriggerModeOptions(loaded.orgModes.modes, {
         isGroupChat,
         isAdmin: loaded.isAdmin,
@@ -3338,9 +3337,9 @@ export class UserDO {
     if (reason === 'missing' || reason === 'unpublished' || reason === 'requires-group') {
       logger.warn('mode_not_found', {
         active_mode: requestedModeName,
-        available_modes: orgModes.modes
-          .filter((m) => isModeVisible(m, { isGroupChat, isAdmin }))
-          .map((m) => m.name),
+        available_modes: chatTriggerModeOptions(orgModes.modes, { isGroupChat, isAdmin }).map(
+          (m) => m.name
+        ),
         reason,
       });
     }

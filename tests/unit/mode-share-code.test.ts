@@ -7,10 +7,11 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 import type { PromptMode } from '../../src/types/prompt-overrides.js';
+import { chatTriggerModeOptions } from '../../src/types/prompt-overrides.js';
 import { MAX_FOREIGN_ORGS_PER_TURN } from '../../src/utils/cross-org-modes.js';
 import type { RequestLogger } from '../../src/utils/logger.js';
 import {
-  chatTriggerModeOptions,
+  loadShareCodeTarget,
   resolveModeShareCode,
   ShareCodeUnavailableError,
 } from '../../src/utils/mode-share-code.js';
@@ -29,30 +30,57 @@ const published = (name: string, extra: Partial<PromptMode> = {}): PromptMode =>
   ...extra,
 });
 
-/** Values are stored as JSON text, exactly as KV holds them. */
-function fakeKv(entries: Record<string, unknown>, opts: { listFails?: boolean } = {}): KVNamespace {
-  const store = new Map(Object.entries(entries).map(([k, v]) => [k, JSON.stringify(v)]));
+interface FakeKvOptions {
+  listFails?: boolean;
+  /** Keys whose get throws. */
+  failGet?: string[];
+  /** Keys present in the store but missing from the listing (list lag). */
+  hideFromList?: string[];
+}
+
+type FakeKv = KVNamespace & { get: ReturnType<typeof vi.fn>; list: ReturnType<typeof vi.fn> };
+
+/**
+ * Values are stored as JSON text, exactly as KV holds them. The home org gets
+ * an empty modes record unless the test seeds one, since the route refuses an
+ * unknown home org.
+ */
+function fakeKv(entries: Record<string, unknown>, opts: FakeKvOptions = {}): FakeKv {
+  const seeded = { [`${HOME}:modes`]: { modes: [] }, ...entries };
+  const store = new Map(Object.entries(seeded).map(([k, v]) => [k, JSON.stringify(v)]));
   return {
     get: vi.fn(async (key: string, type?: string) => {
+      if (opts.failGet?.includes(key) === true) throw new Error(`kv get down: ${key}`);
       const raw = store.get(key);
       if (raw === undefined) return null;
       return type === 'json' ? JSON.parse(raw) : raw;
     }),
     list: vi.fn(async () => {
       if (opts.listFails === true) throw new Error('kv list down');
-      return { keys: [...store.keys()].map((name) => ({ name })), list_complete: true };
+      const keys = [...store.keys()].filter((k) => opts.hideFromList?.includes(k) !== true);
+      return { keys: keys.map((name) => ({ name })), list_complete: true };
     }),
     put: vi.fn(),
     delete: vi.fn(),
-  } as unknown as KVNamespace;
+  } as unknown as FakeKv;
 }
 
-/** Resolve `modeName` in `org` the way the route does: read the org's record, find the mode. */
+/** Resolve `modeName` in `org` exactly as the route does: load the snapshot, then resolve. */
 async function resolve(kv: KVNamespace, org: string, modeName: string, homeOrg = HOME) {
-  const record = (await kv.get(`${org}:modes`, 'json')) as { modes: PromptMode[] };
-  const mode = record.modes.find((m) => m.name === modeName);
-  if (mode === undefined) throw new Error(`test setup: ${org}/${modeName} missing`);
-  return resolveModeShareCode(kv, { org, mode, homeOrg }, spyLogger());
+  const loaded = await loadShareCodeTarget(kv, { org, homeOrg, modeName }, spyLogger());
+  if (loaded.kind !== 'ok') throw new Error(`test setup: ${loaded.kind}`);
+  return resolveModeShareCode(kv, loaded.target, spyLogger());
+}
+
+/** The detail a ShareCodeUnavailableError carries, or a failure if none was thrown. */
+async function unavailableDetail(promise: Promise<unknown>): Promise<string> {
+  try {
+    await promise;
+  } catch (error) {
+    if (error instanceof ShareCodeUnavailableError) return error.detail;
+    throw error;
+  }
+  throw new Error('expected ShareCodeUnavailableError');
 }
 
 describe('resolveModeShareCode — resolving codes', () => {
@@ -118,10 +146,23 @@ describe('resolveModeShareCode — home/foreign by exact key', () => {
       resolved_org: longOrg,
     });
   });
+});
 
-  it('the home org still resolves when the foreign key listing fails', async () => {
+describe('resolveModeShareCode — read cost', () => {
+  it('a home target needs no cross-org read: one get, no listing', async () => {
     const kv = fakeKv({ [`${HOME}:modes`]: { modes: [published('x')] } }, { listFails: true });
     expect((await resolve(kv, HOME, 'x')).resolves).toBe(true);
+    expect(kv.list).not.toHaveBeenCalled();
+    expect(kv.get).toHaveBeenCalledTimes(1);
+  });
+
+  it('a foreign target reads its own record once (the snapshot is reused)', async () => {
+    const kv = fakeKv({ 'PBT:modes': { modes: [published('x')] } });
+    expect((await resolve(kv, 'PBT', 'x')).resolves).toBe(true);
+    const targetGets = kv.get.mock.calls.filter(([key]) => key === 'PBT:modes');
+    const homeGets = kv.get.mock.calls.filter(([key]) => key === `${HOME}:modes`);
+    expect(targetGets).toHaveLength(1);
+    expect(homeGets).toHaveLength(1);
   });
 });
 
@@ -274,9 +315,84 @@ describe('resolveModeShareCode — prefix/fuzzy stealing', () => {
 });
 
 describe('resolveModeShareCode — degraded reads', () => {
-  it('a failed key listing makes a foreign answer unavailable rather than a false negative', async () => {
+  it('a failed key listing makes a foreign answer unavailable (list_failed)', async () => {
     const kv = fakeKv({ 'PBT:modes': { modes: [published('x')] } }, { listFails: true });
-    await expect(resolve(kv, 'PBT', 'x')).rejects.toBeInstanceOf(ShareCodeUnavailableError);
+    expect(await unavailableDetail(resolve(kv, 'PBT', 'x'))).toBe('list_failed');
+  });
+
+  it('a failed get of a same-slug org could hide a collision winner (read_failed)', async () => {
+    const kv = fakeKv(
+      { 'PBT:modes': { modes: [published('x')] }, 'pbt:modes': { modes: [published('x')] } },
+      { failGet: ['PBT:modes'] }
+    );
+    expect(await unavailableDetail(resolve(kv, 'pbt', 'x'))).toBe('read_failed');
+  });
+
+  it('a failed get could hide the look-alike behind a not_found (read_failed)', async () => {
+    const kv = fakeKv(
+      {
+        'other:modes': { modes: [published('y')] },
+        'pbt:modes': { modes: [published('x', { welcome_message: 1 as unknown as string })] },
+      },
+      { failGet: ['other:modes'] }
+    );
+    expect(await unavailableDetail(resolve(kv, 'pbt', 'x'))).toBe('read_failed');
+  });
+
+  it('a failed get of an unrelated org does not block a resolving answer', async () => {
+    const kv = fakeKv(
+      { 'other:modes': { modes: [published('y')] }, 'pbt:modes': { modes: [published('x')] } },
+      { failGet: ['other:modes'] }
+    );
+    expect(await resolve(kv, 'pbt', 'x')).toMatchObject({ resolves: true, resolved_org: 'pbt' });
+  });
+
+  it('a record a complete listing does not show yet is listing_lag, not not_found', async () => {
+    const kv = fakeKv(
+      { 'pbt:modes': { modes: [published('x')] } },
+      { hideFromList: ['pbt:modes'] }
+    );
+    expect(await unavailableDetail(resolve(kv, 'pbt', 'x'))).toBe('listing_lag');
+  });
+});
+
+describe('loadShareCodeTarget', () => {
+  const load = (kv: KVNamespace, org: string, modeName: string, homeOrg = HOME) =>
+    loadShareCodeTarget(kv, { org, homeOrg, modeName }, spyLogger());
+
+  it('a failed get of the target or home record is read_failed', async () => {
+    const target = fakeKv({ 'pbt:modes': { modes: [published('x')] } }, { failGet: ['pbt:modes'] });
+    expect(await unavailableDetail(load(target, 'pbt', 'x'))).toBe('read_failed');
+    const home = fakeKv(
+      { 'pbt:modes': { modes: [published('x')] } },
+      { failGet: [`${HOME}:modes`] }
+    );
+    expect(await unavailableDetail(load(home, 'pbt', 'x'))).toBe('read_failed');
+  });
+
+  it('a home_org with no modes record is unknown_home_org', async () => {
+    const kv = fakeKv({ 'pbt:modes': { modes: [published('x')] } });
+    expect(await load(kv, 'pbt', 'x', 'unfoldingWorld')).toEqual({ kind: 'unknown_home_org' });
+  });
+
+  it('an unknown org or mode is mode_not_found', async () => {
+    const kv = fakeKv({ 'pbt:modes': { modes: [published('x')] } });
+    expect(await load(kv, 'nobody', 'x')).toEqual({ kind: 'mode_not_found' });
+    expect(await load(kv, 'pbt', 'nope')).toEqual({ kind: 'mode_not_found' });
+  });
+
+  it('malformed elements (null, primitive, non-array aliases) are skipped, not dereferenced', async () => {
+    const kv = fakeKv({
+      'pbt:modes': { modes: [null, 7, { name: 'bad', aliases: 5 }, published('x')] },
+    });
+    const loaded = await load(kv, 'pbt', 'x');
+    expect(loaded.kind).toBe('ok');
+    expect(await resolve(kv, 'pbt', 'x')).toMatchObject({ resolves: true });
+  });
+
+  it('a home record with a null element still resolves a home target', async () => {
+    const kv = fakeKv({ [`${HOME}:modes`]: { modes: [null, published('x')] } });
+    expect(await resolve(kv, HOME, 'x')).toMatchObject({ code: 'x', resolves: true });
   });
 });
 

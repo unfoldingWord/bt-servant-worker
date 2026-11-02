@@ -634,18 +634,22 @@ Draft and `requires_group` modes still return the would-be `code`.
 
 **Errors:**
 
-| Status | Body                                | When                                                                             |
-| ------ | ----------------------------------- | -------------------------------------------------------------------------------- |
-| 400    | `{"error":"home_org_required",...}` | `home_org` missing                                                               |
-| 400    | `{"error":"invalid_mode_name",...}` | `:modeName` fails the slug pattern                                               |
-| 404    | `{"error":"mode_not_found",...}`    | no such org or mode                                                              |
-| 503    | `{"error":"modes_unavailable",...}` | the cross-org key listing failed, so a foreign answer would not be authoritative |
+| Status | Body                                         | When                                                                                                                            |
+| ------ | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| 400    | `{"error":"home_org_required",...}`          | `home_org` is missing                                                                                                           |
+| 400    | `{"error":"unknown_home_org",...}`           | `<home_org>:modes` does not exist (a mistyped gateway org)                                                                      |
+| 400    | `{"error":"invalid_mode_name",...}`          | `:modeName` fails the slug pattern                                                                                              |
+| 404    | `{"error":"mode_not_found",...}`             | no such org or mode                                                                                                             |
+| 503    | `{"error":"modes_unavailable","detail":...}` | a read failed or lagged in a way that could change the answer; retry. `detail` is `list_failed`, `read_failed` or `listing_lag` |
 
 A 404 without `"error":"mode_not_found"` means the route itself is missing (a
 worker older than 2.59.0).
 
-Cost: one chat-path read per call (one get of the org's record, one home get,
-one key listing, up to 50 foreign gets). Admin-only and low traffic.
+Cost per call: one get each of `<org>:modes` and `<home_org>:modes` (one get
+when they are the same org). A home mode needs nothing more, because a bare
+`#token` only ever matches home modes. A foreign mode adds the chat path's key
+listing and up to 50 foreign gets, reusing the two records already read. The
+route answers one mode per call; it is admin-only and low traffic.
 
 ---
 

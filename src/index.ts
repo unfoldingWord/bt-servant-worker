@@ -46,8 +46,12 @@ import {
 } from './types/language-scaffold.js';
 import { validateResourceLanguage } from './types/resources.js';
 import { synthesizeModeDocument } from './types/mode-markdown.js';
-import { modesKey, readAllPublishedModes } from './utils/cross-org-modes.js';
-import { resolveModeShareCode, ShareCodeUnavailableError } from './utils/mode-share-code.js';
+import { readAllPublishedModes } from './utils/cross-org-modes.js';
+import {
+  loadShareCodeTarget,
+  resolveModeShareCode,
+  ShareCodeUnavailableError,
+} from './utils/mode-share-code.js';
 import { stripControlChars } from './types/prompt-overrides.js';
 import { constantTimeCompare } from './utils/crypto.js';
 import { ValidationError } from './utils/errors.js';
@@ -896,6 +900,15 @@ app.get('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
 /** Incoming X-Request-ID the BFF may forward, so its logs and ours correlate. */
 const FORWARDED_REQUEST_ID = /^[\w.:-]{1,128}$/;
 
+/** 503 body for a share-code answer that a degraded read could have changed. */
+function shareCodeUnavailableBody(error: ShareCodeUnavailableError) {
+  return {
+    error: 'modes_unavailable',
+    detail: error.detail,
+    message: 'Published modes could not be read consistently; retry',
+  };
+}
+
 /** This request's id: the forwarded X-Request-ID when well-formed, else a fresh one minted at the boundary. */
 function requestIdFor(forwarded: string | undefined): string {
   return forwarded !== undefined && FORWARDED_REQUEST_ID.test(forwarded)
@@ -926,22 +939,24 @@ app.get('/api/v1/admin/orgs/:org/modes/:modeName/share-code', async (c) => {
   }
 
   try {
-    const stored = await c.env.PROMPT_OVERRIDES.get<OrgModes>(modesKey(org), 'json');
-    const mode = Array.isArray(stored?.modes) ? findModeBySlug(stored.modes, modeName) : undefined;
-    if (!mode) {
+    const kv = c.env.PROMPT_OVERRIDES;
+    const loaded = await loadShareCodeTarget(kv, { org, homeOrg, modeName }, logger);
+    if (loaded.kind === 'mode_not_found') {
       return c.json({ error: 'mode_not_found', message: `Mode '${modeName}' not found` }, 404);
     }
+    if (loaded.kind === 'unknown_home_org') {
+      return c.json(
+        { error: 'unknown_home_org', message: `home_org '${homeOrg}' has no modes record` },
+        400
+      );
+    }
 
-    const answer = await resolveModeShareCode(
-      c.env.PROMPT_OVERRIDES,
-      { org, mode, homeOrg },
-      logger
-    );
+    const answer = await resolveModeShareCode(kv, loaded.target, logger);
     logger.log('admin_action', {
       action: 'get_mode_share_code',
       org,
       home_org: homeOrg,
-      mode_name: mode.name,
+      mode_name: loaded.target.mode.name,
       code: answer.code,
       resolves: answer.resolves,
       reason: answer.reason,
@@ -949,9 +964,8 @@ app.get('/api/v1/admin/orgs/:org/modes/:modeName/share-code', async (c) => {
     return c.json({ ...answer, worker_version: APP_VERSION });
   } catch (error) {
     logger.error('admin_action', error, { action: 'get_mode_share_code', org, home_org: homeOrg });
-    if (error instanceof ShareCodeUnavailableError) {
-      return c.json({ error: 'modes_unavailable', message: 'Could not list published modes' }, 503);
-    }
+    if (error instanceof ShareCodeUnavailableError)
+      return c.json(shareCodeUnavailableBody(error), 503);
     return c.json({ error: 'Failed to compute mode share code' }, 500);
   }
 });
