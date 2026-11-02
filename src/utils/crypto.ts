@@ -44,3 +44,15 @@ export async function sha256Hex(data: string | Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', bytes);
   return bytesToHex(new Uint8Array(digest));
 }
+
+/** Standard base64 encoding of a byte array (btoa over a binary string). */
+export function bytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+/** URL-safe base64 without padding (RFC 4648 §5). */
+export function bytesToBase64Url(bytes: Uint8Array): string {
+  return bytesToBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}

@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { bytesToHex, constantTimeCompare, sha256Hex } from '../../src/utils/crypto.js';
+import {
+  bytesToBase64,
+  bytesToBase64Url,
+  bytesToHex,
+  constantTimeCompare,
+  sha256Hex,
+} from '../../src/utils/crypto.js';
 
 describe('constantTimeCompare', () => {
   it('should return true for equal strings', () => {
@@ -30,5 +36,24 @@ describe('bytesToHex / sha256Hex', () => {
     const expected = 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad';
     expect(await sha256Hex('abc')).toBe(expected);
     expect(await sha256Hex(new TextEncoder().encode('abc'))).toBe(expected);
+  });
+});
+
+describe('bytesToBase64 / bytesToBase64Url', () => {
+  const bytes = new Uint8Array([0xfb, 0xff, 0xbf, 0x00, 0x10]);
+
+  it('encodes standard base64 with padding', () => {
+    expect(bytesToBase64(bytes)).toBe('+/+/ABA=');
+    expect(bytesToBase64(new Uint8Array([]))).toBe('');
+  });
+
+  it('encodes unpadded base64url', () => {
+    expect(bytesToBase64Url(bytes)).toBe('-_-_ABA');
+  });
+
+  it('round-trips a large input through atob', () => {
+    const big = new Uint8Array(100_000).map((_, i) => i % 256);
+    const decoded = Uint8Array.from(atob(bytesToBase64(big)), (c) => c.charCodeAt(0));
+    expect(decoded).toEqual(big);
   });
 });

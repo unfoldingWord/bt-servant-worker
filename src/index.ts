@@ -1727,6 +1727,9 @@ app.get('/api/v1/admin/do/:hexId/snapshot', async (c) => {
 
 const PARTNER_KEYS_BASE = '/api/v1/admin/api-keys';
 
+/** On every response that carries a plaintext key: no cache may keep a copy. */
+const NO_STORE_HEADERS = { 'Cache-Control': 'no-store' } as const;
+
 function unknownOrgMessage(org: string): string {
   return `Org '${org}' has no configuration in this worker (check the spelling). Pass "allow_new_org": true to create a key for an org that is not configured yet.`;
 }
@@ -1754,7 +1757,7 @@ app.post(PARTNER_KEYS_BASE, async (c) => {
       app: record.app,
       created_by: record.createdBy,
     });
-    return c.json({ key: toPublicPartnerKey(record), apiKey: plaintext }, 201);
+    return c.json({ key: toPublicPartnerKey(record), apiKey: plaintext }, 201, NO_STORE_HEADERS);
   } catch (error) {
     logger.error('admin_action', error, { action: 'create_api_key', org: validated.input.org });
     return c.json({ error: 'Failed to create API key' }, 500);
@@ -1769,13 +1772,19 @@ app.get(PARTNER_KEYS_BASE, async (c) => {
     if (orgError) return c.json({ error: orgError }, 400);
   }
   try {
-    const records = await listPartnerKeys(c.env.API_KEYS, org, logger);
+    const { records, truncated } = await listPartnerKeys(c.env.API_KEYS, org, logger);
     logger.log('admin_action', {
       action: 'list_api_keys',
       org: org ?? null,
       count: records.length,
+      truncated,
     });
-    return c.json({ org: org ?? null, keys: records.map((r) => toPublicPartnerKey(r)) });
+    // `truncated: true` = the index walk hit its page cap; narrow with ?org=.
+    return c.json({
+      org: org ?? null,
+      keys: records.map((r) => toPublicPartnerKey(r)),
+      truncated,
+    });
   } catch (error) {
     logger.error('admin_action', error, { action: 'list_api_keys', org: org ?? null });
     return c.json({ error: 'Failed to list API keys' }, 500);
@@ -1848,13 +1857,19 @@ app.post(`${PARTNER_KEYS_BASE}/:keyId/_rotate`, async (c) => {
       grace_seconds: body.graceSeconds,
       old_expires_at: result.previous.expiresAt ?? null,
       revoked_ids: result.revokedIds,
+      warnings: result.warnings,
     });
-    return c.json({
-      key: toPublicPartnerKey(result.record),
-      previous: toPublicPartnerKey(result.previous),
-      revokedIds: result.revokedIds,
-      apiKey: result.plaintext,
-    });
+    return c.json(
+      {
+        key: toPublicPartnerKey(result.record),
+        previous: toPublicPartnerKey(result.previous),
+        revokedIds: result.revokedIds,
+        warnings: result.warnings,
+        apiKey: result.plaintext,
+      },
+      200,
+      NO_STORE_HEADERS
+    );
   } catch (error) {
     logger.error('admin_action', error, ctx);
     return c.json({ error: 'Failed to rotate API key' }, 500);

@@ -6,7 +6,6 @@ import { ChatHistoryEntry } from '../../types/engine.js';
 import { PromptSlot } from '../../types/prompt-overrides.js';
 import { UnmatchedTrigger } from '../classifier/index.js';
 import { generateToolCatalog, ToolCatalog } from '../mcp/index.js';
-import { isPartnerClientId } from '../../utils/chat-validation.js';
 
 /**
  * Orchestration preferences (subset of full user preferences)
@@ -59,6 +58,12 @@ interface SystemPromptOptions {
    * `request_audio` guidance, matching the tools omitted by buildAllTools.
    */
   audioEnabled?: boolean | undefined;
+  /**
+   * True when the request came with a partner API key (from `_caller`, the
+   * single source of truth). The Client Platform section then says only "a
+   * partner app"; the server-set client_id is never interpolated.
+   */
+  partnerCaller?: boolean | undefined;
   /** Per-turn language document to inject into the system prompt */
   languageDocument?: string | undefined;
   /** Set when the user's whole message was routing triggers. */
@@ -198,12 +203,16 @@ const RESOURCE_AVAILABILITY_RULES =
   '- NEVER offer a substitute version that no tool returned. If you could not check, say so instead of guessing.';
 
 /** Build the client platform + client_instructions section. */
-function buildClientSection(clientId: string | undefined, clientInstructions: string): string {
+function buildClientSection(
+  clientId: string | undefined,
+  clientInstructions: string,
+  partnerCaller: boolean
+): string {
   const parts: string[] = [];
   if (clientId) {
-    // Partner requests carry a server-set id (`partner:<ns>`); the model is told
-    // only that it is a partner app — no partner-controlled text is interpolated.
-    const platform = isPartnerClientId(clientId) ? 'a partner app (text chat)' : clientId;
+    // Partner requests: the model is told only that it is a partner app,
+    // decided from `_caller` (never from a client_id prefix).
+    const platform = partnerCaller ? 'a partner app (text chat)' : clientId;
     parts.push(`## Client Platform\nThe user is communicating via: ${platform}`);
   }
   parts.push(clientInstructions);
@@ -435,8 +444,15 @@ export function buildSystemPromptBlocks(
   resolvedPromptValues: Required<Record<PromptSlot, string>>,
   options?: SystemPromptOptions
 ): SystemPromptBlocks {
-  const { memoryTOC, memoryEnabled, clientId, groupContext, isVoiceMessage, audioEnabled } =
-    options ?? {};
+  const {
+    memoryTOC,
+    memoryEnabled,
+    clientId,
+    groupContext,
+    isVoiceMessage,
+    audioEnabled,
+    partnerCaller,
+  } = options ?? {};
 
   // ── Cacheable: derived only from org/mode config and the MCP catalog ──
   const stableSections: string[] = [
@@ -453,7 +469,7 @@ export function buildSystemPromptBlocks(
   // recovering those tokens needs actual prompt reordering and is deliberately
   // out of scope here (see docs/plans/prompt-caching.md).
   const sections: string[] = [
-    buildClientSection(clientId, resolvedPromptValues.client_instructions),
+    buildClientSection(clientId, resolvedPromptValues.client_instructions, partnerCaller === true),
   ];
 
   const groupSection = buildGroupSection(groupContext);

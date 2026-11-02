@@ -37,8 +37,10 @@ export function isValidLanguageCode(code: string): boolean {
  * callers that reach the chat routes are no longer only internal services
  * holding ENGINE_API_KEY. So the admin bit must never be derived from
  * client_id alone — use {@link callerIsAdmin}, which also requires the
- * request to come from an internal caller. (Partner requests that name an
- * admin client_id are additionally refused at the worker boundary.)
+ * request to come from an internal caller. For partner requests the client_id
+ * is not the partner's at all: the worker replaces it with a server-set
+ * `partner:<userNamespace>` (see {@link partnerClientId}), so it can never
+ * name an admin client in the first place.
  */
 const ADMIN_CLIENT_IDS: ReadonlySet<string> = new Set(['admin-portal']);
 
@@ -53,7 +55,7 @@ export function isAdminClient(clientId: string | undefined): boolean {
  * after the client spread) is never admin, whatever client_id it carries.
  */
 export function callerIsAdmin(body: Pick<ChatRequest, '_caller' | 'client_id'>): boolean {
-  return body._caller !== 'partner' && isAdminClient(body.client_id);
+  return !isPartnerCaller(body._caller) && isAdminClient(body.client_id);
 }
 
 /**
@@ -68,9 +70,14 @@ export function partnerClientId(userNamespace: string): string {
   return `${PARTNER_CLIENT_ID_PREFIX}${userNamespace}`;
 }
 
-/** True for a server-set partner client_id. */
-export function isPartnerClientId(clientId: string | undefined): boolean {
-  return clientId?.startsWith(PARTNER_CLIENT_ID_PREFIX) ?? false;
+/**
+ * True when the request was authenticated with a partner key. `_caller` is
+ * the single source of truth (stamped by the worker from the auth principal,
+ * after the client spread); never infer it from client_id. Absent `_caller`
+ * (direct DO calls, older queued entries) means internal.
+ */
+export function isPartnerCaller(caller: ChatCaller | undefined): boolean {
+  return caller === 'partner';
 }
 
 /**
@@ -81,7 +88,7 @@ export function isPartnerClientId(clientId: string | undefined): boolean {
  * means internal, i.e. today's behaviour.
  */
 export function callerAllowsAudio(caller: ChatCaller | undefined): boolean {
-  return caller !== 'partner';
+  return !isPartnerCaller(caller);
 }
 
 /** Options for {@link validateChatBody}. */

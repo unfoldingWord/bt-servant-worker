@@ -512,13 +512,22 @@ unchanged. These admin endpoints accept **only** `ENGINE_API_KEY`.
   `createdBy`, `createdAt`, `scopes`, `userNamespace`, `status`, and when set
   `revokedAt`, `revokedBy`, `rotatedFrom`, `rotatedTo`, `termsVersion`,
   `termsAcceptedAt`). Never the plaintext, never the hash.
-- A revocation can take **about a minute** to take effect everywhere: KV is
-  eventually consistent and the auth lookup caches for 60s.
+- Create and rotate responses (the only ones carrying `apiKey`) are sent with
+  `Cache-Control: no-store`.
+- **Propagation.** KV is eventually consistent, and Cloudflare caches every
+  KV read at the edge for 60s by default — misses ("negative lookups")
+  included. So a revocation can take **about a minute** to take effect
+  everywhere, and **a brand-new key may take up to ~60s to work everywhere**
+  (a location that looked the key up just before it existed keeps answering
+  `403` until its cached miss expires). To replace a key without a gap,
+  prefer rotation with a grace period over create-then-revoke.
 - The list is served from a KV listing alone (each index entry carries the
   record as metadata), so a change made seconds ago may not show in it yet.
   `GET …/api-keys/:keyId` reads the authoritative record. Revoked keys are kept
-  for audit; the list walks at most 20 pages (20,000 keys) and logs
-  `partner_key_list_truncated` past that.
+  for audit; the list walks at most 20 pages (20,000 keys). Past that it
+  returns what it read with `"truncated": true` (and logs
+  `partner_key_list_truncated`); filter by `?org=` to see the rest. A complete
+  list has `"truncated": false`.
 
 ### Create a Key
 
@@ -559,6 +568,8 @@ curl "http://localhost:$PORT/api/v1/admin/api-keys" -H "Authorization: Bearer $A
 curl "http://localhost:$PORT/api/v1/admin/api-keys?org=bcs" -H "Authorization: Bearer $API_KEY"
 ```
 
+**Response (200):** `{"org": "bcs" | null, "keys": [...records], "truncated": false}`
+
 ### Get One Key
 
 ```bash
@@ -588,7 +599,7 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_
 
 Issues a new key with the same name, app, org, terms and `userNamespace` (so
 the partner's users keep their history), then retires the old one. Returns
-`{"key": {...new}, "previous": {...old}, "apiKey": "bts_..."}`.
+`{"key": {...new}, "previous": {...old}, "revokedIds": [...], "warnings": [], "apiKey": "bts_..."}`.
 
 **Grace window.** By default the old key keeps working for 7 days
 (`previous.expiresAt`), so the partner can ship the new key without an
@@ -603,7 +614,14 @@ key or rotate the replacement instead. If a
 concurrent revoke or rotate of the same key wins, the response is also `409`
 (`changed concurrently`) and the key this call issued is revoked again; reload
 and retry. If the old key cannot be updated, the new key is revoked and the
-call returns `500` with the old key unchanged. The body is optional:
+call returns `500` with the old key unchanged. Once the old key has been
+updated the rotation has happened, and the call always returns `200` with the
+new `apiKey`: if a follow-up step then fails it is logged
+(`partner_key_rotation_followup_failed`) and named in `warnings` —
+`rotation_unverified` (the re-read that checks for a concurrent writer
+failed; check the old key with `GET`) or `chain_revoke_incomplete` (with
+`graceSeconds: 0`, an older key still in its grace window could not be
+revoked; revoke it explicitly). The body is optional:
 `{"createdBy": "...", "graceSeconds": 86400}`.
 
 ```bash

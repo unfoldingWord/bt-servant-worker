@@ -163,3 +163,23 @@ describe('sanitizeSpeaker', () => {
     expect(sanitizeSpeaker('   ')).toBe('Unknown');
   });
 });
+
+describe('buildSystemPrompt - partner app label comes from the caller, not client_id', () => {
+  const build = (clientId: string, partnerCaller?: boolean) =>
+    buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES, {
+      clientId,
+      ...(partnerCaller === undefined ? {} : { partnerCaller }),
+    });
+
+  it('an internal caller with a partner:-prefixed client_id is not labelled a partner app', () => {
+    const prompt = build('partner:abc');
+    expect(prompt).toContain('The user is communicating via: partner:abc');
+    expect(prompt).not.toContain('a partner app');
+  });
+
+  it('a partner caller is labelled, and its client_id is not shown', () => {
+    const prompt = build('partner:abc', true);
+    expect(prompt).toContain('The user is communicating via: a partner app (text chat)');
+    expect(prompt).not.toContain('partner:abc');
+  });
+});

@@ -3,8 +3,9 @@
  * failures or interleavings the emulated KV in `cloudflare:test` cannot.
  *
  * Supports exactly what src/services/partner-keys/store.ts uses: `get` (text
- * or json), `put` (with metadata), `delete`, and a single-page `list` by
- * prefix. `failPut` makes the next put to a key throw; `afterPut` runs a hook
+ * or json), `put` (with metadata), `delete`, and a cursor-paged `list` by
+ * prefix (`pageSize` keys per page; unlimited by default). `failPut` /
+ * `failGet` make the next put / get of a key throw; `afterPut` runs a hook
  * after a successful put (to simulate a concurrent writer); `gets` counts reads.
  */
 type Entry = { value: string; metadata?: unknown };
@@ -12,11 +13,17 @@ type Entry = { value: string; metadata?: unknown };
 export class FakeKV {
   readonly store = new Map<string, Entry>();
   gets = 0;
+  pageSize = Number.POSITIVE_INFINITY;
   private failures = new Set<string>();
+  private getFailures = new Set<string>();
   private hooks = new Map<string, () => void>();
 
   failPut(key: string): void {
     this.failures.add(key);
+  }
+
+  failGet(key: string): void {
+    this.getFailures.add(key);
   }
 
   afterPut(key: string, hook: () => void): void {
@@ -25,6 +32,7 @@ export class FakeKV {
 
   async get(key: string, type?: unknown): Promise<unknown> {
     this.gets++;
+    if (this.getFailures.delete(key)) throw new Error(`injected get failure for ${key}`);
     const entry = this.store.get(key);
     if (!entry) return null;
     const wantsJson = type === 'json' || (type as { type?: string } | undefined)?.type === 'json';
@@ -45,12 +53,17 @@ export class FakeKV {
     this.store.delete(key);
   }
 
-  async list(opts: { prefix?: string } = {}) {
+  async list(opts: { prefix?: string; cursor?: string } = {}) {
     const prefix = opts.prefix ?? '';
-    const keys = [...this.store.entries()]
+    const all = [...this.store.entries()]
       .filter(([name]) => name.startsWith(prefix))
+      .sort(([a], [b]) => a.localeCompare(b))
       .map(([name, entry]) => ({ name, metadata: entry.metadata }));
-    return { keys, list_complete: true, cursor: undefined };
+    const start = opts.cursor ? Number(opts.cursor) : 0;
+    const end = start + this.pageSize;
+    const keys = all.slice(start, end);
+    const complete = end >= all.length;
+    return { keys, list_complete: complete, cursor: complete ? undefined : String(end) };
   }
 
   /** Typed as the real binding for the code under test. */

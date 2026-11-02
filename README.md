@@ -164,7 +164,7 @@ All `/api/*` routes require a Bearer token in the `Authorization` header.
 
 - **`ENGINE_API_KEY`** — super-admin token, grants access to all orgs and all endpoints
 - **Org admin keys** — stored in the `ORG_ADMIN_KEYS` KV namespace, keyed by org name; grants admin access to that org only
-- **Partner API keys** (admin-portal#354) — named, revocable `bts_…` keys issued per partner app through `/api/v1/admin/api-keys`. Stored only as SHA-256 in the `API_KEYS` KV namespace. A partner key can call **only** `POST /api/v1/chat` and `POST /api/v1/chat/stream`, always for its own org, with its end users' ids namespaced per partner. See [docs/curl-examples.md](docs/curl-examples.md#admin-partner-api-keys).
+- **Partner API keys** (admin-portal#354) — named, revocable `bts_…` keys issued per partner app through `/api/v1/admin/api-keys`. Stored only as SHA-256 in the `API_KEYS` KV namespace. A partner key can call **only** `POST /api/v1/chat` and `POST /api/v1/chat/stream`, always for its own org, with its end users' ids namespaced per partner. A new or revoked key can take up to ~60s to take effect everywhere (KV edge caching), so replace keys by rotation with a grace period. See [docs/curl-examples.md](docs/curl-examples.md#admin-partner-api-keys).
 - **Webhook callbacks** — authenticated via `X-Engine-Token` header containing the `ENGINE_API_KEY`
 
 ```
@@ -235,7 +235,7 @@ All admin endpoints require Bearer token authentication with `ENGINE_API_KEY` (t
 | `/api/v1/admin/api-keys`                                               | GET          | List partner keys, all orgs or `?org=`; never the plaintext or hash                         |
 | `/api/v1/admin/api-keys/:keyId`                                        | GET          | Get one partner key                                                                         |
 | `/api/v1/admin/api-keys/:keyId/_revoke`                                | POST         | Revoke a partner key (idempotent)                                                           |
-| `/api/v1/admin/api-keys/:keyId/_rotate`                                | POST         | Issue a replacement key (same metadata and user namespace) and revoke the old one           |
+| `/api/v1/admin/api-keys/:keyId/_rotate`                                | POST         | Issue a replacement key; the old one keeps working for a grace window (default 7 days)      |
 
 The snapshot route is the only way into a DO whose `user:{org}:{user_id}` name is unknown (object ids from the Cloudflare REST listing are one-way), which is what makes the DO population enumerable after the fact. `identity` is `null` for DOs that predate identity persistence and have not chatted since.
 

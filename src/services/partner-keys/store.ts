@@ -20,7 +20,9 @@
  *
  * Consistency: KV is eventually consistent and the auth lookup caches for
  * AUTH_LOOKUP_CACHE_TTL_SECONDS, so a revocation can take about a minute to
- * be seen everywhere (portal#354 question 5). Rotation-grace expiry is exact,
+ * be seen everywhere (portal#354 question 5), and a brand-new key may also
+ * take up to ~60s to work everywhere (KV documents up-to-60s propagation;
+ * misses are cached too). Rotation with a grace period avoids depending on it. Rotation-grace expiry is exact,
  * not delayed: the record is unchanged at `expiresAt`, and auth compares it
  * with the clock on every request. KV also has no compare-and-swap;
  * see rotatePartnerKey for what that means for concurrent admin writes.
@@ -32,10 +34,17 @@ import {
   PARTNER_KEY_ID_PATTERN,
   partnerKeyStatus,
 } from '../../types/partner-keys.js';
-import { bytesToHex, sha256Hex } from '../../utils/crypto.js';
+import { bytesToBase64Url, bytesToHex, sha256Hex } from '../../utils/crypto.js';
 import type { RequestLogger } from '../../utils/logger.js';
 
-/** Cloudflare's minimum `cacheTtl` for KV reads; also the revocation-delay bound we document. */
+/**
+ * `cacheTtl` for the auth lookup: Cloudflare's default (60s; the minimum is
+ * 30). Per the KV docs, both found keys AND misses ("negative lookups") are
+ * cached at the edge, and writes made elsewhere are not visible in a location
+ * until its cached value expires. Every KV get is cached this way (60s is
+ * also what a get without `cacheTtl` uses), so this is the documented bound
+ * for a revocation — and for a brand-new key — to be seen everywhere.
+ */
 export const AUTH_LOOKUP_CACHE_TTL_SECONDS = 60;
 /** Cloudflare's limit on the serialized metadata of one KV key. */
 export const KV_METADATA_MAX_BYTES = 1024;
@@ -63,10 +72,7 @@ function randomHex(byteCount: number): string {
 }
 
 function randomBase64Url(byteCount: number): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(byteCount));
-  let binary = '';
-  for (const b of bytes) binary += String.fromCharCode(b);
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  return bytesToBase64Url(crypto.getRandomValues(new Uint8Array(byteCount)));
 }
 
 /** The non-secret display prefix (`bts_<8 hex>`) of a partner-shaped token. */
@@ -113,6 +119,15 @@ export async function lookupPartnerKeyByToken(
     type: 'json',
     cacheTtl: AUTH_LOOKUP_CACHE_TTL_SECONDS,
   });
+}
+
+/** Read the authoritative record by its storage hash (when the hash is already known). */
+async function readByHash(
+  kv: KVNamespace,
+  hash: string
+): Promise<{ record: PartnerKeyRecord; hash: string } | null> {
+  const record = await kv.get<PartnerKeyRecord>(`${KEY_PREFIX}${hash}`, 'json');
+  return record ? { record, hash } : null;
 }
 
 /** Admin read by id (uncached). Returns the record and its storage hash, or null. */
@@ -241,7 +256,7 @@ async function writeRevocation(
   };
   const record: PartnerKeyRecord = { ...found.record, ...fields };
   await updateRecord(kv, found.hash, record, logger);
-  const reread = await getPartnerKeyById(kv, found.record.id);
+  const reread = await readByHash(kv, found.hash);
   if (!reread || reread.record.revokedAt !== undefined) {
     return { record: reread?.record ?? record, reapplied: false };
   }
@@ -344,6 +359,8 @@ export type RotateResult =
       plaintext: string;
       /** Keys this rotation killed: with grace 0, the rotated key and its in-grace predecessors. */
       revokedIds: string[];
+      /** Non-fatal post-commit problems: `rotation_unverified`, `chain_revoke_incomplete`. */
+      warnings: string[];
     };
 
 type Issued = { record: PartnerKeyRecord; hash: string };
@@ -461,7 +478,7 @@ export async function rotatePartnerKey(
   const issued = await issueReplacement(kv, found.record, opts.createdBy, logger);
   // Re-read just before writing so a revoke/rotate that landed while the new
   // key was being issued is not silently overwritten by our stale copy.
-  const fresh = await getPartnerKeyById(kv, id);
+  const fresh = await readByHash(kv, found.hash);
   if (!fresh || rotationRefusal(fresh.record)) {
     return abortRotation(kv, issued, { key_id: id, phase: 'pre_write' }, logger);
   }
@@ -477,28 +494,61 @@ export async function rotatePartnerKey(
     throw error;
   }
 
-  const reread = await getPartnerKeyById(kv, id);
-  if (!rotationHeld(reread?.record, previous, issued.record.id)) {
-    return abortRotation(kv, issued, { key_id: id, phase: 'post_write' }, logger);
+  // COMMITTED: the old record now names the new key. Nothing after this line
+  // may turn the rotation into an error — the caller must get the plaintext.
+  return finishRotation(kv, { hash: found.hash, previous, issued, logger });
+}
+
+/**
+ * Post-commit steps of a rotation, all non-fatal: verify our write held (a
+ * lost race still aborts with 409) and, for grace 0, revoke the in-grace
+ * predecessors. A failure is logged (`partner_key_rotation_followup_failed`)
+ * and reported as a warning; the 200 with the new plaintext still goes out.
+ */
+async function finishRotation(
+  kv: KVNamespace,
+  ctx: { hash: string; previous: PartnerKeyRecord; issued: Issued & { plaintext: string } } & {
+    logger: RequestLogger;
   }
-  const revokedIds = await killChainIfImmediate(kv, previous, logger);
+): Promise<RotateResult> {
+  const { hash, previous, issued, logger } = ctx;
+  const ids = { key_id: previous.id, new_key_id: issued.record.id };
+  const warnings: string[] = [];
+  let held = true;
+  try {
+    const reread = await readByHash(kv, hash);
+    held = rotationHeld(reread?.record, previous, issued.record.id);
+  } catch (error) {
+    logger.error('partner_key_rotation_followup_failed', error, { ...ids, step: 'verify' });
+    warnings.push('rotation_unverified');
+  }
+  if (!held) {
+    return abortRotation(kv, issued, { key_id: previous.id, phase: 'post_write' }, logger);
+  }
+  const revokedIds = previous.revokedAt === undefined ? [] : [previous.id];
+  try {
+    revokedIds.push(...(await revokeChainIfImmediate(kv, previous, logger)));
+  } catch (error) {
+    logger.error('partner_key_rotation_followup_failed', error, { ...ids, step: 'chain_revoke' });
+    warnings.push('chain_revoke_incomplete');
+  }
   const { record, plaintext } = issued;
-  return { status: 'ok', previous, record, plaintext, revokedIds };
+  return { status: 'ok', previous, record, plaintext, revokedIds, warnings };
 }
 
 /**
  * `graceSeconds: 0` means "rotate and kill now" for the whole chain, same as
- * revoke: the rotated key is already revoked by retiredRecord; this also
- * revokes its predecessors still in their grace window. Returns all killed ids.
+ * revoke: the rotated key is already revoked by retiredRecord; this revokes
+ * its predecessors still in their grace window. Returns the predecessor ids.
  */
-async function killChainIfImmediate(
+async function revokeChainIfImmediate(
   kv: KVNamespace,
   previous: PartnerKeyRecord,
   logger: RequestLogger
 ): Promise<string[]> {
   if (previous.revokedAt === undefined) return [];
   const stamp = { revokedAt: previous.revokedAt, revokedBy: previous.revokedBy };
-  return [previous.id, ...(await revokeGracePredecessors(kv, previous, stamp, logger))];
+  return revokeGracePredecessors(kv, previous, stamp, logger);
 }
 
 /** Why `record` cannot be rotated now, or null when it can. */
@@ -572,10 +622,10 @@ export async function listPartnerKeys(
   kv: KVNamespace,
   org: string | undefined,
   logger: RequestLogger
-): Promise<PartnerKeyRecord[]> {
+): Promise<{ records: PartnerKeyRecord[]; truncated: boolean }> {
   const { records, truncated } = await listIndex(kv, org, logger);
   if (truncated) {
     logger.warn('partner_key_list_truncated', { org: org ?? null, max_pages: MAX_LIST_PAGES });
   }
-  return records.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  return { records: records.sort((a, b) => b.createdAt.localeCompare(a.createdAt)), truncated };
 }

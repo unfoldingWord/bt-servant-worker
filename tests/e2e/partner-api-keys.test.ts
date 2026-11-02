@@ -600,3 +600,35 @@ describe('route check happens before the key lookup', () => {
     });
   });
 });
+
+describe('responses that carry a plaintext key are not cacheable', () => {
+  it('create and rotate send Cache-Control: no-store; rotate reports warnings', async () => {
+    const created = await SELF.fetch(KEYS, {
+      method: 'POST',
+      headers: JSON_INTERNAL,
+      body: JSON.stringify({
+        org: 'org-354-nostore',
+        name: 'n',
+        app: 'a',
+        createdBy: 'tester@example.org',
+        allow_new_org: true,
+      }),
+    });
+    expect(created.status).toBe(201);
+    expect(created.headers.get('Cache-Control')).toBe('no-store');
+    const { key } = (await created.json()) as CreateBody;
+
+    const rotate = await rotateKey(key.id);
+    expect(rotate.status).toBe(200);
+    expect(rotate.headers.get('Cache-Control')).toBe('no-store');
+    expect(((await rotate.json()) as { warnings: string[] }).warnings).toEqual([]);
+  });
+
+  it('the list reports truncated: false when every index page was read', async () => {
+    await createKey('org-354-truncated');
+    const list = (await (
+      await SELF.fetch(`${KEYS}?org=org-354-truncated`, { headers: INTERNAL })
+    ).json()) as { truncated: boolean };
+    expect(list.truncated).toBe(false);
+  });
+});

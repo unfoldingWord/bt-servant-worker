@@ -203,6 +203,8 @@ interface OrchestratorOptions {
    * The DO derives it from `callerAllowsAudio(body._caller)`.
    */
   audioEnabled?: boolean | undefined;
+  /** True for partner-key requests (DO: `isPartnerCaller(body._caller)`); see SystemPromptOptions. */
+  partnerCaller?: boolean | undefined;
   modeContext?: ModeContext | undefined;
   audioContext?: AudioContext | undefined;
   attachmentsContext?: AttachmentsContext | undefined;
@@ -2200,7 +2202,7 @@ function createOrchestrationContext(
   const llmMax = orgConfig?.max_history_llm ?? DEFAULT_ORG_CONFIG.max_history_llm;
 
   // prettier-ignore
-  const systemBlocks = buildSystemPromptBlocks(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, memoryEnabled: hasMemoryForTurn(options), audioEnabled: options.audioEnabled !== false, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument, triggerOnly: options.triggerOnly, unmatchedTriggers: options.unmatchedTriggers, addressedToBot: options.addressedToBot, inboundVoiceKey: options.inboundVoiceKey });
+  const systemBlocks = buildSystemPromptBlocks(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, memoryEnabled: hasMemoryForTurn(options), audioEnabled: options.audioEnabled !== false, partnerCaller: options.partnerCaller === true, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument, triggerOnly: options.triggerOnly, unmatchedTriggers: options.unmatchedTriggers, addressedToBot: options.addressedToBot, inboundVoiceKey: options.inboundVoiceKey });
 
   return {
     client: new Anthropic({ apiKey: env.ANTHROPIC_API_KEY }),

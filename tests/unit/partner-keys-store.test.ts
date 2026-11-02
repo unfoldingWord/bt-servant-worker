@@ -41,9 +41,9 @@ describe('listPartnerKeys', () => {
     const a = await seed(kv, 'org-a');
     const b = await seed(kv, 'org-b');
     kv.gets = 0;
-    const all = await listPartnerKeys(kv.asKV(), undefined, createMockLogger());
+    const { records: all } = await listPartnerKeys(kv.asKV(), undefined, createMockLogger());
     expect(allKeyIds(all)).toEqual([a.record.id, b.record.id].sort());
-    const onlyA = await listPartnerKeys(kv.asKV(), 'org-a', createMockLogger());
+    const { records: onlyA } = await listPartnerKeys(kv.asKV(), 'org-a', createMockLogger());
     expect(allKeyIds(onlyA)).toEqual([a.record.id]);
     expect(kv.gets).toBe(0);
   });
@@ -52,7 +52,9 @@ describe('listPartnerKeys', () => {
     const kv = new FakeKV();
     const { record } = await seed(kv);
     await revokePartnerKey(kv.asKV(), record.id, { logger: createMockLogger() });
-    const [listed] = await listPartnerKeys(kv.asKV(), 'bcs', createMockLogger());
+    const {
+      records: [listed],
+    } = await listPartnerKeys(kv.asKV(), 'bcs', createMockLogger());
     expect(listed?.revokedAt).toBeDefined();
   });
 });
@@ -108,7 +110,7 @@ describe('rotatePartnerKey failure handling', () => {
 
     const stillOld = await getPartnerKeyById(kv.asKV(), old.record.id);
     expect(stillOld?.record.revokedAt).toBeUndefined();
-    const all = await listPartnerKeys(kv.asKV(), 'bcs', createMockLogger());
+    const { records: all } = await listPartnerKeys(kv.asKV(), 'bcs', createMockLogger());
     const replacement = all.find((r) => r.rotatedFrom === old.record.id);
     expect(replacement?.revokedAt).toBeDefined();
     expect(logger.warn).toHaveBeenCalledWith(
@@ -156,7 +158,7 @@ describe('rotatePartnerKey concurrency', () => {
       logger: createMockLogger(),
     });
     expect(result.status).toBe('conflict');
-    const all = await listPartnerKeys(kv.asKV(), 'bcs', createMockLogger());
+    const { records: all } = await listPartnerKeys(kv.asKV(), 'bcs', createMockLogger());
     const replacement = all.find((r) => r.rotatedFrom === old.record.id);
     expect(replacement?.revokedAt).toBeDefined();
   });
@@ -227,7 +229,7 @@ function afterFirstPut(kv: FakeKV, match: (key: string) => boolean, hook: () => 
 }
 
 const replacementOf = async (kv: FakeKV, oldId: string) =>
-  (await listPartnerKeys(kv.asKV(), 'bcs', createMockLogger())).find(
+  (await listPartnerKeys(kv.asKV(), 'bcs', createMockLogger())).records.find(
     (r) => r.rotatedFrom === oldId
   );
 
@@ -421,7 +423,7 @@ describe('index layout', () => {
     const kv = new FakeKV();
     const mine = await seed(kv, 'bcs');
     await seed(kv, 'bcs2');
-    const listed = await listPartnerKeys(kv.asKV(), 'bcs', createMockLogger());
+    const { records: listed } = await listPartnerKeys(kv.asKV(), 'bcs', createMockLogger());
     expect(listed.map((r) => r.id)).toEqual([mine.record.id]);
     expect(kv.store.has(`id:bcs:${mine.record.id}`)).toBe(true);
     expect(kv.store.get(`ptr:${mine.record.id}`)?.value).toBe(mine.hash);

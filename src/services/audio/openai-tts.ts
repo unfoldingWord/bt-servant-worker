@@ -3,6 +3,7 @@
  */
 
 import OpenAI from 'openai';
+import { bytesToBase64 } from '../../utils/crypto.js';
 import { AudioSynthesisError } from '../../utils/errors.js';
 import { RequestLogger } from '../../utils/logger.js';
 import { MAX_TTS_INPUT_CHARS, SpeechSynthesisResult } from './types.js';
@@ -26,15 +27,6 @@ Dialect: Neutral and standard, avoiding slang or overly casual phrasing; suitabl
 Pronunciation: Careful and precise, ensuring proper enunciation of biblical names and terms, while remaining natural and fluid.
 
 Features: Uses efficient pacing with brief pauses and gentle emphasis to highlight key points. Conveys reverence when reading Scripture and clarity when giving practical instructions. Avoids drawn-out pauses or overly slow delivery.`;
-
-/** Convert a Uint8Array to a base64 string. */
-function uint8ArrayToBase64(bytes: Uint8Array): string {
-  let binary = '';
-  for (const byte of bytes) {
-    binary += String.fromCharCode(byte);
-  }
-  return btoa(binary);
-}
 
 /** Stream the TTS response body, collecting chunks incrementally. */
 async function streamResponseBody(
@@ -95,7 +87,7 @@ async function readTtsResponse(
   });
 
   const encodeStart = Date.now();
-  const audioBase64 = uint8ArrayToBase64(audioBytes);
+  const audioBase64 = bytesToBase64(audioBytes);
   logger.log('tts_base64_encode', {
     attempt,
     base64_length: audioBase64.length,

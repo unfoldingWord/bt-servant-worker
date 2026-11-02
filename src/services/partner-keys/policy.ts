@@ -126,9 +126,20 @@ export const MAX_PARTNER_ID_LENGTH = 256;
 /** Max length of a partner-supplied speaker name after neutralising. */
 export const MAX_PARTNER_SPEAKER_LENGTH = 64;
 
-/** True when `value` contains a control or line-break character. */
+/**
+ * C1 controls (U+0080–U+009F, which include NEL U+0085) and the Unicode line
+ * and paragraph separators. Treated exactly like C0 controls and \r \n \t:
+ * each can break a line in some renderer or model tokenizer.
+ */
+const C1_AND_LINE_SEPARATORS = /[\u0080-\u009f\u2028\u2029]/g;
+
+/** True when `value` contains a C0/C1 control or any line-break character. */
 function hasControlOrLineBreak(value: string): boolean {
-  return stripControlChars(value) !== value || /[\r\n\t\u2028\u2029]/.test(value);
+  return (
+    stripControlChars(value) !== value ||
+    /[\r\n\t]/.test(value) ||
+    new RegExp(C1_AND_LINE_SEPARATORS.source).test(value)
+  );
 }
 
 /** An identifier field: absent/null, or a bounded single-line non-empty string. */
@@ -172,7 +183,10 @@ function checkIdentifiers(body: Record<string, unknown>): PartnerPolicyResult | 
  */
 export function neutralizePartnerSpeaker(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
-  const flat = stripControlChars(value).replace(/\s+/g, ' ').trim();
+  const flat = stripControlChars(value)
+    .replace(C1_AND_LINE_SEPARATORS, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
   return flat.slice(0, MAX_PARTNER_SPEAKER_LENGTH).trim() || undefined;
 }
 
