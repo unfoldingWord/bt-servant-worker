@@ -493,11 +493,11 @@ describe('loadShareCodeTarget — corrupt home', () => {
       logger
     );
     expect(loaded).toMatchObject({ kind: 'ok', homeHasModes: undefined });
-    expect(logger.error).toHaveBeenCalledWith(
+    expect(logger.warn).toHaveBeenCalledWith(
       'org_modes_kv_read_error',
-      expect.anything(),
       expect.objectContaining({ key: `${HOME}:modes`, source: 'share_code' })
     );
+    expect(logger.error).not.toHaveBeenCalled();
     expect(await resolve(kv, 'pbt', 'x')).toMatchObject({ resolves: true });
   });
 
@@ -582,7 +582,7 @@ describe('resolveModeShareCode — failure impact is judged on the raw match', (
     expect(await resolve(kv, 'PBT', 'x')).toMatchObject({ resolves: true, resolved_org: 'PBT' });
   });
 
-  it('capped is firm even when another org failed to read (the cap comes from the listing)', async () => {
+  it('capped stays firm when another org failed to read; only the look-alike is uncertain', async () => {
     const fillers = Object.fromEntries(
       Array.from({ length: MAX_FOREIGN_ORGS_PER_TURN }, (_, i) => [
         `a${String(i).padStart(2, '0')}:modes`,
@@ -597,10 +597,13 @@ describe('resolveModeShareCode — failure impact is judged on the raw match', (
       code: 'zzz/x',
       resolves: false,
       reason: 'capped',
+      resolved_org_uncertain: true,
     });
   });
+});
 
-  it('any failed read makes a non-own-exact answer unavailable, even a collision loss', async () => {
+describe('resolveModeShareCode — failed reads leave misses firm', () => {
+  it('a collision loss stays firm when a read failed; resolved_org is withheld as uncertain', async () => {
     const kv = fakeKv(
       {
         'PBT:modes': { modes: [published('x')] },
@@ -609,7 +612,26 @@ describe('resolveModeShareCode — failure impact is judged on the raw match', (
       },
       { failGet: ['pbt.:modes'] }
     );
-    expect(await unavailableDetail(resolve(kv, 'pbt', 'x'))).toBe('read_failed');
+    expect(await resolve(kv, 'pbt', 'x')).toEqual({
+      code: 'pbt/x',
+      resolves: false,
+      reason: 'collision',
+      resolved_org_uncertain: true,
+    });
+  });
+
+  it('without failed reads there is no uncertainty flag', async () => {
+    const kv = fakeKv({
+      'PBT:modes': { modes: [published('x')] },
+      'pbt:modes': { modes: [published('x')] },
+    });
+    const answer = await resolve(kv, 'pbt', 'x');
+    expect(answer).toEqual({
+      code: 'pbt/x',
+      resolves: false,
+      reason: 'collision',
+      resolved_org: 'PBT',
+    });
   });
 });
 
@@ -655,6 +677,62 @@ describe('invalidOrgError', () => {
     // Bytes, not characters: 'é' is two bytes in UTF-8.
     expect(invalidOrgError('é'.repeat(254))).toMatch(/512 bytes/);
     expect(invalidOrgError('')).toMatch(/empty/);
+  });
+});
+
+describe('share-code logging (round 6)', () => {
+  it('a 404 never emits a home-read event, even when the home record is bad', async () => {
+    const kv = fakeKv({}, { noHome: true, rawText: { [`${HOME}:modes`]: '{not json' } });
+    const logger = spyLogger();
+    const loaded = await loadShareCodeTarget(
+      kv,
+      { org: 'pbt', homeOrg: HOME, modeName: 'x' },
+      logger
+    );
+    expect(loaded).toEqual({ kind: 'mode_not_found' });
+    expect(logger.warn).not.toHaveBeenCalled();
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  it('a corrupt target still logs the home read failure once', async () => {
+    const kv = fakeKv(
+      {},
+      { noHome: true, rawText: { 'pbt:modes': '{bad', [`${HOME}:modes`]: '{bad' } }
+    );
+    const logger = spyLogger();
+    const loaded = await loadShareCodeTarget(
+      kv,
+      { org: 'pbt', homeOrg: HOME, modeName: 'x' },
+      logger
+    );
+    expect(loaded).toEqual({ kind: 'corrupt_record', key: 'pbt:modes' });
+    const homeEvents = (logger.warn as ReturnType<typeof vi.fn>).mock.calls.filter(
+      ([event]) => event === 'org_modes_kv_read_error'
+    );
+    expect(homeEvents).toHaveLength(1);
+    expect(homeEvents[0]?.[1]).toMatchObject({ key: `${HOME}:modes`, source: 'share_code' });
+  });
+});
+
+describe('share-code logging — shared reader', () => {
+  it('a failed foreign get is logged at warn with source share_code, never at error', async () => {
+    const kv = fakeKv(
+      { 'other:modes': { modes: [published('y')] }, 'pbt:modes': { modes: [published('x')] } },
+      { failGet: ['other:modes'] }
+    );
+    const logger = spyLogger();
+    const loaded = await loadShareCodeTarget(
+      kv,
+      { org: 'pbt', homeOrg: HOME, modeName: 'x' },
+      logger
+    );
+    if (loaded.kind !== 'ok') throw new Error('setup');
+    await resolveModeShareCode(kv, loaded.target, logger);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'cross_org_modes_read_failed',
+      expect.objectContaining({ key: 'other:modes', source: 'share_code' })
+    );
+    expect(logger.error).not.toHaveBeenCalled();
   });
 });
 

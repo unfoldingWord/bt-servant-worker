@@ -64,6 +64,13 @@ export interface ShareCodeAnswer {
   reason?: ShareCodeReason;
   /** Raw org name of the mode `#<code>` actually opens, when it opens one. */
   resolved_org?: string;
+  /**
+   * Present (true) on a `resolves: false` answer when a foreign read failed:
+   * the reason stands, but which look-alike (if any) the code opens is
+   * unknown, so `resolved_org` is omitted. `ambiguous` vs `not_found` carries
+   * the same uncertainty.
+   */
+  resolved_org_uncertain?: true;
 }
 
 /** Why no authoritative answer could be given right now; every case is worth a retry. */
@@ -224,23 +231,29 @@ function whyForeignMissing(
 }
 
 /**
- * Whether a failed foreign get could change this answer. `capped` cannot: the
- * cap is decided from the listing before any get. Any other miss could: the
- * failed org may hold the mode the token would really open. (Narrowing this to orgs within fuzzy reach
- * of the slug would need a second edit-distance implementation, so the rule
- * stays broad.) An own exact match can only be pre-empted by a failed org that
- * the merge would have processed first (`compareOrgs`) with the same slug.
+ * Apply failed foreign reads to an answer. A failed read can only ADD
+ * competitors; it can never add this org's own exact match. So `resolves` is
+ * firm both ways, and on a miss only the look-alike is in doubt:
+ * `resolved_org` is dropped and `resolved_org_uncertain` set. The one
+ * exception is an own exact match that a failed org could have pre-empted:
+ * same slug and processed first by the merge (`compareOrgs`), which throws
+ * a retryable 503.
  */
-function failureCouldChange(
+function applyFailedReads(
   answer: ShareCodeAnswer,
   target: { org: string; slug: string },
   sources: CrossOrgModeSources
-): boolean {
-  if (sources.failedKeys.length === 0 || answer.reason === 'capped') return false;
-  if (!answer.resolves) return true;
-  return sources.failedKeys
+): ShareCodeAnswer {
+  if (sources.failedKeys.length === 0) return answer;
+  if (!answer.resolves) {
+    const { resolved_org: _unknown, ...firm } = answer;
+    return { ...firm, resolved_org_uncertain: true };
+  }
+  const preempted = sources.failedKeys
     .map(orgFromModesKey)
     .some((failed) => orgSlug(failed) === target.slug && compareOrgs(failed, target.org) < 0);
+  if (preempted) throw new ShareCodeUnavailableError('read_failed', { key: sources.failedKeys[0] });
+  return answer;
 }
 
 async function resolveForeign(
@@ -251,7 +264,10 @@ async function resolveForeign(
 ): Promise<ShareCodeAnswer> {
   const { org, homeOrg } = target;
   const tagged = withLogContext(logger, SHARE_CODE_LOG_CONTEXT);
-  const sources = await readCrossOrgModeSources(kv, homeOrg, tagged, target.snapshot);
+  const sources = await readCrossOrgModeSources(kv, homeOrg, logger, {
+    prefetched: target.snapshot,
+    source: 'share_code',
+  });
   if (sources.listFailed) throw new ShareCodeUnavailableError('list_failed');
   // The record exists (the caller just read it), yet a COMPLETE listing does
   // not show it: KV list lag. The chat path cannot see it yet either; retry.
@@ -262,10 +278,7 @@ async function resolveForeign(
   const match = matchCode(p.code, merged.modes, homeOrg);
   const why = whyForeignMissing(p.code, target, { sources, merged });
   const answer = answerFromMatch(p.code, match, { name: p.code, org }, why);
-  if (failureCouldChange(answer, { org, slug: p.slug }, sources)) {
-    throw new ShareCodeUnavailableError('read_failed', { key: sources.failedKeys[0] });
-  }
-  return answer;
+  return applyFailedReads(answer, { org, slug: p.slug }, sources);
 }
 
 /**
@@ -361,11 +374,44 @@ function degradeHome(
   home: { key: string; error: unknown },
   logger: RequestLogger
 ): undefined {
-  withLogContext(logger, SHARE_CODE_LOG_CONTEXT).error('org_modes_kv_read_error', home.error, {
-    key: home.key,
-  });
+  logHomeReadError(home, logger);
   snapshot.set(home.key, null);
   return undefined;
+}
+
+/** The chat path's home-read event, at warn and tagged, as the shared reader logs it in share-code mode. */
+function logHomeReadError(home: { key: string; error: unknown }, logger: RequestLogger): void {
+  withLogContext(logger, SHARE_CODE_LOG_CONTEXT).warn('org_modes_kv_read_error', {
+    key: home.key,
+    error: home.error instanceof Error ? home.error.message : String(home.error),
+  });
+}
+
+/** The home read's failure, when the home is a separate key that could not be used. */
+function homeReadFailure(
+  snapshot: ReadonlyMap<string, unknown>,
+  homeKey: string,
+  error: unknown
+): { key: string; error: unknown } | undefined {
+  const value = snapshot.get(homeKey);
+  return value === UNREADABLE || value === CORRUPT ? { key: homeKey, error } : undefined;
+}
+
+/**
+ * The outcome for a target record that could not be used: 500 for corrupt
+ * data, a retryable 503 for a transport error (thrown). `beforeOutcome` runs
+ * first so the home failure, if any, is still logged. Undefined when the
+ * record is usable data.
+ */
+function badTargetOutcome(
+  record: unknown,
+  target: { key: string; error: unknown },
+  beforeOutcome: () => void
+): ShareCodeLoad | undefined {
+  if (record !== UNREADABLE && record !== CORRUPT) return undefined;
+  beforeOutcome();
+  if (record === CORRUPT) return { kind: 'corrupt_record', key: target.key };
+  throw new ShareCodeUnavailableError('read_failed', { key: target.key, cause: target.error });
 }
 
 /**
@@ -386,21 +432,23 @@ export async function loadShareCodeTarget(
   const snapshot = new Map<string, unknown>(keys.map((key, i) => [key, reads.at(i)?.value]));
 
   const record = snapshot.get(orgKey);
-  if (record === UNREADABLE) {
-    throw new ShareCodeUnavailableError('read_failed', { key: orgKey, cause: reads.at(0)?.error });
-  }
-  if (record === CORRUPT) return { kind: 'corrupt_record', key: orgKey };
-
-  const homeValue = snapshot.get(homeKey);
-  const homeHasModes =
-    homeValue === UNREADABLE || homeValue === CORRUPT
-      ? degradeHome(snapshot, { key: homeKey, error: reads.at(1)?.error }, logger)
-      : isOrgModes(homeValue);
-
+  const homeFailure =
+    orgKey === homeKey ? undefined : homeReadFailure(snapshot, homeKey, reads.at(1)?.error);
+  // The target decides first. A bad home is only logged once the request is
+  // going somewhere: a 404 never emits a home-read event.
+  const badTarget = badTargetOutcome(record, { key: orgKey, error: reads.at(0)?.error }, () => {
+    if (homeFailure !== undefined) logHomeReadError(homeFailure, logger);
+  });
+  if (badTarget !== undefined) return badTarget;
   if (!isOrgModes(record)) return { kind: 'mode_not_found' };
   const targetModes = sanitizeModeElements(record.modes).modes;
   const found = findStoredMode(record.modes, targetModes, p.modeName);
   if (found === undefined) return { kind: 'mode_not_found' };
+
+  const homeHasModes =
+    homeFailure === undefined
+      ? isOrgModes(snapshot.get(homeKey))
+      : degradeHome(snapshot, homeFailure, logger);
   return {
     kind: 'ok',
     target: { org: p.org, homeOrg: p.homeOrg, snapshot, targetModes, ...found },

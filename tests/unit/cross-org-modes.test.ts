@@ -10,13 +10,14 @@ import { env } from 'cloudflare:test';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { OrgModes, PromptMode } from '../../src/types/prompt-overrides.js';
 import { chatTriggerModeOptions, validateModeSelection } from '../../src/types/prompt-overrides.js';
-import { resolveTriggerToken } from '../../src/services/classifier/index.js';
+import { classifyTriggers } from '../../src/services/classifier/index.js';
 import {
   MAX_MODES_KEY_PAGES,
   MAX_FOREIGN_ORGS_PER_TURN,
   mergeCrossOrgModes,
   orgSlug,
   readAllPublishedModes,
+  readCrossOrgModeSources,
 } from '../../src/utils/cross-org-modes.js';
 import type { RequestLogger } from '../../src/utils/logger.js';
 
@@ -784,10 +785,27 @@ describe('readAllPublishedModes — malformed home elements are sanitized for ch
     });
     // What the DO does next must not throw: visibility filter + classifier.
     const options = chatTriggerModeOptions(merged.modes, { isGroupChat: false, isAdmin: false });
-    expect(resolveTriggerToken('old-b', options)).toEqual({
-      kind: 'matched',
-      match: { name: 'b', tier: 'alias' },
+    const classified = classifyTriggers('#old-b', {
+      availableModes: options,
+      availableLanguages: [],
     });
+    expect(classified.modeName).toBe('b');
+    expect(classified.modeMatchTier).toBe('alias');
+  });
+});
+
+describe('readAllPublishedModes — home-element warning dedup', () => {
+  it('share-code reads do not use up the chat path once-per-isolate warning', async () => {
+    const kv = fakeKv({ 'home-r6:modes': { modes: [null, published('h')] } });
+    const admin = spyLogger();
+    await readCrossOrgModeSources(kv, 'home-r6', admin, { source: 'share_code' });
+    await readCrossOrgModeSources(kv, 'home-r6', admin, { source: 'share_code' });
+    expect(
+      admin.warn.mock.calls.filter(([event]) => event === 'org_modes_invalid_elements')
+    ).toHaveLength(2);
+    const chat = spyLogger();
+    await readAllPublishedModes(kv, 'home-r6', chat);
+    expect(chat.warn).toHaveBeenCalledWith('org_modes_invalid_elements', expect.anything());
   });
 
   it('warns about a malformed home element once per isolate, not every turn', async () => {

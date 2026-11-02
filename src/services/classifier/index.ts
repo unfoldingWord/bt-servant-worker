@@ -197,7 +197,7 @@ const LEVENSHTEIN_MAX = 2;
 export type MatchTier = 'exact' | 'alias' | 'prefix' | 'fuzzy';
 
 /** A resolved token: the option's canonical `name` and the tier that matched it. */
-export interface TokenMatch {
+interface TokenMatch {
   name: string;
   tier: MatchTier;
 }
@@ -285,17 +285,15 @@ type TokenOutcome =
   | { kind: 'unmatched'; trigger: UnmatchedTrigger; tokenText: string };
 
 /** How one raw token (sigil stripped) resolves against an option list. */
-export type TokenResolution =
+type TokenResolution =
   { kind: 'clear' } | { kind: 'matched'; match: TokenMatch } | { kind: 'unmatched' };
 
 /**
- * Resolve one raw token exactly as `classifyTriggers` does for a leading
- * trigger: reserved clear tokens first, then the exact → prefix → fuzzy
- * cascade. Exported with the match's provenance (tier) so the admin
- * share-code endpoint (admin-portal#345) can report what a token really opens
- * without re-implementing the matcher.
+ * Resolve one raw token (sigil stripped): reserved clear tokens first, then
+ * the exact → prefix → fuzzy cascade, keeping the tier that matched so
+ * `classifyTriggers` can report it as `modeMatchTier`.
  */
-export function resolveTriggerToken(raw: string, options: AvailableOption[]): TokenResolution {
+function resolveTriggerToken(raw: string, options: AvailableOption[]): TokenResolution {
   if (CLEAR_TOKENS.has(raw.toLowerCase())) return { kind: 'clear' };
   const match = matchToken(raw, options);
   return match === null ? { kind: 'unmatched' } : { kind: 'matched', match };
@@ -370,9 +368,13 @@ export function classifyTriggers(messageText: string, ctx: ClassifierContext): C
       ? postTokens
       : `${unmatchedTokenTexts.join(' ')}${postTokens.length > 0 ? ' ' + postTokens : ''}`;
 
-  const result = { modeName, languageName, strippedMessage, unmatchedTriggers };
-  const flags = { clearMode, clearLanguage };
-  return modeMatchTier === undefined
-    ? { ...result, ...flags }
-    : { ...result, ...flags, modeMatchTier };
+  return {
+    modeName,
+    languageName,
+    strippedMessage,
+    unmatchedTriggers,
+    clearMode,
+    clearLanguage,
+    ...(modeMatchTier === undefined ? {} : { modeMatchTier }),
+  };
 }

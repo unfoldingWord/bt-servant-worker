@@ -3,7 +3,6 @@ import {
   classifyTriggers,
   ClassifierContext,
   AvailableOption,
-  resolveTriggerToken,
 } from '../../src/services/classifier/index.js';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
@@ -661,34 +660,25 @@ describe('classifyTriggers — qualified tokens get the cascade within the quali
   });
 });
 
-describe('resolveTriggerToken — match provenance (admin-portal#345)', () => {
-  const options = [
-    { name: 'mast-methodology', label: 'MAST', aliases: ['mast-old'] },
-    { name: 'spoken', label: 'Spoken' },
-  ];
+describe('classifyTriggers — match provenance via modeMatchTier (admin-portal#345)', () => {
+  const ctx = {
+    availableModes: [
+      { name: 'mast-methodology', label: 'MAST', aliases: ['mast-old'] },
+      { name: 'spoken', label: 'Spoken' },
+    ],
+    availableLanguages: [],
+  };
 
-  it('reports the tier that matched', () => {
-    expect(resolveTriggerToken('spoken', options)).toEqual({
-      kind: 'matched',
-      match: { name: 'spoken', tier: 'exact' },
-    });
-    expect(resolveTriggerToken('mast-old', options)).toEqual({
-      kind: 'matched',
-      match: { name: 'mast-methodology', tier: 'alias' },
-    });
-    expect(resolveTriggerToken('mast', options)).toEqual({
-      kind: 'matched',
-      match: { name: 'mast-methodology', tier: 'prefix' },
-    });
-    expect(resolveTriggerToken('spokne', options)).toEqual({
-      kind: 'matched',
-      match: { name: 'spoken', tier: 'fuzzy' },
-    });
+  it('reports the alias tier when an old slug matched', () => {
+    const result = classifyTriggers('#mast-old', ctx);
+    expect(result.modeName).toBe('mast-methodology');
+    expect(result.modeMatchTier).toBe('alias');
   });
 
-  it('clear tokens and misses', () => {
-    expect(resolveTriggerToken('Default', options)).toEqual({ kind: 'clear' });
-    expect(resolveTriggerToken('zzz-nothing', options)).toEqual({ kind: 'unmatched' });
+  it('a clear token carries no tier', () => {
+    const result = classifyTriggers('#Default', ctx);
+    expect(result.clearMode).toBe(true);
+    expect('modeMatchTier' in result).toBe(false);
   });
 });
 

@@ -30,7 +30,7 @@
  */
 import type { ChatMode, ChatOrgModes, OrgModes, PromptMode } from '../types/prompt-overrides.js';
 import { validatePromptMode } from '../types/prompt-overrides.js';
-import type { RequestLogger } from './logger.js';
+import { type RequestLogger, withLogContext } from './logger.js';
 import { MCP_GLOBAL_KEY } from './mcp-validation.js';
 
 /** Suffix of the per-org modes key in PROMPT_OVERRIDES: `${org}:modes`. */
@@ -425,8 +425,9 @@ interface ForeignKeyListing {
 async function listForeignModesKeys(
   kv: KVNamespace,
   homeKey: string,
-  logger: RequestLogger
+  ctx: ReaderContext
 ): Promise<ForeignKeyListing> {
+  const { logger } = ctx;
   const names: string[] = [];
   try {
     let cursor: string | undefined;
@@ -446,7 +447,7 @@ async function listForeignModesKeys(
     });
     return { keys: names, failed: false, truncated: true };
   } catch (error) {
-    logger.error('cross_org_modes_list_failed', error, { listed: names.length });
+    logReadFailure(ctx, 'cross_org_modes_list_failed', error, { listed: names.length });
     // Degrade to the home org only — the turn must never fail on this read.
     return { keys: [], failed: true, truncated: false };
   }
@@ -494,13 +495,14 @@ export async function readModesJson(kv: KVNamespace, key: string): Promise<unkno
 async function readForeignModes(
   get: JsonGet,
   key: string,
-  logger: RequestLogger
+  ctx: ReaderContext
 ): Promise<ForeignOrgModes | 'read_failed' | null> {
+  const { logger } = ctx;
   let value: unknown;
   try {
     value = await get(key);
   } catch (error) {
-    logger.error('cross_org_modes_read_failed', error, { key });
+    logReadFailure(ctx, 'cross_org_modes_read_failed', error, { key });
     // Corrupt JSON is permanent bad data, skipped like any record that is not
     // a modes shape; only a transport failure is reported as retryable.
     return error instanceof CorruptModesRecordError ? null : 'read_failed';
@@ -520,16 +522,13 @@ async function readForeignModes(
 }
 
 /** Read the home org's modes; a failure or bad shape is logged and yields an empty list. */
-async function readHomeModes(
-  get: JsonGet,
-  homeKey: string,
-  logger: RequestLogger
-): Promise<OrgModes> {
+async function readHomeModes(get: JsonGet, homeKey: string, ctx: ReaderContext): Promise<OrgModes> {
+  const { logger } = ctx;
   let value: unknown;
   try {
     value = await get(homeKey);
   } catch (error) {
-    logger.error('org_modes_kv_read_error', error, { key: homeKey });
+    logReadFailure(ctx, 'org_modes_kv_read_error', error, { key: homeKey });
     return { modes: [] };
   }
   if (value === null) return { modes: [] }; // no modes configured — the normal case for most orgs
@@ -538,7 +537,10 @@ async function readHomeModes(
     return { modes: [] };
   }
   const { modes, issues } = sanitizeModeElements(value.modes);
-  const fresh = freshHomeIssues(homeKey, issues);
+  // Admin share-code reads must not use up chat's once-per-isolate warning.
+  const fresh = ctx.shareCode
+    ? issues.filter((issue) => !issue.draft)
+    : freshHomeIssues(homeKey, issues);
   if (fresh.length > 0) {
     logger.warn('org_modes_invalid_elements', {
       key: homeKey,
@@ -547,6 +549,46 @@ async function readHomeModes(
     });
   }
   return { modes };
+}
+
+/** Who is reading: the chat path, or the admin share-code endpoint (admin-portal#345). */
+interface ReaderContext {
+  logger: RequestLogger;
+  /**
+   * The share-code endpoint: events carry `source: 'share_code'`, read and
+   * list failures are warn (the route's `mode_share_code_unavailable` is the
+   * summary when they matter), and the home-element dedup set is left alone.
+   */
+  shareCode: boolean;
+}
+
+/** Log a KV failure: error on the chat path, warn (message only) for share-code reads. */
+function logReadFailure(
+  ctx: ReaderContext,
+  event: string,
+  error: unknown,
+  data: Record<string, unknown>
+): void {
+  if (!ctx.shareCode) {
+    ctx.logger.error(event, error, data);
+    return;
+  }
+  ctx.logger.warn(event, {
+    ...data,
+    error: error instanceof Error ? error.message : String(error),
+  });
+}
+
+/** Options for `readCrossOrgModeSources`; the chat path passes none. */
+export interface CrossOrgReadOptions {
+  /**
+   * Raw JSON values (as `kv.get(key, 'json')` returned them) the caller has
+   * already read; those keys are not read again, so a caller that inspected a
+   * record answers from that same snapshot.
+   */
+  prefetched?: ReadonlyMap<string, unknown>;
+  /** Set by the admin share-code endpoint; see `ReaderContext.shareCode`. */
+  source?: 'share_code';
 }
 
 /** Everything the chat path read, before merging, plus how the read went. */
@@ -566,29 +608,30 @@ export interface CrossOrgModeSources {
 
 /**
  * The chat path's raw read: the home get and the key listing in parallel, then
- * the capped foreign gets in parallel. Never throws.
- *
- * `prefetched` holds raw JSON values (as `kv.get(key, 'json')` returned them)
- * that the caller has already read; those keys are not read again, so a caller
- * that inspected a record answers from that same snapshot. The chat path
- * passes nothing.
+ * the capped foreign gets in parallel. Never throws. See CrossOrgReadOptions.
  */
 export async function readCrossOrgModeSources(
   kv: KVNamespace,
   homeOrg: string,
   logger: RequestLogger,
-  prefetched?: ReadonlyMap<string, unknown>
+  opts: CrossOrgReadOptions = {}
 ): Promise<CrossOrgModeSources> {
+  const { prefetched } = opts;
+  const shareCode = opts.source === 'share_code';
+  const ctx: ReaderContext = {
+    logger: shareCode ? withLogContext(logger, { source: opts.source }) : logger,
+    shareCode,
+  };
   const get: JsonGet = async (key) =>
     prefetched?.has(key) === true ? prefetched.get(key) : readModesJson(kv, key);
   const homeKey = modesKey(homeOrg);
   const [home, listing] = await Promise.all([
-    readHomeModes(get, homeKey, logger),
-    listForeignModesKeys(kv, homeKey, logger),
+    readHomeModes(get, homeKey, ctx),
+    listForeignModesKeys(kv, homeKey, ctx),
   ]);
-  const readKeys = capForeignKeys(listing.keys, logger);
+  const readKeys = capForeignKeys(listing.keys, ctx.logger);
   const results = await Promise.all(
-    readKeys.map(async (key) => ({ key, result: await readForeignModes(get, key, logger) }))
+    readKeys.map(async (key) => ({ key, result: await readForeignModes(get, key, ctx) }))
   );
   const foreign: ForeignOrgModes[] = [];
   const failedKeys: string[] = [];
