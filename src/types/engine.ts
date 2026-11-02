@@ -218,18 +218,15 @@ export interface ChatResponse {
    * Array of response text segments from the assistant.
    *
    * Why an array instead of a single string?
-   * - Claude may produce multiple text blocks interleaved with tool calls
-   * - Each text block from Claude becomes a separate array element
-   * - This preserves the structure of multi-turn tool-assisted responses
+   * - Claude may produce multiple text blocks in the final iteration
+   * - Each of those blocks becomes a separate array element
    *
-   * Common patterns:
-   * - Simple responses: Single element with the complete response
-   * - Tool-assisted responses: Multiple elements (e.g., "Let me check that...", then result)
+   * Text turns (#421) contain only the final iteration. Earlier rounds are
+   * not entries here. Voice turns still include earlier iterations; speech
+   * uses the final slice.
    *
-   * For display, consumers should typically:
-   * - Join with '\n' for plain text: responses.join('\n')
-   * - Display sequentially for chat UI
-   * - Use the last element if only the final answer matters
+   * For display, join with '\n' for plain text: responses.join('\n').
+   * History stores that same join.
    */
   responses: string[];
 
@@ -442,6 +439,15 @@ export interface StreamCallbacks {
   onToolUse?: (toolName: string, input: unknown) => void;
   onToolResult?: (toolName: string, result: unknown) => void;
   onIterationComplete?: (text: string) => void;
+  /**
+   * Webhook periodic and sentence modes (#421). The orchestrator forwards a
+   * round's deltas while the gate is held, so a throttle can elapse during a
+   * slow final round. `discard` drops that text when the round calls a tool.
+   * `release` lets a due throttle post only the text that had arrived when it
+   * elapsed; `complete` carries the rest. Absent on SSE, where the final
+   * round is still emitted once, when it ends.
+   */
+  holdProgress?: (action: 'hold' | 'release' | 'discard') => void;
   /**
    * Deliver a one-time mode first-contact welcome (#311) as its OWN message
    * ahead of the model's answer. Present only on transports that render each

@@ -201,6 +201,11 @@ export class ProgressCallbackSender {
     return this.accumulatedText;
   }
 
+  /** Roll the accumulator back to text that was actually posted (#421). */
+  replaceAccumulated(text: string): void {
+    this.accumulatedText = text;
+  }
+
   private async post(
     payload: Omit<CallbackPayload, 'user_id' | 'message_key' | 'timestamp'>
   ): Promise<void> {
@@ -334,6 +339,14 @@ export class IncrementalProgressSender {
   private lastSentText = '';
   private timerId: ReturnType<typeof setTimeout> | null = null;
   private isComplete = false;
+  /**
+   * While held, a due throttle records a snapshot and does not post. The
+   * orchestrator releases the snapshot only when the round ends the turn,
+   * or discards it when the round calls a tool (#421).
+   */
+  private hold = false;
+  private overdue = false;
+  private overdueSnapshot: string | null = null;
   private config: IncrementalProgressConfig;
   private logger: RequestLogger;
 
@@ -367,12 +380,65 @@ export class IncrementalProgressSender {
     }
   }
 
+  /** Start holding posts. Deltas may still accumulate and arm the throttle. */
+  holdSends(): void {
+    this.hold = true;
+  }
+
+  /**
+   * The round ended the turn. A throttle that already elapsed posts only the
+   * snapshot from that moment. Otherwise sentence mode flushes a finished
+   * sentence now, and a still-pending periodic timer is left for `complete`
+   * to cancel when it wins the race.
+   */
+  releaseSends(): void {
+    this.hold = false;
+    if (this.overdue && this.overdueSnapshot && this.overdueSnapshot !== this.lastSentText) {
+      const snapshot = this.overdueSnapshot;
+      this.overdue = false;
+      this.overdueSnapshot = null;
+      this.clearTimer();
+      runSafe(this.logger, 'periodic_send_failed', () => this.sendProgress(snapshot));
+      this.lastSentText = snapshot;
+      return;
+    }
+    this.overdue = false;
+    this.overdueSnapshot = null;
+    if (this.config.mode === 'sentence') this.checkSentenceBoundary();
+  }
+
+  /** The round called a tool. Drop unsent text so it cannot become progress. */
+  discardUnsent(): void {
+    this.hold = false;
+    this.overdue = false;
+    this.overdueSnapshot = null;
+    this.accumulatedText = this.lastSentText;
+    this.sender.replaceAccumulated(this.lastSentText);
+    this.clearTimer();
+  }
+
+  private clearTimer(): void {
+    if (this.timerId === null) return;
+    clearTimeout(this.timerId);
+    this.timerId = null;
+  }
+
   private schedulePeriodicSend(): void {
     if (this.timerId !== null || this.isComplete) return;
     const throttleMs = this.config.throttleSeconds * 1000;
     this.timerId = setTimeout(() => {
       this.timerId = null;
-      if (!this.isComplete && this.accumulatedText !== this.lastSentText) {
+      if (this.isComplete) return;
+      if (this.hold) {
+        // First time the throttle elapses during this round. Later ticks must
+        // not move the snapshot forward, or `complete` would have nothing left.
+        if (!this.overdue && this.accumulatedText !== this.lastSentText) {
+          this.overdue = true;
+          this.overdueSnapshot = this.accumulatedText;
+        }
+        return;
+      }
+      if (this.accumulatedText !== this.lastSentText) {
         runSafe(this.logger, 'periodic_send_failed', () => this.sendProgress(this.accumulatedText));
         this.lastSentText = this.accumulatedText;
       }
@@ -381,6 +447,7 @@ export class IncrementalProgressSender {
   }
 
   private checkSentenceBoundary(): void {
+    if (this.hold) return;
     const unsent = this.accumulatedText.slice(this.lastSentText.length);
     // Match sentence-ending punctuation followed by space or end of string.
     // Known limitations: May incorrectly trigger on abbreviations (Dr. Smith),
@@ -477,6 +544,18 @@ function buildOnComplete(
   };
 }
 
+function attachHoldProgress(
+  callbacks: StreamCallbacks,
+  sender: IncrementalProgressSender | null
+): void {
+  if (!sender) return;
+  callbacks.holdProgress = (action) => {
+    if (action === 'hold') sender.holdSends();
+    else if (action === 'release') sender.releaseSends();
+    else sender.discardUnsent();
+  };
+}
+
 export function createWebhookCallbacks(
   sender: ProgressCallbackSender,
   logger: RequestLogger,
@@ -508,7 +587,15 @@ export function createWebhookCallbacks(
         sender.accumulateProgress(text);
       }
     },
-    onComplete: buildOnComplete(sender, logger, incrementalSender, () => lastSentText),
+    // Sentence and periodic modes track what they already POSTed on the
+    // sender, not on the iteration cursor. Complete must send only the
+    // remainder, or the final answer arrives twice (#421).
+    onComplete: buildOnComplete(
+      sender,
+      logger,
+      incrementalSender,
+      () => incrementalSender?.getLastSentText() ?? lastSentText
+    ),
     onError: (error) => {
       incrementalSender?.complete();
       runSafe(logger, 'webhook_error_failed', () => sender.sendError(error));
@@ -518,6 +605,8 @@ export function createWebhookCallbacks(
     // so the DO withholds the mode_welcomed flag and re-emits on retry.
     onWelcome: (text) => sender.sendWelcome(text),
   };
+
+  attachHoldProgress(callbacks, incrementalSender);
 
   if (mode === 'iteration' && !suppressProgressText) {
     callbacks.onIterationComplete = (text) => {

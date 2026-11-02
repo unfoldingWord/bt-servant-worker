@@ -658,3 +658,24 @@ describe('buildSystemPrompt - trigger-only section (#360)', () => {
     expect(promptWith({ triggerOnly: { language: 'Hindi' } })).toContain('Do not call any tools');
   });
 });
+
+describe('buildSystemPrompt - text turns do not narrate between tools (#421)', () => {
+  it('tells a text turn to look up silently and answer once', () => {
+    const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
+    expect(prompt).toContain('Do not write text between tool rounds');
+    expect(prompt).toContain('then answer once');
+    expect(prompt).toContain('Never say you were answering from memory');
+  });
+
+  it('leaves the voice prompt without that text-turn line', () => {
+    const prompt = buildSystemPrompt(
+      createEmptyCatalog(),
+      defaultPrefs,
+      [],
+      DEFAULT_PROMPT_VALUES,
+      { isVoiceMessage: true }
+    );
+    expect(prompt).not.toContain('Do not write text between tool rounds');
+    expect(prompt).toContain('Do NOT narrate your actions');
+  });
+});

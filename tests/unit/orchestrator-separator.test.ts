@@ -189,7 +189,7 @@ describe('Orchestrator iteration separator - multi iteration', () => {
   });
   afterEach(() => vi.restoreAllMocks());
 
-  it('uses single newline separator between iterations during streaming', async () => {
+  it('uses single newline separator between iterations during voice streaming', async () => {
     setupMultiIterationMock();
     await orchestrate('test message', {
       env: createMockEnv(),
@@ -198,12 +198,13 @@ describe('Orchestrator iteration separator - multi iteration', () => {
       preferences: { response_language: 'en', first_interaction: true },
       logger: createMockLogger(),
       callbacks: createMockCallbacks(progressChunks),
+      isVoiceMessage: true,
     });
     expect(progressChunks.filter((c) => c === '\n').length).toBe(1);
     expect(progressChunks.filter((c) => c === '\n\n').length).toBe(0);
   });
 
-  it('sets finalIterationStartIndex to 1 for multi-iteration', async () => {
+  it('sets finalIterationStartIndex to 1 for a voice multi-iteration turn', async () => {
     setupMultiIterationMock();
     const result = await orchestrate('test message', {
       env: createMockEnv(),
@@ -212,6 +213,7 @@ describe('Orchestrator iteration separator - multi iteration', () => {
       preferences: { response_language: 'en', first_interaction: true },
       logger: createMockLogger(),
       callbacks: createMockCallbacks(progressChunks),
+      isVoiceMessage: true,
     });
     expect(result.finalIterationStartIndex).toBe(1);
     expect(result.responses.slice(result.finalIterationStartIndex)).toEqual(['Here is the answer']);
