@@ -22,8 +22,9 @@
  * - `destination_not_empty`: the partner key has already been used for this
  *   user; the import never overwrites a conversation.
  * - `destination_busy` / `source_busy`: a turn is running or queued in that
- *   DO. The export and the check-and-write each run under that DO's own
- *   turn lock, so neither sees a turn half-done. Retry later.
+ *   DO. The export and the check-and-write each run as one storage
+ *   transaction inside that DO, which no turn can interleave with, and are
+ *   refused while a turn holds its lock or anything is queued. Retry later.
  * The source is never modified, so a re-run (or a mistake) loses nothing.
  */
 
@@ -149,10 +150,14 @@ async function copyOneUser(ctx: ImportContext, userId: string): Promise<LegacyIm
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ entries: exported.entries }),
   });
+  // Status first: only a 200 or a 409 carries an import result (a storage
+  // error answers 500 with an error body, which is not one).
+  if (dest.status !== 200 && dest.status !== 409) {
+    throw new Error(`destination import failed with ${dest.status}`);
+  }
   const result = (await dest.json()) as UserDataImportResult;
   if (result.ok) return { userId, status: 'copied', entries: result.imported };
-  if (dest.status === 409) return { userId, status: result.reason };
-  throw new Error(`destination import failed with ${dest.status}`);
+  return { userId, status: result.reason };
 }
 
 /**

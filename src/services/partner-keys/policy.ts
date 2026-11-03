@@ -212,10 +212,26 @@ function checkIdentifiers(
   );
 }
 
-/** `speaker` is optional text (`null` = absent); sanitizeSpeaker does the rest. */
+/** Longest `speaker` a partner may send (code points); it is then cut to 64 for everyone. */
+export const MAX_PARTNER_SPEAKER_LENGTH = 256;
+
+/**
+ * `speaker` is optional text (`null` = absent) of at most 256 code points;
+ * normalizeSpeaker / sanitizeSpeaker do the rest.
+ */
 function checkSpeakerType(speaker: unknown): PartnerPolicyResult | null {
-  if (!isPresent(speaker) || typeof speaker === 'string') return null;
-  return reject(400, 'partner_speaker', 'speaker must be a string');
+  if (!isPresent(speaker)) return null;
+  if (typeof speaker !== 'string') {
+    return reject(400, 'partner_speaker', 'speaker must be a string');
+  }
+  if (codePointLength(speaker) > MAX_PARTNER_SPEAKER_LENGTH) {
+    return reject(
+      400,
+      'partner_speaker',
+      `speaker must be at most ${MAX_PARTNER_SPEAKER_LENGTH} characters`
+    );
+  }
+  return null;
 }
 
 /**

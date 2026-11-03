@@ -47,6 +47,13 @@ export const PROJECTION_RETRY_MS = 30_000;
 const MAX_CHAIN_DEPTH = 50;
 /** DO storage `get` / `put` / `delete` accept at most 128 keys per call. */
 const GET_BATCH = 128;
+/**
+ * Bound on each KV operation. The DO runs one operation at a time (its
+ * `serialize` chain), so a KV call that never settles would hold every later
+ * admin action and the alarm behind it; a timeout settles it as a projection
+ * failure instead (the key stays owed and the alarm retries it).
+ */
+export const KV_OP_TIMEOUT_MS = 10_000;
 /** Warning returned when a change is committed but auth (KV) does not have it yet. */
 export const AUTH_UPDATE_PENDING = 'auth_update_pending';
 
@@ -68,6 +75,8 @@ export type LedgerContext = {
   logger: RequestLogger;
   /** The request this operation serves; stored on the `proj:` markers it writes. */
   requestId: string;
+  /** Per-KV-operation timeout; defaults to KV_OP_TIMEOUT_MS (tests shorten it). */
+  kvTimeoutMs?: number;
 };
 
 type RevocationStamp = { revokedAt: string; revokedBy?: string | undefined };
@@ -154,6 +163,7 @@ export class PartnerKeyLedger {
   private readonly tagSecret: string | undefined;
   private readonly logger: RequestLogger;
   private readonly requestId: string;
+  private readonly kvTimeoutMs: number;
 
   constructor(ctx: LedgerContext) {
     this.storage = ctx.storage;
@@ -161,6 +171,7 @@ export class PartnerKeyLedger {
     this.tagSecret = ctx.tagSecret;
     this.logger = ctx.logger;
     this.requestId = ctx.requestId;
+    this.kvTimeoutMs = ctx.kvTimeoutMs ?? KV_OP_TIMEOUT_MS;
   }
 
   async get(id: string): Promise<LedgerEntry | null> {
@@ -442,9 +453,13 @@ export class PartnerKeyLedger {
     return failed;
   }
 
-  /** The auth projection of one key: its public record at `key:<sha256>`. */
+  /**
+   * The auth projection of one key: its public record at `key:<sha256>`.
+   * Rejects after `kvTimeoutMs` if KV has not answered (a projection failure).
+   */
   private putProjection({ record, hash }: LedgerEntry): Promise<void> {
-    return this.kv.put(`${PARTNER_KEY_KV_PREFIX}${hash}`, JSON.stringify(record));
+    const put = this.kv.put(`${PARTNER_KEY_KV_PREFIX}${hash}`, JSON.stringify(record));
+    return withTimeout(put, this.kvTimeoutMs, 'KV put');
   }
 
   private async deleteMany(keys: string[]): Promise<void> {
@@ -461,4 +476,13 @@ export class PartnerKeyLedger {
     }
     return out;
   }
+}
+
+/** `op`, or a rejection once `ms` pass without it settling (the timer is always cleared). */
+function withTimeout<T>(op: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms} ms`)), ms);
+  });
+  return Promise.race([op, timeout]).finally(() => clearTimeout(timer));
 }

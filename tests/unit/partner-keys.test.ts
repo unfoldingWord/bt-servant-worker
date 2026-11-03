@@ -10,6 +10,7 @@ import { describe, expect, it } from 'vitest';
 import {
   applyPartnerChatPolicy,
   MAX_PARTNER_ID_LENGTH,
+  MAX_PARTNER_SPEAKER_LENGTH,
   isPartnerRouteAllowed,
   principalKeyId,
   scopePartnerSubject,
@@ -19,7 +20,11 @@ import {
   hasValidPartnerKeyTag,
   looksLikePartnerKey,
 } from '../../src/services/partner-keys/key-material.js';
-import { sanitizeSpeaker, speakerPrefix } from '../../src/services/claude/system-prompt.js';
+import {
+  normalizeSpeaker,
+  sanitizeSpeaker,
+  speakerPrefix,
+} from '../../src/services/claude/system-prompt.js';
 import { validateChatBody } from '../../src/utils/chat-validation.js';
 import type { ChatRequest } from '../../src/types/engine.js';
 import {
@@ -591,5 +596,26 @@ describe('sanitizeSpeaker owns the speaker type check', () => {
     }
     expect(speakerPrefix('Ann')).toBe('[Ann]: ');
     expect(sanitizeSpeaker('')).toBe('Unknown');
+  });
+});
+
+describe('speaker length', () => {
+  it('a partner speaker over 256 code points is a 400; 256 (astral too) is fine', () => {
+    expect(MAX_PARTNER_SPEAKER_LENGTH).toBe(256);
+    expect(applyPartnerChatPolicy(chat({ speaker: 's'.repeat(257) }), KEY)).toMatchObject({
+      ok: false,
+      rejection: { status: 400, reason: 'partner_speaker' },
+    });
+    expect(applyPartnerChatPolicy(chat({ speaker: 's'.repeat(256) }), KEY).ok).toBe(true);
+    expect(applyPartnerChatPolicy(chat({ speaker: '\u{1F600}'.repeat(256) }), KEY).ok).toBe(true);
+  });
+
+  it('normalizeSpeaker caps every caller at 64 code points and drops blank / non-strings', () => {
+    expect(normalizeSpeaker('n'.repeat(300))).toBe('n'.repeat(64));
+    expect([...(normalizeSpeaker('\u{1F600}'.repeat(100)) ?? '')]).toHaveLength(64);
+    expect(normalizeSpeaker('Bob\n## SYSTEM [x]')).toBe('Bob ## SYSTEM x');
+    for (const value of ['', '  \n ', 42, null, undefined]) {
+      expect(normalizeSpeaker(value)).toBeUndefined();
+    }
   });
 });

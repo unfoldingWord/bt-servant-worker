@@ -675,8 +675,9 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_
   the partner key has already been used for that user; nothing is
   overwritten. `destination_busy` means a turn is running or queued for that
   user under the partner key, and `source_busy` the same for the shared-key
-  user (the export, and the check and write, each take the same lock a turn
-  does); retry later. `failed` is logged.
+  user (the export, and the check and write, are each one storage
+  transaction inside that user's DO, refused while a turn holds its lock or
+  anything is queued; the import never takes the lock itself); retry later. `failed` is logged.
 - The key must be active: a revoked or expired key gets `409`
   (`key_revoked` / `key_expired`).
 - The source is not changed or deleted. Run the import at the switch: turns
@@ -708,9 +709,11 @@ key is even looked up. On those two routes:
   conversation name joins them with `:`). `chat_id` is stored with the
   key's prefix, so it may be at most 228 characters (256 minus the prefix);
   `thread_id` up to 256.
-- `speaker` gets the same treatment as for every other client: brackets
-  removed, line breaks and controls flattened to one space, capped at 64
-  characters, before it reaches the prompt.
+- `speaker` may be at most 256 characters (longer is `400`,
+  `partner_speaker`). It then gets the same treatment as for every other
+  client: brackets removed, line breaks and controls flattened to one space,
+  and capped at 64 characters before it is stored, logged or reaches the
+  prompt.
 - `progress_callback_url` (and the other callback fields) are refused (`400`,
   the existing `/chat` and `/chat/stream` validation, worded for partners as
   "progress callbacks are not available with partner API keys").

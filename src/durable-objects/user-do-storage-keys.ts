@@ -8,9 +8,14 @@
 export const IDENTITY_KEY = 'identity';
 /** Held while a turn runs (see tryAcquireLock / LOCK_STALE_THRESHOLD_MS). */
 export const PROCESSING_LOCK_KEY = '_processing_lock';
+/** A lock (or in-flight reservation) older than this is from a dead turn. */
+export const LOCK_STALE_THRESHOLD_MS = 90_000; // 90 seconds
 /** Queued turns waiting for the lock. */
 export const QUEUE_KEY = 'queue';
-/** True while the alarm drains the queue. */
+/**
+ * True from the moment an entry is enqueued until the alarm finds the queue
+ * empty, so `true` covers every non-empty queue (read without loading it).
+ */
 export const QUEUE_PROCESSING_KEY = 'queue_processing';
 /**
  * Reservation for the entry currently being processed off the queue. The

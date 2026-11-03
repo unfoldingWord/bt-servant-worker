@@ -63,6 +63,11 @@ function stallingKv(): { kv: KVNamespace; putCalled: Promise<void>; fail: () => 
   return { kv: { put } as unknown as KVNamespace, putCalled, fail };
 }
 
+/** A KV binding whose put never settles (a hung KV call). */
+const hangingKv = {
+  put: () => new Promise<void>(() => undefined),
+} as unknown as KVNamespace;
+
 const REQUEST_ID = 'req-test-1';
 /** A test ledger over `storage` and `target`. */
 const ledgerOver = (storage: DurableObjectStorage, target: KVNamespace) =>
@@ -418,5 +423,33 @@ describe('re-revoking re-attempts the owed projections of the whole killed chain
     expect((await projected(toB.plaintext))?.revokedAt).toBeDefined();
     const owed = await withLedger(async (_l, s) => (await s.list({ prefix: 'proj:' })).size);
     expect(owed).toBe(0);
+  });
+});
+
+describe('a KV call that never settles times out as a projection failure', () => {
+  const hangingLedger = (storage: DurableObjectStorage) =>
+    new PartnerKeyLedger({
+      storage,
+      kv: hangingKv,
+      tagSecret: SECRET,
+      logger: createMockLogger(),
+      requestId: REQUEST_ID,
+      kvTimeoutMs: 20,
+    });
+
+  it('create and the alarm retry both settle; the key stays owed with an alarm', async () => {
+    const created = await withLedger((_l, s) => hangingLedger(s).create(INPUT));
+    expect(created.warnings).toEqual([AUTH_UPDATE_PENDING]);
+    await withLedger(async (_l, s) => s.deleteAlarm());
+    const retry = await withLedger((_l, s) =>
+      hangingLedger(s).retryProjections(loggersById().loggerFor)
+    );
+    expect(retry).toEqual({ retried: 1, remaining: 1 });
+    const state = await withLedger(async (_l, s) => ({
+      marker: await s.get(`proj:${created.record.id}`),
+      alarm: await s.getAlarm(),
+    }));
+    expect(state.marker).toEqual({ requestId: REQUEST_ID });
+    expect(state.alarm).not.toBeNull();
   });
 });

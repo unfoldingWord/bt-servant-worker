@@ -22,6 +22,7 @@ import {
   OrchestrationResult,
   TriggerOnlyContext,
   DEFAULT_MODEL,
+  normalizeSpeaker,
 } from '../services/claude/index.js';
 import { formatTOCForPrompt, JsonMemoryStore } from '../services/memory/index.js';
 import { buildToolCatalog, discoverAllTools } from '../services/mcp/index.js';
@@ -86,9 +87,10 @@ import {
   ValidationError,
 } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
-import { exportUserData, importUserData, type UserDataImportResult } from './user-data-transfer.js';
+import { exportUserData, importUserData } from './user-data-transfer.js';
 import {
   IDENTITY_KEY,
+  LOCK_STALE_THRESHOLD_MS,
   PROCESSING_LOCK_KEY,
   QUEUE_INFLIGHT_KEY,
   QUEUE_KEY,
@@ -166,7 +168,6 @@ interface QueueInFlightReservation {
 }
 
 // ── Constants ──────────────────────────────────────────────────────────────────
-const LOCK_STALE_THRESHOLD_MS = 90_000; // 90 seconds
 const DEFAULT_MAX_QUEUE_DEPTH = 50;
 /**
  * Byte budget for the serialized callback/SSE queue. The queue is persisted as
@@ -1040,6 +1041,12 @@ export class UserDO {
       return { error: Response.json({ error: validationError }, { status: 400 }) };
     }
 
+    // One normalized speaker (flattened, at most 64 code points, absent when
+    // blank or not a string) for everything downstream: history, logs, the
+    // queue, the voice-submission path and the prompt.
+    const speaker = normalizeSpeaker(body.speaker);
+    if (speaker === undefined) delete body.speaker;
+    else body.speaker = speaker;
     return { body };
   }
 
@@ -3989,12 +3996,26 @@ export class UserDO {
     );
   }
 
+  /*
+   * Legacy import (admin-portal#354): export from the source DO, import into
+   * the destination DO. Neither takes the turn lock. Both handlers do ONLY
+   * storage operations (no outbound fetch, no timers), each inside one
+   * `storage.transaction`, so the DO's input gate delivers no other event
+   * — no new request, no alarm, no resumed turn — until it returns: the
+   * busy check, the emptiness check and the write see one consistent state.
+   * Taking the lock instead would be worse: releasing it does not drain the
+   * queue (only a fetch-handler turn can reach Anthropic; alarm() cannot),
+   * and processQueueEntry overwrites it anyway. So a DO with a turn in
+   * flight (a live lock) or anything queued (`queue_processing`) is refused
+   * — `source_busy` / `destination_busy`, retry later — and an idle one is
+   * read or written without being touched otherwise.
+   */
   private async handleExportUserData(): Promise<Response> {
     return withEndpointLogging(
       this.getLogger(),
       'export_user_data',
       async () => {
-        const exported = await this.underTurnLock(() => exportUserData(this.state.storage));
+        const exported = await exportUserData(this.state.storage);
         return exported === 'busy'
           ? Response.json({ ok: false, reason: 'source_busy' }, { status: 409 })
           : Response.json(exported);
@@ -4009,36 +4030,11 @@ export class UserDO {
       'import_user_data',
       async () => {
         const { entries } = (await request.json()) as { entries: [string, unknown][] };
-        const result = await this.importUnderTurnLock(entries);
+        const result = await importUserData(this.state.storage, entries);
         return Response.json(result, { status: result.ok ? 200 : 409 });
       },
       storageErrorResponse
     );
-  }
-
-  /**
-   * Legacy import into this DO under the turn lock (see underTurnLock): the
-   * emptiness check and the write happen with no turn in flight. Busy →
-   * `destination_busy` (retry later).
-   */
-  private async importUnderTurnLock(entries: [string, unknown][]): Promise<UserDataImportResult> {
-    const result = await this.underTurnLock(() => importUserData(this.state.storage, entries));
-    return result === 'busy' ? { ok: false, reason: 'destination_busy' } : result;
-  }
-
-  /**
-   * Run `task` holding the same lock a chat turn takes, so no turn runs while
-   * it does; 'busy' (and `task` not run) while a turn holds the lock or
-   * anything is queued. The lock is always released.
-   */
-  private async underTurnLock<T>(task: () => Promise<T>): Promise<T | 'busy'> {
-    if (!(await this.tryAcquireLock())) return 'busy';
-    try {
-      const queued = (await this.state.storage.get<InternalQueueEntry[]>(QUEUE_KEY)) ?? [];
-      return queued.length > 0 ? 'busy' : await task();
-    } finally {
-      await this.releaseLock();
-    }
   }
 
   private async handleGetPromptOverrides(): Promise<Response> {

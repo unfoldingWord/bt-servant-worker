@@ -99,6 +99,16 @@ export function sanitizeSpeaker(name: unknown): string | undefined {
   return toSingleLine(name, MAX_SPEAKER_LENGTH, '[]') || 'Unknown';
 }
 
+/**
+ * The speaker as the UserDO stores and logs it, for EVERY caller: the same
+ * flattening as sanitizeSpeaker (so at most 64 code points), but nothing to
+ * show (blank, or not a string) → undefined, so no name is stored at all.
+ */
+export function normalizeSpeaker(name: unknown): string | undefined {
+  if (typeof name !== 'string') return undefined;
+  return toSingleLine(name, MAX_SPEAKER_LENGTH, '[]') || undefined;
+}
+
 /** `[Name]: ` for a message from a group speaker, or '' when there is none to show. */
 export function speakerPrefix(speaker: unknown): string {
   const name = speaker ? sanitizeSpeaker(speaker) : undefined;
