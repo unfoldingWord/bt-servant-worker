@@ -82,17 +82,6 @@ export function isPartnerCaller(caller: ChatCaller | undefined): boolean {
 }
 
 /**
- * Partner API keys are text-only (decided 2026-11-02, admin-portal#354): no
- * audio in, no audio out, and no tool that yields an audio URL. The ONE place
- * that decision is read from the request; the DO and orchestrator only ask
- * this function. Absent `_caller` (direct DO calls, older queued entries)
- * means internal, i.e. today's behaviour.
- */
-export function callerAllowsAudio(caller: ChatCaller | undefined): boolean {
-  return !isPartnerCaller(caller);
-}
-
-/**
  * Characters the admin group/thread routes accept in a chat_id or thread_id
  * path parameter: letters, digits, `_`, `.`, `-` and `:` (Telegram ids are
  * typically numeric). Partner chat_id/thread_id use the same set minus `:`

@@ -4,14 +4,15 @@
  * Three rules, each kept in one function so it is easy to find and change:
  *
  * 1. isPartnerRouteAllowed — a partner key reaches ONLY the two end-user chat
- *    endpoints. Everything else under /api/* (admin, callback transport,
- *    path-addressed user preferences/history, audio) is denied by default.
+ *    endpoints and the two audio download routes (the latter only for its own
+ *    users' and groups' audio: partnerOwnsAudioKey, enforced by the routes).
+ *    Everything else under /api/* (admin, callback transport, path-addressed
+ *    user preferences/history) is denied by default.
  * 2. applyPartnerChatPolicy — on those chat endpoints the body is locked to
  *    the key: org is the key's org, client_id is set by the server (so a
  *    partner can neither claim another platform nor put its own text in the
- *    prompt), identifiers are bounded single-line strings, and audio
- *    requests are refused (their replies are URLs under /api/v1/audio/*, which
- *    a partner key cannot fetch). progress_callback_url needs no rule here:
+ *    prompt) and identifiers are bounded single-line strings. Audio in and
+ *    out works as for internal callers, with the same limits. progress_callback_url needs no rule here:
  *    validateChatBody already rejects it on /chat and /chat/stream, the only
  *    routes a partner key reaches (the DO would send ENGINE_API_KEY to it; #40).
  * 3. scopePartnerSubject — end-user ids are namespaced per partner so one
@@ -47,8 +48,17 @@ const PARTNER_ROUTES: ReadonlySet<string> = new Set([
   'POST /api/v1/chat/stream',
 ]);
 
+/**
+ * GET prefixes a partner key may read: the audio download routes. Each route
+ * serves a partner key ONLY audio in that partner's own partition
+ * (partnerOwnsAudioKey); anything else answers like a missing object.
+ */
+const PARTNER_AUDIO_PREFIXES: readonly string[] = ['/api/v1/audio/', '/api/v1/voice-submissions/'];
+
 export function isPartnerRouteAllowed(method: string, path: string): boolean {
-  return PARTNER_ROUTES.has(`${method.toUpperCase()} ${path}`);
+  const verb = method.toUpperCase();
+  if (PARTNER_ROUTES.has(`${verb} ${path}`)) return true;
+  return verb === 'GET' && PARTNER_AUDIO_PREFIXES.some((prefix) => path.startsWith(prefix));
 }
 
 /**
@@ -101,29 +111,6 @@ function checkOrg(body: Record<string, unknown>, keyOrg: string): PartnerPolicyR
     400,
     'partner_org_mismatch',
     `${mismatched} must be omitted or equal this API key's org ('${keyOrg}')`
-  );
-}
-
-/**
- * Body fields that send audio IN. Partner keys are text-only (by default,
- * 2026-11-02): a voice message would be transcribed, archived under
- * /api/v1/voice-submissions/* and answered with TTS, none of which a partner
- * key can use, so the request is refused up front. `voice_format` only shapes
- * audio OUT, which partners never get (callerAllowsAudio), so it is dropped
- * rather than refused — see applyPartnerChatPolicy.
- */
-const AUDIO_INPUT_FIELDS = ['audio_base64', 'audio_format'] as const;
-
-function checkAudio(body: Record<string, unknown>): PartnerPolicyResult | null {
-  const field =
-    body.message_type === 'audio'
-      ? 'message_type "audio"'
-      : AUDIO_INPUT_FIELDS.find((name) => isPresent(Reflect.get(body, name)));
-  if (field === undefined) return null;
-  return reject(
-    400,
-    'partner_audio',
-    `${field} is not available with partner API keys; send text messages (message_type "text")`
   );
 }
 
@@ -257,17 +244,17 @@ function checkSpeakerType(speaker: unknown): PartnerPolicyResult | null {
  * success returns a NEW body; the input is untouched:
  * - org forced to the key's org; client_id set by the server;
  * - user_id / chat_id namespaced;
- * - org_id, voice_format (no TTS for partners) and a null chat_id dropped.
+ * - org_id and a null chat_id dropped (audio fields pass through unchanged).
  * `speaker` is bounded here (256); the UserDO normalizes a partner's speaker (normalizeSpeaker).
  */
 export function applyPartnerChatPolicy(
   raw: Record<string, unknown>,
   key: PartnerKeyRecord
 ): PartnerPolicyResult {
-  const failure = checkAudio(raw) ?? checkOrg(raw, key.org) ?? checkIdentifiers(raw, key);
+  const failure = checkOrg(raw, key.org) ?? checkIdentifiers(raw, key);
   if (failure) return failure;
 
-  const { org_id: _orgId, voice_format: _voiceFormat, chat_id: _chatId, ...rest } = raw;
+  const { org_id: _orgId, chat_id: _chatId, ...rest } = raw;
   const scoped: Record<string, unknown> = {
     ...rest,
     org: key.org,

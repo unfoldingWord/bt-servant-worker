@@ -3,7 +3,7 @@
  */
 
 import { ChatCaller, ChatHistoryEntry } from '../../types/engine.js';
-import { callerAllowsAudio, isPartnerCaller } from '../../utils/chat-validation.js';
+import { isPartnerCaller } from '../../utils/chat-validation.js';
 import { PromptSlot } from '../../types/prompt-overrides.js';
 import { toSingleLine } from '../../types/single-line.js';
 import { UnmatchedTrigger } from '../classifier/index.js';
@@ -56,10 +56,9 @@ interface SystemPromptOptions {
   isVoiceMessage?: boolean | undefined;
   /**
    * Who authenticated the request (`_caller`, the single source of truth;
-   * absent = internal). For a partner API key (admin-portal#354) the prompt
-   * drops the `request_audio` guidance (callerAllowsAudio — matching the tools
-   * omitted by buildAllTools) and the Client Platform section says only "a
-   * partner app"; the server-set client_id is never interpolated.
+   * absent = internal). For a partner API key (admin-portal#354) the Client
+   * Platform section says only "a partner app"; the server-set client_id is
+   * never interpolated.
    */
   caller?: ChatCaller | undefined;
   /** Per-turn language document to inject into the system prompt */
@@ -393,8 +392,7 @@ function pushMiddleSections(
     sections.push(resolvedPromptValues.memory_instructions);
     if (memoryTOC) sections.push(memoryTOC);
   }
-  // Text-only callers are never told audio exists (the tool is not registered).
-  if (callerAllowsAudio(opts.caller)) sections.push(AUDIO_GUIDANCE);
+  sections.push(AUDIO_GUIDANCE);
   if (catalog.tools.some((t) => t.serverId === 'ptxprint-mcp')) {
     sections.push(PTXPRINT_FLOW_GUIDANCE);
   }

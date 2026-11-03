@@ -24,53 +24,19 @@ import { JSONSchema, ToolCatalog } from '../mcp/types.js';
 export interface BuildToolsOptions {
   hasModes?: boolean;
   hasMemory?: boolean;
-  /**
-   * Default true. When false (partner API keys are text-only, admin-portal#354)
-   * the tools that yield audio — `request_audio` (TTS reply URL),
-   * `attach_audio` (AudioAttachment) and `read_r2_object` (a voice-submission
-   * URL) — are not registered and `execute_code`'s guidance stops naming them.
-   */
-  hasAudio?: boolean;
 }
-
-/**
- * The built-in tools whose result is, or produces, an audio URL. Insertion
- * order is the order execute_code's guidance names them in (kept identical to
- * the pre-#354 text so the prompt does not change for internal callers).
- */
-export const AUDIO_TOOL_NAMES: ReadonlySet<string> = new Set([
-  'attach_audio',
-  'request_audio',
-  'read_r2_object',
-]);
 
 /** Internal tool names `execute_code` must never be asked to call from inside the sandbox. */
-function internalToolNamesForGuidance(hasMemory: boolean, hasAudio: boolean): string {
+function internalToolNamesForGuidance(hasMemory: boolean): string {
   const memory = hasMemory ? ['update_memory', 'read_memory'] : [];
-  const audio = hasAudio ? [...AUDIO_TOOL_NAMES] : [];
-  return [...memory, ...audio].join(', ');
-}
-
-/**
- * The "internal tools" clause of execute_code's NOT AVAILABLE line. With no
- * internal tools to name (text-only caller + suppress_memory) the
- * parenthetical is left out rather than rendered empty.
- */
-function internalToolsClause(names: string): string {
-  return names
-    ? `internal tools (${names} — call these directly as tool calls, never from inside execute_code)`
-    : 'internal tools';
+  return [...memory, 'attach_audio', 'request_audio', 'read_r2_object'].join(', ');
 }
 
 /**
  * Build execute_code tool definition
  */
-export function buildExecuteCodeTool(
-  opts?: Pick<BuildToolsOptions, 'hasMemory' | 'hasAudio'>
-): Anthropic.Tool {
-  const internalTools = internalToolsClause(
-    internalToolNamesForGuidance(opts?.hasMemory ?? true, opts?.hasAudio ?? true)
-  );
+export function buildExecuteCodeTool(opts?: Pick<BuildToolsOptions, 'hasMemory'>): Anthropic.Tool {
+  const internalTools = internalToolNamesForGuidance(opts?.hasMemory ?? true);
   return {
     name: 'execute_code',
     description: `Execute JavaScript code in a sandboxed QuickJS environment.
@@ -82,7 +48,7 @@ const result = await tool_name({ param: "value" });
 __result__ = result;
 
 AVAILABLE: console.log/info/warn/error, JSON, all MCP tool functions (e.g. fetch_scripture, search_resources)
-NOT AVAILABLE: fetch, require, import, process, eval, Function constructor, ${internalTools}
+NOT AVAILABLE: fetch, require, import, process, eval, Function constructor, internal tools (${internalTools} — call these directly as tool calls, never from inside execute_code)
 
 RESOURCE LIMITS:
 - Maximum 10 MCP tool calls per execute_code invocation (hard limit - execution fails if exceeded)
@@ -392,20 +358,19 @@ export function buildSwitchModeTool(): Anthropic.Tool {
  */
 export function buildAllTools(_catalog: ToolCatalog, opts?: BuildToolsOptions): Anthropic.Tool[] {
   const hasMemory = opts?.hasMemory ?? true;
-  const hasAudio = opts?.hasAudio ?? true;
   const tools: Anthropic.Tool[] = [
-    buildExecuteCodeTool({ hasMemory, hasAudio }),
+    buildExecuteCodeTool({ hasMemory }),
     buildGetToolDefinitionsTool(),
     // #392: omitted entirely when the request suppressed memory — the handlers
     // would only answer "Memory is not available", so exposing them wastes an
     // iteration and contradicts the (also omitted) memory_instructions slot.
     ...(hasMemory ? [buildReadMemoryTool(), buildUpdateMemoryTool()] : []),
-    buildRequestAudioTool(), // Platform capability, not org-gated
+    buildRequestAudioTool(), // Always available — TTS is a platform capability, not org-gated
     buildGenerateScripturePdfTool(), // Always available — short-circuits to error if ptxprint-mcp not registered for the org
     buildPrepareUsfmSourceTool(),
-    buildReadR2ObjectTool(), // Scope-guarded to the request's org
-    buildAttachAudioTool(), // Scope-guarded to the request's org
-  ].filter((tool) => hasAudio || !AUDIO_TOOL_NAMES.has(tool.name)); // text-only callers: AUDIO_TOOL_NAMES gate
+    buildReadR2ObjectTool(), // Always available — scope-guarded to the request's org
+    buildAttachAudioTool(), // Always available — scope-guarded to the request's org
+  ];
 
   if (opts?.hasModes) {
     tools.push(buildListModesTool(), buildSwitchModeTool());

@@ -26,7 +26,6 @@ import type { PublicPartnerKey } from '../../src/types/partner-keys';
 import { sha256Hex } from '../../src/utils/crypto';
 import { generatePartnerKeyMaterial } from '../../src/services/partner-keys/key-material';
 import { PARTNER_KEY_STORE_NAME } from '../../src/services/partner-keys/store';
-import { AUDIO_TOOL_NAMES } from '../../src/services/claude/tools';
 import {
   setupAnthropicFetchCapture,
   type AnthropicCapture,
@@ -431,15 +430,15 @@ describe('partner key on chat: refusals', () => {
     expect(capture.calls).toHaveLength(0);
   });
 
-  it('refuses audio input up front; ignores voice_format and null audio fields', async () => {
+  it('applies the existing audio validation to partners, like any caller', async () => {
     const { apiKey } = await createKey('org-354-audio');
-    const res = await postChat(apiKey, chatBody({ message_type: 'audio', audio_base64: 'AAAA' }));
-    expect(res.status).toBe(400);
-    expect(((await res.json()) as { error: string }).error).toContain('partner API keys');
+    const bad = await postChat(apiKey, chatBody({ voice_format: 'not-a-format' }));
+    expect(bad.status).toBe(400);
+    expect(((await bad.json()) as { error: string }).error).toContain('Invalid voice_format');
     expect(capture.calls).toHaveLength(0);
 
-    const ignored = chatBody({ voice_format: 'aac', audio_format: null, org: null });
-    expect((await postChat(apiKey, ignored)).status).toBe(200);
+    const nulls = chatBody({ voice_format: 'aac', audio_format: null, org: null });
+    expect((await postChat(apiKey, nulls)).status).toBe(200);
   });
 });
 
@@ -467,7 +466,7 @@ describe('partner key outside chat', () => {
     ['POST', '/api/v1/chat/callback'],
     ['GET', '/api/v1/orgs/org-354-deny/users/alice/preferences'],
     ['GET', '/api/v1/orgs/org-354-deny/users/alice/history'],
-    ['GET', '/api/v1/audio/audio/x.ogg'],
+    ['POST', '/api/v1/audio/audio/x.ogg'],
     ['GET', '/api/v1/admin/api-keys'],
     ['POST', '/api/v1/admin/api-keys'],
     ['GET', '/api/v1/admin/orgs/org-354-deny/modes'],
@@ -492,19 +491,19 @@ function offeredTools(): string[] {
   return tools.map((t) => t.name);
 }
 
-const audioToolsIn = (names: string[]): string[] => names.filter((n) => AUDIO_TOOL_NAMES.has(n));
+const AUDIO_TOOLS = ['attach_audio', 'read_r2_object', 'request_audio'];
 
-/** A model reply that calls one tool, then (second call) a plain text answer. */
-function modelCallsToolOnce(toolName: string): void {
+/** A model reply that calls one tool with `input`, then (second call) a plain text answer. */
+function modelCallsToolOnce(toolName: string, input: Record<string, unknown> = {}): void {
   let call = 0;
-  vi.mocked(globalThis.fetch).mockImplementation(async (input) => {
-    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+  vi.mocked(globalThis.fetch).mockImplementation(async (req) => {
+    const url = typeof req === 'string' ? req : req instanceof URL ? req.href : req.url;
     if (!url.includes('api.anthropic.com')) throw new Error(`unexpected fetch to ${url}`);
     call++;
     const content =
       call === 1
-        ? [{ type: 'tool_use', id: 'toolu_audio', name: toolName, input: {} }]
-        : [{ type: 'text', text: 'text only' }];
+        ? [{ type: 'tool_use', id: 'toolu_audio', name: toolName, input }]
+        : [{ type: 'text', text: 'done' }];
     return Response.json({
       id: `msg_${call}`,
       type: 'message',
@@ -518,35 +517,41 @@ function modelCallsToolOnce(toolName: string): void {
   });
 }
 
-describe('partner keys are text-only (decided 2026-11-02)', () => {
-  it('a partner request is not offered any audio tool or audio guidance', async () => {
-    const { apiKey } = await createKey('org-354-text-only');
+describe('partner keys get the audio tools (audio decided 2026-11-02)', () => {
+  it('a partner request is offered the same audio tools and guidance as an internal one', async () => {
+    const { apiKey } = await createKey('org-354-audio-tools');
     expect((await postChat(apiKey, chatBody())).status).toBe(200);
-    expect(offeredTools()).toContain('execute_code');
-    expect(audioToolsIn(offeredTools())).toEqual([]);
-    expect(capture.calls[0]?.system).not.toContain('request_audio');
-  });
-
-  it('an internal request is unchanged: audio tools and guidance present', async () => {
-    const res = await SELF.fetch(CHAT, {
-      method: 'POST',
-      headers: JSON_INTERNAL,
-      body: JSON.stringify(chatBody({ org: 'internal-354-audio', user_id: 'carol' })),
-    });
-    expect(res.status).toBe(200);
-    expect(audioToolsIn(offeredTools()).sort()).toEqual([...AUDIO_TOOL_NAMES].sort());
+    expect(offeredTools()).toEqual(expect.arrayContaining(AUDIO_TOOLS));
     expect(capture.calls[0]?.system).toContain('request_audio');
   });
 
-  it('refuses an audio tool the model names anyway, and returns no audio', async () => {
-    const { apiKey } = await createKey('org-354-refuse-tool');
-    modelCallsToolOnce('request_audio');
+  it("attach_audio in a partner chat refuses a recording outside that partner's partition", async () => {
+    const { apiKey } = await createKey('org-354-attach');
+    const internalKey = 'voice-submissions/org-354-attach/bob/bob/story.ogg';
+    modelCallsToolOnce('attach_audio', { r2_key: internalKey });
     const res = await postChat(apiKey, chatBody());
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { voice_audio_url: string | null };
-    expect(body.voice_audio_url).toBeNull();
-    expect(findLog(capture.warnLogs, 'audio_tool_refused_text_only')?.payload).toMatchObject({
-      tool: 'request_audio',
+    const body = (await res.json()) as { attachments?: unknown[] };
+    expect(body.attachments ?? []).toEqual([]);
+    expect(findLog(capture.warnLogs, 'r2_key_out_of_scope')?.payload).toMatchObject({
+      tool: 'attach_audio',
+      reason: 'not-this-partner',
+    });
+  });
+
+  it('attach_audio in an internal chat refuses a partner recording', async () => {
+    const partnerKey =
+      'voice-submissions/internal-354-attach/partner:pk_0123456789abcdef:u/s/x.ogg';
+    modelCallsToolOnce('attach_audio', { r2_key: partnerKey });
+    const res = await SELF.fetch(CHAT, {
+      method: 'POST',
+      headers: JSON_INTERNAL,
+      body: JSON.stringify(chatBody({ org: 'internal-354-attach', user_id: 'dave' })),
+    });
+    expect(res.status).toBe(200);
+    expect(findLog(capture.warnLogs, 'r2_key_out_of_scope')?.payload).toMatchObject({
+      tool: 'attach_audio',
+      reason: 'partner-partition',
     });
   });
 });

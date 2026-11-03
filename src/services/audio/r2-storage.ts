@@ -16,6 +16,12 @@
  *   output so we can diverge on auth/cache policy later without entangling
  *   the two.
  *
+ * Partner API keys (admin-portal#354): a partner's users and groups have
+ * ids `partner:<ns>:<id>` (set by the worker; reserved for internal callers),
+ * so their audio lives under one partner partition per org — the third key
+ * segment starts with `partner:<ns>:` — and `partnerOwnsAudioKey` is the
+ * one ownership rule the download routes and the audio tools apply.
+ *
  * Chat history entries store only the lightweight R2 key, not the audio
  * bytes, so audio persists across page refreshes and stays well under the
  * 2 MB per-value DO storage limit.
@@ -128,7 +134,48 @@ export function generateVoiceSubmissionKey(
   speakerScope: string
 ): string {
   const id = crypto.randomUUID();
-  return `${VOICE_SUBMISSION_PREFIX}/${org}/${slugSegment(chatScope)}/${slugSegment(speakerScope)}/${id}.ogg`;
+  return `${VOICE_SUBMISSION_PREFIX}/${org}/${chatSegment(chatScope)}/${slugSegment(speakerScope)}/${id}.ogg`;
+}
+
+/**
+ * The chat segment of a voice-submission key. A partner chat scope
+ * (`partner:<ns>:<id>`) keeps its `partner:<ns>:` prefix and slugs only the
+ * rest, so the key stays in that partner's partition; slugSegment never
+ * emits ':', so no other scope can produce that prefix.
+ */
+function chatSegment(chatScope: string): string {
+  const partner = PARTNER_SCOPE.exec(chatScope);
+  if (!partner) return slugSegment(chatScope);
+  return `${PARTNER_PREFIX}${partner[1] ?? ''}:${slugSegment(partner[2] ?? '')}`;
+}
+
+const PARTNER_PREFIX = 'partner:';
+/** `partner:<ns>:<rest>`; a partner namespace is `pk_<hex>` (no ':'). */
+const PARTNER_SCOPE = /^partner:([A-Za-z0-9_]+):(.*)$/s;
+
+/**
+ * THE partner audio ownership rule: true only for a TTS key
+ * (`audio/<org>/<user>/<file>`, 4 segments) or a voice-submission key
+ * (`voice-submissions/<org>/<chat>/<speaker>/<file>`, 5 segments) in the
+ * key's org whose owner segment (user / chat) starts with `partner:<ns>:`.
+ * The exact segment count stops an id or org containing '/' from shifting
+ * segments: partner ids never contain '/', and their org is the key's
+ * validated org. Internal ids may not start with `partner:` (reserved), so
+ * an internal user's or group's audio never matches.
+ */
+export function partnerOwnsAudioKey(key: string, org: string, namespace: string): boolean {
+  const parts = key.split('/');
+  const expected = parts[0] === 'audio' ? 4 : parts[0] === VOICE_SUBMISSION_PREFIX ? 5 : Number.NaN;
+  return (
+    parts.length === expected &&
+    parts[1] === org &&
+    (parts[2] ?? '').startsWith(`${PARTNER_PREFIX}${namespace}:`)
+  );
+}
+
+/** True when a voice-submission key sits in some partner's partition. */
+export function isPartnerVoiceSubmissionKey(key: string): boolean {
+  return (key.split('/')[2] ?? '').startsWith(PARTNER_PREFIX);
 }
 
 /** Build the public-facing URL path for a voice-submission R2 key. */

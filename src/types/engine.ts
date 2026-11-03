@@ -160,7 +160,8 @@ export interface ChatRequest {
    * Internal: who authenticated the request — `internal` (ENGINE_API_KEY) or
    * `partner` (a partner API key, admin-portal#354). Set by the worker AFTER
    * spreading the client body, so a client value never survives. Partner
-   * requests are text-only: see `callerAllowsAudio` in utils/chat-validation.
+   * requests may use audio; their audio is scoped to their own namespace
+   * (services/audio/r2-storage.ts, partnerOwnsAudioKey).
    */
   _caller?: ChatCaller;
 }

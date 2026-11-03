@@ -704,8 +704,10 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_
 
 ### Calling Chat With a Partner Key
 
-A partner key may call **only** `POST /api/v1/chat` and
-`POST /api/v1/chat/stream`. Every other `/api/*` route answers `403`
+A partner key may call **only** `POST /api/v1/chat`,
+`POST /api/v1/chat/stream`, and `GET` on the two audio download routes
+(`/api/v1/audio/...` and `/api/v1/voice-submissions/...`, for its own audio
+only; see below). Every other `/api/*` route answers `403`
 (`This API key is not permitted to call this endpoint`). That answer is given
 only once the key is authenticated (tag checked, key found and active); a
 forged or unknown look-alike gets `403 Invalid API key` on every route. On
@@ -736,14 +738,23 @@ those two routes:
 - `progress_callback_url` (and the other callback fields) are refused (`400`,
   the existing `/chat` and `/chat/stream` validation, worded for partners as
   "progress callbacks are not available with partner API keys").
-- Partner keys are **text-only by default** (2026-11-02, pending confirmation
-  on admin-portal#354). Audio input is refused (`400`): `message_type:
-"audio"`, `audio_base64` and `audio_format` (`null` counts as absent).
-  `voice_format` only shapes audio output, which partners never get, so it is
-  ignored (dropped), not refused. The model is not offered the audio tools (`request_audio`,
-  `attach_audio`, `read_r2_object`) or the audio prompt guidance, and a call
-  to one of them is refused, so a partner response never carries an audio
-  URL.
+- Audio works as for internal clients (decided 2026-11-02): voice messages
+  in (`message_type: "audio"`, `audio_base64`, `audio_format`, with the same
+  size and format limits) and spoken replies out (`voice_format`, the audio
+  tools and the audio prompt guidance). Reply audio comes back as
+  `voice_audio_url` (`/api/v1/audio/...`); archived voice messages and
+  attached recordings as `/api/v1/voice-submissions/...` URLs. Fetch them
+  with the same partner key.
+- **Audio ownership.** A partner's audio lives in its own partition: TTS
+  replies at `audio/<org>/partner:<ns>:<user_id>/<file>` and voice
+  submissions at `voice-submissions/<org>/partner:<ns>:<chat>/<speaker>/<file>`
+  (the chat segment is the user for a private chat, the group for a group).
+  A partner key downloads only keys with exactly that shape, in its key's org
+  and its own namespace; any other key (another partner's, an internal
+  user's, another org's) answers `404`, exactly like a missing object. In a
+  partner chat, `attach_audio` / `read_r2_object` reach only that partner's
+  own recordings, and internal chats can never attach a partner's recording.
+  There is no listing route.
 - Inside the worker `user_id` becomes
   `partner:<userNamespace>:<user_id>` (and `chat_id` likewise), so a partner's
   users can never reach another app's or a WhatsApp user's conversation.

@@ -10,9 +10,15 @@
 
 import Anthropic from '@anthropic-ai/sdk';
 import { Env } from '../../config/types.js';
-import { AudioContext, VOICE_SUBMISSION_PREFIX, voiceSubmissionKeyToUrl } from '../audio/index.js';
+import {
+  AudioContext,
+  isPartnerVoiceSubmissionKey,
+  partnerOwnsAudioKey,
+  VOICE_SUBMISSION_PREFIX,
+  voiceSubmissionKeyToUrl,
+} from '../audio/index.js';
 import { ChatCaller, ChatHistoryEntry, StreamCallbacks } from '../../types/engine.js';
-import { callerAllowsAudio } from '../../utils/chat-validation.js';
+import { isPartnerCaller, PARTNER_CLIENT_ID_PREFIX } from '../../utils/chat-validation.js';
 import { uiString } from '../../i18n/ui-strings.js';
 import { createStatusEmitter, StatusEmitter } from '../../i18n/status-emitter.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig } from '../../types/org-config.js';
@@ -69,7 +75,6 @@ import {
 } from './system-prompt.js';
 import { applyResourcePriority } from './resource-priority.js';
 import {
-  AUDIO_TOOL_NAMES,
   buildAllTools,
   getToolDefinitions,
   isR2KeyInput,
@@ -199,9 +204,9 @@ interface OrchestratorOptions {
   memoryEnabled?: boolean | undefined;
   /**
    * Who authenticated the request (the DO passes `body._caller`; absent =
-   * internal). Partner API keys are text-only (admin-portal#354): via
-   * callerAllowsAudio this removes the audio tools and their prompt guidance,
-   * and refuses them at dispatch should the model name one anyway.
+   * internal). For a partner API key (admin-portal#354) the prompt names only
+   * "a partner app", and `read_r2_object` / `attach_audio` reach only that
+   * partner's own voice submissions (partnerNamespace below).
    */
   caller?: ChatCaller | undefined;
   modeContext?: ModeContext | undefined;
@@ -396,8 +401,12 @@ interface OrchestrationContext {
   modeContext: ModeContext | undefined;
   audioContext: AudioContext | undefined;
   attachmentsContext: AttachmentsContext | undefined;
-  /** callerAllowsAudio(options.caller): false for text-only callers (partner API keys). */
-  audioEnabled: boolean;
+  /**
+   * The partner's user namespace for a partner-key request (from its
+   * server-set client_id `partner:<ns>`), else undefined. Scopes
+   * `read_r2_object` / `attach_audio` to that partner's own recordings.
+   */
+  partnerNamespace: string | undefined;
   workerOrigin: string;
   /** The org scope for this request. Used by `read_r2_object` / `attach_audio` to
    *  enforce that requested R2 keys belong to this org. */
@@ -2286,7 +2295,6 @@ function turnTools(catalog: ToolCatalog, options: OrchestratorOptions): Anthropi
   return buildAllTools(catalog, {
     hasModes: (options.modeContext?.availableModes.length ?? 0) > 0,
     hasMemory: hasMemoryForTurn(options),
-    hasAudio: callerAllowsAudio(options.caller),
   });
 }
 
@@ -2392,7 +2400,7 @@ function createOrchestrationContext(
     modeContext: options.modeContext,
     audioContext: options.audioContext,
     attachmentsContext: options.attachmentsContext,
-    audioEnabled: callerAllowsAudio(options.caller),
+    partnerNamespace: partnerNamespaceOf(options),
     workerOrigin: options.workerOrigin ?? '',
     org: options.org ?? options.env.DEFAULT_ORG,
     env: options.env,
@@ -2780,12 +2788,6 @@ function dispatchSimpleInternalTool(
   toolCall: ToolUseBlock,
   ctx: OrchestrationContext
 ): Promise<unknown> | unknown | null {
-  // Defense in depth: the audio tools are not offered to text-only callers, so
-  // a call here means the model named one anyway. Refuse it, observably.
-  if (!ctx.audioEnabled && AUDIO_TOOL_NAMES.has(toolCall.name)) {
-    ctx.logger.warn('audio_tool_refused_text_only', { tool: toolCall.name });
-    return { error: 'Audio is not available for this session; reply in text only.' };
-  }
   if (toolCall.name === 'read_memory') return handleReadMemory(toolCall.input, ctx);
   if (toolCall.name === 'update_memory') return handleUpdateMemory(toolCall.input, ctx);
   if (toolCall.name === 'request_audio') return handleRequestAudio(ctx);
@@ -2977,6 +2979,40 @@ async function handleUpdateMemory(input: unknown, ctx: OrchestrationContext): Pr
 }
 
 /**
+ * Partner scoping for the audio tools (admin-portal#354). A partner chat may
+ * reach only its own partner's recordings (partnerOwnsAudioKey); a non-partner
+ * chat may never reach any partner's. Logged and answered like any other
+ * out-of-scope key, without saying whether the object exists.
+ */
+function checkPartnerVoiceScope(
+  toolName: string,
+  r2Key: string,
+  ctx: OrchestrationContext
+): { error: string } | null {
+  const allowed =
+    ctx.partnerNamespace === undefined
+      ? !isPartnerVoiceSubmissionKey(r2Key)
+      : partnerOwnsAudioKey(r2Key, ctx.org, ctx.partnerNamespace);
+  if (allowed) return null;
+  ctx.logger.warn('r2_key_out_of_scope', {
+    tool: toolName,
+    r2_key: r2Key,
+    org: ctx.org,
+    reason: ctx.partnerNamespace === undefined ? 'partner-partition' : 'not-this-partner',
+  });
+  return { error: 'r2_key is out of scope for this request.' };
+}
+
+/** The partner namespace of a partner-key turn (client_id `partner:<ns>`), else undefined. */
+function partnerNamespaceOf(options: OrchestratorOptions): string | undefined {
+  if (!isPartnerCaller(options.caller)) return undefined;
+  const clientId = options.clientId ?? '';
+  return clientId.startsWith(PARTNER_CLIENT_ID_PREFIX)
+    ? clientId.slice(PARTNER_CLIENT_ID_PREFIX.length)
+    : '';
+}
+
+/**
  * Verify that an R2 key passed to `read_r2_object` / `attach_audio` belongs
  * to the current org's voice-submissions namespace. Returns `null` when the
  * key is in scope; otherwise returns an error envelope (logged at WARN per
@@ -2990,6 +3026,8 @@ function checkVoiceSubmissionScope(
   r2Key: string,
   ctx: OrchestrationContext
 ): { error: string } | null {
+  const partnerError = checkPartnerVoiceScope(toolName, r2Key, ctx);
+  if (partnerError) return partnerError;
   const expectedPrefix = `${VOICE_SUBMISSION_PREFIX}/${ctx.org}/`;
   if (!r2Key.startsWith(expectedPrefix)) {
     ctx.logger.warn('r2_key_out_of_scope', {

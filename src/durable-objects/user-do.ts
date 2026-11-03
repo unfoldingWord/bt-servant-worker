@@ -119,7 +119,6 @@ import {
   UNDETERMINED_LANGUAGE,
 } from '../services/language/index.js';
 import {
-  callerAllowsAudio,
   callerIsAdmin,
   isPartnerCaller,
   isValidLanguageCode,
@@ -3558,10 +3557,7 @@ export class UserDO {
     emit?: StatusEmitter
   ): Promise<{ audioKey: string } | null> {
     const ttsFlowStart = Date.now();
-    // Text-only callers (partner keys) never get TTS, whatever the turn did.
-    const shouldGenerate =
-      callerAllowsAudio(body._caller) &&
-      (body.message_type === 'audio' || audioContext.audioRequested);
+    const shouldGenerate = body.message_type === 'audio' || audioContext.audioRequested;
     const combinedText = responses.join('\n\n');
     const org = body.org ?? this.env.DEFAULT_ORG;
     const userId = body.user_id;

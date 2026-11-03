@@ -9,6 +9,8 @@ export {
   voiceSubmissionKeyToUrl,
   uploadVoiceSubmission,
   VOICE_SUBMISSION_PREFIX,
+  partnerOwnsAudioKey,
+  isPartnerVoiceSubmissionKey,
 } from './r2-storage.js';
 export type {
   TranscriptionResult,

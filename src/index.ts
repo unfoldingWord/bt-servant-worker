@@ -50,7 +50,7 @@ import { readAllPublishedModes } from './utils/cross-org-modes.js';
 import { stripControlChars } from './types/prompt-overrides.js';
 import { constantTimeCompare } from './utils/crypto.js';
 import { ValidationError } from './utils/errors.js';
-import { getAudio, VOICE_SUBMISSION_PREFIX } from './services/audio/index.js';
+import { getAudio, partnerOwnsAudioKey, VOICE_SUBMISSION_PREFIX } from './services/audio/index.js';
 import { createRequestLogger, type RequestLogger } from './utils/logger.js';
 import { createTimingContext, timePhase, type TimingContext } from './utils/timing.js';
 import {
@@ -399,6 +399,24 @@ app.get('/api/v1/orgs/:org/users/:userId/history', async (c) => {
   return handleUserRequest(c.req.raw, c.env, org, userId, '/history');
 });
 
+/**
+ * Who may download an audio object (admin-portal#354). Internal callers: any,
+ * as before. A partner key: only audio in its own partition — its own users'
+ * and groups' TTS replies and voice submissions in its org
+ * (partnerOwnsAudioKey). Anything else answers exactly like a missing object
+ * (404), so a partner learns nothing about other audio; the refusal is logged.
+ */
+function principalMayReadAudio(
+  principal: Principal | undefined,
+  key: string,
+  logger: RequestLogger
+): boolean {
+  if (principal?.kind !== 'partner') return true;
+  if (partnerOwnsAudioKey(key, principal.key.org, principal.key.userNamespace)) return true;
+  logger.warn('partner_audio_refused', { key_id: principal.key.id });
+  return false;
+}
+
 // Audio serving endpoint — serves TTS audio from R2
 app.get('/api/v1/audio/*', async (c) => {
   const start = Date.now();
@@ -408,6 +426,9 @@ app.get('/api/v1/audio/*', async (c) => {
   }
 
   const logger = createRequestLogger(crypto.randomUUID());
+  if (!principalMayReadAudio(c.get('principal'), audioKey, logger)) {
+    return c.json({ error: 'Audio not found' }, 404);
+  }
   try {
     const object = await getAudio(c.env.AUDIO_BUCKET, audioKey, logger);
     if (!object) {
@@ -454,6 +475,9 @@ app.get('/api/v1/voice-submissions/*', async (c) => {
   }
 
   const logger = createRequestLogger(crypto.randomUUID());
+  if (!principalMayReadAudio(c.get('principal'), key, logger)) {
+    return c.json({ error: 'Voice submission not found' }, 404);
+  }
   try {
     const object = await getAudio(c.env.AUDIO_BUCKET, key, logger);
     if (!object) {

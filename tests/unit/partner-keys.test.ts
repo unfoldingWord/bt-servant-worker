@@ -25,6 +25,11 @@ import {
   speakerPrefix,
 } from '../../src/services/claude/system-prompt.js';
 import { MAX_CHAT_ID_LENGTH, validateChatBody } from '../../src/utils/chat-validation.js';
+import {
+  generateVoiceSubmissionKey,
+  isPartnerVoiceSubmissionKey,
+  partnerOwnsAudioKey,
+} from '../../src/services/audio/r2-storage.js';
 import type { ChatRequest } from '../../src/types/engine.js';
 import {
   DEFAULT_ROTATION_GRACE_SECONDS,
@@ -58,9 +63,11 @@ const chat = (extra: Record<string, unknown> = {}) => ({
 });
 
 describe('isPartnerRouteAllowed', () => {
-  it('allows only POST /api/v1/chat and /api/v1/chat/stream', () => {
+  it('allows the two chat routes and GET on the two audio download routes', () => {
     expect(isPartnerRouteAllowed('POST', '/api/v1/chat')).toBe(true);
     expect(isPartnerRouteAllowed('POST', '/api/v1/chat/stream')).toBe(true);
+    expect(isPartnerRouteAllowed('GET', '/api/v1/audio/audio/x.ogg')).toBe(true);
+    expect(isPartnerRouteAllowed('get', '/api/v1/voice-submissions/x')).toBe(true);
   });
 
   it.each([
@@ -70,8 +77,9 @@ describe('isPartnerRouteAllowed', () => {
     ['GET', '/api/v1/orgs/bcs/users/alice/preferences'],
     ['PUT', '/api/v1/orgs/bcs/users/alice/preferences'],
     ['GET', '/api/v1/orgs/bcs/users/alice/history'],
-    ['GET', '/api/v1/audio/audio/x.ogg'],
-    ['GET', '/api/v1/voice-submissions/x'],
+    ['POST', '/api/v1/audio/audio/x.ogg'],
+    ['DELETE', '/api/v1/voice-submissions/x'],
+    ['GET', '/api/v1/audio'],
     ['GET', '/api/v1/admin/api-keys'],
     ['GET', '/api/v1/admin/orgs/bcs/modes'],
   ])('denies %s %s', (method, path) => {
@@ -135,16 +143,13 @@ describe('applyPartnerChatPolicy refusals', () => {
     }
   );
 
-  it.each([[{ message_type: 'audio' }], [{ audio_base64: 'AAAA' }], [{ audio_format: 'ogg' }]])(
-    'refuses audio input with 400 (%o)',
-    (fields) => {
-      const result = applyPartnerChatPolicy(chat(fields), KEY);
-      expect(result).toMatchObject({
-        ok: false,
-        rejection: { status: 400, reason: 'partner_audio' },
-      });
-    }
-  );
+  it('passes audio input fields through unchanged (validateChatBody applies its usual limits)', () => {
+    const audio = { message_type: 'audio', audio_base64: 'AAAA', audio_format: 'ogg' };
+    const result = applyPartnerChatPolicy(chat(audio), KEY);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.body).toMatchObject(audio);
+  });
 
   it.each([{ audio_format: null }, { audio_base64: null }])(
     'treats a null audio input field as absent (%o)',
@@ -153,16 +158,13 @@ describe('applyPartnerChatPolicy refusals', () => {
     }
   );
 
-  it.each(['opus', 'aac', 'not-a-format', null])(
-    'ignores voice_format (%o): dropped, not refused, since partners get no TTS',
-    (voiceFormat) => {
-      const result = applyPartnerChatPolicy(chat({ voice_format: voiceFormat }), KEY);
-      expect(result.ok).toBe(true);
-      if (!result.ok) return;
-      expect(result.body).not.toHaveProperty('voice_format');
-      expect(validateChatBody(result.body, 'final', { caller: 'partner' })).toBeNull();
-    }
-  );
+  it('keeps voice_format, validated by validateChatBody like any caller', () => {
+    const result = applyPartnerChatPolicy(chat({ voice_format: 'aac' }), KEY);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.body).toMatchObject({ voice_format: 'aac' });
+    expect(validateChatBody(result.body, 'final', { caller: 'partner' })).toBeNull();
+  });
 
   it('leaves progress_callback_url to validateChatBody, which already rejects it', () => {
     // Not a partner rule on purpose: /chat and /chat/stream (the only partner
@@ -695,5 +697,35 @@ describe('org may not contain ":" wherever it names a conversation', () => {
     }
     const ok = { ...base, org: 'unfoldingWord', user_id: 'u1' } as unknown as ChatRequest;
     expect(validateChatBody(ok, 'final')).toBeNull();
+  });
+});
+
+describe('partnerOwnsAudioKey: the partner audio ownership rule', () => {
+  const NS = KEY.userNamespace;
+  it('accepts TTS and voice-submission keys in the partner partition of the key org', () => {
+    expect(partnerOwnsAudioKey(`audio/bcs/partner:${NS}:alice/a.opus`, 'bcs', NS)).toBe(true);
+    const voice = `voice-submissions/bcs/partner:${NS}:g1/ann/v.ogg`;
+    expect(partnerOwnsAudioKey(voice, 'bcs', NS)).toBe(true);
+  });
+
+  it.each([
+    ['another partner', `audio/bcs/partner:pk_ffffffffffffffff:alice/a.opus`],
+    ['an internal user', 'audio/bcs/alice/a.opus'],
+    ['another org', `audio/other/partner:${NS}:alice/a.opus`],
+    ['an extra segment', `audio/bcs/partner:${NS}:alice/x/a.opus`],
+    ['a shifted org', `audio/bcs/x/partner:${NS}:alice/a.opus`],
+    ['a slugged look-alike', `voice-submissions/bcs/partner-${NS}-g1/ann/v.ogg`],
+    ['a namespace prefix only', `audio/bcs/partner:${NS}x:alice/a.opus`],
+    ['another family', `ptxprint/bcs/partner:${NS}:alice/a.pdf`],
+  ])('refuses %s', (_label, key) => {
+    expect(partnerOwnsAudioKey(key, 'bcs', NS)).toBe(false);
+  });
+
+  it('a partner chat scope keeps its partition in voice-submission keys; internal ones never get it', () => {
+    const own = generateVoiceSubmissionKey('bcs', `partner:${NS}:team one`, 'Ann B');
+    expect(own).toMatch(new RegExp(`^voice-submissions/bcs/partner:${NS}:team-one/Ann-B/`));
+    expect(partnerOwnsAudioKey(own, 'bcs', NS)).toBe(true);
+    const internal = generateVoiceSubmissionKey('bcs', `partner-${NS}-x`, 'y');
+    expect(isPartnerVoiceSubmissionKey(internal)).toBe(false);
   });
 });
