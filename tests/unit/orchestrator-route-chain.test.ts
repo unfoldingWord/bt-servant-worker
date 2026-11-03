@@ -260,9 +260,7 @@ describe('route chain — sticky within the turn', () => {
 
     const result = await run(fullEnv(), sink);
 
-    // Text turns keep the final iteration only (#421). "thinking" is the
-    // tool round and must not be a user-facing response.
-    expect(result.responses).toEqual(['final']);
+    expect(result.responses).toEqual(['thinking', 'final']);
     // 2 failed primary attempts, then every call of the turn on the alt.
     expect(calls.map((c) => c.model)).toEqual([
       'claude-sonnet-4-6',

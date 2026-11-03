@@ -152,16 +152,6 @@ const VOICE_RESPONSE_GUIDANCE =
   '\n\n' +
   VOICE_PLANNING_RULES;
 
-/**
- * Text-mode planning line (#421). Voice already has "Do NOT narrate your
- * actions" inside {@link VOICE_WRITING_RULES}. This only cuts wasted tokens;
- * the emission path still drops anything written between tool rounds.
- */
-const TEXT_TURN_RULES =
-  '## Answer once\n\n' +
-  'Do not write text between tool rounds. Do the lookups, then answer once. ' +
-  'Never say you were answering from memory.';
-
 // Non-overridable rendering contract. Downstream clients (web, WhatsApp) parse
 // Claude's output for media URLs and render them natively — this rule set is
 // the wire format between the worker and those clients. Do not move this into
@@ -471,7 +461,6 @@ export function buildSystemPromptBlocks(
   sections.push(...buildConditionalSections(preferences, history));
   sections.push(RESOURCE_AVAILABILITY_RULES);
   if (!isVoiceMessage) {
-    sections.push(TEXT_TURN_RULES);
     sections.push(MEDIA_FORMATTING_RULES);
   }
   sections.push(resolvedPromptValues.closing);
