@@ -94,7 +94,7 @@
       "undici": ">=8.12.2",
       "vite": "^6.4.5",
       "esbuild": ">=0.28.1",
-      "qs": ">=6.16.1",
+      "qs": "6.16.1",
       "ws": ">=8.20.1",
       "body-parser": ">=2.4.0",
       "@cloudflare/vitest-pool-workers>zod": ">=4.6.6",

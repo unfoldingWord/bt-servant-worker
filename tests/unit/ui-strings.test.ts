@@ -31,6 +31,7 @@ const EXPECTED_KEYS: readonly UiStringKey[] = [
   'status_tts_generating',
   'status_tts_still_generating',
   'notice_max_iterations',
+  'notice_empty_answer',
   'error_processing_failed',
 ];
 
@@ -98,6 +99,9 @@ describe('ui-strings literals', () => {
     expect(UI_STRINGS.en.status_tts_still_generating).toBe('Still generating audio...');
     expect(UI_STRINGS.en.error_processing_failed).toBe('Processing failed');
     expect(UI_STRINGS.en.notice_max_iterations).toBe(EN_NOTICE_MAX_ITERATIONS);
+    expect(UI_STRINGS.en.notice_empty_answer).toBe(
+      "Sorry, I couldn't finish an answer just now. Please try again."
+    );
   });
 
   it('pt max-iterations notice is the owner-reviewed paragraph (native BR-PT)', () => {

@@ -10,7 +10,8 @@
  * max-iterations notice in one turn:
  *
  *   status_processing → status_executing_tools → status_preparing →
- *   status_executing_tools → notice_max_iterations
+ *   status_executing_tools → status_preparing (recovery, outside the cap)
+ *   → notice_max_iterations
  */
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
@@ -118,12 +119,16 @@ describe('Orchestrator status locale (#405)', () => {
         'status_executing_tools',
         'status_preparing',
         'status_executing_tools',
+        // The cap stops the loop on a tool round. One recovery call follows,
+        // outside the cap, and announces itself with status_preparing.
+        'status_preparing',
       ]);
       expect(turn.messages).toEqual([
         strings.status_processing,
         EXECUTING_ONE_TOOL[table],
         strings.status_preparing,
         EXECUTING_ONE_TOOL[table],
+        strings.status_preparing,
       ]);
     }
   );
