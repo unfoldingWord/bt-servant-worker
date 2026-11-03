@@ -8,6 +8,14 @@ export interface Env {
   CODE_EXEC_TIMEOUT_MS: string;
   DEFAULT_ORG: string;
 
+  /**
+   * `"true"` ⇒ only ADMIN_API_KEY has super-admin authority; ENGINE_API_KEY gets
+   * 403 on admin routes. Anything else (default `"false"`) keeps ENGINE_API_KEY
+   * as super admin during the transition. Has no effect while ADMIN_API_KEY is
+   * unset.
+   */
+  ADMIN_KEY_REQUIRED?: string;
+
   // Rate limiting (optional - has defaults)
   ADMIN_RATE_LIMIT_MAX?: string;
   ADMIN_RATE_LIMIT_WINDOW_MS?: string;
@@ -49,6 +57,12 @@ export interface Env {
   // Secrets (set via wrangler secret put)
   ANTHROPIC_API_KEY: string;
   ENGINE_API_KEY: string;
+  /**
+   * Dedicated key for the admin routes (`/api/v1/admin/*`). Also passes the
+   * global `/api/*` check. Unset ⇒ behaviour as before the split: the engine
+   * key is super admin. See src/utils/admin-auth.ts.
+   */
+  ADMIN_API_KEY?: string;
   OPENAI_API_KEY: string;
   /** OpenRouter key for the two OpenRouter fallback tiers (#403). Unset ⇒ both tiers absent. */
   OPENROUTER_API_KEY?: string;

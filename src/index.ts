@@ -49,6 +49,13 @@ import { synthesizeModeDocument } from './types/mode-markdown.js';
 import { readAllPublishedModes } from './utils/cross-org-modes.js';
 import { stripControlChars } from './types/prompt-overrides.js';
 import { constantTimeCompare } from './utils/crypto.js';
+import {
+  adminKeyConfigured,
+  adminKeyEnforced,
+  bearerToken,
+  classifyToken,
+  isSuperAdminClass,
+} from './utils/admin-auth.js';
 import { ValidationError } from './utils/errors.js';
 import { getAudio, VOICE_SUBMISSION_PREFIX } from './services/audio/index.js';
 import { createRequestLogger, type RequestLogger } from './utils/logger.js';
@@ -74,7 +81,7 @@ import {
   upsertServer,
 } from './utils/mcp-servers.js';
 import { resolveOrgFromBody } from './utils/org.js';
-import { validateChatBody } from './utils/chat-validation.js';
+import { isAdminClient, validateChatBody } from './utils/chat-validation.js';
 import { instrument, instrumentDO } from '@microlabs/otel-cf-workers';
 import {
   resolveTelemetryConfig,
@@ -156,8 +163,10 @@ app.use('/api/*', async (c, next) => {
     return c.json({ error: 'Authorization header with Bearer token required' }, 401);
   }
 
+  // ENGINE_API_KEY or (when configured) ADMIN_API_KEY. Which one matched only
+  // matters on admin surfaces; see the /api/v1/admin/* middleware below.
   const token = authHeader.slice(7);
-  if (!constantTimeCompare(token, c.env.ENGINE_API_KEY)) {
+  if (classifyToken(token, c.env) === null) {
     createRequestLogger(crypto.randomUUID()).warn('auth_rejected', {
       reason: 'invalid_token',
       status: 403,
@@ -301,12 +310,64 @@ app.get('/api/v1/voice-submissions/*', async (c) => {
   }
 });
 
-// Admin auth middleware - validates org-specific or super admin access.
+// Admin surface gate - every route under /api/v1/admin/* (org-scoped config
+// routes, group/thread routes, global MCP pool, DO snapshots). Runs after the
+// global `/api/*` middleware, so the bearer token here is already known to be
+// ENGINE_API_KEY or ADMIN_API_KEY.
+//
+// Super-admin authority: ADMIN_API_KEY always; ENGINE_API_KEY only while the
+// admin key is not enforced (ADMIN_KEY_REQUIRED != "true", or no
+// ADMIN_API_KEY configured). Each admin request logs `admin_auth` with the key
+// class (never the key) so ENGINE_API_KEY admin use can be watched down to
+// zero before the flag is flipped.
+app.use('/api/v1/admin/*', async (c, next) => {
+  const token = bearerToken(c.req.header('Authorization'));
+  const keyClass = token === null ? null : classifyToken(token, c.env);
+  const enforced = adminKeyEnforced(c.env);
+  const logger = createRequestLogger(crypto.randomUUID());
+
+  if (c.env.ADMIN_KEY_REQUIRED === 'true' && !adminKeyConfigured(c.env)) {
+    logger.warn('admin_key_required_without_admin_key', {
+      path: c.req.path,
+      detail: 'ADMIN_KEY_REQUIRED is "true" but ADMIN_API_KEY is not set; not enforced',
+    });
+  }
+
+  if (isSuperAdminClass(keyClass, c.env)) {
+    logger.log('admin_auth', {
+      key_class: keyClass,
+      enforced,
+      path: c.req.path,
+      method: c.req.method,
+    });
+    return next();
+  }
+
+  // Not super admin. Org-scoped routes still get their own KV org-key check in
+  // the next middleware; every other admin route is super-admin only.
+  const orgScoped = c.req.path.startsWith('/api/v1/admin/orgs/');
+  if (keyClass === null && orgScoped) {
+    return next();
+  }
+
+  const reason = keyClass === 'engine' ? 'admin_key_required' : 'not_super_admin';
+  logger.warn('auth_rejected', {
+    reason,
+    key_class: keyClass,
+    status: 403,
+    path: c.req.path,
+    method: c.req.method,
+  });
+  countMetric('auth_rejections_total', { reason, status_code: 403 });
+  return c.json({ error: 'This route requires the admin API key' }, 403);
+});
+
+// Org admin auth middleware - validates org-specific or super admin access.
 // NOTE: auth rejections for these routes are already gated and logged
-// (auth_rejected) by the global `/api/*` middleware above, which runs first. A
-// request only reaches here after presenting a valid ENGINE_API_KEY, so the
-// rejection branches below are effectively unreachable and deliberately do not
-// re-log — the global middleware is the single place auth failures are recorded.
+// (auth_rejected) by the global `/api/*` middleware and the `/api/v1/admin/*`
+// gate above, which run first. A request only reaches here with super-admin
+// authority, so the rejection branches below are effectively unreachable and
+// deliberately do not re-log.
 app.use('/api/v1/admin/orgs/:org/*', async (c, next) => {
   const org = c.req.param('org');
   const authHeader = c.req.header('Authorization');
@@ -317,8 +378,8 @@ app.use('/api/v1/admin/orgs/:org/*', async (c, next) => {
 
   const token = authHeader.slice(7);
 
-  // Check super admin (ENGINE_API_KEY) first
-  if (constantTimeCompare(token, c.env.ENGINE_API_KEY)) {
+  // Check super admin (ADMIN_API_KEY, or ENGINE_API_KEY while not enforced) first
+  if (isSuperAdminClass(classifyToken(token, c.env), c.env)) {
     return next();
   }
 
@@ -466,9 +527,10 @@ function poolNotMigratedResponse(
 /**
  * Common guard for the three pool write routes: the reserved-org 400 and the
  * super-admin 403 (poolWriteAuthError). Today the global `/api/*` middleware
- * already accepts nothing but ENGINE_API_KEY, so the 403 is a second fence
- * rather than a live gate — it keeps the invariant next to the shared store in
- * case org-scoped admin keys are ever honoured upstream.
+ * and the `/api/v1/admin/*` gate already admit only super-admin keys here, so
+ * the 403 is a second fence rather than a live gate — it keeps the invariant
+ * next to the shared store in case org-scoped admin keys are ever honoured
+ * upstream.
  */
 function rejectMcpWrite(
   c: Context<{ Bindings: Env }>,
@@ -480,7 +542,7 @@ function rejectMcpWrite(
   if (orgError) {
     return c.json({ error: orgError }, 400);
   }
-  const authError = poolWriteAuthError(c.req.header('Authorization'), c.env.ENGINE_API_KEY);
+  const authError = poolWriteAuthError(c.req.header('Authorization'), c.env);
   if (authError === null) {
     return null;
   }
@@ -1536,8 +1598,8 @@ app.delete('/api/v1/admin/orgs/:org/users/:userId/history', async (c) => {
 // retroactively enumerable. Reaches the DO's own /identity and /history
 // handlers; identity is null for DOs that predate identity persistence and
 // have not chatted since. Super-admin only: the path sits outside
-// /api/v1/admin/orgs/*, so the global /api/* middleware (ENGINE_API_KEY)
-// is the sole gate.
+// /api/v1/admin/orgs/*, so the global /api/* middleware plus the
+// /api/v1/admin/* super-admin gate are what protect it.
 app.get('/api/v1/admin/do/:hexId/snapshot', async (c) => {
   const hexId = c.req.param('hexId');
   const logger = createRequestLogger(crypto.randomUUID());
@@ -2327,6 +2389,39 @@ async function handleChatRequest(
   );
 }
 
+/**
+ * A chat request whose `client_id` marks it as admin-origin (`isAdminClient`)
+ * gets admin visibility (unpublished modes and languages, admin welcome
+ * preview). That is a super-admin capability, so it follows the same key rule
+ * as `/api/v1/admin/*`: ADMIN_API_KEY always, ENGINE_API_KEY only while the
+ * admin key is not enforced. Logs `admin_auth` with the key class so the
+ * switch-over can be watched. Returns a 403 response, or null to proceed.
+ */
+function checkAdminClientKey(
+  request: Request,
+  env: Env,
+  body: ChatRequest,
+  transport: ChatTransport,
+  logger: RequestLogger
+): Response | null {
+  if (!isAdminClient(body.client_id)) return null;
+  const token = bearerToken(request.headers.get('Authorization') ?? undefined);
+  const keyClass = token === null ? null : classifyToken(token, env);
+  const fields = { key_class: keyClass, enforced: adminKeyEnforced(env), transport };
+  if (isSuperAdminClass(keyClass, env)) {
+    logger.log('admin_auth', { ...fields, path: 'chat', client_id: body.client_id });
+    return null;
+  }
+  logger.warn('auth_rejected', {
+    ...fields,
+    reason: 'admin_key_required',
+    status: 403,
+    client_id: body.client_id,
+  });
+  countMetric('auth_rejections_total', { reason: 'admin_key_required', status_code: 403 });
+  return Response.json({ error: 'This client_id requires the admin API key' }, { status: 403 });
+}
+
 /** Params for {@link dispatchChatRequest} — the chat flow inside the pseudonym scope. */
 type ChatDispatchParams = {
   request: Request;
@@ -2355,6 +2450,11 @@ async function dispatchChatRequest(params: ChatDispatchParams): Promise<Response
     });
     countMetric('requests_total', { transport, status: 'validation_failed', status_code: 400 });
     return Response.json({ error: validationError }, { status: 400 });
+  }
+
+  const adminClientRejection = checkAdminClientKey(request, env, body, transport, logger);
+  if (adminClientRejection) {
+    return adminClientRejection;
   }
 
   const org = resolveOrgFromBody(body, env.DEFAULT_ORG);

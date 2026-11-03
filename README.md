@@ -162,15 +162,26 @@ A mode document's `## Tool Guidance` section may carry a portal-authored, HTML-c
 
 All `/api/*` routes require a Bearer token in the `Authorization` header.
 
-- **`ENGINE_API_KEY`** — super-admin token, grants access to all orgs and all endpoints
-- **Org admin keys** — stored in the `ORG_ADMIN_KEYS` KV namespace, keyed by org name; grants admin access to that org only
+- **`ENGINE_API_KEY`** — the chat/user key: chat, user preferences and history, audio and voice-submission routes. It also has super-admin access while `ADMIN_KEY_REQUIRED` is not `"true"` (see below).
+- **`ADMIN_API_KEY`** (optional secret) — the dedicated admin key. Passes the `/api/*` check on its own and always has super-admin access to every admin route (all orgs, the global MCP pool, DO snapshots), so an admin client needs only this key.
+- **Org admin keys** — stored in the `ORG_ADMIN_KEYS` KV namespace, keyed by org name; grants admin access to that org only (see the note under [Admin Endpoints](#admin-endpoints)).
 - **Webhook callbacks** — authenticated via `X-Engine-Token` header containing the `ENGINE_API_KEY`
 
 ```
-Authorization: Bearer <ENGINE_API_KEY or org-specific admin key>
+Authorization: Bearer <ENGINE_API_KEY, ADMIN_API_KEY or org-specific admin key>
 ```
 
 `/health` and `/public/ptxprint/*` are unauthenticated. Every auth rejection is logged as `auth_rejected` (token value never logged) and counted in `auth_rejections_total`.
+
+**Admin key enforcement (`ADMIN_KEY_REQUIRED`).** Every request to `/api/v1/admin/*` logs `admin_auth` with `key_class` (`admin` or `engine`, never the key) and `enforced`.
+
+| `ADMIN_API_KEY` | `ADMIN_KEY_REQUIRED` | Admin routes accept                                                                                               |
+| --------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| unset           | any                  | `ENGINE_API_KEY` (unchanged behaviour; `"true"` without an admin key logs `admin_key_required_without_admin_key`) |
+| set             | `"false"` (default)  | `ADMIN_API_KEY` or `ENGINE_API_KEY` (transition)                                                                  |
+| set             | `"true"`             | `ADMIN_API_KEY` only; `ENGINE_API_KEY` gets `403` (`auth_rejected`, `reason: admin_key_required`)                 |
+
+Chat and user routes accept either key in every row, with one exception: a chat request with an admin `client_id` (`admin-portal`, which gets admin visibility of unpublished modes and languages) follows the admin-route rule and logs `admin_auth` the same way. Switch-over: set the `ADMIN_API_KEY` secret, point admin clients at it, watch `admin_auth` logs until no `key_class: engine` entries remain, then set `ADMIN_KEY_REQUIRED = "true"` in `wrangler.toml`. If `ADMIN_API_KEY` were ever set to the same value as `ENGINE_API_KEY`, that value is treated as the engine key.
 
 ## API Endpoints
 
@@ -200,7 +211,7 @@ Authorization: Bearer <ENGINE_API_KEY or org-specific admin key>
 
 ### Admin Endpoints
 
-All admin endpoints require Bearer token authentication with `ENGINE_API_KEY` (the global `/api/*` middleware accepts nothing else today; the org-specific `ORG_ADMIN_KEYS` branch below it is not reachable).
+All admin endpoints (everything under `/api/v1/admin/*`) require a key with super-admin authority: `ADMIN_API_KEY`, or `ENGINE_API_KEY` while `ADMIN_KEY_REQUIRED` is not `"true"` (see [Authentication](#authentication)). The global `/api/*` middleware accepts only those two keys, so the org-specific `ORG_ADMIN_KEYS` branch of the `/api/v1/admin/orgs/:org/*` gate is not reachable today. Global MCP pool writes and `/api/v1/admin/do/:hexId/snapshot` are super-admin only regardless.
 
 | Endpoint                                                               | Method       | Description                                                                                 |
 | ---------------------------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------- |
@@ -611,29 +622,31 @@ Access control (who can reset a group, who counts as "addressed") is the **gatew
 
 ### Secrets (set via `wrangler secret put`)
 
-| Secret                        | Description                                                                                            |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `ANTHROPIC_API_KEY`           | API key for Claude                                                                                     |
-| `OPENROUTER_API_KEY`          | OpenRouter key for the two OpenRouter fallback tiers (#403). Unset ⇒ those tiers are absent (optional) |
-| `OPENAI_API_KEY`              | API key for OpenAI (TTS)                                                                               |
-| `ENGINE_API_KEY`              | Bearer token for API auth + super-admin access + webhook `X-Engine-Token`                              |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP base URL of the collector. Telemetry is a no-op unless this AND the token are set (optional) |
-| `OTEL_COLLECTOR_TOKEN`        | Bearer token the collector expects (optional)                                                          |
-| `TELEMETRY_USER_ID_SALT`      | HMAC key for the OTLP-path `user_hash` pseudonym; unset ⇒ no pseudonym egresses (optional)             |
+| Secret                        | Description                                                                                                                                      |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ANTHROPIC_API_KEY`           | API key for Claude                                                                                                                               |
+| `OPENROUTER_API_KEY`          | OpenRouter key for the two OpenRouter fallback tiers (#403). Unset ⇒ those tiers are absent (optional)                                           |
+| `OPENAI_API_KEY`              | API key for OpenAI (TTS)                                                                                                                         |
+| `ENGINE_API_KEY`              | Bearer token for API auth + webhook `X-Engine-Token`; super-admin access only while `ADMIN_KEY_REQUIRED` is not `"true"`                         |
+| `ADMIN_API_KEY`               | Dedicated admin key: passes `/api/*` auth and has super-admin access to `/api/v1/admin/*`. Unset ⇒ `ENGINE_API_KEY` stays super admin (optional) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP base URL of the collector. Telemetry is a no-op unless this AND the token are set (optional)                                           |
+| `OTEL_COLLECTOR_TOKEN`        | Bearer token the collector expects (optional)                                                                                                    |
+| `TELEMETRY_USER_ID_SALT`      | HMAC key for the OTLP-path `user_hash` pseudonym; unset ⇒ no pseudonym egresses (optional)                                                       |
 
 ### Required Environment Variables
 
 Set in `wrangler.toml` under `[vars]`. The top-level `[vars]` block **is** the production config (the Deploy workflow runs `wrangler deploy` with no `--env` and asserts `ENVIRONMENT = "production"`); `[env.staging.vars]` holds staging's copy.
 
-| Variable                       | Default           | Description                                                                                |
-| ------------------------------ | ----------------- | ------------------------------------------------------------------------------------------ |
-| `ENVIRONMENT`                  | `"production"`    | Runtime environment label (`"staging"` under `[env.staging]`); used as `service.namespace` |
-| `MAX_ORCHESTRATION_ITERATIONS` | `"100"`           | Max Claude tool-use loop iterations                                                        |
-| `CODE_EXEC_TIMEOUT_MS`         | `"30000"`         | QuickJS execution timeout (ms)                                                             |
-| `MAX_MCP_CALLS_PER_EXECUTION`  | `"10"`            | Max MCP calls per `execute_code` invocation                                                |
-| `MAX_MCP_CALLS_PER_REQUEST`    | `"100"`           | Max MCP calls across a whole request                                                       |
-| `DEFAULT_ORG`                  | `"unfoldingWord"` | Fallback org when not specified in request                                                 |
-| `WHATSAPP_NUMBER`              | `"15558196461"`   | WhatsApp business number (E.164 digits, no `+`) for the per-mode `wa.me` share link (#311) |
+| Variable                       | Default           | Description                                                                                   |
+| ------------------------------ | ----------------- | --------------------------------------------------------------------------------------------- |
+| `ENVIRONMENT`                  | `"production"`    | Runtime environment label (`"staging"` under `[env.staging]`); used as `service.namespace`    |
+| `MAX_ORCHESTRATION_ITERATIONS` | `"100"`           | Max Claude tool-use loop iterations                                                           |
+| `CODE_EXEC_TIMEOUT_MS`         | `"30000"`         | QuickJS execution timeout (ms)                                                                |
+| `MAX_MCP_CALLS_PER_EXECUTION`  | `"10"`            | Max MCP calls per `execute_code` invocation                                                   |
+| `MAX_MCP_CALLS_PER_REQUEST`    | `"100"`           | Max MCP calls across a whole request                                                          |
+| `DEFAULT_ORG`                  | `"unfoldingWord"` | Fallback org when not specified in request                                                    |
+| `WHATSAPP_NUMBER`              | `"15558196461"`   | WhatsApp business number (E.164 digits, no `+`) for the per-mode `wa.me` share link (#311)    |
+| `ADMIN_KEY_REQUIRED`           | `"false"`         | `"true"` ⇒ admin routes accept only `ADMIN_API_KEY`. No effect while `ADMIN_API_KEY` is unset |
 
 ### Optional Environment Variables
 

@@ -885,8 +885,22 @@ describe('describeLeftoverLegacyKeys', () => {
 });
 
 describe('poolWriteAuthError', () => {
-  it('accepts exactly the engine key', () => {
-    expect(poolWriteAuthError('Bearer engine-key', 'engine-key')).toBeNull();
+  const engineOnly = { ENGINE_API_KEY: 'engine-key' };
+  const withAdmin = { ENGINE_API_KEY: 'engine-key', ADMIN_API_KEY: 'admin-key' };
+  const enforced = { ...withAdmin, ADMIN_KEY_REQUIRED: 'true' };
+
+  it('accepts exactly the engine key when no admin key is configured', () => {
+    expect(poolWriteAuthError('Bearer engine-key', engineOnly)).toBeNull();
+  });
+
+  it('accepts the admin key, and the engine key until enforcement', () => {
+    expect(poolWriteAuthError('Bearer admin-key', withAdmin)).toBeNull();
+    expect(poolWriteAuthError('Bearer engine-key', withAdmin)).toBeNull();
+    expect(poolWriteAuthError('Bearer admin-key', enforced)).toBeNull();
+  });
+
+  it('rejects the engine key once the admin key is enforced', () => {
+    expect(poolWriteAuthError('Bearer engine-key', enforced)).toContain('super admin');
   });
 
   it.each([
@@ -896,6 +910,7 @@ describe('poolWriteAuthError', () => {
     ['empty token', 'Bearer '],
     ['no header', undefined],
   ])('rejects %s', (_label, header) => {
-    expect(poolWriteAuthError(header, 'engine-key')).toContain('super admin');
+    expect(poolWriteAuthError(header, engineOnly)).toContain('super admin');
+    expect(poolWriteAuthError(header, withAdmin)).toContain('super admin');
   });
 });

@@ -48,6 +48,10 @@ DEFAULT_ORG = "unfoldingWord"
 # link in first-contact welcomes (#311). Non-secret, so it lives in [vars], not
 # a wrangler secret. Same var/value the portal reads for its share panel.
 WHATSAPP_NUMBER = "15558196461"
+# Admin key enforcement. "true" => only the ADMIN_API_KEY secret may use the
+# admin routes; "false" keeps ENGINE_API_KEY accepted there during the switch-
+# over. No effect while ADMIN_API_KEY is unset. See README "Authentication".
+ADMIN_KEY_REQUIRED = "false"
 
 # KV Namespaces
 [[kv_namespaces]]
@@ -122,6 +126,8 @@ MAX_MCP_CALLS_PER_REQUEST = "100"
 DEFAULT_ORG = "unfoldingWord"
 # See top-level [vars] note. Same wa.me share number as prod/portal (#311).
 WHATSAPP_NUMBER = "15558196461"
+# See top-level [vars] note on admin key enforcement.
+ADMIN_KEY_REQUIRED = "false"
 # Model fallback chain (#403), last tier: a non-Claude model via OpenRouter. Set
 # on staging first so its answers can be checked (quality, theology) with the
 # FALLBACK_FORCE_ROUTE drill before production gets a value. Needs the
