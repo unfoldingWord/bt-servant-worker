@@ -288,18 +288,91 @@ describe('parallel and sequential tool statuses', () => {
         message: 'Looking up Translation Words and reading Translation Academy…',
       },
     ]);
+  });
 
+  it('sends the next label once the gap has passed and the turn is still running', async () => {
+    callMCPToolMock.mockImplementation(async (_server: unknown, toolName: string) => {
+      if (toolName === 'th_get_passage') {
+        await new Promise((resolve) => setTimeout(resolve, 2_500));
+      }
+      return { result: {}, responseTimeMs: 1 };
+    });
     const sequential =
       'await get_word_article({ path: "bible/kt/grace" });' +
       'await th_get_passage({ reference: "John 3:16" });' +
       '__result__ = "done";';
     installFetch(codeThenAnswer(sequential), []);
-    const second = createMockCallbacks();
-    await orchestrate('then', options(createMockLogger(), { callbacks: second.callbacks }));
-    expect(second.statuses.map((status) => status.message)).toContain(
-      'Looking up Translation Words…'
-    );
-    expect(second.statuses.map((status) => status.message).join('\n')).not.toContain('John 3:16');
+    const { callbacks, statuses } = createMockCallbacks();
+    await orchestrate('then', options(createMockLogger(), { callbacks }));
+    const messages = statuses.map((status) => status.message);
+    expect(messages).toContain('Looking up Translation Words…');
+    expect(messages).toContain('Reading John 3:16…');
+  });
+});
+
+describe('a label dropped when the turn ends first', () => {
+  it('drops a later label when the turn ends before the gap', async () => {
+    callMCPToolMock.mockResolvedValue({ result: {}, responseTimeMs: 1 });
+    const sequential =
+      'await get_word_article({ path: "bible/kt/grace" });' +
+      'await th_get_passage({ reference: "John 3:16" });' +
+      '__result__ = "done";';
+    installFetch(codeThenAnswer(sequential), []);
+    const { callbacks, statuses } = createMockCallbacks();
+    await orchestrate('then', options(createMockLogger(), { callbacks }));
+    expect(statuses.map((status) => status.message)).toContain('Looking up Translation Words…');
+    expect(statuses.map((status) => status.message).join('\n')).not.toContain('John 3:16');
+  });
+});
+
+describe('a reference on the first argument, and a mixed round', () => {
+  it('reads reference from the first argument when more than one was passed', async () => {
+    callMCPToolMock.mockResolvedValue({ result: {}, responseTimeMs: 1 });
+    const code =
+      'await th_get_passage({ reference: "Genesis 1" }, { extra: true }); __result__ = "done";';
+    installFetch(codeThenAnswer(code), []);
+    const { callbacks, statuses } = createMockCallbacks();
+    await orchestrate('genesis', options(createMockLogger(), { callbacks }));
+    expect(statuses).toContainEqual({
+      key: 'status_read_passage',
+      message: 'Reading Genesis 1…',
+    });
+  });
+
+  it('keeps the generic line when execute_code shares the round with another tool', async () => {
+    callMCPToolMock.mockResolvedValue({ result: {}, responseTimeMs: 1 });
+    const rounds = [
+      message('msg_1', 'tool_use', [
+        {
+          type: 'tool_use',
+          id: 'tool_1',
+          name: 'execute_code',
+          input: { code: PASSAGE },
+        } as unknown as Anthropic.ContentBlock,
+        {
+          type: 'tool_use',
+          id: 'tool_2',
+          name: 'list_resources',
+          input: {},
+        } as unknown as Anthropic.ContentBlock,
+      ]),
+      message('msg_2', 'end_turn', [
+        { type: 'text', text: 'Here is the answer' } as Anthropic.ContentBlock,
+      ]),
+    ];
+    installFetch(rounds, []);
+    const { callbacks, statuses } = createMockCallbacks();
+    await orchestrate('both', options(createMockLogger(), { callbacks }));
+    expect(statuses.map((status) => status.key)).toEqual([
+      'status_processing',
+      'status_executing_tools',
+      'status_read_passage',
+      'status_preparing',
+    ]);
+    expect(statuses[2]).toEqual({
+      key: 'status_read_passage',
+      message: 'Reading John 3:16…',
+    });
   });
 });
 

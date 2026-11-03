@@ -2,11 +2,13 @@
  * Status lines for a tool the worker is about to call (#28).
  *
  * The label is chosen from the tool name, never from model text. A short
- * Bible or OBS `reference` argument may be included. Anything else in the
- * arguments is ignored. One turn says each label at most once, and waits
- * about two seconds between labels.
+ * Bible or OBS `reference` argument may be included when the book is one the
+ * worker already recognizes. Anything else in the arguments is ignored. One
+ * turn says each label at most once, and waits about two seconds between
+ * labels. A label held back by that gap is kept until the gap ends.
  */
 
+import { isKnownBibleBook, isKnownBookCode } from '../utils/bible-books.js';
 import { uiString, type StatusKey, type UiStringKey } from './ui-strings.js';
 
 /** Minimum gap between two tool-progress statuses in one turn. */
@@ -17,27 +19,13 @@ const MAX_REFERENCE_LENGTH = 40;
 const MAX_SERVER_NAME = 80;
 const NUMBER = /^\d{1,3}$/;
 const NUMBER_RANGE = /^\d{1,3}[-–]\d{1,3}$/;
-const BOOK_WORD = /^[\p{L}][\p{L}.'’-]{0,22}$/u;
 const UNSAFE_REFERENCE_CHAR = /[\\/<>{}[\]()"'`$%@!?;|&*#+=~,]/;
-const INSTRUCTION_WORD =
-  /^(?:please|read|ignore|previous|instructions|instruction|fetch|the|a|an|for|and|now|just|let|me|tell|user|select|drop|script|eval|system|prompt)$/i;
-const BOOK_CODE_DENY = new Set([
-  'THE',
-  'AND',
-  'FOR',
-  'NOT',
-  'BUT',
-  'YOU',
-  'ARE',
-  'WAS',
-  'OBS',
-  'ALL',
-  'ANY',
-]);
+/** Markup and quotes stripped from an operator-configured server name. */
+const UNSAFE_SERVER_CHAR = /[<>"'`]/g;
 
 export interface ToolCallSnapshot {
   name: string;
-  /** Argument object when the tool was called with one. Other shapes are ignored. */
+  /** First argument when it is a plain object. Other shapes are ignored. */
   args: unknown;
   /** Display name from the MCP server config. Absent when the tool has no server. */
   serverName?: string | undefined;
@@ -48,10 +36,26 @@ export type ToolStatusDecision =
   | { kind: 'skip'; reason: 'duplicate' | 'interval' }
   | { kind: 'fallback'; count: number };
 
+/** A label the interval held back. `sendAt` does not move if a later call replaces it. */
+export interface PendingToolStatus {
+  key: StatusKey;
+  message: string;
+  sendAt: number;
+}
+
 export interface ToolStatusGate {
   decide(calls: readonly ToolCallSnapshot[], locale: string, now: number): ToolStatusDecision;
   /** An `execute_code` block that called no host tool. */
   noteIdle(now: number): ToolStatusDecision;
+  /** The label waiting for the interval, if one is. */
+  pending(): PendingToolStatus | null;
+  /**
+   * Say the held label when `now` has reached its time. Null when nothing is
+   * waiting or the time has not come. Does not postpone the label.
+   */
+  flushPending(now: number): ToolStatusDecision | null;
+  /** Drop a held label without saying it. The turn ended, or the caller cancelled. */
+  cancelPending(): void;
 }
 
 interface ActivitySpec {
@@ -71,6 +75,7 @@ interface RenderedClause {
 interface GateState {
   labels: Set<string>;
   lastAt: number;
+  pending?: PendingToolStatus | undefined;
 }
 
 const ACTIVITY_ENTRIES: readonly (readonly [string, ActivitySpec])[] = [
@@ -167,15 +172,14 @@ function isStoryFrame(token: string): boolean {
 }
 
 function isIntroReference(text: string): boolean {
-  if (/^front:intro$/i.test(text)) return true;
   const parts = splitBookTail(text);
-  return parts !== null && /^\d{1,3}:intro$/i.test(parts.tail) && isBookName(parts.book);
+  return parts !== null && /^\d{1,3}:intro$/i.test(parts.tail) && isKnownBibleBook(parts.book);
 }
 
 function isBibleReference(text: string): boolean {
-  if (isBookCode(text)) return true;
+  if (isKnownBookCode(text)) return true;
   const parts = splitBookTail(text);
-  return parts !== null && isChapterToken(parts.tail) && isBookName(parts.book);
+  return parts !== null && isChapterToken(parts.tail) && isKnownBibleBook(parts.book);
 }
 
 function splitBookTail(text: string): { book: string; tail: string } | null {
@@ -193,30 +197,13 @@ function isChapterToken(token: string): boolean {
   return NUMBER.test(verse) || NUMBER_RANGE.test(verse);
 }
 
-function isBookName(book: string): boolean {
-  if (hasInstructionWord(book)) return false;
-  const words = book.split(' ');
-  const name = words.slice(leadingNumber(words));
-  return name.length >= 1 && name.length <= 3 && name.every((word) => BOOK_WORD.test(word));
-}
-
-function leadingNumber(words: readonly string[]): number {
-  const first = words[0];
-  return first === '1' || first === '2' || first === '3' ? 1 : 0;
-}
-
-function isBookCode(text: string): boolean {
-  if (/^[1-3][A-Z]{2}$/.test(text)) return true;
-  return /^[A-Z]{3}$/.test(text) && !BOOK_CODE_DENY.has(text);
-}
-
-function hasInstructionWord(book: string): boolean {
-  return book.split(/\s+/).some((word) => INSTRUCTION_WORD.test(word));
-}
-
 function displayServerName(name: string | undefined): string | null {
   if (!name) return null;
-  const cleaned = replaceControls(name).replace(/[{}]/g, ' ').replace(/\s+/g, ' ').trim();
+  const cleaned = replaceControls(name)
+    .replace(UNSAFE_SERVER_CHAR, ' ')
+    .replace(/[{}]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
   if (!cleaned) return null;
   return cleaned.length > MAX_SERVER_NAME ? cleaned.slice(0, MAX_SERVER_NAME).trim() : cleaned;
 }
@@ -354,7 +341,18 @@ function admit(
   if (now - state.lastAt < intervalMs) return 'interval';
   state.labels.add(label);
   state.lastAt = now;
+  state.pending = undefined;
   return 'ok';
+}
+
+/** Keep the newest unsaid label. The release time stays the one already scheduled. */
+function holdPending(
+  state: GateState,
+  planned: { key: StatusKey; message: string },
+  intervalMs: number
+): void {
+  const sendAt = state.pending?.sendAt ?? state.lastAt + intervalMs;
+  state.pending = { key: planned.key, message: planned.message, sendAt };
 }
 
 function admitFallback(
@@ -379,8 +377,25 @@ function decideBatch(
   const planned = planBatch(calls, locale);
   if (!planned) return admitFallback(state, calls.length, now, intervalMs);
   const admission = admit(state, planned.message, now, intervalMs);
+  if (admission === 'interval') {
+    holdPending(state, planned, intervalMs);
+    return { kind: 'skip', reason: admission };
+  }
   if (admission !== 'ok') return { kind: 'skip', reason: admission };
   return { kind: 'emit', key: planned.key, message: planned.message };
+}
+
+function releasePending(
+  state: GateState,
+  now: number,
+  intervalMs: number
+): ToolStatusDecision | null {
+  const pending = state.pending;
+  if (!pending || now < pending.sendAt) return null;
+  state.pending = undefined;
+  const admission = admit(state, pending.message, now, intervalMs);
+  if (admission !== 'ok') return { kind: 'skip', reason: admission };
+  return { kind: 'emit', key: pending.key, message: pending.message };
 }
 
 /** One gate per turn. `now` is injectable so tests do not wait. */
@@ -392,6 +407,15 @@ export function createToolStatusGate(intervalMs = TOOL_STATUS_MIN_INTERVAL_MS): 
     },
     noteIdle(now) {
       return admitFallback(state, 1, now, intervalMs);
+    },
+    pending() {
+      return state.pending ?? null;
+    },
+    flushPending(now) {
+      return releasePending(state, now, intervalMs);
+    },
+    cancelPending() {
+      state.pending = undefined;
     },
   };
 }

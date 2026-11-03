@@ -395,6 +395,10 @@ interface OrchestrationContext {
   emitStatus?: StatusEmitter | undefined;
   /** One per turn. Text turns use it to name the tool being called (#28). */
   toolStatus: ToolStatusGate;
+  /** Fires a tool status the 2s gap held back. Cleared when the turn ends. */
+  toolStatusTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Set when the turn ends so a timer that already fired does not speak late. */
+  toolStatusClosed: boolean;
   healthTracker: HealthTracker;
   memoryStore: UserMemoryStore | undefined;
   modeContext: ModeContext | undefined;
@@ -2340,6 +2344,8 @@ function iterationGateState(
   | 'callbacks'
   | 'emitStatus'
   | 'toolStatus'
+  | 'toolStatusTimer'
+  | 'toolStatusClosed'
 > {
   const gated = gateIterationProgress(options);
   return {
@@ -2354,6 +2360,8 @@ function iterationGateState(
       options.logger
     ),
     toolStatus: createToolStatusGate(),
+    toolStatusTimer: undefined,
+    toolStatusClosed: false,
   };
 }
 
@@ -2555,6 +2563,8 @@ export async function orchestrate(
     logOrchestrationSummary(ctx);
   } catch (error) {
     handleOrchestrationError(error, ctx.logger);
+  } finally {
+    closeToolStatus(ctx);
   }
 
   return publishOrchestrationResult(ctx);
@@ -3348,6 +3358,7 @@ async function publishToolStatus(
   const decision = ctx.toolStatus.decide(toolSnapshots(ctx, calls), ctx.locale, Date.now());
   ctx.logger.log('tool_status', { kind: decision.kind, tools: calls.map((call) => call.name) });
   await applyToolStatusDecision(ctx, decision);
+  armToolStatusTimer(ctx);
 }
 
 async function publishIdleToolStatus(ctx: OrchestrationContext): Promise<void> {
@@ -3355,6 +3366,7 @@ async function publishIdleToolStatus(ctx: OrchestrationContext): Promise<void> {
   const decision = ctx.toolStatus.noteIdle(Date.now());
   ctx.logger.log('tool_status', { kind: decision.kind, tools: [] });
   await applyToolStatusDecision(ctx, decision);
+  armToolStatusTimer(ctx);
 }
 
 async function applyToolStatusDecision(
@@ -3395,10 +3407,61 @@ function toolSnapshots(
 
 function snapshotOf(ctx: OrchestrationContext, call: HostCallStart): ToolCallSnapshot {
   const serverName = serverDisplayName(ctx, call.name);
-  const args = call.args.length === 1 ? call.args[0] : undefined;
+  const args = firstArgumentObject(call.args);
   return serverName === undefined
     ? { name: call.name, args }
     : { name: call.name, args, serverName };
+}
+
+/** The reference lives on the first argument when that argument is a plain object. */
+function firstArgumentObject(args: readonly unknown[]): unknown {
+  const first = args[0];
+  if (typeof first !== 'object' || first === null || Array.isArray(first)) return undefined;
+  return first;
+}
+
+function clearToolStatusTimer(ctx: OrchestrationContext): void {
+  if (ctx.toolStatusTimer === undefined) return;
+  clearTimeout(ctx.toolStatusTimer);
+  ctx.toolStatusTimer = undefined;
+}
+
+/**
+ * One held label, released when its gap ends, while the turn is still running.
+ * A newer label replaces the text but does not push the release later.
+ * Errors stay inside the timer: a status line must not reject the sandbox.
+ */
+function armToolStatusTimer(ctx: OrchestrationContext): void {
+  clearToolStatusTimer(ctx);
+  if (ctx.toolStatusClosed || !ctx.holdIterationText) return;
+  const pending = ctx.toolStatus.pending();
+  if (!pending) return;
+  const delay = Math.max(0, pending.sendAt - Date.now());
+  ctx.toolStatusTimer = setTimeout(() => {
+    ctx.toolStatusTimer = undefined;
+    void releasePendingToolStatus(ctx);
+  }, delay);
+}
+
+async function releasePendingToolStatus(ctx: OrchestrationContext): Promise<void> {
+  if (ctx.toolStatusClosed || !ctx.holdIterationText) return;
+  try {
+    const decision = ctx.toolStatus.flushPending(Date.now());
+    if (!decision || decision.kind === 'skip' || ctx.toolStatusClosed) return;
+    ctx.logger.log('tool_status', { kind: decision.kind, deferred: true });
+    await applyToolStatusDecision(ctx, decision);
+  } catch (error) {
+    ctx.logger.warn('tool_status_failed', {
+      error: error instanceof Error ? error.message : String(error),
+      deferred: true,
+    });
+  }
+}
+
+function closeToolStatus(ctx: OrchestrationContext): void {
+  ctx.toolStatusClosed = true;
+  ctx.toolStatus.cancelPending();
+  clearToolStatusTimer(ctx);
 }
 
 function serverDisplayName(ctx: OrchestrationContext, toolName: string): string | undefined {

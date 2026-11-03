@@ -7,6 +7,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { BOOK_INDEX } from '../../src/utils/bible-books.js';
 import { STATUS_KEYS, UI_STRINGS, uiString } from '../../src/i18n/ui-strings.js';
 import {
   TOOL_STATUS_MIN_INTERVAL_MS,
@@ -154,6 +155,26 @@ describe('tool status mapping', () => {
   });
 });
 
+describe('server names on a status line', () => {
+  it('strips brackets and quotes from the server display name', () => {
+    expect(emit([call('list_resources', {}, 'PTXprint <test>')]).message).toBe(
+      'Checking PTXprint test…'
+    );
+    expect(emit([call('list_resources', {}, `Say "hi" 'there'`)]).message).toBe(
+      'Checking Say hi there…'
+    );
+    expect(emit([call('submit_typeset', {}, 'Name `quoted`')]).message).toBe(
+      'Checking Name quoted…'
+    );
+  });
+
+  it('falls back when the server name is only markup', () => {
+    const markup = ['<', '>', '"', "'", '`'].join('');
+    const decision = createToolStatusGate().decide([call('list_resources', {}, markup)], 'en', 0);
+    expect(decision).toEqual({ kind: 'fallback', count: 1 });
+  });
+});
+
 describe('safe references in a status', () => {
   it('replaces the passage or OBS object with a safe reference', () => {
     expect(emit([call('get_passage', { reference: 'John 3:16' })]).message).toBe(
@@ -162,8 +183,8 @@ describe('safe references in a status', () => {
     expect(emit([call('get_obs_story', { reference: 'OBS 3:5' })]).message).toBe(
       'Reading OBS 3:5…'
     );
-    expect(emit([call('th_get_passage', { reference: 'Juan 3:16' })], 'pt').message).toBe(
-      'Lendo Juan 3:16…'
+    expect(emit([call('th_get_passage', { reference: 'John 3:16' })], 'pt').message).toBe(
+      'Lendo John 3:16…'
     );
   });
 
@@ -183,14 +204,16 @@ describe('safe references in a status', () => {
 describe('which references are safe to show', () => {
   it.each([
     'John 3:16',
+    'john 3:16',
     'JHN 3:16',
+    'jhn 3:16',
+    'Gen 1:1',
     '1 Corinthians 13:4-7',
     'Genesis 1',
     'Psalm 23',
+    'Psalms 23',
+    'Song of Solomon 2:1',
     '3 John 1:4',
-    'João 3:16',
-    '1 João 3:16',
-    'front:intro',
     'JHN 1:intro',
     'John 1:intro',
     'OBS 3',
@@ -198,9 +221,19 @@ describe('which references are safe to show', () => {
     'OBS 3:1-3',
     '3:5',
     '1CO',
+    '1co',
     'PSA',
   ])('accepts the reference %j', (reference) => {
     expect(referenceFromArgs({ reference })).toBe(reference);
+  });
+
+  it('accepts every Paratext code the worker already knows, and no invented code', () => {
+    for (const code of Object.keys(BOOK_INDEX)) {
+      expect(referenceFromArgs({ reference: code }), code).toBe(code);
+    }
+    expect(referenceFromArgs({ reference: 'ZZZ' })).toBeNull();
+    expect(referenceFromArgs({ reference: 'AAA' })).toBeNull();
+    expect(referenceFromArgs({ reference: 'Joh 3:16' })).toBeNull();
   });
 });
 
@@ -216,6 +249,13 @@ describe('references that must stay off the status line', () => {
     ['empty', ''],
     ['blank', '   '],
     ['a bare number', '16'],
+    ['a made-up book', 'Covenant 9:9'],
+    ['an invented code', 'ZZZ'],
+    ['a code the worker does not use', 'Joh 3:16'],
+    ['a Portuguese book name', 'João 3:16'],
+    ['a numbered Portuguese name', '1 João 3:16'],
+    ['a Spanish book name', 'Juan 3:16'],
+    ['front matter', 'front:intro'],
   ])('rejects %s', (_label, reference) => {
     expect(referenceFromArgs({ reference })).toBeNull();
   });
@@ -248,6 +288,18 @@ describe('references that must stay off the status line', () => {
     ]).message;
     expect(message).toBe('Reading John 3:16…');
     expect(message).not.toContain('ignore');
+  });
+});
+
+describe('unknown books stay off the status line', () => {
+  it('keeps the plain clause when the book is not one the worker knows', () => {
+    expect(emit([call('get_passage', { reference: 'Covenant 9:9' })]).message).toBe(
+      'Reading the passage…'
+    );
+    expect(emit([call('get_passage', { reference: 'ZZZ' })]).message).toBe('Reading the passage…');
+    expect(emit([call('get_passage', { reference: 'Juan 3:16' })], 'pt').message).toBe(
+      'Lendo a passagem…'
+    );
   });
 });
 
@@ -306,6 +358,76 @@ describe('tool status throttle and combining', () => {
   });
 });
 
+describe('a label held for the gap', () => {
+  it('holds a skipped label and releases it when the gap ends, without a new call', () => {
+    const gate = createToolStatusGate();
+    const passage = call('get_passage', { reference: 'John 3:16' });
+    expect(gate.decide([call('get_word_article')], 'en', 0).kind).toBe('emit');
+    expect(gate.decide([passage], 'en', 100)).toEqual({ kind: 'skip', reason: 'interval' });
+    expect(gate.pending()).toMatchObject({
+      key: 'status_read_passage',
+      message: 'Reading John 3:16…',
+      sendAt: TOOL_STATUS_MIN_INTERVAL_MS,
+    });
+    expect(gate.flushPending(TOOL_STATUS_MIN_INTERVAL_MS - 1)).toBeNull();
+    expect(gate.flushPending(TOOL_STATUS_MIN_INTERVAL_MS)).toMatchObject({
+      kind: 'emit',
+      key: 'status_read_passage',
+      message: 'Reading John 3:16…',
+    });
+    expect(gate.pending()).toBeNull();
+  });
+
+  it('a later skipped label replaces the held text and keeps the original release time', () => {
+    const gate = createToolStatusGate();
+    expect(gate.decide([call('get_word_article')], 'en', 0).kind).toBe('emit');
+    expect(gate.decide([call('get_passage', { reference: 'John 3:16' })], 'en', 100).kind).toBe(
+      'skip'
+    );
+    expect(gate.decide([call('get_note', { reference: 'Genesis 1' })], 'en', 400).kind).toBe(
+      'skip'
+    );
+    expect(gate.pending()).toMatchObject({
+      message: 'Checking the translation notes for Genesis 1…',
+      sendAt: TOOL_STATUS_MIN_INTERVAL_MS,
+    });
+    expect(gate.flushPending(TOOL_STATUS_MIN_INTERVAL_MS)).toMatchObject({
+      kind: 'emit',
+      message: 'Checking the translation notes for Genesis 1…',
+    });
+    expect(gate.flushPending(TOOL_STATUS_MIN_INTERVAL_MS)).toBeNull();
+  });
+});
+
+describe('a held label after a fallback', () => {
+  it('a fallback followed by a mapped tool holds the mapped label', () => {
+    const gate = createToolStatusGate();
+    expect(gate.decide([call('prepare_usfm_source')], 'en', 0)).toEqual({
+      kind: 'fallback',
+      count: 1,
+    });
+    expect(gate.decide([call('get_passage', { reference: 'John 3:16' })], 'en', 50)).toEqual({
+      kind: 'skip',
+      reason: 'interval',
+    });
+    expect(gate.flushPending(TOOL_STATUS_MIN_INTERVAL_MS)).toMatchObject({
+      kind: 'emit',
+      message: 'Reading John 3:16…',
+    });
+  });
+
+  it('cancelPending drops the held label', () => {
+    const gate = createToolStatusGate();
+    expect(gate.decide([call('get_word_article')], 'en', 0).kind).toBe('emit');
+    expect(gate.decide([call('get_passage', { reference: 'John 3:16' })], 'en', 100).kind).toBe(
+      'skip'
+    );
+    gate.cancelPending();
+    expect(gate.pending()).toBeNull();
+    expect(gate.flushPending(TOOL_STATUS_MIN_INTERVAL_MS)).toBeNull();
+  });
+});
+
 describe('tool status locales', () => {
   const TOOL_KEYS = [
     'status_lookup_words',
@@ -354,8 +476,8 @@ describe('tool status locales', () => {
 
   it('unknown locales fall back to English', () => {
     expect(emit([call('get_word_article')], 'sw').message).toBe('Looking up Translation Words…');
-    expect(emit([call('get_passage', { reference: 'Juan 3:16' })], 'pt-BR').message).toBe(
-      'Lendo Juan 3:16…'
+    expect(emit([call('get_passage', { reference: 'John 3:16' })], 'pt-BR').message).toBe(
+      'Lendo John 3:16…'
     );
   });
 });
