@@ -91,6 +91,15 @@ export function callerAllowsAudio(caller: ChatCaller | undefined): boolean {
   return !isPartnerCaller(caller);
 }
 
+/**
+ * Characters the admin group/thread routes accept in a chat_id or thread_id
+ * path parameter: letters, digits, `_`, `.`, `-` and `:` (Telegram ids are
+ * typically numeric). Partner chat_id/thread_id use the same set minus `:`
+ * (services/partner-keys/policy.ts), so every partner group stays manageable
+ * through those routes.
+ */
+export const CHAT_ID_PATTERN = /^[\w.:-]+$/;
+
 /** Options for {@link validateChatBody}. */
 export interface ChatValidationOptions {
   /**

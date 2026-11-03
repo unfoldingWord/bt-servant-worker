@@ -11,14 +11,21 @@
  * finish, including its KV writes. Admin traffic is tiny, so the queue costs
  * nothing in practice and makes every operation straight-line code.
  *
- * Alarm: retries KV projections that failed (see ledger.ts).
+ * Alarm: retries owed KV projections (see ledger.ts).
  *
  * Reached only from the worker (partnerKeyStore in services/partner-keys/
  * store.ts) after the admin guard; a DO has no public address.
  */
 
 import type { Env } from '../config/types.js';
-import { PartnerKeyLedger } from '../services/partner-keys/ledger.js';
+import { PartnerKeyLedger, PROJECTION_RETRY_MS } from '../services/partner-keys/ledger.js';
+import {
+  flushLogTelemetry,
+  flushMetricTelemetry,
+  initLogTelemetry,
+  initMetricTelemetry,
+  runWithMetricsSuppressed,
+} from '../services/telemetry/index.js';
 import type { PartnerKeyStoreOp } from '../services/partner-keys/store.js';
 import { createRequestLogger, type RequestLogger } from '../utils/logger.js';
 
@@ -40,6 +47,11 @@ async function readOp(request: Request, logger: RequestLogger): Promise<PartnerK
   return null;
 }
 
+/** Request id used when the worker sent none (it always does); never random. */
+const NO_REQUEST_ID = 'partner-key-store:no-request-id';
+/** Request id for alarm-level events not tied to one owed key; never random. */
+const ALARM_REQUEST_ID = 'partner-key-store:alarm';
+
 export class PartnerKeyStoreDO {
   private tail: Promise<unknown> = Promise.resolve();
 
@@ -49,11 +61,51 @@ export class PartnerKeyStoreDO {
   ) {}
 
   async fetch(request: Request): Promise<Response> {
-    const logger = createRequestLogger(request.headers.get('X-Request-ID') ?? crypto.randomUUID());
-    const op = await readOp(request, logger);
-    if (!op) return Response.json({ error: 'Body must be a JSON operation' }, { status: 400 });
+    const requestId = request.headers.get('X-Request-ID') ?? NO_REQUEST_ID;
+    const logger = createRequestLogger(requestId);
+    // Like UserDO: the DO runs in its own isolate with its own log buffer and
+    // metric aggregation, so it initialises and flushes telemetry itself.
+    initLogTelemetry(this.env);
+    initMetricTelemetry(this.env);
     try {
-      const result = await this.serialize(() => this.run(op, logger));
+      const op = await readOp(request, logger);
+      if (!op) return Response.json({ error: 'Body must be a JSON operation' }, { status: 400 });
+      return await this.handle(op, logger, requestId);
+    } finally {
+      flushLogTelemetry((promise) => this.state.waitUntil(promise));
+      flushMetricTelemetry((promise) => this.state.waitUntil(promise));
+    }
+  }
+
+  /**
+   * Retry owed KV projections. Like UserDO.alarm: no OTLP flush here (outbound
+   * fetch from an alarm is blocked; the tail worker forwards these logs) and
+   * metrics are suppressed. Each key's retry is logged under the request that
+   * owes it. A failure is logged and re-thrown so the runtime retries the
+   * alarm; first, an alarm is kept scheduled while any projection is owed.
+   */
+  async alarm(): Promise<void> {
+    const logger = createRequestLogger(ALARM_REQUEST_ID);
+    await runWithMetricsSuppressed(async () => {
+      try {
+        await this.serialize(() =>
+          this.ledger(logger, ALARM_REQUEST_ID).retryProjections(createRequestLogger)
+        );
+      } catch (error) {
+        logger.error('partner_key_projection_alarm_failed', error);
+        await this.keepAlarmWhileOwed(logger);
+        throw error;
+      }
+    });
+  }
+
+  private async handle(
+    op: PartnerKeyStoreOp,
+    logger: RequestLogger,
+    requestId: string
+  ): Promise<Response> {
+    try {
+      const result = await this.serialize(() => this.run(op, logger, requestId));
       return result === undefined
         ? Response.json({ error: `Unknown operation '${String(op.op)}'` }, { status: 400 })
         : Response.json(result);
@@ -63,30 +115,45 @@ export class PartnerKeyStoreDO {
     }
   }
 
-  async alarm(): Promise<void> {
-    const logger = createRequestLogger(crypto.randomUUID());
-    await this.serialize(() => this.ledger(logger).retryProjections());
+  /** After a failed alarm: make sure a retry is still scheduled while anything is owed. */
+  private async keepAlarmWhileOwed(logger: RequestLogger): Promise<void> {
+    try {
+      const owed = await this.ledger(logger, ALARM_REQUEST_ID).hasOwedProjections();
+      if (owed && (await this.state.storage.getAlarm()) === null) {
+        await this.state.storage.setAlarm(Date.now() + PROJECTION_RETRY_MS);
+      }
+    } catch (error) {
+      logger.error('partner_key_projection_alarm_rearm_failed', error);
+    }
   }
 
   /** Run `task` after every earlier task has settled; a failure does not block later ones. */
   private serialize<T>(task: () => Promise<T>): Promise<T> {
     const run = this.tail.then(task, task);
+    // Not a silent catch: this only keeps the QUEUE moving past a failed task.
+    // The failure itself reaches the caller through `run`, which is returned
+    // (and awaited, logged and answered by handle() / alarm()).
     this.tail = run.catch(() => undefined);
     return run;
   }
 
-  private ledger(logger: RequestLogger): PartnerKeyLedger {
-    return new PartnerKeyLedger(
-      this.state.storage,
-      this.env.API_KEYS,
-      this.env.PARTNER_KEY_TAG_SECRET,
-      logger
-    );
+  private ledger(logger: RequestLogger, requestId: string): PartnerKeyLedger {
+    return new PartnerKeyLedger({
+      storage: this.state.storage,
+      kv: this.env.API_KEYS,
+      tagSecret: this.env.PARTNER_KEY_TAG_SECRET,
+      logger,
+      requestId,
+    });
   }
 
   /** Dispatch one operation; undefined for an unknown op. */
-  private async run(op: PartnerKeyStoreOp, logger: RequestLogger): Promise<unknown> {
-    const ledger = this.ledger(logger);
+  private async run(
+    op: PartnerKeyStoreOp,
+    logger: RequestLogger,
+    requestId: string
+  ): Promise<unknown> {
+    const ledger = this.ledger(logger, requestId);
     switch (op.op) {
       case 'create':
         return ledger.create(op.input);

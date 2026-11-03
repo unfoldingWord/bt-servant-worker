@@ -349,7 +349,7 @@ describe('partner identifiers are bounded and single-line', () => {
     [{ user_id: 'a\nb' }, 'partner_user_id'],
     [{ user_id: 'u'.repeat(MAX_PARTNER_ID_LENGTH + 1) }, 'partner_user_id'],
     [{ chat_id: 'g\r1' }, 'partner_chat_id'],
-    [{ thread_id: 't x' }, 'partner_thread_id'],
+    [{ thread_id: 't\u2028x' }, 'partner_thread_id'],
     [{ thread_id: 't'.repeat(MAX_PARTNER_ID_LENGTH + 1) }, 'partner_thread_id'],
   ])('rejects %o', (fields, reason) => {
     expect(applyPartnerChatPolicy(chat(fields), KEY)).toMatchObject({
@@ -370,14 +370,31 @@ describe('partner identifiers are bounded and single-line', () => {
   });
 });
 
-describe("':' is refused in partner chat_id and thread_id (group DO name collision)", () => {
+describe('partner chat_id / thread_id use the admin group-route characters, minus ":"', () => {
   it.each([
     [{ chat_id: 'a:b' }, 'partner_chat_id'],
     [{ chat_id: 'g1', thread_id: 'b:c' }, 'partner_thread_id'],
-  ])('rejects %o', (fields, reason) => {
+    [{ chat_id: 'a/b' }, 'partner_chat_id'],
+    [{ chat_id: 'a b' }, 'partner_chat_id'],
+    [{ chat_id: 'team@g.us' }, 'partner_chat_id'],
+    [{ chat_id: 'café' }, 'partner_chat_id'],
+    [{ chat_id: 'g1', thread_id: 't%2F1' }, 'partner_thread_id'],
+  ])('rejects %o with a clear 400', (fields, reason) => {
     expect(applyPartnerChatPolicy(chat({ chat_type: 'supergroup', ...fields }), KEY)).toMatchObject(
-      { ok: false, rejection: { status: 400, reason, error: expect.stringContaining("':'") } }
+      {
+        ok: false,
+        rejection: {
+          status: 400,
+          reason,
+          error: expect.stringContaining("only letters, digits, '_', '.' and '-'"),
+        },
+      }
     );
+  });
+
+  it('accepts ids the admin group routes accept (without ":")', () => {
+    const fields = { chat_type: 'supergroup', chat_id: '-100123_g.x', thread_id: 't-1.2_3' };
+    expect(applyPartnerChatPolicy(chat(fields), KEY).ok).toBe(true);
   });
 
   it('still allows a colon in user_id (last segment of its DO name)', () => {
@@ -385,11 +402,48 @@ describe("':' is refused in partner chat_id and thread_id (group DO name collisi
   });
 });
 
+describe('invisible Unicode format characters (Cf) are refused in ids and labels', () => {
+  const FORMAT: [string, string][] = [
+    ['U+202E (RLO)', '\u202e'],
+    ['U+202A (LRE)', '\u202a'],
+    ['U+2066 (LRI)', '\u2066'],
+    ['U+2069 (PDI)', '\u2069'],
+    ['U+200B (ZWSP)', '\u200b'],
+    ['U+200F (RLM)', '\u200f'],
+    ['U+FEFF (BOM)', '\ufeff'],
+    ['U+00AD (soft hyphen)', '\u00ad'],
+  ];
+
+  it.each(FORMAT)('user_id rejects %s', (_label, ch) => {
+    expect(applyPartnerChatPolicy(chat({ user_id: `al${ch}ice` }), KEY)).toMatchObject({
+      ok: false,
+      rejection: { status: 400, reason: 'partner_user_id' },
+    });
+  });
+
+  it.each(FORMAT)('labels reject %s', (_label, ch) => {
+    const base = { org: 'bcs', name: 'n', app: 'a', createdBy: 'c' };
+    for (const field of ['name', 'app', 'createdBy'] as const) {
+      expect(validatePartnerKeyCreate({ ...base, [field]: `x${ch}y` })).toMatchObject({
+        ok: false,
+        error: expect.stringContaining('invisible format'),
+      });
+    }
+    expect(readRevokeBody({ revokedBy: `x${ch}y` }).ok).toBe(false);
+  });
+
+  it('sanitizeSpeaker drops them, but keeps the zero-width joiner of emoji sequences', () => {
+    expect(sanitizeSpeaker('Ann\u202eevil\u200b')).toBe('Annevil');
+    const family = '\u{1F468}\u200d\u{1F469}\u200d\u{1F467}';
+    expect(sanitizeSpeaker(`Kim ${family}`)).toBe(`Kim ${family}`);
+  });
+});
+
 describe('C1 controls and Unicode line/paragraph separators count as line breaks', () => {
   const SEPARATORS: [string, string][] = [
     ['U+0085 (NEL)', '\u0085'],
-    ['U+2028 (LS)', ' '],
-    ['U+2029 (PS)', ' '],
+    ['U+2028 (LS)', '\u2028'],
+    ['U+2029 (PS)', '\u2029'],
     ['U+0080 (first C1)', '\u0080'],
     ['U+009B (CSI)', '\u009b'],
     ['U+009F (last C1)', '\u009f'],

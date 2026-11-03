@@ -17,7 +17,8 @@
  */
 
 import { env, runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { PartnerKeyStoreDO } from '../../src/durable-objects/partner-key-store-do';
 import {
   AUTH_UPDATE_PENDING,
   PartnerKeyLedger,
@@ -42,17 +43,45 @@ const failingKv = {
   },
 } as unknown as KVNamespace;
 
-/** A KV binding whose put never settles: the DO "dies" mid-projection. */
-function stallingKv(): { kv: KVNamespace; putCalled: Promise<void> } {
+/**
+ * A KV binding whose put stalls until `fail()`: lets a test look at storage
+ * while the projection is in flight (as if the DO died right then).
+ */
+function stallingKv(): { kv: KVNamespace; putCalled: Promise<void>; fail: () => void } {
   let signal: () => void = () => undefined;
+  let reject: (error: Error) => void = () => undefined;
   const putCalled = new Promise<void>((resolve) => {
     signal = resolve;
   });
   const put = () => {
     signal();
-    return new Promise<void>(() => undefined);
+    return new Promise<void>((_resolve, rejectPut) => {
+      reject = rejectPut;
+    });
   };
-  return { kv: { put } as unknown as KVNamespace, putCalled };
+  const fail = () => reject(new Error('the DO died before KV answered'));
+  return { kv: { put } as unknown as KVNamespace, putCalled, fail };
+}
+
+const REQUEST_ID = 'req-test-1';
+/** A test ledger over `storage` and `target`. */
+const ledgerOver = (storage: DurableObjectStorage, target: KVNamespace) =>
+  new PartnerKeyLedger({
+    storage,
+    kv: target,
+    tagSecret: SECRET,
+    logger: createMockLogger(),
+    requestId: REQUEST_ID,
+  });
+/** Per-request loggers for retryProjections, remembered so tests can inspect them. */
+function loggersById() {
+  const made = new Map<string, ReturnType<typeof createMockLogger>>();
+  const loggerFor = (requestId: string) => {
+    const logger = made.get(requestId) ?? createMockLogger();
+    made.set(requestId, logger);
+    return logger;
+  };
+  return { made, loggerFor };
 }
 
 const failDelete = async () => {
@@ -76,7 +105,7 @@ function withLedger<T>(
   target: KVNamespace = kv.asKV()
 ): Promise<T> {
   return runInDurableObject(stub(), async (_instance, state) =>
-    fn(new PartnerKeyLedger(state.storage, target, SECRET, createMockLogger()), state.storage)
+    fn(ledgerOver(state.storage, target), state.storage)
   );
 }
 
@@ -224,7 +253,7 @@ describe('KV projection failure is retried by the DO alarm', () => {
       alarm: await s.getAlarm(),
       entry: await s.get<LedgerEntry>(`rec:${created.record.id}`),
     }));
-    expect(owed.marker).toBe(true);
+    expect(owed.marker).toEqual({ requestId: REQUEST_ID });
     expect(owed.alarm).not.toBeNull();
     expect(owed.entry?.record).toEqual(created.record);
 
@@ -239,13 +268,13 @@ describe('KV projection failure is retried by the DO alarm', () => {
   it('a retry that fails again keeps the key owed and re-arms the alarm', async () => {
     const created = await withLedger((l) => l.create(INPUT), failingKv);
     await withLedger(async (_l, s) => s.deleteAlarm());
-    const retry = await withLedger((l) => l.retryProjections(), failingKv);
+    const retry = await withLedger((l) => l.retryProjections(loggersById().loggerFor), failingKv);
     expect(retry).toEqual({ retried: 1, remaining: 1 });
     const state = await withLedger(async (_l, s) => ({
       marker: await s.get(`proj:${created.record.id}`),
       alarm: await s.getAlarm(),
     }));
-    expect(state).toMatchObject({ marker: true });
+    expect(state).toMatchObject({ marker: { requestId: REQUEST_ID } });
     expect(state.alarm).not.toBeNull();
   });
 
@@ -264,23 +293,35 @@ describe('a committed change always has its projection owed', () => {
     const { id } = created.record;
     const stalled = stallingKv();
     const snapshot = await runInDurableObject(stub(), async (_i, state) => {
-      const ledger = new PartnerKeyLedger(state.storage, stalled.kv, SECRET, createMockLogger());
-      void ledger.revoke(id); // never finishes: as if the DO died after its commit
-      await stalled.putCalled;
-      return {
+      const revoking = ledgerOver(state.storage, stalled.kv).revoke(id);
+      await stalled.putCalled; // committed; the KV write is in flight
+      const seen = {
         entry: await state.storage.get<LedgerEntry>(`rec:${id}`),
         marker: await state.storage.get(`proj:${id}`),
         alarm: await state.storage.getAlarm(),
       };
+      stalled.fail(); // the projection never lands
+      return { ...seen, outcome: await revoking };
     });
     expect(snapshot.entry?.record.revokedAt).toBeDefined();
-    expect(snapshot.marker).toBe(true);
+    expect(snapshot.marker).toEqual({ requestId: REQUEST_ID });
+    expect(snapshot.outcome?.warnings).toEqual(['auth_update_pending']);
     expect(snapshot.alarm).not.toBeNull();
     // KV (what auth reads) still says active until the owed projection runs.
     expect((await projected(created.plaintext))?.revokedAt).toBeUndefined();
 
-    expect(await withLedger((l) => l.retryProjections())).toEqual({ retried: 1, remaining: 0 });
+    const logs = loggersById();
+    expect(await withLedger((l) => l.retryProjections(logs.loggerFor))).toEqual({
+      retried: 1,
+      remaining: 0,
+    });
     expect((await projected(created.plaintext))?.revokedAt).toBeDefined();
+    // The retry is logged under the request that owed it, not a random id.
+    expect([...logs.made.keys()]).toEqual([REQUEST_ID]);
+    expect(logs.made.get(REQUEST_ID)?.log).toHaveBeenCalledWith('partner_key_projection_retried', {
+      key_id: id,
+      found: true,
+    });
   });
 
   it('a clean change leaves nothing owed and no alarm', async () => {
@@ -298,12 +339,64 @@ describe('after the commit nothing can fail create', () => {
   it('bookkeeping errors still return the plaintext, with auth_update_pending', async () => {
     const created = await runInDurableObject(stub(), async (_i, state) => {
       const storage = storageWithFailingDelete(state.storage);
-      return new PartnerKeyLedger(storage, kv.asKV(), SECRET, createMockLogger()).create(INPUT);
+      return ledgerOver(storage, kv.asKV()).create(INPUT);
     });
     expect(created.plaintext).toMatch(/^bts_/);
     expect(created.warnings).toEqual(['auth_update_pending']);
     // The KV put itself succeeded; the marker stays for the alarm (an idempotent re-put).
     expect(await projected(created.plaintext)).toEqual(created.record);
-    expect(await withLedger(async (_l, s) => s.get(`proj:${created.record.id}`))).toBe(true);
+    expect(await withLedger(async (_l, s) => s.get(`proj:${created.record.id}`))).toEqual({
+      requestId: REQUEST_ID,
+    });
+  });
+});
+
+describe('an owed retry is never pushed back', () => {
+  it('a later commit keeps an earlier-due alarm, and only ever moves it earlier', async () => {
+    await withLedger((l) => l.create(INPUT), failingKv); // owed: alarm due in ~30s
+    const soon = Date.now() + 5_000;
+    await withLedger(async (_l, s) => s.setAlarm(soon));
+    await withLedger((l) => l.create(INPUT)); // a commit 25s "later" must not move it
+    expect(await withLedger(async (_l, s) => s.getAlarm())).toBe(soon);
+
+    const far = Date.now() + 10 * 60_000;
+    await withLedger(async (_l, s) => s.setAlarm(far));
+    const before = Date.now();
+    await withLedger((l) => l.create(INPUT), failingKv);
+    const due = await withLedger(async (_l, s) => s.getAlarm());
+    expect(due).toBeLessThan(far);
+    expect(due).toBeGreaterThanOrEqual(before + 30_000);
+  });
+});
+
+describe('revoking an already-revoked key whose projection is still owed', () => {
+  it('re-attempts the projection: pending while KV fails, settled once it works', async () => {
+    const created = await withLedger((l) => l.create(INPUT));
+    await withLedger((l) => l.revoke(created.record.id), failingKv); // revocation owed
+    const again = await withLedger((l) => l.revoke(created.record.id), failingKv);
+    expect(again).toMatchObject({ alreadyRevoked: true, warnings: ['auth_update_pending'] });
+
+    const settled = await withLedger((l) => l.revoke(created.record.id));
+    expect(settled).toMatchObject({ alreadyRevoked: true, revokedIds: [], warnings: [] });
+    expect((await projected(created.plaintext))?.revokedAt).toBeDefined();
+    expect(await withLedger(async (_l, s) => s.get(`proj:${created.record.id}`))).toBeUndefined();
+  });
+});
+
+describe('the DO alarm', () => {
+  it('logs and re-throws a failure, keeping an alarm scheduled while projections are owed', async () => {
+    await withLedger((l) => l.create(INPUT), failingKv);
+    await withLedger(async (_l, s) => s.deleteAlarm());
+    const spy = vi
+      .spyOn(PartnerKeyLedger.prototype, 'retryProjections')
+      .mockRejectedValue(new Error('storage list failed'));
+    try {
+      await expect(
+        runInDurableObject(stub(), async (instance) => (instance as PartnerKeyStoreDO).alarm())
+      ).rejects.toThrow('storage list failed');
+    } finally {
+      spy.mockRestore();
+    }
+    expect(await withLedger(async (_l, s) => s.getAlarm())).not.toBeNull();
   });
 });

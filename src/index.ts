@@ -74,7 +74,7 @@ import {
   upsertServer,
 } from './utils/mcp-servers.js';
 import { resolveOrgFromBody } from './utils/org.js';
-import { validateChatBody } from './utils/chat-validation.js';
+import { CHAT_ID_PATTERN, validateChatBody } from './utils/chat-validation.js';
 import {
   applyPartnerChatPolicy,
   isPartnerRouteAllowed,
@@ -2512,8 +2512,6 @@ function doChatPathForTransport(transport: ChatTransport): string {
 
 /** Max length for chat_id and thread_id path parameters. */
 const MAX_CHAT_ID_LENGTH = 256;
-/** Pattern: alphanumeric, hyphens, underscores, dots, colons (Telegram IDs are typically numeric). */
-const CHAT_ID_PATTERN = /^[\w.:-]+$/;
 
 /** Validate a chat_id or thread_id path parameter. Returns an error string or null. */
 function validateChatIdParam(value: string, paramName: string): string | null {

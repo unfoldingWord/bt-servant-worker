@@ -9,7 +9,9 @@
  * DO storage layout:
  *   rec:<key id>          → { record, hash }   (authoritative)
  *   org:<org>:<key id>    → <key id>           (org index for list ?org=)
- *   proj:<key id>         → true               (KV projection still owed)
+ *   proj:<key id>         → { requestId }      (KV projection still owed, and
+ *                                                the request that owes it, so
+ *                                                alarm retries log under it)
  *
  * Auth projection: chat-time auth must stay one fast KV read, so after each
  * committed change the ledger writes the record to API_KEYS `key:<sha256>` —
@@ -50,6 +52,23 @@ export const AUTH_UPDATE_PENDING = 'auth_update_pending';
 
 /** A stored key: its record and the SHA-256 of its plaintext (its KV key). */
 export type LedgerEntry = { record: PartnerKeyRecord; hash: string };
+
+/** Value of a `proj:` marker. (`true` was the round-6 shape; read for safety.) */
+type PendingMarker = { requestId: string } | true;
+
+/** One owed projection, with the request id its retries are logged under. */
+type Owed = { id: string; requestId: string };
+
+/** What the ledger needs from the PartnerKeyStoreDO for one operation. */
+export type LedgerContext = {
+  storage: DurableObjectStorage;
+  kv: KVNamespace;
+  /** Needed only to issue keys (create, rotate); the alarm retry runs without it. */
+  tagSecret: string | undefined;
+  logger: RequestLogger;
+  /** The request this operation serves; stored on the `proj:` markers it writes. */
+  requestId: string;
+};
 
 type RevocationStamp = { revokedAt: string; revokedBy?: string | undefined };
 
@@ -130,13 +149,19 @@ function replacementInput(old: PartnerKeyRecord, createdBy?: string): PartnerKey
 }
 
 export class PartnerKeyLedger {
-  constructor(
-    private readonly storage: DurableObjectStorage,
-    private readonly kv: KVNamespace,
-    /** Needed only to issue keys (create, rotate); the alarm retry runs without it. */
-    private readonly tagSecret: string | undefined,
-    private readonly logger: RequestLogger
-  ) {}
+  private readonly storage: DurableObjectStorage;
+  private readonly kv: KVNamespace;
+  private readonly tagSecret: string | undefined;
+  private readonly logger: RequestLogger;
+  private readonly requestId: string;
+
+  constructor(ctx: LedgerContext) {
+    this.storage = ctx.storage;
+    this.kv = ctx.kv;
+    this.tagSecret = ctx.tagSecret;
+    this.logger = ctx.logger;
+    this.requestId = ctx.requestId;
+  }
 
   async get(id: string): Promise<LedgerEntry | null> {
     if (!PARTNER_KEY_ID_PATTERN.test(id)) return null;
@@ -166,13 +191,17 @@ export class PartnerKeyLedger {
    * Revoke by id, and every predecessor still working in its rotation grace
    * window, so revoking the current key really cuts the partner off.
    * Idempotent: an already-revoked key is returned with `alreadyRevoked: true`
-   * and nothing is written (its chain was killed when it was revoked).
+   * and nothing new is committed (its chain was killed when it was revoked).
+   * If that revocation's KV projection is still owed, this call re-attempts
+   * it, so the caller learns whether auth has the revocation yet.
    */
   async revoke(id: string, revokedBy?: string): Promise<RevokeOutcome | null> {
     const entry = await this.get(id);
     if (!entry) return null;
     if (entry.record.revokedAt !== undefined) {
-      return { record: entry.record, alreadyRevoked: true, revokedIds: [], warnings: [] };
+      const owed = (await this.storage.get(pendingKey(id))) !== undefined;
+      const warnings = owed ? await this.project([entry]) : [];
+      return { record: entry.record, alreadyRevoked: true, revokedIds: [], warnings };
     }
     const now = Date.now();
     const stamp = { revokedAt: new Date(now).toISOString(), revokedBy };
@@ -229,21 +258,52 @@ export class PartnerKeyLedger {
     };
   }
 
-  /** Alarm: write every still-owed projection to KV; re-arm while any remain. */
-  async retryProjections(): Promise<{ retried: number; remaining: number }> {
-    const ids = [...(await this.storage.list({ prefix: PENDING_PREFIX })).keys()].map((k) =>
-      k.slice(PENDING_PREFIX.length)
+  /**
+   * Alarm: write every still-owed projection to KV; re-arm while any remain.
+   * Each key's outcome is logged under the request that owes it
+   * (`loggerFor(requestId)`), so a retry correlates with the admin action.
+   */
+  async retryProjections(
+    loggerFor: (requestId: string) => RequestLogger
+  ): Promise<{ retried: number; remaining: number }> {
+    const owed = await this.listOwed();
+    const entries = new Map(
+      (await this.getMany(owed.map((o) => o.id))).map((e) => [e.record.id, e] as const)
     );
-    const entries = await this.getMany(ids);
-    const failed = await this.putProjections(entries);
-    const done = ids.filter((id) => !failed.includes(id));
-    await this.deleteMany(done.map(pendingKey));
-    if (failed.length > 0) await this.storage.setAlarm(Date.now() + PROJECTION_RETRY_MS);
-    this.logger.log('partner_key_projection_retried', {
-      retried: ids.length,
-      remaining: failed.length,
+    const results = await Promise.allSettled(
+      owed.map((o) => {
+        const entry = entries.get(o.id);
+        return entry ? this.putProjection(entry) : Promise.resolve();
+      })
+    );
+    const failed = owed.filter((o, i) => {
+      const result = results.at(i);
+      const logger = loggerFor(o.requestId);
+      if (result?.status === 'rejected') {
+        logger.error('partner_key_projection_retry_failed', result.reason, { key_id: o.id });
+        return true;
+      }
+      logger.log('partner_key_projection_retried', { key_id: o.id, found: entries.has(o.id) });
+      return false;
     });
-    return { retried: ids.length, remaining: failed.length };
+    await this.deleteMany(owed.filter((o) => !failed.includes(o)).map((o) => pendingKey(o.id)));
+    if (failed.length > 0) await this.storage.setAlarm(Date.now() + PROJECTION_RETRY_MS);
+    return { retried: owed.length, remaining: failed.length };
+  }
+
+  /** True while any projection is owed (the alarm must stay scheduled). */
+  async hasOwedProjections(): Promise<boolean> {
+    return (await this.storage.list({ prefix: PENDING_PREFIX, limit: 1 })).size > 0;
+  }
+
+  /** Every `proj:` marker, with the request id to log its retry under. */
+  private async listOwed(): Promise<Owed[]> {
+    const markers = await this.storage.list<PendingMarker>({ prefix: PENDING_PREFIX });
+    return [...markers].map(([key, marker]) => ({
+      id: key.slice(PENDING_PREFIX.length),
+      // A marker without a request id (older shape) logs under its own key: deterministic.
+      requestId: marker === true ? key : marker.requestId,
+    }));
   }
 
   /** New key material and record. `carry` links a rotation's replacement. */
@@ -294,18 +354,24 @@ export class PartnerKeyLedger {
    * marker per key (its KV projection is owed from this instant) and the
    * retry alarm, all in one storage transaction — so no record change can be
    * committed without its owed projection and the alarm that will deliver it.
+   * The alarm is only ever moved EARLIER: an alarm already due sooner (a
+   * retry owed by an earlier failure) is kept, so steady admin traffic can
+   * never keep pushing an owed retry out.
    */
   private async commit(changed: LedgerEntry[]): Promise<void> {
+    const marker: PendingMarker = { requestId: this.requestId };
     const entries = changed.flatMap((entry) => [
       [recKey(entry.record.id), entry] as const,
       [orgKey(entry.record), entry.record.id] as const,
-      [pendingKey(entry.record.id), true] as const,
+      [pendingKey(entry.record.id), marker] as const,
     ]);
     await this.storage.transaction(async (txn) => {
       for (let i = 0; i < entries.length; i += GET_BATCH) {
         await txn.put(Object.fromEntries(entries.slice(i, i + GET_BATCH)));
       }
-      await txn.setAlarm(Date.now() + PROJECTION_RETRY_MS);
+      const due = Date.now() + PROJECTION_RETRY_MS;
+      const existing = await txn.getAlarm();
+      if (existing === null || existing > due) await txn.setAlarm(due);
     });
   }
 
@@ -333,17 +399,12 @@ export class PartnerKeyLedger {
 
   /** Drop the retry alarm once no projection is owed (avoids a no-op wake-up). */
   private async clearAlarmIfNothingOwed(): Promise<void> {
-    const owed = await this.storage.list({ prefix: PENDING_PREFIX, limit: 1 });
-    if (owed.size === 0) await this.storage.deleteAlarm();
+    if (!(await this.hasOwedProjections())) await this.storage.deleteAlarm();
   }
 
   /** Put each record at `key:<hash>`; returns the ids whose put failed (logged). */
   private async putProjections(entries: LedgerEntry[]): Promise<string[]> {
-    const results = await Promise.allSettled(
-      entries.map(({ record, hash }) =>
-        this.kv.put(`${PARTNER_KEY_KV_PREFIX}${hash}`, JSON.stringify(record))
-      )
-    );
+    const results = await Promise.allSettled(entries.map((entry) => this.putProjection(entry)));
     const failed: string[] = [];
     for (const [i, result] of results.entries()) {
       const record = entries.at(i)?.record;
@@ -353,6 +414,11 @@ export class PartnerKeyLedger {
       }
     }
     return failed;
+  }
+
+  /** The auth projection of one key: its public record at `key:<sha256>`. */
+  private putProjection({ record, hash }: LedgerEntry): Promise<void> {
+    return this.kv.put(`${PARTNER_KEY_KV_PREFIX}${hash}`, JSON.stringify(record));
   }
 
   private async deleteMany(keys: string[]): Promise<void> {

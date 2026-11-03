@@ -144,7 +144,7 @@ function readLabel(
   if (hasLineBreakOrControl(value)) {
     return {
       ok: false,
-      error: `${field} must be a single line (no control characters or line breaks)`,
+      error: `${field} must be a single line (no control, invisible format or line-break characters)`,
     };
   }
   const cleaned = value.trim();

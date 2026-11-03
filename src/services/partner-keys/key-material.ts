@@ -6,7 +6,10 @@
  *   └─ prefix ─┘ └ 256 random ┘ └── tag ───┘
  *
  * The tag is the first 8 bytes of HMAC-SHA-256(PARTNER_KEY_TAG_SECRET, body),
- * where body is everything before the last `_`. The auth middleware checks it
+ * where body is the fixed-length first 56 characters (`bts_<8 hex>_<43>`,
+ * TAGGED_BODY_LENGTH) and the tag is the 11 characters after the `_` at
+ * offset 56. The token is sliced at those fixed offsets, never split on `_`:
+ * base64url text (body and tag alike) can itself contain `_`. The auth middleware checks it
  * locally (no I/O) before the KV lookup, so a random or guessed token can
  * never cost a KV read: forging a tag needs the secret (a 64-bit tag is
  * 1 in 2^64 by chance). The tag is NOT the credential — the 256 random bits

@@ -22,7 +22,7 @@
 import type { PartnerKeyRecord } from '../../types/partner-keys.js';
 import type { ChatRequest } from '../../types/engine.js';
 import { codePointLength, hasLineBreakOrControl } from '../../types/single-line.js';
-import { partnerClientId } from '../../utils/chat-validation.js';
+import { CHAT_ID_PATTERN, partnerClientId } from '../../utils/chat-validation.js';
 
 /** Who made an /api/* request, as established by the auth middleware. */
 export type Principal = { kind: 'internal' } | { kind: 'partner'; key: PartnerKeyRecord };
@@ -125,13 +125,19 @@ function checkAudio(body: Record<string, unknown>): PartnerPolicyResult | null {
 export const MAX_PARTNER_ID_LENGTH = 256;
 
 /**
- * Group DO names are `group:<org>:<chat_id>[:<thread_id>]` (resolveDOId), so a
- * ':' inside a partner's chat_id or thread_id could make two different
- * (chat, thread) pairs produce the same name — `a:b` + `c` vs `a` + `b:c`.
- * Partners may not use ':' there. (user_id is the last segment of its DO name,
- * so it cannot collide that way.)
+ * A partner's chat_id / thread_id name a group DO and must stay manageable
+ * through the admin group routes, so they use the characters those routes
+ * accept (CHAT_ID_PATTERN) MINUS ':'. Group DO names are
+ * `group:<org>:<chat_id>[:<thread_id>]` (resolveDOId), so a ':' could make two
+ * different (chat, thread) pairs produce the same name — `a:b` + `c` vs
+ * `a` + `b:c`. (user_id is the last segment of its DO name, so it cannot
+ * collide that way and keeps the general single-line rule.)
  */
-const COLON_FREE_FIELDS: ReadonlySet<string> = new Set(['chat_id', 'thread_id']);
+const GROUP_ID_FIELDS: ReadonlySet<string> = new Set(['chat_id', 'thread_id']);
+
+function isPartnerGroupId(value: string): boolean {
+  return CHAT_ID_PATTERN.test(value) && !value.includes(':');
+}
 
 /** An identifier field: absent/null, or a bounded single-line non-empty string. */
 function checkIdentifier(
@@ -152,8 +158,12 @@ function checkIdentifier(
       `${field} ${required ? 'is required and ' : ''}must be a non-empty single-line string of at most ${MAX_PARTNER_ID_LENGTH} characters`
     );
   }
-  if (COLON_FREE_FIELDS.has(field) && value.includes(':')) {
-    return reject(400, `partner_${field}`, `${field} must not contain ':'`);
+  if (GROUP_ID_FIELDS.has(field) && !isPartnerGroupId(value)) {
+    return reject(
+      400,
+      `partner_${field}`,
+      `${field} may contain only letters, digits, '_', '.' and '-' (no ':' or other characters)`
+    );
   }
   return null;
 }
