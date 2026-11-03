@@ -128,6 +128,23 @@ describe('partner audio downloads are limited to the partner partition', () => {
     }
   });
 
+  it('HEAD is allowed like GET and scoped the same way', async () => {
+    const a = await createKey();
+    const b = await createKey();
+    const ownA = `audio/${ORG}/partner:${a.key.userNamespace}:u1/head.opus`;
+    const ofB = `audio/${ORG}/partner:${b.key.userNamespace}:u1/head.opus`;
+    const voiceA = `voice-submissions/${ORG}/partner:${a.key.userNamespace}:c1/u1/head.ogg`;
+    for (const k of [ownA, ofB, voiceA]) await putAudio(k);
+    const head = (path: string) =>
+      SELF.fetch(`${W}${path}`, { method: 'HEAD', headers: bearer(a.apiKey) });
+
+    expect((await head(`/api/v1/audio/${ownA}`)).status).toBe(200);
+    expect((await head(`/api/v1/voice-submissions/${voiceA}`)).status).toBe(200);
+    expect((await head(`/api/v1/audio/${ofB}`)).status).toBe(404);
+    // HEAD on a route outside the allowlist is refused like any other verb.
+    expect((await head(`/api/v1/orgs/${ORG}/users/u1/history`)).status).toBe(403);
+  });
+
   it('a key with an extra path segment cannot pass as the partner partition', async () => {
     const a = await createKey();
     const shifted = `audio/${ORG}/partner:${a.key.userNamespace}:u1/extra/x.opus`;

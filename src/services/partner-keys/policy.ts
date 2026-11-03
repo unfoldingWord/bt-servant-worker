@@ -58,16 +58,10 @@ const PARTNER_AUDIO_PREFIXES: readonly string[] = ['/api/v1/audio/', '/api/v1/vo
 export function isPartnerRouteAllowed(method: string, path: string): boolean {
   const verb = method.toUpperCase();
   if (PARTNER_ROUTES.has(`${verb} ${path}`)) return true;
-  return verb === 'GET' && PARTNER_AUDIO_PREFIXES.some((prefix) => path.startsWith(prefix));
+  // HEAD rides along with GET: Hono answers it from the same GET handler.
+  const read = verb === 'GET' || verb === 'HEAD';
+  return read && PARTNER_AUDIO_PREFIXES.some((prefix) => path.startsWith(prefix));
 }
-
-/**
- * PROPOSAL (portal#354 Q6): the identity a partner end user has inside the
- * worker, `partner:<ns>:<user_id>` (types/partner-namespace.ts holds the
- * scheme). The prefix is set server-side, never by the caller, so no other
- * partner key can produce it.
- */
-export { scopePartnerSubject };
 
 export type PartnerPolicyRejection = {
   status: 400 | 403;

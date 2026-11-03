@@ -39,8 +39,13 @@ import type {
   UserDataImportResult,
 } from '../../durable-objects/user-data-transfer.js';
 import type { RequestLogger } from '../../utils/logger.js';
-import { isReservedPartnerId, PARTNER_PREFIX } from '../../types/partner-namespace.js';
-import { isValidPartnerIdentifier, isValidPartnerUserId, scopePartnerSubject } from './policy.js';
+import {
+  isReservedPartnerId,
+  PARTNER_PREFIX,
+  scopePartnerSubject,
+} from '../../types/partner-namespace.js';
+import { codePointLength } from '../../types/single-line.js';
+import { isValidPartnerIdentifier, isValidPartnerUserId } from './policy.js';
 import {
   type AudioCopyCounts,
   R2_OPERATIONS_PER_AUDIO_OBJECT,
@@ -118,7 +123,7 @@ export function readLegacyImportBody(
   const { legacyClientId, userIds } = parsed.record;
   if (
     !isValidPartnerIdentifier(legacyClientId) ||
-    legacyClientId.length > MAX_LEGACY_CLIENT_ID_LENGTH
+    codePointLength(legacyClientId) > MAX_LEGACY_CLIENT_ID_LENGTH
   ) {
     return {
       ok: false,

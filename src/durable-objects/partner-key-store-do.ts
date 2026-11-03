@@ -144,6 +144,15 @@ export class PartnerKeyStoreDO {
       tagSecret: this.env.PARTNER_KEY_TAG_SECRET,
       logger,
       requestId,
+      // A timed-out KV put that settles later is logged then: keep that work
+      // alive and flush its line, as the fetch handler does for its own.
+      afterResponse: (work) =>
+        this.state.waitUntil(
+          work.then(() => {
+            flushLogTelemetry((promise) => this.state.waitUntil(promise));
+            flushMetricTelemetry((promise) => this.state.waitUntil(promise));
+          })
+        ),
     });
   }
 

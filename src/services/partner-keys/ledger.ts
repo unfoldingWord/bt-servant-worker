@@ -103,6 +103,12 @@ export type LedgerContext = {
   requestId: string;
   /** Per-KV-operation timeout; defaults to KV_OP_TIMEOUT_MS (tests shorten it). */
   kvTimeoutMs?: number;
+  /**
+   * Keeps work that outlives the operation alive and flushed: the DO passes
+   * its `waitUntil` + telemetry flush, so a late-settle log line (written
+   * after the response) still reaches the exporter. Optional (tests).
+   */
+  afterResponse?: (work: Promise<unknown>) => void;
 };
 
 type RevocationStamp = { revokedAt: string; revokedBy?: string | undefined };
@@ -200,6 +206,7 @@ export class PartnerKeyLedger {
   private readonly logger: RequestLogger;
   private readonly requestId: string;
   private readonly kvTimeoutMs: number;
+  private readonly afterResponse: (work: Promise<unknown>) => void;
 
   constructor(ctx: LedgerContext) {
     this.storage = ctx.storage;
@@ -208,6 +215,7 @@ export class PartnerKeyLedger {
     this.logger = ctx.logger;
     this.requestId = ctx.requestId;
     this.kvTimeoutMs = ctx.kvTimeoutMs ?? KV_OP_TIMEOUT_MS;
+    this.afterResponse = ctx.afterResponse ?? (() => undefined);
   }
 
   async get(id: string): Promise<LedgerEntry | null> {
@@ -598,7 +606,7 @@ export class PartnerKeyLedger {
   private putProjection({ record, hash }: LedgerEntry, requestId: string): Promise<void> {
     const put = this.kv.put(`${PARTNER_KEY_KV_PREFIX}${hash}`, JSON.stringify(record));
     const fields = { key_id: record.id, request_id: requestId };
-    return withTimeout(put, this.kvTimeoutMs, 'KV put', (error) => {
+    const onLate = (error?: unknown) => {
       if (error === undefined) {
         this.logger.warn('partner_key_projection_late_settle', { ...fields, outcome: 'stored' });
       } else {
@@ -607,7 +615,10 @@ export class PartnerKeyLedger {
           outcome: 'rejected',
         });
       }
-    });
+    };
+    return withTimeout(put, this.kvTimeoutMs, 'KV put', (late) =>
+      this.afterResponse(late.then(onLate, onLate))
+    );
   }
 
   private async deleteMany(keys: string[]): Promise<void> {
@@ -633,30 +644,21 @@ function isTimeout(result: PromiseSettledResult<unknown> | undefined): boolean {
 
 /**
  * `op`, or a KvTimeoutError once `ms` pass without it settling (the timer is
- * always cleared). If it timed out, `onLate` is called once `op` finally
- * settles: with no argument when it resolved, with the error when it rejected.
+ * always cleared). On a timeout `onTimeout` receives `op` itself — still
+ * running — so the caller can watch it settle late.
  */
 function withTimeout<T>(
   op: Promise<T>,
   ms: number,
   what: string,
-  onLate: (error?: unknown) => void
+  onTimeout: (late: Promise<T>) => void
 ): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  let timedOut = false;
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
-      timedOut = true;
+      onTimeout(op);
       reject(new KvTimeoutError(`${what} timed out after ${ms} ms`));
     }, ms);
   });
-  op.then(
-    () => {
-      if (timedOut) onLate();
-    },
-    (error: unknown) => {
-      if (timedOut) onLate(error);
-    }
-  );
   return Promise.race([op, timeout]).finally(() => clearTimeout(timer));
 }

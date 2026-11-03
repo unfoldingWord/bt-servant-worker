@@ -114,13 +114,6 @@ function validateNoPartnerIds(body: ChatRequest): string | null {
   return null;
 }
 
-/**
- * The reserved-id rule (admin-portal#354; isReservedPartnerId in
- * types/partner-namespace.ts), shared by validateChatBody and the non-admin
- * user routes. Super-admin admin routes may still address partner DOs.
- */
-export { isReservedPartnerId };
-
 /** The 400 message for a reserved id in `field`. */
 export function reservedPartnerIdError(field: string): string {
   return `${field} must not start with '${PARTNER_PREFIX}' (reserved for partner API keys)`;

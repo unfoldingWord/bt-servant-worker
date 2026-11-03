@@ -12,8 +12,8 @@ import {
   MAX_PARTNER_SPEAKER_LENGTH,
   isPartnerRouteAllowed,
   principalKeyId,
-  scopePartnerSubject,
 } from '../../src/services/partner-keys/policy.js';
+import { scopePartnerSubject } from '../../src/types/partner-namespace.js';
 import {
   generatePartnerKeyMaterial,
   hasValidPartnerKeyTag,
@@ -68,6 +68,14 @@ describe('isPartnerRouteAllowed', () => {
     expect(isPartnerRouteAllowed('POST', '/api/v1/chat/stream')).toBe(true);
     expect(isPartnerRouteAllowed('GET', '/api/v1/audio/audio/x.ogg')).toBe(true);
     expect(isPartnerRouteAllowed('get', '/api/v1/voice-submissions/x')).toBe(true);
+  });
+
+  it('allows HEAD wherever it allows GET on the audio routes, and nowhere else', () => {
+    expect(isPartnerRouteAllowed('HEAD', '/api/v1/audio/audio/x.ogg')).toBe(true);
+    expect(isPartnerRouteAllowed('head', '/api/v1/voice-submissions/x')).toBe(true);
+    expect(isPartnerRouteAllowed('HEAD', '/api/v1/chat')).toBe(false);
+    expect(isPartnerRouteAllowed('HEAD', '/api/v1/audio')).toBe(false);
+    expect(isPartnerRouteAllowed('HEAD', '/api/v1/orgs/bcs/users/alice/history')).toBe(false);
   });
 
   it.each([

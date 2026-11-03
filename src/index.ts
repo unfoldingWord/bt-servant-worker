@@ -76,7 +76,6 @@ import {
 import { orgDoNameError, resolveOrgFromBody } from './utils/org.js';
 import {
   chatIdProblem,
-  isReservedPartnerId,
   MAX_CHAT_ID_LENGTH,
   reservedPartnerIdError,
   validateChatBody,
@@ -87,6 +86,7 @@ import {
   principalKeyId,
   type Principal,
 } from './services/partner-keys/policy.js';
+import { isReservedPartnerId } from './types/partner-namespace.js';
 import { lookupPartnerKeyByToken, partnerKeyStore } from './services/partner-keys/store.js';
 import {
   hasValidPartnerKeyTag,
@@ -377,6 +377,11 @@ app.post('/api/v1/chat/callback', async (c) => {
 // reserved `partner:` form is a 400 here, the same rule validateChatBody
 // applies to chat bodies. Super-admin /api/v1/admin/* routes may still
 // address partner DOs (that is how support manages them).
+// Today ENGINE_API_KEY is also the super-admin key, so for that caller this
+// check only blocks a path it could reach through /admin anyway. It matters
+// once worker #479 lands: ENGINE_API_KEY then stops being super-admin, and
+// this check is what keeps it (and every non-admin caller) out of a
+// partner's user DO.
 app.use('/api/v1/orgs/:org/users/:userId/*', async (c, next) => {
   if (!isReservedPartnerId(c.req.param('userId'))) return next();
   return c.json({ error: reservedPartnerIdError('userId') }, 400);
@@ -386,19 +391,19 @@ app.use('/api/v1/orgs/:org/users/:userId/*', async (c, next) => {
 app.get('/api/v1/orgs/:org/users/:userId/preferences', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/preferences');
+  return handleUserRequest(c, org, userId, '/preferences');
 });
 
 app.put('/api/v1/orgs/:org/users/:userId/preferences', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/preferences');
+  return handleUserRequest(c, org, userId, '/preferences');
 });
 
 app.get('/api/v1/orgs/:org/users/:userId/history', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/history');
+  return handleUserRequest(c, org, userId, '/history');
 });
 
 /**
@@ -1683,58 +1688,58 @@ app.delete('/api/v1/admin/orgs/:org/language-scaffold', async (c) => {
 app.get('/api/v1/admin/orgs/:org/users/:userId/mode', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/mode');
+  return handleUserRequest(c, org, userId, '/mode');
 });
 
 app.put('/api/v1/admin/orgs/:org/users/:userId/mode', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/mode');
+  return handleUserRequest(c, org, userId, '/mode');
 });
 
 app.delete('/api/v1/admin/orgs/:org/users/:userId/mode', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/mode');
+  return handleUserRequest(c, org, userId, '/mode');
 });
 
 // Admin endpoints for user-level prompt overrides (routed to DO)
 app.get('/api/v1/admin/orgs/:org/users/:userId/prompt-overrides', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/prompt-overrides');
+  return handleUserRequest(c, org, userId, '/prompt-overrides');
 });
 
 app.put('/api/v1/admin/orgs/:org/users/:userId/prompt-overrides', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/prompt-overrides');
+  return handleUserRequest(c, org, userId, '/prompt-overrides');
 });
 
 app.delete('/api/v1/admin/orgs/:org/users/:userId/prompt-overrides', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/prompt-overrides');
+  return handleUserRequest(c, org, userId, '/prompt-overrides');
 });
 
 // Admin endpoints for user memory (routed to DO)
 app.get('/api/v1/admin/orgs/:org/users/:userId/memory', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/memory');
+  return handleUserRequest(c, org, userId, '/memory');
 });
 
 app.delete('/api/v1/admin/orgs/:org/users/:userId/memory', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/memory');
+  return handleUserRequest(c, org, userId, '/memory');
 });
 
 // Admin endpoint for user history (routed to DO)
 app.delete('/api/v1/admin/orgs/:org/users/:userId/history', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/history');
+  return handleUserRequest(c, org, userId, '/history');
 });
 
 // Admin endpoint: open a DO directly by the 64-hex object id the Cloudflare
@@ -2041,43 +2046,25 @@ function rotateRefusal(c: Context<AppEnv>, result: Exclude<RotateOutcome, { stat
 // ── Group/thread admin helpers ──────────────────────────────────────────────────
 
 /** Handle a group admin request with chatId validation. */
-function handleGroupRequest(
-  c: { req: { raw: Request; param: (k: string) => string }; env: Env },
-  doPath: string
-) {
-  const org = c.req.param('org');
-  const chatId = c.req.param('chatId');
+function handleGroupRequest(c: Context<AppEnv>, doPath: string) {
+  const org = c.req.param('org') ?? '';
+  const chatId = c.req.param('chatId') ?? '';
   const chatIdError = validateChatIdParam(chatId, 'chatId');
   if (chatIdError) return Promise.resolve(Response.json({ error: chatIdError }, { status: 400 }));
-  return handleDORequest({
-    request: c.req.raw,
-    env: c.env,
-    org,
-    doKey: `group:${org}:${chatId}`,
-    doPath,
-  });
+  return handleDORequest(c, { org, doKey: `group:${org}:${chatId}`, doPath });
 }
 
 /** Handle a thread admin request with chatId + threadId validation. */
-function handleThreadRequest(
-  c: { req: { raw: Request; param: (k: string) => string }; env: Env },
-  doPath: string
-) {
-  const org = c.req.param('org');
-  const chatId = c.req.param('chatId');
-  const threadId = c.req.param('threadId');
+function handleThreadRequest(c: Context<AppEnv>, doPath: string) {
+  const org = c.req.param('org') ?? '';
+  const chatId = c.req.param('chatId') ?? '';
+  const threadId = c.req.param('threadId') ?? '';
   const chatIdError = validateChatIdParam(chatId, 'chatId');
   if (chatIdError) return Promise.resolve(Response.json({ error: chatIdError }, { status: 400 }));
   const threadIdError = validateChatIdParam(threadId, 'threadId');
   if (threadIdError)
     return Promise.resolve(Response.json({ error: threadIdError }, { status: 400 }));
-  return handleDORequest({
-    request: c.req.raw,
-    env: c.env,
-    org,
-    doKey: `group:${org}:${chatId}:${threadId}`,
-    doPath,
-  });
+  return handleDORequest(c, { org, doKey: `group:${org}:${chatId}:${threadId}`, doPath });
 }
 
 // ── Group admin endpoints (routed to group DO) ─────────────────────────────────
@@ -2906,8 +2893,6 @@ function respondToChatRequestError(
 }
 
 interface DORequestParams {
-  request: Request;
-  env: Env;
   org: string;
   doKey: string;
   doPath: string;
@@ -2919,10 +2904,13 @@ interface DORequestParams {
  *
  * Routes to the DO identified by doKey (e.g. "user:org:userId" or "group:org:chatId").
  */
-async function handleDORequest(params: DORequestParams): Promise<Response> {
-  const { request, env, org, doKey, doPath, userId } = params;
-  const requestId = crypto.randomUUID();
-  const logger = createRequestLogger(requestId, userId);
+async function handleDORequest(c: Context<AppEnv>, params: DORequestParams): Promise<Response> {
+  const { org, doKey, doPath, userId } = params;
+  const request = c.req.raw;
+  const env = c.env;
+  // The request's id and logger from the /api/* middleware, so these lines
+  // correlate with its auth line.
+  const logger = c.get('logger');
   const start = Date.now();
 
   if (!org) {
@@ -2933,7 +2921,13 @@ async function handleDORequest(params: DORequestParams): Promise<Response> {
     return Response.json({ error: orgError, code: 'invalid_org' }, { status: 400 });
   }
 
-  logger.log('do_request_received', { do_key: doKey, org, path: doPath, method: request.method });
+  logger.log('do_request_received', {
+    do_key: doKey,
+    org,
+    path: doPath,
+    method: request.method,
+    ...(userId ? { user_id: userId } : {}),
+  });
 
   const doId = env.USER_DO.idFromName(doKey);
   const stub = env.USER_DO.get(doId);
@@ -3003,8 +2997,7 @@ async function servePublicPtxprintObject(path: string, env: Env): Promise<Respon
 
 /** Convenience wrapper for user-scoped DO requests. */
 async function handleUserRequest(
-  request: Request,
-  env: Env,
+  c: Context<AppEnv>,
   org: string,
   userId: string,
   doPath: string
@@ -3012,5 +3005,5 @@ async function handleUserRequest(
   if (!userId) {
     return Response.json({ error: 'user_id is required in path' }, { status: 400 });
   }
-  return handleDORequest({ request, env, org, doKey: `user:${org}:${userId}`, doPath, userId });
+  return handleDORequest(c, { org, doKey: `user:${org}:${userId}`, doPath, userId });
 }

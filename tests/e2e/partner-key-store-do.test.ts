@@ -544,6 +544,30 @@ describe('settle bookkeeping: logging and request ids', () => {
     });
   });
 
+  it('hands the late put to afterResponse, settled only after its log line is written', async () => {
+    const late = latePutKv(kv);
+    const logger = createMockLogger();
+    const handed: Promise<unknown>[] = [];
+    await withLedger((_l, s) =>
+      new PartnerKeyLedger({
+        storage: s,
+        kv: late.kv,
+        tagSecret: SECRET,
+        logger,
+        requestId: REQUEST_ID,
+        kvTimeoutMs: 20,
+        afterResponse: (work) => handed.push(work),
+      }).create(INPUT)
+    );
+    expect(handed).toHaveLength(1);
+    late.land();
+    await handed[0];
+    expect(logger.warn).toHaveBeenCalledWith(
+      'partner_key_projection_late_settle',
+      expect.objectContaining({ outcome: 'stored' })
+    );
+  });
+
   it("a settle created by an alarm retry keeps the owing marker's request id", async () => {
     const created = await withLedger((l) => l.create(INPUT), failingKv); // owed by REQUEST_ID
     await withLedger((_l, s) =>

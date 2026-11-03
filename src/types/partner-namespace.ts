@@ -29,7 +29,11 @@ export function partnerSubjectPrefix(namespace: string): string {
   return `${PARTNER_PREFIX}${namespace}:`;
 }
 
-/** A partner end-user or group id inside the worker: `partner:<ns>:<subject>`. */
+/**
+ * A partner end-user or group id inside the worker: `partner:<ns>:<subject>`
+ * (portal#354 Q6). The prefix is set server-side, never by the caller, so no
+ * other partner key can produce it.
+ */
 export function scopePartnerSubject(key: { userNamespace: string }, subject: string): string {
   return `${partnerSubjectPrefix(key.userNamespace)}${subject}`;
 }

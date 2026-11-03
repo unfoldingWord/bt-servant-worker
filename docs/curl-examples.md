@@ -524,8 +524,11 @@ API key`, and the misconfiguration is logged once per isolate), and
   changing it invalidates every issued key.
 - List and get return the record (`id`, `prefix`, `name`, `app`, `org`,
   `createdBy`, `createdAt`, `scopes`, `userNamespace`, `status`, and when set
-  `revokedAt`, `revokedBy`, `rotatedFrom`, `rotatedTo`, `termsVersion`,
-  `termsAcceptedAt`). Never the plaintext, never the hash.
+  `revokedAt`, `revokedBy`, `rotatedFrom`, `rotatedTo`, `expiresAt`,
+  `termsVersion`, `termsAcceptedAt`, `limits`). Never the plaintext, never
+  the hash. `expiresAt` is set on a key rotated away with a non-zero grace:
+  the end of that grace, after which its `status` reads `expired`. `limits` is reserved for
+  future per-key limits; no request can set it today, so it is absent.
 - Create and rotate responses (the only ones carrying `apiKey`) are sent with
   `Cache-Control: no-store`.
 - **Propagation.** KV is eventually consistent, and Cloudflare caches every
