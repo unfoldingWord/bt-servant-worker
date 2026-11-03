@@ -52,7 +52,7 @@ WHATSAPP_NUMBER = "15558196461"
 # on the admin routes during the switch-over; "true" (or any other value: fails
 # closed) means only the ADMIN_API_KEY secret may use them. No effect while
 # ADMIN_API_KEY is unset. See README "Authentication".
-ADMIN_KEY_REQUIRED = "false"
+ADMIN_KEY_REQUIRED = "true"
 
 # KV Namespaces
 [[kv_namespaces]]
@@ -140,7 +140,7 @@ DEFAULT_ORG = "unfoldingWord"
 # See top-level [vars] note. Same wa.me share number as prod/portal (#311).
 WHATSAPP_NUMBER = "15558196461"
 # See top-level [vars] note on admin key enforcement.
-ADMIN_KEY_REQUIRED = "false"
+ADMIN_KEY_REQUIRED = "true"
 # Model fallback chain (#403), last tier: a non-Claude model via OpenRouter. Set
 # on staging first so its answers can be checked (quality, theology) with the
 # FALLBACK_FORCE_ROUTE drill before production gets a value. Needs the
