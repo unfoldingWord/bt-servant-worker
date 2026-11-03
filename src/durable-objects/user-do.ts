@@ -87,6 +87,13 @@ import {
 } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
 import { exportUserData, importUserData, type UserDataImportResult } from './user-data-transfer.js';
+import {
+  IDENTITY_KEY,
+  PROCESSING_LOCK_KEY,
+  QUEUE_INFLIGHT_KEY,
+  QUEUE_KEY,
+  QUEUE_PROCESSING_KEY,
+} from './user-do-storage-keys.js';
 import { countryFromPhoneUserId } from '../utils/phone-country.js';
 import { applyTemplateVariables } from '../utils/template.js';
 import { createTimingContext, timePhase, TimingContext } from '../utils/timing.js';
@@ -123,7 +130,6 @@ import { createStatusEmitter, StatusEmitter } from '../i18n/status-emitter.js';
 
 // ── Storage keys ───────────────────────────────────────────────────────────────
 const HISTORY_KEY = 'history';
-const IDENTITY_KEY = 'identity';
 const PREFERENCES_KEY = 'preferences';
 const PROMPT_OVERRIDES_KEY = 'prompt_overrides';
 const SELECTED_MODE_KEY = 'selected_mode';
@@ -152,18 +158,6 @@ const MODE_WELCOME_PENDING_PREFIX = 'mode_welcome_pending:';
  * (one prefix `list`, limit 1) whenever pending bits are deleted.
  */
 const MODE_WELCOME_PENDING_ANY_KEY = 'mode_welcome_pending_any';
-const PROCESSING_LOCK_KEY = '_processing_lock';
-const QUEUE_KEY = 'queue';
-const QUEUE_PROCESSING_KEY = 'queue_processing';
-/**
- * Reservation for the entry currently being processed off the queue. The
- * queue is one storage value with a byte budget (`MAX_QUEUE_BYTES`); a
- * dequeued entry leaves that value but may come BACK via `reEnqueue` on a
- * transient failure, so its bytes stay counted against the budget until the
- * turn ends. Expires like the processing lock (`LOCK_STALE_THRESHOLD_MS`) so
- * an eviction mid-turn can never shrink the budget for good.
- */
-const QUEUE_INFLIGHT_KEY = 'queue_inflight';
 
 /** What `QUEUE_INFLIGHT_KEY` stores: the entry's serialized size and when it was dequeued. */
 interface QueueInFlightReservation {
@@ -3304,7 +3298,10 @@ export class UserDO {
     const org = body.org ?? body.org_id ?? this.env.DEFAULT_ORG;
     const isGroup = this.isGroupChatType(body);
     const chatScope = isGroup && body.chat_id ? body.chat_id : body.user_id;
-    const speakerScope = body.speaker?.trim() ? body.speaker : body.user_id;
+    // A path segment: only a real, non-blank name (a non-string speaker from a
+    // client falls back to the user id instead of throwing).
+    const speakerScope =
+      typeof body.speaker === 'string' && body.speaker.trim() ? body.speaker : body.user_id;
     const key = generateVoiceSubmissionKey(org, chatScope, speakerScope);
     const mimeType = audioFormatToMime(audioFormat);
     try {
@@ -3996,7 +3993,12 @@ export class UserDO {
     return withEndpointLogging(
       this.getLogger(),
       'export_user_data',
-      async () => Response.json(await exportUserData(this.state.storage)),
+      async () => {
+        const exported = await this.underTurnLock(() => exportUserData(this.state.storage));
+        return exported === 'busy'
+          ? Response.json({ ok: false, reason: 'source_busy' }, { status: 409 })
+          : Response.json(exported);
+      },
       storageErrorResponse
     );
   }
@@ -4015,16 +4017,25 @@ export class UserDO {
   }
 
   /**
-   * Run a legacy import under the same lock a chat turn takes, so no turn can
-   * start or be mid-flight while the emptiness check and the write happen. A
-   * turn in progress or anything queued → `destination_busy` (retry later).
+   * Legacy import into this DO under the turn lock (see underTurnLock): the
+   * emptiness check and the write happen with no turn in flight. Busy →
+   * `destination_busy` (retry later).
    */
   private async importUnderTurnLock(entries: [string, unknown][]): Promise<UserDataImportResult> {
-    if (!(await this.tryAcquireLock())) return { ok: false, reason: 'destination_busy' };
+    const result = await this.underTurnLock(() => importUserData(this.state.storage, entries));
+    return result === 'busy' ? { ok: false, reason: 'destination_busy' } : result;
+  }
+
+  /**
+   * Run `task` holding the same lock a chat turn takes, so no turn runs while
+   * it does; 'busy' (and `task` not run) while a turn holds the lock or
+   * anything is queued. The lock is always released.
+   */
+  private async underTurnLock<T>(task: () => Promise<T>): Promise<T | 'busy'> {
+    if (!(await this.tryAcquireLock())) return 'busy';
     try {
       const queued = (await this.state.storage.get<InternalQueueEntry[]>(QUEUE_KEY)) ?? [];
-      if (queued.length > 0) return { ok: false, reason: 'destination_busy' };
-      return await importUserData(this.state.storage, entries);
+      return queued.length > 0 ? 'busy' : await task();
     } finally {
       await this.releaseLock();
     }

@@ -64,7 +64,7 @@ export function callerIsAdmin(body: Pick<ChatRequest, '_caller' | 'client_id'>):
  * partner's own client_id is discarded, so a partner can neither pose as
  * `whatsapp`/`web`/`admin-portal` nor put its own text into the prompt.
  */
-const PARTNER_CLIENT_ID_PREFIX = 'partner:';
+export const PARTNER_CLIENT_ID_PREFIX = 'partner:';
 
 export function partnerClientId(userNamespace: string): string {
   return `${PARTNER_CLIENT_ID_PREFIX}${userNamespace}`;
@@ -249,11 +249,12 @@ function validateClientOwnedFields(body: ChatRequest, isGroup: boolean): string 
 function validateCoreFields(body: ChatRequest): string | null {
   if (!body.user_id) return 'user_id is required';
   if (!body.client_id) return 'client_id is required';
-  // is_admin is not a public field — admin origin is derived from client_id
-  // server-side via isAdminClient(). Reject the field so older callers that
+  // is_admin is not a public field — admin origin is derived server-side by
+  // callerIsAdmin(): an internal caller (`_caller`, set from the auth
+  // principal) AND an admin client_id. Reject the field so older callers that
   // try to self-assert get a clear error rather than silent false-negatives.
   if ((body as unknown as Record<string, unknown>).is_admin !== undefined) {
-    return 'is_admin is not a valid field; admin origin is derived from client_id';
+    return 'is_admin is not a valid field; admin origin is derived server-side from the authenticated caller and client_id';
   }
   const enumError = validateEnumFields(body);
   if (enumError) return enumError;

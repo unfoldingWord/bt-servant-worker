@@ -131,7 +131,7 @@ describe('ENGINE_API_KEY is unchanged', () => {
     expect(list.status).toBe(200);
   });
 
-  it('an internal non-string speaker in a group chat is dropped and noted, never a 400', async () => {
+  it('an internal non-string speaker in a group chat is not refused and is not rendered', async () => {
     const res = await SELF.fetch(CHAT, {
       method: 'POST',
       headers: JSON_INTERNAL,
@@ -146,10 +146,8 @@ describe('ENGINE_API_KEY is unchanged', () => {
       ),
     });
     expect(res.status).toBe(200);
-    expect(findLog(capture.logs, 'chat_speaker_ignored')?.payload).toMatchObject({
-      reason: 'not_a_string',
-      type: 'number',
-    });
+    expect(capture.calls[0]?.system).not.toContain('The current speaker is');
+    expect(JSON.stringify(capture.calls[0]?.body.messages)).not.toContain('[42]');
   });
 
   it('lets an internal caller use any org and admin-portal client_id', async () => {
@@ -889,5 +887,50 @@ describe('legacy user import: concurrency, key status and what is copied', () =>
     for (const excluded of ['identity', 'queue_inflight', '_processing_lock', 'queue']) {
       expect(keys).not.toContain(excluded);
     }
+  });
+});
+
+describe('legacy user import cannot cross partner tenants', () => {
+  it("refuses to copy partner B's user into partner A's namespace (the reviewer's input)", async () => {
+    const a = await createKey(ORG);
+    const b = await createKey(ORG);
+    const bNs = b.key.userNamespace;
+    // Partner B's user exists: DO user:<org>:partner:<B>:u1, identity client_id partner:<B>.
+    expect((await postChat(b.apiKey, chatBody({ user_id: 'u1', message: 'B only' }))).status).toBe(
+      200
+    );
+    const attempts = [
+      { legacyClientId: `partner:${bNs}`, userIds: [`partner:${bNs}:u1`] },
+      { legacyClientId: `partner:${bNs}`, userIds: ['u1'] },
+      { legacyClientId: 'shema', userIds: [`partner:${bNs}:u1`] },
+      { legacyClientId: 'shema', userIds: [`x-partner:${bNs}:u1`] },
+    ];
+    for (const body of attempts) {
+      const res = await importUsers(a.key.id, body);
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toContain("'partner:'");
+    }
+    const target = `user:${ORG}:partner:${a.key.userNamespace}:partner:${bNs}:u1`;
+    expect((await historyOf(target)).total_count).toBe(0);
+  });
+});
+
+describe('legacy user import: the source is exported under its turn lock', () => {
+  it('reports source_busy while a turn holds the source lock or something is queued', async () => {
+    expect((await internalChat('shema', 's1', 'source one')).status).toBe(200);
+    expect((await internalChat('shema', 's2', 'source two')).status).toBe(200);
+    const put = (name: string, entries: Record<string, unknown>) =>
+      runInDurableObject(env.USER_DO.get(env.USER_DO.idFromName(name)), async (_i, state) => {
+        await state.storage.put(entries);
+      });
+    await put(`user:${ORG}:s1`, { _processing_lock: Date.now() });
+    await put(`user:${ORG}:s2`, { queue: [{ message_id: 'm1' }] });
+    const { key } = await createKey(ORG);
+    const res = await importUsers(key.id, { legacyClientId: 'shema', userIds: ['s1', 's2'] });
+    expect(((await res.json()) as { results: unknown[] }).results).toEqual([
+      { userId: 's1', status: 'source_busy' },
+      { userId: 's2', status: 'source_busy' },
+    ]);
+    expect((await historyOf(`user:${ORG}:partner:${key.userNamespace}:s1`)).total_count).toBe(0);
   });
 });

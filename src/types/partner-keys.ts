@@ -155,6 +155,33 @@ function readLabel(
   return { ok: true, value: cleaned };
 }
 
+/**
+ * Strict ISO-8601 date-time: `YYYY-MM-DDTHH:MM[:SS[.fraction]]` with `Z` or a
+ * `±HH:MM` offset. Date.parse alone accepts "2026" or "Nov 2 2026", which are
+ * not what a terms-acceptance timestamp should be.
+ */
+const DATE_HOUR_MINUTE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/;
+const SECONDS = /^:\d{2}/;
+const FRACTION = /^\.\d{1,9}/;
+const ZONE = /^(?:Z|[+-]\d{2}:\d{2})$/;
+
+/** Consume an optional `:SS[.fraction]` from the start of `rest`. */
+function skipSeconds(rest: string): string {
+  const seconds = SECONDS.exec(rest);
+  if (!seconds) return rest;
+  const afterSeconds = rest.slice(seconds[0].length);
+  const fraction = FRACTION.exec(afterSeconds);
+  return fraction ? afterSeconds.slice(fraction[0].length) : afterSeconds;
+}
+
+function isIsoDateTime(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const head = DATE_HOUR_MINUTE.exec(value);
+  if (!head) return false;
+  const zone = skipSeconds(value.slice(head[0].length));
+  return ZONE.test(zone) && !Number.isNaN(Date.parse(value));
+}
+
 /** Validate the optional terms fields. Returns the cleaned pair or an error. */
 function readTerms(
   body: Record<string, unknown>
@@ -167,8 +194,12 @@ function readTerms(
     out.termsVersion = version.value;
   }
   if (termsAcceptedAt !== undefined) {
-    if (typeof termsAcceptedAt !== 'string' || Number.isNaN(Date.parse(termsAcceptedAt))) {
-      return { ok: false, error: 'termsAcceptedAt must be an ISO-8601 date-time string' };
+    if (!isIsoDateTime(termsAcceptedAt)) {
+      return {
+        ok: false,
+        error:
+          'termsAcceptedAt must be an ISO-8601 date-time with a time zone, e.g. 2026-11-02T15:00:00Z',
+      };
     }
     out.termsAcceptedAt = new Date(termsAcceptedAt).toISOString();
   }
@@ -278,7 +309,12 @@ export function readRotateBody(
   if (!parsed.ok) return parsed;
   const actor = readActor(parsed.record.createdBy, 'createdBy');
   if (!actor.ok) return actor;
-  const grace = parsed.record.graceSeconds ?? DEFAULT_ROTATION_GRACE_SECONDS;
+  // Absent → default. `null` is NOT absent here: it is a 400 like any other
+  // non-integer, so a caller never gets a 7-day grace it did not ask for.
+  const grace =
+    parsed.record.graceSeconds === undefined
+      ? DEFAULT_ROTATION_GRACE_SECONDS
+      : parsed.record.graceSeconds;
   if (
     typeof grace !== 'number' ||
     !Number.isInteger(grace) ||

@@ -89,10 +89,20 @@ const MAX_SPEAKER_LENGTH = 64;
  * history prefix is `[name]:`), controls and line breaks of every kind
  * (C0, C1, U+2028/U+2029) and whitespace runs flattened to one space, trimmed,
  * and capped at 64 code points. A name can therefore never start a new prompt
- * line or a heading. Empty → "Unknown".
+ * line or a heading. Empty → "Unknown". Not a string (a number, an object —
+ * anything a client sent) → undefined: there is no name to render, and the
+ * caller renders none. This is the ONE type check for speakers; partner keys
+ * additionally get a 400 for a non-string speaker at the boundary.
  */
-export function sanitizeSpeaker(name: string): string {
+export function sanitizeSpeaker(name: unknown): string | undefined {
+  if (typeof name !== 'string') return undefined;
   return toSingleLine(name, MAX_SPEAKER_LENGTH, '[]') || 'Unknown';
+}
+
+/** `[Name]: ` for a message from a group speaker, or '' when there is none to show. */
+export function speakerPrefix(speaker: unknown): string {
+  const name = speaker ? sanitizeSpeaker(speaker) : undefined;
+  return name === undefined ? '' : `[${name}]: `;
 }
 
 /**
@@ -231,8 +241,10 @@ function buildGroupSection(groupContext: GroupChatContext | undefined): string |
     '## Group Chat Context',
     'You are in a group conversation. Messages come from different participants.',
   ];
-  if (groupContext.currentSpeaker) {
-    const safe = sanitizeSpeaker(groupContext.currentSpeaker);
+  const safe = groupContext.currentSpeaker
+    ? sanitizeSpeaker(groupContext.currentSpeaker)
+    : undefined;
+  if (safe !== undefined) {
     lines.push(`The current speaker is: ${safe}.`);
     lines.push('Address the current speaker by name when responding.');
   }
@@ -565,9 +577,7 @@ export function historyToMessages(
   const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
 
   for (const entry of truncated) {
-    const userContent = entry.speaker
-      ? `[${sanitizeSpeaker(entry.speaker)}]: ${entry.user_message}`
-      : entry.user_message;
+    const userContent = `${speakerPrefix(entry.speaker)}${entry.user_message}`;
     messages.push({ role: 'user', content: userContent });
     messages.push({ role: 'assistant', content: entry.assistant_response });
   }

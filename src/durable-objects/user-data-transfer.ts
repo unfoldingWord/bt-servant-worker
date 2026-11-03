@@ -19,9 +19,10 @@
  */
 
 import type { StoredIdentity } from '../types/engine.js';
+import { IDENTITY_KEY, TRANSIENT_USER_DO_KEYS } from './user-do-storage-keys.js';
 
-/** Storage keys that belong to one DO instance or one in-flight turn. Keep in sync with user-do.ts. */
-const NOT_COPIED = ['_processing_lock', 'identity', 'queue', 'queue_inflight', 'queue_processing'];
+/** Storage keys that belong to one DO instance or one in-flight turn (shared with user-do.ts). */
+const NOT_COPIED = TRANSIENT_USER_DO_KEYS;
 /** DO storage `put` accepts at most 128 keys per call. */
 const PUT_BATCH = 128;
 
@@ -58,7 +59,7 @@ export async function exportUserData(storage: DurableObjectStorage): Promise<Use
   for (const range of copiedRanges()) {
     entries.push(...(await storage.list(range)));
   }
-  const identity = (await storage.get<StoredIdentity>('identity')) ?? null;
+  const identity = (await storage.get<StoredIdentity>(IDENTITY_KEY)) ?? null;
   return { identity, entries };
 }
 

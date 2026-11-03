@@ -2691,9 +2691,9 @@ function scopeChatBodyForPrincipal(
   transport: ChatTransport,
   logger: RequestLogger
 ): { ok: true; body: ChatRequest } | { ok: false; response: Response } {
-  if (principal.kind !== 'partner') {
-    return { ok: true, body: dropNonStringSpeaker(body, logger) as unknown as ChatRequest };
-  }
+  // Internal callers: a non-string `speaker` is not refused; sanitizeSpeaker
+  // renders nothing for it (see system-prompt.ts).
+  if (principal.kind !== 'partner') return { ok: true, body: body as unknown as ChatRequest };
   const result = applyPartnerChatPolicy(body, principal.key);
   if (result.ok) return result;
   const { status, reason, error } = result.rejection;
@@ -2704,22 +2704,6 @@ function scopeChatBodyForPrincipal(
     status_code: status,
   });
   return { ok: false, response: Response.json({ error }, { status }) };
-}
-
-/**
- * Internal callers: a `speaker` that is present but not a string cannot be
- * rendered (sanitizeSpeaker takes text), so it is dropped and noted, never a
- * 400 — ENGINE_API_KEY callers are not refused anything new. (Partners get a
- * 400 instead; see applyPartnerChatPolicy.)
- */
-function dropNonStringSpeaker(
-  body: Record<string, unknown>,
-  logger: RequestLogger
-): Record<string, unknown> {
-  const { speaker, ...rest } = body;
-  if (speaker === undefined || speaker === null || typeof speaker === 'string') return body;
-  logger.log('chat_speaker_ignored', { reason: 'not_a_string', type: typeof speaker });
-  return rest;
 }
 
 /**

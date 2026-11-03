@@ -63,7 +63,7 @@ import {
   buildSystemPromptBlocks,
   GroupChatContext,
   historyToMessages,
-  sanitizeSpeaker,
+  speakerPrefix,
   TriggerOnlyContext,
   VOICE_WRITING_RULES,
 } from './system-prompt.js';
@@ -2108,9 +2108,7 @@ function buildSeedMessages(
     ...historyToMessages(options.history, llmMax),
     {
       role: 'user',
-      content: options.groupContext?.currentSpeaker
-        ? `[${sanitizeSpeaker(options.groupContext.currentSpeaker)}]: ${userMessage}`
-        : userMessage,
+      content: `${speakerPrefix(options.groupContext?.currentSpeaker)}${userMessage}`,
     },
   ];
 }

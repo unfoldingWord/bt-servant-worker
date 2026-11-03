@@ -19,7 +19,7 @@ import {
   hasValidPartnerKeyTag,
   looksLikePartnerKey,
 } from '../../src/services/partner-keys/key-material.js';
-import { sanitizeSpeaker } from '../../src/services/claude/system-prompt.js';
+import { sanitizeSpeaker, speakerPrefix } from '../../src/services/claude/system-prompt.js';
 import { validateChatBody } from '../../src/utils/chat-validation.js';
 import type { ChatRequest } from '../../src/types/engine.js';
 import {
@@ -302,11 +302,13 @@ describe('readRevokeBody / readRotateBody', () => {
       createdBy: 'a@b.org',
     });
     expect(readRotateBody({ graceSeconds: MAX_ROTATION_GRACE_SECONDS }).ok).toBe(true);
-    // null means "use the default", like the other optional fields.
+    // null is a 400, like a null createdBy: only an ABSENT field gets the default.
     expect(readRotateBody({ graceSeconds: null })).toMatchObject({
-      ok: true,
-      graceSeconds: DEFAULT_ROTATION_GRACE_SECONDS,
+      ok: false,
+      error: expect.stringContaining('graceSeconds'),
     });
+    expect(readRotateBody({ createdBy: null }).ok).toBe(false);
+    expect(readRotateBody({})).toMatchObject({ graceSeconds: DEFAULT_ROTATION_GRACE_SECONDS });
     for (const bad of [MAX_ROTATION_GRACE_SECONDS + 1, -1, 1.5, '60']) {
       expect(readRotateBody({ graceSeconds: bad }).ok).toBe(false);
     }
@@ -554,5 +556,40 @@ describe('partner identifier whitespace and stored length', () => {
   it('thread_id is stored as sent, so it keeps the full 256', () => {
     const fields = { chat_type: 'supergroup', chat_id: 'g1', thread_id: 't'.repeat(256) };
     expect(applyPartnerChatPolicy(chat(fields), KEY).ok).toBe(true);
+  });
+});
+
+describe('termsAcceptedAt is a strict ISO-8601 date-time', () => {
+  const base = { org: 'bcs', name: 'n', app: 'a', createdBy: 'c' };
+  it.each([
+    '2026',
+    'Nov 2 2026',
+    '2026-11-02',
+    '2026-11-02T15:00:00',
+    '2026-11-02 15:00:00Z',
+    '2026-13-45T99:99:99Z',
+  ])('refuses %j', (value) => {
+    expect(validatePartnerKeyCreate({ ...base, termsAcceptedAt: value })).toMatchObject({
+      ok: false,
+      error: expect.stringContaining('termsAcceptedAt'),
+    });
+  });
+
+  it.each(['2026-11-02T15:00:00Z', '2026-11-02T15:00Z', '2026-11-02T15:00:00.123+02:00'])(
+    'accepts %j',
+    (value) => {
+      expect(validatePartnerKeyCreate({ ...base, termsAcceptedAt: value }).ok).toBe(true);
+    }
+  );
+});
+
+describe('sanitizeSpeaker owns the speaker type check', () => {
+  it('returns undefined for any non-string, and renders no prefix for it', () => {
+    for (const value of [42, {}, ['a'], true, null, undefined]) {
+      expect(sanitizeSpeaker(value)).toBeUndefined();
+      expect(speakerPrefix(value)).toBe('');
+    }
+    expect(speakerPrefix('Ann')).toBe('[Ann]: ');
+    expect(sanitizeSpeaker('')).toBe('Unknown');
   });
 });

@@ -183,7 +183,7 @@ export class PartnerKeyLedger {
     input: PartnerKeyCreateInput
   ): Promise<{ record: PartnerKeyRecord; plaintext: string; warnings: string[] }> {
     const { entry, plaintext } = await this.issue(input, {});
-    await this.commit([entry]);
+    await this.commit([entry], [entry]);
     return { record: entry.record, plaintext, warnings: await this.project([entry]) };
   }
 
@@ -200,7 +200,8 @@ export class PartnerKeyLedger {
     const entry = await this.get(id);
     if (!entry) return null;
     if (entry.record.revokedAt !== undefined) {
-      const owed = await this.owedAmong([entry, ...(await this.predecessorChain(entry.record))]);
+      const chain = await this.walkPredecessors(entry.record, () => 'take');
+      const owed = await this.owedAmong([entry, ...chain]);
       const warnings = owed.length > 0 ? await this.project(owed) : [];
       return { record: entry.record, alreadyRevoked: true, revokedIds: [], warnings };
     }
@@ -247,7 +248,7 @@ export class PartnerKeyLedger {
           )
         : [];
     const changed = [issued.entry, previous, ...chain];
-    await this.commit(changed);
+    await this.commit(changed, [issued.entry]);
     const revokedIds = opts.graceSeconds === 0 ? [id, ...chain.map((e) => e.record.id)] : [];
     return {
       status: 'ok',
@@ -331,35 +332,38 @@ export class PartnerKeyLedger {
   }
 
   /**
-   * Predecessors of `key` still working in their grace window, walking
-   * `rotatedFrom` (a link counts only if the predecessor's `rotatedTo` names
-   * its successor). Stops at an already-revoked predecessor: its own revoke
-   * (or grace-0 rotation) already killed everything behind it.
+   * Walk `key`'s predecessors along `rotatedFrom`, nearest first (a link
+   * counts only if the predecessor's `rotatedTo` names its successor; at most
+   * MAX_CHAIN_DEPTH links). `visit` decides per predecessor: 'take' it,
+   * 'skip' it and keep walking, or 'stop'.
    */
-  private async inGracePredecessors(key: PartnerKeyRecord, now: number): Promise<LedgerEntry[]> {
-    const found: LedgerEntry[] = [];
+  private async walkPredecessors(
+    key: PartnerKeyRecord,
+    visit: (entry: LedgerEntry) => 'take' | 'skip' | 'stop'
+  ): Promise<LedgerEntry[]> {
+    const taken: LedgerEntry[] = [];
     let successor = key;
     for (let depth = 0; depth < MAX_CHAIN_DEPTH && successor.rotatedFrom; depth++) {
       const entry = await this.get(successor.rotatedFrom);
       if (!entry || entry.record.rotatedTo !== successor.id) break;
-      if (entry.record.revokedAt !== undefined) break;
-      if (partnerKeyStatus(entry.record, now) === 'active') found.push(entry);
+      const verdict = visit(entry);
+      if (verdict === 'stop') break;
+      if (verdict === 'take') taken.push(entry);
       successor = entry.record;
     }
-    return found;
+    return taken;
   }
 
-  /** Every linked predecessor of `key` (any status), nearest first. */
-  private async predecessorChain(key: PartnerKeyRecord): Promise<LedgerEntry[]> {
-    const chain: LedgerEntry[] = [];
-    let successor = key;
-    for (let depth = 0; depth < MAX_CHAIN_DEPTH && successor.rotatedFrom; depth++) {
-      const entry = await this.get(successor.rotatedFrom);
-      if (!entry || entry.record.rotatedTo !== successor.id) break;
-      chain.push(entry);
-      successor = entry.record;
-    }
-    return chain;
+  /**
+   * Predecessors still working in their grace window. Stops at an
+   * already-revoked one: its own revoke (or grace-0 rotation) already killed
+   * everything behind it.
+   */
+  private inGracePredecessors(key: PartnerKeyRecord, now: number): Promise<LedgerEntry[]> {
+    return this.walkPredecessors(key, ({ record }) => {
+      if (record.revokedAt !== undefined) return 'stop';
+      return partnerKeyStatus(record, now) === 'active' ? 'take' : 'skip';
+    });
   }
 
   /** The entries among `entries` whose KV projection is still owed. */
@@ -369,7 +373,7 @@ export class PartnerKeyLedger {
   }
 
   /**
-   * One atomic commit: every changed record, its org-index entry, a `proj:`
+   * One atomic commit: every changed record, the org-index row of each newly issued key, a `proj:`
    * marker per key (its KV projection is owed from this instant) and the
    * retry alarm, all in one storage transaction — so no record change can be
    * committed without its owed projection and the alarm that will deliver it.
@@ -377,13 +381,16 @@ export class PartnerKeyLedger {
    * retry owed by an earlier failure) is kept, so steady admin traffic can
    * never keep pushing an owed retry out.
    */
-  private async commit(changed: LedgerEntry[]): Promise<void> {
+  private async commit(changed: LedgerEntry[], issued: LedgerEntry[] = []): Promise<void> {
     const marker: PendingMarker = { requestId: this.requestId };
-    const entries = changed.flatMap((entry) => [
-      [recKey(entry.record.id), entry] as const,
-      [orgKey(entry.record), entry.record.id] as const,
-      [pendingKey(entry.record.id), marker] as const,
-    ]);
+    const entries = [
+      ...changed.flatMap((entry) => [
+        [recKey(entry.record.id), entry] as const,
+        [pendingKey(entry.record.id), marker] as const,
+      ]),
+      // A key's org never changes, so its index row is written once, at issue.
+      ...issued.map((entry) => [orgKey(entry.record), entry.record.id] as const),
+    ];
     await this.storage.transaction(async (txn) => {
       for (let i = 0; i < entries.length; i += GET_BATCH) {
         await txn.put(Object.fromEntries(entries.slice(i, i + GET_BATCH)));

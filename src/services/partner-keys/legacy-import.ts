@@ -21,8 +21,9 @@
  *   in the key's org — so a wrong id can't pull in someone else's user.
  * - `destination_not_empty`: the partner key has already been used for this
  *   user; the import never overwrites a conversation.
- * - `destination_busy`: a turn is running or queued in the destination; the
- *   check and write run under the destination's own turn lock. Retry later.
+ * - `destination_busy` / `source_busy`: a turn is running or queued in that
+ *   DO. The export and the check-and-write each run under that DO's own
+ *   turn lock, so neither sees a turn half-done. Retry later.
  * The source is never modified, so a re-run (or a mistake) loses nothing.
  */
 
@@ -33,6 +34,7 @@ import type {
   UserDataImportResult,
 } from '../../durable-objects/user-data-transfer.js';
 import type { RequestLogger } from '../../utils/logger.js';
+import { PARTNER_CLIENT_ID_PREFIX } from '../../utils/chat-validation.js';
 import { isValidPartnerIdentifier, scopePartnerSubject } from './policy.js';
 
 export const MAX_LEGACY_IMPORT_USERS = 100;
@@ -49,9 +51,18 @@ export type LegacyImportStatus =
   | 'client_mismatch'
   | 'destination_not_empty'
   | 'destination_busy'
+  | 'source_busy'
   | 'failed';
 
 export type LegacyImportResult = { userId: string; status: LegacyImportStatus; entries?: number };
+
+/**
+ * The import only ever reads SHARED-KEY users. A partner key's users live
+ * under `partner:<ns>:...` with client_id `partner:<ns>`; accepting either
+ * form would let one partner's users be copied into another partner's
+ * namespace, so both are refused outright.
+ */
+const PARTNER_SOURCE_ERROR = `legacyClientId and userIds must not name partner-key users (no '${PARTNER_CLIENT_ID_PREFIX}' prefix or namespace)`;
 
 /** 1-MAX distinct ids, each a valid partner user_id. */
 function areImportUserIds(userIds: unknown): userIds is string[] {
@@ -80,11 +91,17 @@ export function readLegacyImportBody(
       error: `legacyClientId must be a single-line string of 1-${MAX_LEGACY_CLIENT_ID_LENGTH} characters`,
     };
   }
+  if (legacyClientId.startsWith(PARTNER_CLIENT_ID_PREFIX)) {
+    return { ok: false, error: PARTNER_SOURCE_ERROR };
+  }
   if (!areImportUserIds(userIds)) {
     return {
       ok: false,
       error: `userIds must be 1-${MAX_LEGACY_IMPORT_USERS} distinct user ids, each a valid partner user_id`,
     };
+  }
+  if (userIds.some((id) => id.includes(PARTNER_CLIENT_ID_PREFIX))) {
+    return { ok: false, error: PARTNER_SOURCE_ERROR };
   }
   return { ok: true, input: { legacyClientId, userIds } };
 }
@@ -120,6 +137,7 @@ function userDoFetch(ctx: ImportContext, name: string, init: RequestInit = {}) {
 async function copyOneUser(ctx: ImportContext, userId: string): Promise<LegacyImportResult> {
   const { key } = ctx;
   const source = await userDoFetch(ctx, `user:${key.org}:${userId}`);
+  if (source.status === 409) return { userId, status: 'source_busy' };
   if (!source.ok) throw new Error(`source export failed with ${source.status}`);
   const exported = (await source.json()) as UserDataExport;
   if (exported.identity === null) return { userId, status: 'not_found' };

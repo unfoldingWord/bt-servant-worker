@@ -556,7 +556,8 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys" \
 **Response (201):** `{"key": {...record, "status": "active"}, "warnings": [], "apiKey": "bts_1a2b3c4d_..."}`
 
 `org`, `name`, `app` and `createdBy` are required; `termsVersion` and
-`termsAcceptedAt` are optional. Size caps are UTF-8 bytes of the JSON-encoded
+`termsAcceptedAt` are optional; `termsAcceptedAt` must be an ISO-8601
+date-time with a time zone (`2026-11-02T15:00:00Z` or `...+02:00`). Size caps are UTF-8 bytes of the JSON-encoded
 value: `name` and `app` 100, `createdBy` (and `revokedBy`) 120,
 `termsVersion` 32. Labels must be a single line: a control character or line
 break of any kind is a `400`, not silently removed. Any other field (for example `scopes` or
@@ -612,7 +613,7 @@ the partner's users keep their history), then retires the old one. Returns
 **Grace window.** By default the old key keeps working for 7 days
 (`previous.expiresAt`), so the partner can ship the new key without an
 outage; after that it gets `403` (reason `expired_partner_key`) and shows
-`status: "expired"`. Set `graceSeconds` (integer, 0 to 2592000 = 30 days) to
+`status: "expired"`. Set `graceSeconds` (integer, 0 to 2592000 = 30 days; `null` is a `400`) to
 change it; `"graceSeconds": 0` revokes the old key at once ("rotate and kill
 now"), together with any older keys still in their own grace window, and the
 response lists them in `revokedIds`. An explicit `_revoke` is always immediate, also during a grace window.
@@ -673,13 +674,17 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_
   `not_found` when there is no identity record. `destination_not_empty` means
   the partner key has already been used for that user; nothing is
   overwritten. `destination_busy` means a turn is running or queued for that
-  user under the partner key (the check and the write take the same lock a
-  turn does); retry later. `failed` is logged.
+  user under the partner key, and `source_busy` the same for the shared-key
+  user (the export, and the check and write, each take the same lock a turn
+  does); retry later. `failed` is logged.
 - The key must be active: a revoked or expired key gets `409`
   (`key_revoked` / `key_expired`).
 - The source is not changed or deleted. Run the import at the switch: turns
   the app still sends with the shared key afterwards are not copied.
 - `userIds`: 1-100 distinct ids, each valid as a partner `user_id`.
+- Only shared-key users can be imported: a `legacyClientId` starting with
+  `partner:`, or a `userId` containing `partner:`, is a `400`, so one
+  partner's users can never be copied into another partner's namespace.
 
 ### Calling Chat With a Partner Key
 
