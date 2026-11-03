@@ -93,6 +93,7 @@ export { validateChatBody };
 // trace context, flushed from the DO fetch context where raw global fetch works.
 // No-op export until telemetry is configured (0% head sampler when unset).
 export const UserDO = instrumentDO(UserDOClass, resolveTelemetryConfig);
+export { PartnerKeyStoreDO } from './durable-objects/partner-key-store-do.js';
 
 const app = new Hono<{ Bindings: Env }>();
 

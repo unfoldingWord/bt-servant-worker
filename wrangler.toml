@@ -89,6 +89,12 @@ bucket_name = "bt-servant-ptxprint"
 name = "USER_DO"
 class_name = "UserDO"
 
+# Placeholder binding for the partner API key store (admin-portal#354, PR #475).
+# The class is an empty stub until #475 lands; see src/durable-objects/partner-key-store-do.ts.
+[[durable_objects.bindings]]
+name = "PARTNER_KEY_STORE"
+class_name = "PartnerKeyStoreDO"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["UserSession"]
@@ -101,6 +107,12 @@ new_sqlite_classes = ["UserQueue"]
 tag = "v3"
 renamed_classes = [{from = "UserSession", to = "UserDO"}]
 deleted_classes = ["UserQueue"]
+
+# v4 is already applied on the staging script (by PR #475's branch deploy on
+# 2026-11-03). Declaring it here lets main deploy to staging again.
+[[migrations]]
+tag = "v4"
+new_sqlite_classes = ["PartnerKeyStoreDO"]
 
 # ──── Staging environment ────
 [env.staging]
@@ -158,3 +170,7 @@ bucket_name = "bt-servant-ptxprint-staging"
 [[env.staging.durable_objects.bindings]]
 name = "USER_DO"
 class_name = "UserDO"
+
+[[env.staging.durable_objects.bindings]]
+name = "PARTNER_KEY_STORE"
+class_name = "PartnerKeyStoreDO"
