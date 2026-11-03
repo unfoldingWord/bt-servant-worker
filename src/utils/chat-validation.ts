@@ -11,6 +11,7 @@
 import type { ChatCaller, ChatRequest, ChatTransport } from '../types/engine.js';
 import { hasClientHistory, validateClientHistory } from './history-validation.js';
 import { orgDoNameError, resolveOrgFromBody } from './org.js';
+import { isReservedPartnerId, PARTNER_PREFIX } from '../types/partner-namespace.js';
 
 const VALID_CHAT_TYPES: ReadonlySet<string> = new Set(['private', 'group', 'supergroup']);
 
@@ -57,18 +58,6 @@ export function isAdminClient(clientId: string | undefined): boolean {
  */
 export function callerIsAdmin(body: Pick<ChatRequest, '_caller' | 'client_id'>): boolean {
   return !isPartnerCaller(body._caller) && isAdminClient(body.client_id);
-}
-
-/**
- * client_id of every partner-key request (admin-portal#354). The SERVER sets
- * it from the key's user namespace (`pk_<hex>`, stable across rotation); the
- * partner's own client_id is discarded, so a partner can neither pose as
- * `whatsapp`/`web`/`admin-portal` nor put its own text into the prompt.
- */
-export const PARTNER_CLIENT_ID_PREFIX = 'partner:';
-
-export function partnerClientId(userNamespace: string): string {
-  return `${PARTNER_CLIENT_ID_PREFIX}${userNamespace}`;
 }
 
 /**
@@ -126,18 +115,15 @@ function validateNoPartnerIds(body: ChatRequest): string | null {
 }
 
 /**
- * THE reserved-id rule (admin-portal#354), shared by validateChatBody and the
- * non-admin user routes: an id in the `partner:...` form names a partner's
- * DO, and only the worker writes that form (for partner keys). Super-admin
- * admin routes may still address those DOs; nothing else may.
+ * The reserved-id rule (admin-portal#354; isReservedPartnerId in
+ * types/partner-namespace.ts), shared by validateChatBody and the non-admin
+ * user routes. Super-admin admin routes may still address partner DOs.
  */
-export function isReservedPartnerId(value: unknown): boolean {
-  return typeof value === 'string' && value.startsWith(PARTNER_CLIENT_ID_PREFIX);
-}
+export { isReservedPartnerId };
 
 /** The 400 message for a reserved id in `field`. */
 export function reservedPartnerIdError(field: string): string {
-  return `${field} must not start with '${PARTNER_CLIENT_ID_PREFIX}' (reserved for partner API keys)`;
+  return `${field} must not start with '${PARTNER_PREFIX}' (reserved for partner API keys)`;
 }
 
 /**

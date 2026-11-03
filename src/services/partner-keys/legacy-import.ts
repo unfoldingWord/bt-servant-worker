@@ -39,8 +39,9 @@ import type {
   UserDataImportResult,
 } from '../../durable-objects/user-data-transfer.js';
 import type { RequestLogger } from '../../utils/logger.js';
-import { PARTNER_CLIENT_ID_PREFIX } from '../../utils/chat-validation.js';
+import { isReservedPartnerId, PARTNER_PREFIX } from '../../types/partner-namespace.js';
 import { isValidPartnerIdentifier, isValidPartnerUserId, scopePartnerSubject } from './policy.js';
+import { type AudioCopyCounts, rehomeHistoryAudio, removeRehomedAudio } from './legacy-audio.js';
 
 export const MAX_LEGACY_IMPORT_USERS = 100;
 const MAX_LEGACY_CLIENT_ID_LENGTH = 64;
@@ -62,7 +63,13 @@ export type LegacyImportStatus =
   | 'status_check_failed'
   | 'failed';
 
-export type LegacyImportResult = { userId: string; status: LegacyImportStatus; entries?: number };
+export type LegacyImportResult = {
+  userId: string;
+  status: LegacyImportStatus;
+  entries?: number;
+  /** Audio objects the copied history references (see legacy-audio.ts). */
+  audio?: AudioCopyCounts;
+};
 
 /**
  * The import only ever reads SHARED-KEY users. A partner key's users live
@@ -70,7 +77,7 @@ export type LegacyImportResult = { userId: string; status: LegacyImportStatus; e
  * form would let one partner's users be copied into another partner's
  * namespace, so both are refused outright.
  */
-const PARTNER_SOURCE_ERROR = `legacyClientId and userIds must not name partner-key users (no '${PARTNER_CLIENT_ID_PREFIX}' prefix or namespace)`;
+const PARTNER_SOURCE_ERROR = `legacyClientId and userIds must not name partner-key users (no '${PARTNER_PREFIX}' prefix or namespace)`;
 
 /** 1-MAX distinct ids, each a valid partner user_id. */
 function areImportUserIds(userIds: unknown): userIds is string[] {
@@ -99,7 +106,7 @@ export function readLegacyImportBody(
       error: `legacyClientId must be a single-line string of 1-${MAX_LEGACY_CLIENT_ID_LENGTH} characters`,
     };
   }
-  if (legacyClientId.startsWith(PARTNER_CLIENT_ID_PREFIX)) {
+  if (isReservedPartnerId(legacyClientId)) {
     return { ok: false, error: PARTNER_SOURCE_ERROR };
   }
   if (!areImportUserIds(userIds)) {
@@ -108,7 +115,7 @@ export function readLegacyImportBody(
       error: `userIds must be 1-${MAX_LEGACY_IMPORT_USERS} distinct user ids, each a valid partner user_id`,
     };
   }
-  if (userIds.some((id) => id.includes(PARTNER_CLIENT_ID_PREFIX))) {
+  if (userIds.some((id) => id.includes(PARTNER_PREFIX))) {
     return { ok: false, error: PARTNER_SOURCE_ERROR };
   }
   return { ok: true, input: { legacyClientId, userIds } };
@@ -134,6 +141,7 @@ type ImportContext = {
   key: PartnerKeyRecord;
   legacyClientId: string;
   requestId: string;
+  logger: RequestLogger;
 };
 
 function userDoFetch(ctx: ImportContext, name: string, init: RequestInit = {}) {
@@ -152,19 +160,47 @@ async function copyOneUser(ctx: ImportContext, userId: string): Promise<LegacyIm
   if (!ownedByLegacyClient(exported.identity, key.org, ctx.legacyClientId)) {
     return { userId, status: 'client_mismatch' };
   }
-  const dest = await userDoFetch(ctx, `user:${key.org}:${scopePartnerSubject(key, userId)}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ entries: exported.entries }),
-  });
+  const target = { org: key.org, namespace: key.userNamespace, subject: userId };
+  const audio = await rehomeHistoryAudio(
+    ctx.env.AUDIO_BUCKET,
+    exported.entries,
+    target,
+    ctx.logger
+  );
+  try {
+    const result = await importInto(ctx, userId, audio.entries);
+    if (result.ok) {
+      return { userId, status: 'copied', entries: result.imported, audio: audio.counts };
+    }
+    await removeRehomedAudio(ctx.env.AUDIO_BUCKET, audio.written, ctx.logger);
+    return { userId, status: result.reason };
+  } catch (error) {
+    await removeRehomedAudio(ctx.env.AUDIO_BUCKET, audio.written, ctx.logger);
+    throw error;
+  }
+}
+
+/** PUT `entries` into the user's partner DO; the import result, or a throw. */
+async function importInto(
+  ctx: ImportContext,
+  userId: string,
+  entries: [string, unknown][]
+): Promise<UserDataImportResult> {
+  const dest = await userDoFetch(
+    ctx,
+    `user:${ctx.key.org}:${scopePartnerSubject(ctx.key, userId)}`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entries }),
+    }
+  );
   // Status first: only a 200 or a 409 carries an import result (a storage
   // error answers 500 with an error body, which is not one).
   if (dest.status !== 200 && dest.status !== 409) {
     throw new Error(`destination import failed with ${dest.status}`);
   }
-  const result = (await dest.json()) as UserDataImportResult;
-  if (result.ok) return { userId, status: 'copied', entries: result.imported };
-  return { userId, status: result.reason };
+  return (await dest.json()) as UserDataImportResult;
 }
 
 /**
@@ -182,7 +218,13 @@ export async function importLegacyUsers(
     currentStatus: () => Promise<PartnerKeyStatus>;
   }
 ): Promise<LegacyImportResult[]> {
-  const ctx = { env, key, legacyClientId: input.legacyClientId, requestId: opts.requestId };
+  const ctx = {
+    env,
+    key,
+    legacyClientId: input.legacyClientId,
+    requestId: opts.requestId,
+    logger: opts.logger,
+  };
   const results: LegacyImportResult[] = [];
   for (let i = 0; i < input.userIds.length; i += IMPORT_CONCURRENCY) {
     // A revoke (or the grace running out) during a long import stops it:

@@ -9,7 +9,7 @@
  * real (miniflare) AUDIO_BUCKET.
  */
 
-import { env, SELF } from 'cloudflare:test';
+import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PublicPartnerKey } from '../../src/types/partner-keys';
 import { setupAnthropicFetchCapture } from '../helpers/anthropic-capture.js';
@@ -139,5 +139,85 @@ describe('partner audio downloads are limited to the partner partition', () => {
     const a = await createKey();
     const res = await get(`/api/v1/orgs/${ORG}/users/alice/history`, a.apiKey);
     expect(res.status).toBe(403);
+  });
+});
+
+/** A shared-key user `leg1` whose history references a TTS reply, a voice message and a missing object. */
+async function seedLegacyUser(): Promise<{ tts: string; voice: string }> {
+  const chat = await SELF.fetch(CHAT, {
+    method: 'POST',
+    headers: JSON_INTERNAL,
+    body: JSON.stringify({
+      client_id: 'shema',
+      org: ORG,
+      user_id: 'leg1',
+      message: 'hi',
+      message_type: 'text',
+    }),
+  });
+  expect(chat.status).toBe(200);
+  const tts = `audio/${ORG}/leg1/t1.opus`;
+  const voice = `voice-submissions/${ORG}/leg1/leg1/v1.ogg`;
+  await putAudio(tts);
+  await putAudio(voice);
+  const source = env.USER_DO.get(env.USER_DO.idFromName(`user:${ORG}:leg1`));
+  await runInDurableObject(source, async (_i, state) => {
+    await state.storage.put('history', [
+      { user_message: 'a', assistant_response: 'b', timestamp: 1, voice_audio_key: tts },
+      { user_message: 'c', assistant_response: 'd', timestamp: 2, inbound_voice_audio_key: voice },
+      {
+        user_message: 'e',
+        assistant_response: 'f',
+        timestamp: 3,
+        voice_audio_key: `audio/${ORG}/leg1/gone.opus`,
+      },
+    ]);
+  });
+  return { tts, voice };
+}
+
+async function importLeg1(keyId: string): Promise<Record<string, unknown> | undefined> {
+  const res = await SELF.fetch(`${KEYS}/${keyId}/_import-legacy-users`, {
+    method: 'POST',
+    headers: JSON_INTERNAL,
+    body: JSON.stringify({ legacyClientId: 'shema', userIds: ['leg1'] }),
+  });
+  return ((await res.json()) as { results: Record<string, unknown>[] }).results[0];
+}
+
+async function historyOf(doName: string): Promise<Record<string, unknown>[]> {
+  const stub = env.USER_DO.get(env.USER_DO.idFromName(doName));
+  return runInDurableObject(
+    stub,
+    async (_i, state) => (await state.storage.get<Record<string, unknown>[]>('history')) ?? []
+  );
+}
+
+describe('legacy import moves referenced audio into the partner partition', () => {
+  it('copies the objects, rewrites the history keys and drops a missing one', async () => {
+    await seedLegacyUser();
+    const { key, apiKey } = await createKey();
+    expect(await importLeg1(key.id)).toMatchObject({
+      status: 'copied',
+      audio: { copied: 2, failed: 0, missing: 1 },
+    });
+    const owner = `partner:${key.userNamespace}:leg1`;
+    const [first, second, third] = await historyOf(`user:${ORG}:${owner}`);
+    expect(first?.voice_audio_key).toBe(`audio/${ORG}/${owner}/t1.opus`);
+    expect(second?.inbound_voice_audio_key).toBe(`voice-submissions/${ORG}/${owner}/leg1/v1.ogg`);
+    expect(third).not.toHaveProperty('voice_audio_key');
+    expect(third?.user_message).toBe('e');
+    expect((await get(`/api/v1/audio/${String(first?.voice_audio_key)}`, apiKey)).status).toBe(200);
+    const voiceCopy = String(second?.inbound_voice_audio_key);
+    expect((await get(`/api/v1/voice-submissions/${voiceCopy}`, apiKey)).status).toBe(200);
+  });
+
+  it("leaves the source objects in place (and still not the partner's)", async () => {
+    const { tts, voice } = await seedLegacyUser();
+    const { key, apiKey } = await createKey();
+    await importLeg1(key.id);
+    expect(await env.AUDIO_BUCKET.head(tts)).not.toBeNull();
+    expect(await env.AUDIO_BUCKET.head(voice)).not.toBeNull();
+    expect((await get(`/api/v1/audio/${tts}`, apiKey)).status).toBe(404);
   });
 });

@@ -208,7 +208,7 @@ describe('buildSystemPrompt - partner app label comes from the caller, not clien
 
   it('a partner caller is labelled, and its client_id is not shown', () => {
     const prompt = build('partner:abc', 'partner');
-    expect(prompt).toContain('The user is communicating via: a partner app (text chat)');
+    expect(prompt).toContain('The user is communicating via: a partner app');
     expect(prompt).not.toContain('partner:abc');
   });
 });

@@ -5,7 +5,9 @@
  * for that user, decided from the status before the body is parsed.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { rehomeHistoryAudio } from '../../src/services/partner-keys/legacy-audio.js';
+import { partnerAudioKeyFor } from '../../src/services/audio/r2-storage.js';
 import type { Env } from '../../src/config/types.js';
 import { isJsonSafe, readImportEntries } from '../../src/durable-objects/user-data-transfer.js';
 import { importLegacyUsers } from '../../src/services/partner-keys/legacy-import.js';
@@ -68,7 +70,9 @@ describe('importLegacyUsers reads the destination status before its body', () =>
     );
     expect(await run(busy)).toEqual([{ userId: 'u1', status: 'destination_busy' }]);
     const ok = envWithDestination(() => Response.json({ ok: true, imported: 1 }));
-    expect(await run(ok)).toEqual([{ userId: 'u1', status: 'copied', entries: 1 }]);
+    expect(await run(ok)).toEqual([
+      { userId: 'u1', status: 'copied', entries: 1, audio: { copied: 0, failed: 0, missing: 0 } },
+    ]);
   });
 });
 
@@ -190,5 +194,58 @@ describe('readImportEntries: the import body shape', () => {
       { entries: [{ key: 'k', value: 1 }] },
     ];
     for (const body of bad) expect(readImportEntries(body)).toBeNull();
+  });
+});
+
+describe('rehomeHistoryAudio: failures and odd keys', () => {
+  const target = { org: 'bcs', namespace: 'pk_0123456789abcdef', subject: 'u1' };
+  const history = (key: string) =>
+    [
+      [
+        'history',
+        [{ user_message: 'm', assistant_response: 'r', timestamp: 1, voice_audio_key: key }],
+      ],
+    ] as [string, unknown][];
+
+  it('counts a failed copy, logs it, and drops the key while keeping the entry', async () => {
+    const bucket = {
+      get: async () => ({ arrayBuffer: async () => new ArrayBuffer(1), httpMetadata: {} }),
+      put: async () => {
+        throw new Error('R2 put failed');
+      },
+    } as unknown as R2Bucket;
+    const logger = createMockLogger();
+    const out = await rehomeHistoryAudio(bucket, history('audio/bcs/u1/a.opus'), target, logger);
+    expect(out.counts).toEqual({ copied: 0, failed: 1, missing: 0 });
+    expect(out.written).toEqual([]);
+    const [entry] = out.entries[0]?.[1] as Record<string, unknown>[];
+    expect(entry).toEqual({ user_message: 'm', assistant_response: 'r', timestamp: 1 });
+    expect(logger.error).toHaveBeenCalledWith(
+      'partner_key_legacy_import_audio_copy_failed',
+      expect.any(Error),
+      { user_id: 'u1', source_key: 'audio/bcs/u1/a.opus' }
+    );
+  });
+
+  it('treats a key outside the two audio families as failed, without touching R2', async () => {
+    const bucket = { get: vi.fn(), put: vi.fn() } as unknown as R2Bucket;
+    const out = await rehomeHistoryAudio(
+      bucket,
+      history('ptxprint/x.pdf'),
+      target,
+      createMockLogger()
+    );
+    expect(out.counts).toEqual({ copied: 0, failed: 1, missing: 0 });
+    expect(bucket.get).not.toHaveBeenCalled();
+  });
+
+  it('maps keys to the partner partition exactly as the chat flow writes them', () => {
+    expect(partnerAudioKeyFor('audio/old/u1/a.opus', target)).toBe(
+      'audio/bcs/partner:pk_0123456789abcdef:u1/a.opus'
+    );
+    expect(
+      partnerAudioKeyFor('voice-submissions/bcs/u1/Ann/v.ogg', { ...target, subject: 'a b' })
+    ).toBe('voice-submissions/bcs/partner:pk_0123456789abcdef:a-b/Ann/v.ogg');
+    expect(partnerAudioKeyFor('audio/bcs/u1/x/a.opus', target)).toBeNull();
   });
 });

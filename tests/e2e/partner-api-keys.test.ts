@@ -409,7 +409,7 @@ describe('partner key on chat: refusals', () => {
     expect(findLog(capture.logs, 'request_received')?.payload).toMatchObject({
       client_id: `partner:${key.userNamespace}`,
     });
-    expect(capture.calls[0]?.system).toContain('communicating via: a partner app (text chat)');
+    expect(capture.calls[0]?.system).toContain('communicating via: a partner app');
     expect(capture.calls[0]?.system).not.toContain('whatsapp');
   });
 

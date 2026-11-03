@@ -247,7 +247,7 @@ function buildClientSection(
   if (clientId) {
     // Partner requests: the model is told only that it is a partner app,
     // decided from `_caller` (never from a client_id prefix).
-    const platform = partnerCaller ? 'a partner app (text chat)' : clientId;
+    const platform = partnerCaller ? 'a partner app' : clientId;
     parts.push(`## Client Platform\nThe user is communicating via: ${platform}`);
   }
   parts.push(clientInstructions);
@@ -382,7 +382,7 @@ function pushMiddleSections(
   sections: string[],
   resolvedPromptValues: Required<Record<PromptSlot, string>>,
   catalog: ToolCatalog,
-  opts: Pick<SystemPromptOptions, 'memoryTOC' | 'isVoiceMessage' | 'memoryEnabled' | 'caller'>
+  opts: Pick<SystemPromptOptions, 'memoryTOC' | 'isVoiceMessage' | 'memoryEnabled'>
 ): void {
   const { memoryTOC, isVoiceMessage } = opts;
   // #392: with memory suppressed, the model is told nothing about memory —
@@ -514,7 +514,6 @@ export function buildSystemPromptBlocks(
     memoryTOC,
     isVoiceMessage,
     memoryEnabled,
-    caller,
   });
   sections.push(...buildConditionalSections(preferences, history));
   sections.push(RESOURCE_AVAILABILITY_RULES);

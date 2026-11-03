@@ -18,7 +18,8 @@ import {
   voiceSubmissionKeyToUrl,
 } from '../audio/index.js';
 import { ChatCaller, ChatHistoryEntry, StreamCallbacks } from '../../types/engine.js';
-import { isPartnerCaller, PARTNER_CLIENT_ID_PREFIX } from '../../utils/chat-validation.js';
+import { isPartnerCaller } from '../../utils/chat-validation.js';
+import { namespaceOfClientId } from '../../types/partner-namespace.js';
 import { uiString } from '../../i18n/ui-strings.js';
 import { createStatusEmitter, StatusEmitter } from '../../i18n/status-emitter.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig } from '../../types/org-config.js';
@@ -3006,10 +3007,8 @@ function checkPartnerVoiceScope(
 /** The partner namespace of a partner-key turn (client_id `partner:<ns>`), else undefined. */
 function partnerNamespaceOf(options: OrchestratorOptions): string | undefined {
   if (!isPartnerCaller(options.caller)) return undefined;
-  const clientId = options.clientId ?? '';
-  return clientId.startsWith(PARTNER_CLIENT_ID_PREFIX)
-    ? clientId.slice(PARTNER_CLIENT_ID_PREFIX.length)
-    : '';
+  // A partner turn without a well-formed partner client_id owns nothing ('').
+  return namespaceOfClientId(options.clientId) ?? '';
 }
 
 /**

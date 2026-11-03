@@ -31,6 +31,12 @@ import { RequestLogger } from '../../utils/logger.js';
 import { withSpan, countMetric } from '../telemetry/index.js';
 import { voiceFormatSpec } from './types.js';
 import type { VoiceFormat } from '../../types/engine.js';
+import {
+  isOwnedByPartner,
+  isReservedPartnerId,
+  partnerSubjectPrefix,
+  splitPartnerSubject,
+} from '../../types/partner-namespace.js';
 
 /** Generate a unique R2 key for a TTS audio object. */
 export function generateAudioKey(
@@ -144,14 +150,10 @@ export function generateVoiceSubmissionKey(
  * emits ':', so no other scope can produce that prefix.
  */
 function chatSegment(chatScope: string): string {
-  const partner = PARTNER_SCOPE.exec(chatScope);
+  const partner = splitPartnerSubject(chatScope);
   if (!partner) return slugSegment(chatScope);
-  return `${PARTNER_PREFIX}${partner[1] ?? ''}:${slugSegment(partner[2] ?? '')}`;
+  return `${partnerSubjectPrefix(partner.namespace)}${slugSegment(partner.rest)}`;
 }
-
-const PARTNER_PREFIX = 'partner:';
-/** `partner:<ns>:<rest>`; a partner namespace is `pk_<hex>` (no ':'). */
-const PARTNER_SCOPE = /^partner:([A-Za-z0-9_]+):(.*)$/s;
 
 /**
  * THE partner audio ownership rule: true only for a TTS key
@@ -167,15 +169,35 @@ export function partnerOwnsAudioKey(key: string, org: string, namespace: string)
   const parts = key.split('/');
   const expected = parts[0] === 'audio' ? 4 : parts[0] === VOICE_SUBMISSION_PREFIX ? 5 : Number.NaN;
   return (
-    parts.length === expected &&
-    parts[1] === org &&
-    (parts[2] ?? '').startsWith(`${PARTNER_PREFIX}${namespace}:`)
+    parts.length === expected && parts[1] === org && isOwnedByPartner(parts[2] ?? '', namespace)
   );
+}
+
+/**
+ * Where an existing audio key lives once its conversation moves into a
+ * partner partition (the legacy import): same family and file, the key's
+ * org, and the owner segment for `subject` (the user id) in namespace `ns` —
+ * exactly the key the chat flow would have written for that partner user.
+ * Null for a key that is not a TTS or voice-submission key.
+ */
+export function partnerAudioKeyFor(
+  key: string,
+  target: { org: string; namespace: string; subject: string }
+): string | null {
+  const parts = key.split('/');
+  const owner = `${partnerSubjectPrefix(target.namespace)}${target.subject}`;
+  if (parts[0] === 'audio' && parts.length === 4) {
+    return ['audio', target.org, owner, parts[3]].join('/');
+  }
+  if (parts[0] === VOICE_SUBMISSION_PREFIX && parts.length === 5) {
+    return [VOICE_SUBMISSION_PREFIX, target.org, chatSegment(owner), parts[3], parts[4]].join('/');
+  }
+  return null;
 }
 
 /** True when a voice-submission key sits in some partner's partition. */
 export function isPartnerVoiceSubmissionKey(key: string): boolean {
-  return (key.split('/')[2] ?? '').startsWith(PARTNER_PREFIX);
+  return isReservedPartnerId(key.split('/')[2] ?? '');
 }
 
 /** Build the public-facing URL path for a voice-submission R2 key. */

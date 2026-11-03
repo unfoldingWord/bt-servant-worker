@@ -10,6 +10,7 @@ export {
   uploadVoiceSubmission,
   VOICE_SUBMISSION_PREFIX,
   partnerOwnsAudioKey,
+  partnerAudioKeyFor,
   isPartnerVoiceSubmissionKey,
 } from './r2-storage.js';
 export type {

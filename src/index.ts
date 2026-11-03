@@ -291,8 +291,10 @@ async function partnerPreflight(c: Context<AppEnv>, token: string): Promise<Resp
 // behaves exactly as before and is the "internal" principal. Any other bearer
 // token is looked up as a partner key (admin-portal#354); an active one becomes
 // the "partner" principal and may only reach the routes in
-// isPartnerRouteAllowed (the two chat endpoints). Every rejection is logged
-// (auth_rejected + reason) and counted.
+// isPartnerRouteAllowed: POST /api/v1/chat and /api/v1/chat/stream, plus
+// GET /api/v1/audio/* and GET /api/v1/voice-submissions/*, which serve a
+// partner only its own audio (principalMayReadAudio). Every rejection is
+// logged (auth_rejected + reason) and counted.
 app.use('/api/*', async (c, next) => {
   // The request's id and logger are minted HERE, once, and shared through the
   // context with the auth path, the /api/v1/admin/api-keys routes and the chat
@@ -425,7 +427,7 @@ app.get('/api/v1/audio/*', async (c) => {
     return c.json({ error: 'Invalid audio key' }, 400);
   }
 
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
   if (!principalMayReadAudio(c.get('principal'), audioKey, logger)) {
     return c.json({ error: 'Audio not found' }, 404);
   }
@@ -474,7 +476,7 @@ app.get('/api/v1/voice-submissions/*', async (c) => {
     return c.json({ error: 'Invalid voice-submission key' }, 400);
   }
 
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
   if (!principalMayReadAudio(c.get('principal'), key, logger)) {
     return c.json({ error: 'Voice submission not found' }, 404);
   }

@@ -27,9 +27,9 @@ import {
   chatIdProblem,
   isPathAddressableUserId,
   MAX_CHAT_ID_LENGTH,
-  partnerClientId,
   USER_PATH_UNSAFE_CHARACTERS,
 } from '../../utils/chat-validation.js';
+import { partnerClientId, scopePartnerSubject } from '../../types/partner-namespace.js';
 
 /** Who made an /api/* request, as established by the auth middleware. */
 export type Principal = { kind: 'internal' } | { kind: 'partner'; key: PartnerKeyRecord };
@@ -63,14 +63,11 @@ export function isPartnerRouteAllowed(method: string, path: string): boolean {
 
 /**
  * PROPOSAL (portal#354 Q6): the identity a partner end user has inside the
- * worker. Prefixing with the key's user namespace (stable across rotation)
- * makes the DO name `user:{org}:partner:{ns}:{user_id}`, which no other
- * partner key can produce because the prefix is set server-side, never by the
- * caller. Change this one function if the team picks a different scheme.
+ * worker, `partner:<ns>:<user_id>` (types/partner-namespace.ts holds the
+ * scheme). The prefix is set server-side, never by the caller, so no other
+ * partner key can produce it.
  */
-export function scopePartnerSubject(key: PartnerKeyRecord, subject: string): string {
-  return `partner:${key.userNamespace}:${subject}`;
-}
+export { scopePartnerSubject };
 
 export type PartnerPolicyRejection = {
   status: 400 | 403;

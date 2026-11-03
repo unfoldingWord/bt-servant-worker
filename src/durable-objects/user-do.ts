@@ -4034,7 +4034,16 @@ export class UserDO {
       this.getLogger(),
       'import_user_data',
       async () => {
-        const entries = readImportEntries(await request.json().catch(() => undefined));
+        let parsed: unknown;
+        try {
+          parsed = await request.json();
+        } catch (error) {
+          this.getLogger().warn('import_user_data_invalid_json', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          parsed = undefined;
+        }
+        const entries = readImportEntries(parsed);
         if (!entries) {
           return Response.json(
             { error: 'Body must be { "entries": [[key, value], ...] } with string keys' },

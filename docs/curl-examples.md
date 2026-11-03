@@ -686,6 +686,14 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_
   `key_revoked` / `key_expired` (or `status_check_failed`, logged, if the
   status cannot be read). The response is still `200` with every user's
   status.
+- Audio the copied history references (`voice_audio_key` TTS replies,
+  `inbound_voice_audio_key` voice messages) is copied in R2 into the
+  partner's partition (`audio/<org>/partner:<ns>:<user_id>/...`,
+  `voice-submissions/<org>/partner:<ns>:<user_id>/...`) and the keys in the
+  copied history are rewritten, so the partner key can download it. The
+  source objects are not changed. A missing object, or one whose copy fails,
+  keeps its history entry without the audio key (logged). Each copied user's
+  result carries `audio: { copied, failed, missing }`.
 - Every copied value must survive a JSON round-trip (all UserDO data is JSON
   today). If one does not, that user is `failed` (logged with the storage key)
   and nothing is written.
