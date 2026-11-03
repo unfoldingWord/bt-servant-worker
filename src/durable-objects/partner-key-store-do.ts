@@ -93,7 +93,9 @@ export class PartnerKeyStoreDO {
         );
       } catch (error) {
         logger.error('partner_key_projection_alarm_failed', error);
-        await this.keepAlarmWhileOwed(logger);
+        // Through the same chain as every operation, so the re-arm can never
+        // interleave with the next admin operation's commit.
+        await this.serialize(() => this.keepAlarmWhileOwed(logger));
         throw error;
       }
     });

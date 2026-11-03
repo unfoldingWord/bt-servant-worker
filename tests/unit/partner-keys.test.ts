@@ -671,3 +671,29 @@ describe('partner user_id stays addressable in the /users/:userId routes', () =>
     }
   });
 });
+
+describe('the joined group-segment check applies to group chats only', () => {
+  const base = { client_id: 'web', user_id: 'u1', message: 'hi', message_type: 'text' };
+  const joined = { chat_id: 'partner', thread_id: 'pk_1:team1' };
+
+  it('refuses it for a group or supergroup, not for a private chat', () => {
+    for (const chatType of ['group', 'supergroup']) {
+      const body = { ...base, ...joined, chat_type: chatType } as unknown as ChatRequest;
+      expect(validateChatBody(body, 'final')).toContain('chat_id');
+    }
+    const priv = { ...base, ...joined, chat_type: 'private' } as unknown as ChatRequest;
+    expect(validateChatBody(priv, 'final')).toBeNull();
+  });
+});
+
+describe('org may not contain ":" wherever it names a conversation', () => {
+  it("refuses the reviewer's chat input (org 'acme:partner' + user_id 'pk_abc:u1')", () => {
+    const base = { client_id: 'web', message: 'hi', message_type: 'text' };
+    for (const org of [{ org: 'acme:partner' }, { org_id: 'acme:partner' }]) {
+      const body = { ...base, ...org, user_id: 'pk_abc:u1' } as unknown as ChatRequest;
+      expect(validateChatBody(body, 'final')).toContain("org must not contain ':'");
+    }
+    const ok = { ...base, org: 'unfoldingWord', user_id: 'u1' } as unknown as ChatRequest;
+    expect(validateChatBody(ok, 'final')).toBeNull();
+  });
+});

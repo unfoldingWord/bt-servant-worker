@@ -73,7 +73,7 @@ import {
   toPublicServerConfigs,
   upsertServer,
 } from './utils/mcp-servers.js';
-import { resolveOrgFromBody } from './utils/org.js';
+import { orgDoNameError, resolveOrgFromBody } from './utils/org.js';
 import {
   chatIdProblem,
   isReservedPartnerId,
@@ -2901,6 +2901,10 @@ async function handleDORequest(params: DORequestParams): Promise<Response> {
 
   if (!org) {
     return Response.json({ error: 'org is required in path' }, { status: 400 });
+  }
+  const orgError = orgDoNameError(org);
+  if (orgError) {
+    return Response.json({ error: orgError, code: 'invalid_org' }, { status: 400 });
   }
 
   logger.log('do_request_received', { do_key: doKey, org, path: doPath, method: request.method });

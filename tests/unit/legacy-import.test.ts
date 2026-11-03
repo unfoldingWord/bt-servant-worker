@@ -7,7 +7,7 @@
 
 import { describe, expect, it } from 'vitest';
 import type { Env } from '../../src/config/types.js';
-import { isJsonSafe } from '../../src/durable-objects/user-data-transfer.js';
+import { isJsonSafe, readImportEntries } from '../../src/durable-objects/user-data-transfer.js';
 import { importLegacyUsers } from '../../src/services/partner-keys/legacy-import.js';
 import type { PartnerKeyRecord } from '../../src/types/partner-keys.js';
 import { createMockLogger } from '../helpers/mock-logger.js';
@@ -130,5 +130,65 @@ describe('isJsonSafe: what the legacy copy can carry', () => {
       BigInt(1),
     ];
     for (const value of notOk) expect(isJsonSafe(value)).toBe(false);
+  });
+});
+
+describe('importLegacyUsers when the status re-check itself fails', () => {
+  it('stops, reports status_check_failed for the rest, and logs it', async () => {
+    const env = envWithDestination(() => Response.json({ ok: true, imported: 1 }));
+    let call = 0;
+    const currentStatus = async () => {
+      call += 1;
+      if (call > 1) throw new Error('store unavailable');
+      return 'active' as const;
+    };
+    const logger = createMockLogger();
+    const userIds = ['u1', 'u2', 'u3', 'u4', 'u5', 'u6'];
+    const results = await importLegacyUsers(
+      env,
+      KEY,
+      { legacyClientId: 'shema', userIds },
+      { logger, requestId: 'r', currentStatus }
+    );
+    expect(results.map((r) => r.status)).toEqual([
+      'copied',
+      'copied',
+      'copied',
+      'copied',
+      'copied',
+      'status_check_failed',
+    ]);
+    expect(logger.error).toHaveBeenCalledWith(
+      'partner_key_legacy_import_status_check_failed',
+      expect.any(Error),
+      { key_id: KEY.id }
+    );
+  });
+});
+
+describe('readImportEntries: the import body shape', () => {
+  it('accepts [key, value] pairs with string keys and refuses anything else', () => {
+    expect(
+      readImportEntries({
+        entries: [
+          ['history', []],
+          ['x', 1],
+        ],
+      })
+    ).toHaveLength(2);
+    expect(readImportEntries({ entries: [] })).toEqual([]);
+    const bad = [
+      undefined,
+      null,
+      [],
+      {},
+      { entries: 'x' },
+      { entries: [['k']] },
+      { entries: [['k', 1, 2]] },
+      { entries: [[1, 'v']] },
+      { entries: [['', 'v']] },
+      { entries: [{ key: 'k', value: 1 }] },
+    ];
+    for (const body of bad) expect(readImportEntries(body)).toBeNull();
   });
 });

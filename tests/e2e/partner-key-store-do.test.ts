@@ -581,3 +581,52 @@ describe('settle re-puts run concurrently', () => {
     }
   });
 });
+
+describe('the failed-alarm re-arm runs inside the operation chain', () => {
+  it('a request that arrives during the re-arm waits for it', async () => {
+    await withLedger((l) => l.create(INPUT), failingKv); // something is owed
+    const original = PartnerKeyLedger.prototype.armAlarm;
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let armStarted: () => void = () => undefined;
+    const started = new Promise<void>((resolve) => {
+      armStarted = resolve;
+    });
+    const retry = vi
+      .spyOn(PartnerKeyLedger.prototype, 'retryProjections')
+      .mockRejectedValue(new Error('alarm failed'));
+    const arm = vi
+      .spyOn(PartnerKeyLedger.prototype, 'armAlarm')
+      .mockImplementationOnce(async function (this: PartnerKeyLedger, now?: number) {
+        armStarted();
+        await gate;
+        return original.call(this, now);
+      });
+    const list = vi.spyOn(PartnerKeyLedger.prototype, 'list');
+    try {
+      await runInDurableObject(stub(), async (instance) => {
+        const store = instance as PartnerKeyStoreDO;
+        const alarm = store.alarm().catch((error: unknown) => error);
+        await started;
+        const op = store.fetch(
+          new Request('https://partner-key-store/op', {
+            method: 'POST',
+            body: JSON.stringify({ op: 'list' }),
+          })
+        );
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        expect(list).not.toHaveBeenCalled(); // queued behind the re-arm
+        release();
+        expect((await op).status).toBe(200);
+        expect(list).toHaveBeenCalledTimes(1);
+        expect(await alarm).toBeInstanceOf(Error);
+      });
+    } finally {
+      retry.mockRestore();
+      arm.mockRestore();
+      list.mockRestore();
+    }
+  });
+});

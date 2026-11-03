@@ -59,6 +59,7 @@ export type LegacyImportStatus =
   | 'source_busy'
   | 'key_revoked'
   | 'key_expired'
+  | 'status_check_failed'
   | 'failed';
 
 export type LegacyImportResult = { userId: string; status: LegacyImportStatus; entries?: number };
@@ -186,10 +187,9 @@ export async function importLegacyUsers(
   for (let i = 0; i < input.userIds.length; i += IMPORT_CONCURRENCY) {
     // A revoke (or the grace running out) during a long import stops it:
     // the users not yet copied are reported `key_revoked` / `key_expired`.
-    const status = await opts.currentStatus();
-    if (status !== 'active') {
-      opts.logger.warn('partner_key_legacy_import_stopped', { key_id: key.id, status });
-      const stopped = `key_${status}` as const;
+    // If the status cannot be read, stop too: `status_check_failed`.
+    const stopped = await stopReason(key, opts);
+    if (stopped) {
       results.push(...input.userIds.slice(i).map((userId) => ({ userId, status: stopped })));
       break;
     }
@@ -209,4 +209,24 @@ export async function importLegacyUsers(
     });
   }
   return results;
+}
+
+/**
+ * Why the import must stop before the next batch (logged), or null to go on:
+ * the key is no longer active, or its status could not be read.
+ */
+async function stopReason(
+  key: PartnerKeyRecord,
+  opts: { logger: RequestLogger; currentStatus: () => Promise<PartnerKeyStatus> }
+): Promise<LegacyImportStatus | null> {
+  let status: PartnerKeyStatus;
+  try {
+    status = await opts.currentStatus();
+  } catch (error) {
+    opts.logger.error('partner_key_legacy_import_status_check_failed', error, { key_id: key.id });
+    return 'status_check_failed';
+  }
+  if (status === 'active') return null;
+  opts.logger.warn('partner_key_legacy_import_stopped', { key_id: key.id, status });
+  return `key_${status}`;
 }

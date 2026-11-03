@@ -154,3 +154,17 @@ export function isJsonSafe(value: unknown): boolean {
   if (proto !== Object.prototype && proto !== null) return false;
   return Object.values(value).every((member) => member !== undefined && isJsonSafe(member));
 }
+
+/**
+ * The import body's entries, or null when its shape is wrong: it must be
+ * `{ entries: [[key, value], ...] }` with a non-empty string key in every
+ * pair (the handler answers 400).
+ */
+export function readImportEntries(body: unknown): [string, unknown][] | null {
+  if (typeof body !== 'object' || body === null) return null;
+  const entries: unknown = Reflect.get(body, 'entries');
+  if (!Array.isArray(entries)) return null;
+  const isPair = (pair: unknown): pair is [string, unknown] =>
+    Array.isArray(pair) && pair.length === 2 && typeof pair[0] === 'string' && pair[0] !== '';
+  return entries.every(isPair) ? entries : null;
+}

@@ -87,7 +87,7 @@ import {
   ValidationError,
 } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
-import { exportUserData, importUserData } from './user-data-transfer.js';
+import { exportUserData, importUserData, readImportEntries } from './user-data-transfer.js';
 import {
   IDENTITY_KEY,
   LOCK_STALE_THRESHOLD_MS,
@@ -4038,7 +4038,13 @@ export class UserDO {
       this.getLogger(),
       'import_user_data',
       async () => {
-        const { entries } = (await request.json()) as { entries: [string, unknown][] };
+        const entries = readImportEntries(await request.json().catch(() => undefined));
+        if (!entries) {
+          return Response.json(
+            { error: 'Body must be { "entries": [[key, value], ...] } with string keys' },
+            { status: 400 }
+          );
+        }
         const result = await importUserData(this.state.storage, entries);
         return Response.json(result, { status: result.ok ? 200 : 409 });
       },

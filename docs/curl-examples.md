@@ -683,7 +683,9 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_
   (`key_revoked` / `key_expired`). The status is checked again before each
   batch of 5 users: if the key is revoked (or its grace runs out) during the
   import, the import stops and the users not yet copied are reported
-  `key_revoked` / `key_expired`.
+  `key_revoked` / `key_expired` (or `status_check_failed`, logged, if the
+  status cannot be read). The response is still `200` with every user's
+  status.
 - Every copied value must survive a JSON round-trip (all UserDO data is JSON
   today). If one does not, that user is `failed` (logged with the storage key)
   and nothing is written.
@@ -751,6 +753,11 @@ those two routes:
   `partner:`-form `:userId` on the non-admin user routes
   (`/api/v1/orgs/:org/users/:userId/preferences` and `/history`). The
   super-admin `/api/v1/admin/...` routes may still address partner users.
+- For every caller, an `org` containing `:` is a `400` wherever it names a
+  conversation: chat bodies (`org` / `org_id`) and every `/orgs/:org/users/...`
+  and `/orgs/:org/groups/...` route, admin or not (`invalid_org`).
+  Conversation names join their parts with `:`, so such an org could rebuild
+  another org's or a partner's name.
 
 ```bash
 export PARTNER_KEY="bts_..."   # from the create response

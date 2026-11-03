@@ -10,6 +10,7 @@
 
 import type { ChatCaller, ChatRequest, ChatTransport } from '../types/engine.js';
 import { hasClientHistory, validateClientHistory } from './history-validation.js';
+import { orgDoNameError, resolveOrgFromBody } from './org.js';
 
 const VALID_CHAT_TYPES: ReadonlySet<string> = new Set(['private', 'group', 'supergroup']);
 
@@ -127,7 +128,9 @@ export interface ChatValidationOptions {
  */
 function validateNoPartnerIds(body: ChatRequest): string | null {
   if (isReservedPartnerId(body.user_id)) return reservedPartnerIdError('user_id');
-  if (isReservedPartnerId(groupSegment(body))) {
+  const isGroup = body.chat_type === 'group' || body.chat_type === 'supergroup';
+  // The group segment names a DO only for group chats (resolveDOId).
+  if (isGroup && isReservedPartnerId(groupSegment(body))) {
     return reservedPartnerIdError("chat_id (joined with thread_id as in the group's name)");
   }
   return null;
@@ -354,6 +357,8 @@ export function validateChatBody(
 ): string | null {
   const coreError = validateCoreFields(body);
   if (coreError) return coreError;
+  const orgError = orgDoNameError(resolveOrgFromBody(body, ''));
+  if (orgError) return orgError;
   if (!isPartnerCaller(options.caller ?? body._caller)) {
     const partnerIdError = validateNoPartnerIds(body);
     if (partnerIdError) return partnerIdError;

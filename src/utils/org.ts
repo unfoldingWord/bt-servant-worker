@@ -22,3 +22,20 @@ export function resolveOrgFromBody(
 export function resolveOrgFromParams(params: URLSearchParams, defaultOrg: string): string {
   return params.get('org') ?? params.get('org_id') ?? defaultOrg;
 }
+
+/**
+ * THE org check for every path that builds a conversation (Durable Object)
+ * name — `user:<org>:<user_id>`, `group:<org>:<chat_id>[:<thread_id>]` — used
+ * by chat bodies (validateChatBody) and the user / group routes
+ * (handleDORequest). Those names join their parts with ':', so an org
+ * containing ':' could rebuild another org's or a partner's name (org
+ * `acme:partner` + user_id `pk_abc:u1` = partner `pk_abc`'s user `u1` in
+ * `acme`). Returns the 400 message, or null. Every known org (unfoldingWord,
+ * wordcollective, ...) is a plain name.
+ */
+export function orgDoNameError(org: unknown): string | null {
+  if (typeof org === 'string' && org.includes(':')) {
+    return "org must not contain ':' (it is part of conversation names)";
+  }
+  return null;
+}

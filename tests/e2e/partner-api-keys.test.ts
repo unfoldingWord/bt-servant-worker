@@ -1128,3 +1128,59 @@ describe('legacy import refuses values that would not survive the JSON copy', ()
     expect(res.status).toBe(400);
   });
 });
+
+describe("org containing ':' is refused on every route that names a conversation", () => {
+  const W = 'https://worker/api/v1';
+  const org = encodeURIComponent('acme:partner');
+  const user = encodeURIComponent('pk_abc:u1');
+
+  it("chat: the reviewer's input is a 400 before any model call", async () => {
+    const res = await SELF.fetch(CHAT, {
+      method: 'POST',
+      headers: JSON_INTERNAL,
+      body: JSON.stringify(
+        chatBody({ client_id: 'web', org: 'acme:partner', user_id: 'pk_abc:u1' })
+      ),
+    });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toContain("org must not contain ':'");
+    expect(capture.calls).toHaveLength(0);
+  });
+
+  it('user and group routes (non-admin and admin) answer 400 invalid_org', async () => {
+    const urls = [
+      `${W}/orgs/${org}/users/${user}/history`,
+      `${W}/orgs/${org}/users/${user}/preferences`,
+      `${W}/admin/orgs/${org}/users/${user}/memory`,
+      `${W}/admin/orgs/${org}/users/${user}/mode`,
+      `${W}/admin/orgs/${org}/groups/g1/history`,
+      `${W}/admin/orgs/${org}/groups/g1/threads/t1/history`,
+    ];
+    for (const url of urls) {
+      const res = await SELF.fetch(url, { headers: INTERNAL });
+      expect(res.status, url).toBe(400);
+      expect(await res.json()).toMatchObject({ code: 'invalid_org' });
+    }
+  });
+});
+
+describe('the UserDO import route validates its body shape', () => {
+  it('answers 400 for anything but { entries: [[key, value], ...] }', async () => {
+    const stub = env.USER_DO.get(env.USER_DO.idFromName(`user:${ORG}:shape-check`));
+    for (const body of [
+      'not json',
+      '{}',
+      '{"entries":"x"}',
+      '{"entries":[["k"]]}',
+      '{"entries":[[1,2]]}',
+    ]) {
+      const res = await stub.fetch('https://user-do/admin/user-data', { method: 'PUT', body });
+      expect(res.status, body).toBe(400);
+    }
+    const ok = await stub.fetch('https://user-do/admin/user-data', {
+      method: 'PUT',
+      body: JSON.stringify({ entries: [['extra_note', 'kept']] }),
+    });
+    expect(ok.status).toBe(200);
+  });
+});
