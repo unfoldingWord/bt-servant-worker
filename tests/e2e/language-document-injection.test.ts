@@ -146,7 +146,9 @@ describe('Language document injection — end-to-end through UserDO', () => {
     // Turn 1: admin persists testlang while it is published.
     await postChatFinal(
       stub,
-      buildBody({ client_id: 'admin-portal', message: '@testlang first turn' })
+      // The worker sets `_is_admin` from client_id + key class; this suite posts
+      // to the DO directly, so it sets the field the worker would.
+      buildBody({ client_id: 'admin-portal', _is_admin: true, message: '@testlang first turn' })
     );
     expect(captured.calls[0].system).toContain(TEST_LANG_MARKER);
 
@@ -166,6 +168,7 @@ describe('Language document injection — end-to-end through UserDO', () => {
       stub,
       buildBody({
         client_id: 'admin-portal',
+        _is_admin: true,
         message: 'second turn no trigger',
         _org_languages: stale,
       })

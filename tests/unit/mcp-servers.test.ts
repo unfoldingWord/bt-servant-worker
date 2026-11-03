@@ -889,28 +889,22 @@ describe('poolWriteAuthError', () => {
   const withAdmin = { ENGINE_API_KEY: 'engine-key', ADMIN_API_KEY: 'admin-key' };
   const enforced = { ...withAdmin, ADMIN_KEY_REQUIRED: 'true' };
 
-  it('accepts exactly the engine key when no admin key is configured', () => {
-    expect(poolWriteAuthError('Bearer engine-key', engineOnly)).toBeNull();
+  it('accepts the engine key class when no admin key is configured', () => {
+    expect(poolWriteAuthError('engine', engineOnly)).toBeNull();
   });
 
-  it('accepts the admin key, and the engine key until enforcement', () => {
-    expect(poolWriteAuthError('Bearer admin-key', withAdmin)).toBeNull();
-    expect(poolWriteAuthError('Bearer engine-key', withAdmin)).toBeNull();
-    expect(poolWriteAuthError('Bearer admin-key', enforced)).toBeNull();
+  it('accepts the admin key class, and the engine key class until enforcement', () => {
+    expect(poolWriteAuthError('admin', withAdmin)).toBeNull();
+    expect(poolWriteAuthError('engine', withAdmin)).toBeNull();
+    expect(poolWriteAuthError('admin', enforced)).toBeNull();
   });
 
-  it('rejects the engine key once the admin key is enforced', () => {
-    expect(poolWriteAuthError('Bearer engine-key', enforced)).toContain('super admin');
+  it('rejects the engine key class once the admin key is enforced', () => {
+    expect(poolWriteAuthError('engine', enforced)).toContain('super admin');
   });
 
-  it.each([
-    ['org-scoped key', 'Bearer org-key'],
-    ['prefix of the engine key', 'Bearer engine'],
-    ['missing Bearer prefix', 'engine-key'],
-    ['empty token', 'Bearer '],
-    ['no header', undefined],
-  ])('rejects %s', (_label, header) => {
-    expect(poolWriteAuthError(header, engineOnly)).toContain('super admin');
-    expect(poolWriteAuthError(header, withAdmin)).toContain('super admin');
+  it('rejects an unclassified token (org-scoped or unknown key)', () => {
+    expect(poolWriteAuthError(null, engineOnly)).toContain('super admin');
+    expect(poolWriteAuthError(null, withAdmin)).toContain('super admin');
   });
 });

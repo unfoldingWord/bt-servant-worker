@@ -52,9 +52,11 @@ import { constantTimeCompare } from './utils/crypto.js';
 import {
   adminKeyConfigured,
   adminKeyEnforced,
+  adminKeyRequiredSetting,
   bearerToken,
   classifyToken,
   isSuperAdminClass,
+  type KeyClass,
 } from './utils/admin-auth.js';
 import { ValidationError } from './utils/errors.js';
 import { getAudio, VOICE_SUBMISSION_PREFIX } from './services/audio/index.js';
@@ -101,7 +103,17 @@ export { validateChatBody };
 // No-op export until telemetry is configured (0% head sampler when unset).
 export const UserDO = instrumentDO(UserDOClass, resolveTelemetryConfig);
 
-const app = new Hono<{ Bindings: Env }>();
+/**
+ * Per-request values set by the `/api/*` auth middleware: the key class the
+ * bearer token matched (never the key), and the request id + logger every
+ * later middleware and route should log through.
+ */
+type AppEnv = {
+  Bindings: Env;
+  Variables: { keyClass: KeyClass | null; requestId: string; logger: RequestLogger };
+};
+
+const app = new Hono<AppEnv>();
 
 // Telemetry (M2): tee structured logs to OTLP and flush this isolate's buffered
 // records at the request boundary. Registered first so its `finally` wraps every
@@ -147,13 +159,21 @@ app.get('/health', (c) => c.json({ status: 'healthy', version: APP_VERSION }));
 // Bucket: PTXPRINT_BUCKET (defined in wrangler.toml).
 app.get('/public/ptxprint/*', async (c) => servePublicPtxprintObject(c.req.path, c.env));
 
-// Auth middleware for all /api routes
+// Auth middleware for all /api routes. Accepts ENGINE_API_KEY or (when
+// configured) ADMIN_API_KEY, and is the one place the bearer token is
+// classified: the key class is stored on the context (`keyClass`) for the admin
+// gate, the org middleware, the MCP pool fence and the chat admin check. It also
+// mints the request id + logger later middlewares log through.
 app.use('/api/*', async (c, next) => {
-  const authHeader = c.req.header('Authorization');
+  const requestId = crypto.randomUUID();
+  const logger = createRequestLogger(requestId);
+  c.set('requestId', requestId);
+  c.set('logger', logger);
 
-  if (!authHeader?.startsWith('Bearer ')) {
+  const presented = bearerToken(c.req.header('Authorization'));
+  if (presented === null) {
     // Observable rejection: never silently drop a 401. Token value is never logged.
-    createRequestLogger(crypto.randomUUID()).warn('auth_rejected', {
+    logger.warn('auth_rejected', {
       reason: 'missing_bearer',
       status: 401,
       path: c.req.path,
@@ -163,20 +183,20 @@ app.use('/api/*', async (c, next) => {
     return c.json({ error: 'Authorization header with Bearer token required' }, 401);
   }
 
-  // ENGINE_API_KEY or (when configured) ADMIN_API_KEY. Which one matched only
-  // matters on admin surfaces; see the /api/v1/admin/* middleware below.
-  const token = authHeader.slice(7);
-  if (classifyToken(token, c.env) === null) {
-    createRequestLogger(crypto.randomUUID()).warn('auth_rejected', {
+  const keyClass = classifyToken(presented, c.env);
+  if (keyClass === null) {
+    logger.warn('auth_rejected', {
       reason: 'invalid_token',
       status: 403,
       path: c.req.path,
       method: c.req.method,
     });
     countMetric('auth_rejections_total', { reason: 'invalid_token', status_code: 403 });
-    return c.json({ error: 'Invalid API key' }, 403);
+    // `code` is the stable, machine-readable reason; `error` text is unchanged.
+    return c.json({ error: 'Invalid API key', code: 'invalid_api_key' }, 403);
   }
 
+  c.set('keyClass', keyClass);
   return next();
 });
 
@@ -194,15 +214,15 @@ app.use('/api/*', async (c, next) => {
 // - POST /api/v1/chat/callback  → 202 + webhook delivery; requires
 //                                  progress_callback_url and message_key.
 app.post('/api/v1/chat', async (c) => {
-  return handleChatRequest(c.req.raw, c.env, 'final');
+  return handleChatRequest(c.req.raw, c.env, 'final', chatAuth(c));
 });
 
 app.post('/api/v1/chat/stream', async (c) => {
-  return handleChatRequest(c.req.raw, c.env, 'stream');
+  return handleChatRequest(c.req.raw, c.env, 'stream', chatAuth(c));
 });
 
 app.post('/api/v1/chat/callback', async (c) => {
-  return handleChatRequest(c.req.raw, c.env, 'callback');
+  return handleChatRequest(c.req.raw, c.env, 'callback', chatAuth(c));
 });
 
 // User endpoints with org scope (new paths)
@@ -310,56 +330,78 @@ app.get('/api/v1/voice-submissions/*', async (c) => {
   }
 });
 
-// Admin surface gate - every route under /api/v1/admin/* (org-scoped config
-// routes, group/thread routes, global MCP pool, DO snapshots). Runs after the
-// global `/api/*` middleware, so the bearer token here is already known to be
-// ENGINE_API_KEY or ADMIN_API_KEY.
-//
-// Super-admin authority: ADMIN_API_KEY always; ENGINE_API_KEY only while the
-// admin key is not enforced (ADMIN_KEY_REQUIRED != "true", or no
-// ADMIN_API_KEY configured). Each admin request logs `admin_auth` with the key
-// class (never the key) so ENGINE_API_KEY admin use can be watched down to
-// zero before the flag is flipped.
-app.use('/api/v1/admin/*', async (c, next) => {
-  const token = bearerToken(c.req.header('Authorization'));
-  const keyClass = token === null ? null : classifyToken(token, c.env);
-  const enforced = adminKeyEnforced(c.env);
-  const logger = createRequestLogger(crypto.randomUUID());
+/** Auth context the chat routes hand to {@link handleChatRequest}. */
+type ChatAuth = { keyClass: KeyClass | null; requestId: string };
 
-  if (c.env.ADMIN_KEY_REQUIRED === 'true' && !adminKeyConfigured(c.env)) {
+function chatAuth(c: Context<AppEnv>): ChatAuth {
+  return { keyClass: c.get('keyClass'), requestId: c.get('requestId') };
+}
+
+// Once-per-isolate flags for admin-key config warnings, so a misconfiguration is
+// visible in logs without repeating on every admin request.
+let warnedAdminKeyRequiredInvalid = false;
+let warnedAdminKeyRequiredWithoutKey = false;
+
+/**
+ * Log, once per isolate, an ADMIN_KEY_REQUIRED value that is neither true nor
+ * false (not enforced), or "true" with no ADMIN_API_KEY (not enforced either).
+ * The flag value is config, not a secret, so it is logged as-is.
+ */
+function warnOnAdminKeyConfig(env: Env, logger: RequestLogger): void {
+  const setting = adminKeyRequiredSetting(env);
+  if (setting === 'invalid' && !warnedAdminKeyRequiredInvalid) {
+    warnedAdminKeyRequiredInvalid = true;
+    logger.warn('admin_key_required_invalid_value', {
+      value: env.ADMIN_KEY_REQUIRED,
+      detail: 'ADMIN_KEY_REQUIRED must be "true" or "false"; not enforced',
+    });
+  }
+  if (setting === 'true' && !adminKeyConfigured(env) && !warnedAdminKeyRequiredWithoutKey) {
+    warnedAdminKeyRequiredWithoutKey = true;
     logger.warn('admin_key_required_without_admin_key', {
-      path: c.req.path,
       detail: 'ADMIN_KEY_REQUIRED is "true" but ADMIN_API_KEY is not set; not enforced',
     });
   }
+}
+
+// Admin surface gate - every route under /api/v1/admin/* (org-scoped config
+// routes, group/thread routes, global MCP pool, DO snapshots). Runs after the
+// global `/api/*` middleware, which has already rejected any token that is not
+// ENGINE_API_KEY or ADMIN_API_KEY and stored the key class on the context.
+//
+// Super-admin authority: ADMIN_API_KEY always; ENGINE_API_KEY only while the
+// admin key is not enforced (ADMIN_KEY_REQUIRED not "true", or no
+// ADMIN_API_KEY configured). Anything else gets 403 here, so org-scoped KV
+// keys (which cannot pass the `/api/*` check anyway) never reach the org gate. Each admin request logs `admin_auth` with the key
+// class (never the key) so ENGINE_API_KEY admin use can be watched down to
+// zero before the flag is flipped.
+app.use('/api/v1/admin/*', async (c, next) => {
+  const keyClass = c.get('keyClass');
+  const logger = c.get('logger');
+  warnOnAdminKeyConfig(c.env, logger);
 
   if (isSuperAdminClass(keyClass, c.env)) {
     logger.log('admin_auth', {
       key_class: keyClass,
-      enforced,
+      enforced: adminKeyEnforced(c.env),
       path: c.req.path,
       method: c.req.method,
     });
     return next();
   }
 
-  // Not super admin. Org-scoped routes still get their own KV org-key check in
-  // the next middleware; every other admin route is super-admin only.
-  const orgScoped = c.req.path.startsWith('/api/v1/admin/orgs/');
-  if (keyClass === null && orgScoped) {
-    return next();
-  }
-
-  const reason = keyClass === 'engine' ? 'admin_key_required' : 'not_super_admin';
   logger.warn('auth_rejected', {
-    reason,
+    reason: 'admin_key_required',
     key_class: keyClass,
     status: 403,
     path: c.req.path,
     method: c.req.method,
   });
-  countMetric('auth_rejections_total', { reason, status_code: 403 });
-  return c.json({ error: 'This route requires the admin API key' }, 403);
+  countMetric('auth_rejections_total', { reason: 'admin_key_required', status_code: 403 });
+  return c.json(
+    { error: 'This route requires the admin API key', code: 'admin_key_required' },
+    403
+  );
 });
 
 // Org admin auth middleware - validates org-specific or super admin access.
@@ -370,22 +412,20 @@ app.use('/api/v1/admin/*', async (c, next) => {
 // deliberately do not re-log.
 app.use('/api/v1/admin/orgs/:org/*', async (c, next) => {
   const org = c.req.param('org');
-  const authHeader = c.req.header('Authorization');
+  const presented = bearerToken(c.req.header('Authorization'));
 
-  if (!authHeader?.startsWith('Bearer ')) {
+  if (presented === null) {
     return c.json({ error: 'Authorization header with Bearer token required' }, 401);
   }
 
-  const token = authHeader.slice(7);
-
   // Check super admin (ADMIN_API_KEY, or ENGINE_API_KEY while not enforced) first
-  if (isSuperAdminClass(classifyToken(token, c.env), c.env)) {
+  if (isSuperAdminClass(c.get('keyClass'), c.env)) {
     return next();
   }
 
   // Check org-specific admin key from KV
   const orgAdminKey = await c.env.ORG_ADMIN_KEYS.get(org);
-  if (orgAdminKey && constantTimeCompare(token, orgAdminKey)) {
+  if (orgAdminKey && constantTimeCompare(presented, orgAdminKey)) {
     return next();
   }
 
@@ -497,7 +537,7 @@ function poolStateFields(defaultOrg: string, pool: McpServerPool) {
  * (admin-portal#153/#154).
  */
 function poolNotMigratedResponse(
-  c: Context<{ Bindings: Env }>,
+  c: Context<AppEnv>,
   logger: RequestLogger,
   action: string,
   org: string,
@@ -532,17 +572,12 @@ function poolNotMigratedResponse(
  * next to the shared store in case org-scoped admin keys are ever honoured
  * upstream.
  */
-function rejectMcpWrite(
-  c: Context<{ Bindings: Env }>,
-  logger: RequestLogger,
-  action: string,
-  org: string
-) {
+function rejectMcpWrite(c: Context<AppEnv>, logger: RequestLogger, action: string, org: string) {
   const orgError = validateOrgNotReserved(org);
   if (orgError) {
     return c.json({ error: orgError }, 400);
   }
-  const authError = poolWriteAuthError(c.req.header('Authorization'), c.env);
+  const authError = poolWriteAuthError(c.get('keyClass'), c.env);
   if (authError === null) {
     return null;
   }
@@ -2285,6 +2320,8 @@ async function buildDOChatRequest(
     transport: ChatTransport;
     logger: ReturnType<typeof createRequestLogger>;
     requestId?: string;
+    /** Admin visibility, decided here from client_id AND the authenticated key class. */
+    isAdmin: boolean;
   }
 ): Promise<{ stub: DurableObjectStub; doRequest: Request }> {
   const { body, org, transport, logger } = opts;
@@ -2330,6 +2367,10 @@ async function buildDOChatRequest(
       // AFTER the spread, so a client-supplied `_edge_country` in the inbound
       // body is always overwritten and can never reach telemetry.
       _edge_country: (request.cf as { country?: string } | undefined)?.country,
+      // Admin visibility, decided by the worker from client_id AND the key the
+      // request authenticated with. Set AFTER the spread so a client-supplied
+      // `_is_admin` is always overwritten; the DO reads only this field.
+      _is_admin: opts.isAdmin,
     }),
   });
 
@@ -2339,9 +2380,10 @@ async function buildDOChatRequest(
 async function handleChatRequest(
   request: Request,
   env: Env,
-  transport: ChatTransport
+  transport: ChatTransport,
+  auth: ChatAuth
 ): Promise<Response> {
-  const requestId = crypto.randomUUID();
+  const { requestId } = auth;
   const logger = createRequestLogger(requestId);
   const timing = createTimingContext();
 
@@ -2375,6 +2417,7 @@ async function handleChatRequest(
           logger,
           timing,
           requestId,
+          keyClass: auth.keyClass,
         });
       } catch (error) {
         return respondToChatRequestError(error, transport, timing, logger);
@@ -2391,22 +2434,22 @@ async function handleChatRequest(
 
 /**
  * A chat request whose `client_id` marks it as admin-origin (`isAdminClient`)
- * gets admin visibility (unpublished modes and languages, admin welcome
+ * asks for admin visibility (unpublished modes and languages, admin welcome
  * preview). That is a super-admin capability, so it follows the same key rule
  * as `/api/v1/admin/*`: ADMIN_API_KEY always, ENGINE_API_KEY only while the
  * admin key is not enforced. Logs `admin_auth` with the key class so the
- * switch-over can be watched. Returns a 403 response, or null to proceed.
+ * switch-over can be watched. Returns a 403 response, or null to proceed. The
+ * DO itself reads only the server-set `_is_admin` (see buildDOChatRequest).
  */
 function checkAdminClientKey(
-  request: Request,
   env: Env,
   body: ChatRequest,
   transport: ChatTransport,
+  keyClass: KeyClass | null,
   logger: RequestLogger
 ): Response | null {
   if (!isAdminClient(body.client_id)) return null;
-  const token = bearerToken(request.headers.get('Authorization') ?? undefined);
-  const keyClass = token === null ? null : classifyToken(token, env);
+  warnOnAdminKeyConfig(env, logger);
   const fields = { key_class: keyClass, enforced: adminKeyEnforced(env), transport };
   if (isSuperAdminClass(keyClass, env)) {
     logger.log('admin_auth', { ...fields, path: 'chat', client_id: body.client_id });
@@ -2419,7 +2462,11 @@ function checkAdminClientKey(
     client_id: body.client_id,
   });
   countMetric('auth_rejections_total', { reason: 'admin_key_required', status_code: 403 });
-  return Response.json({ error: 'This client_id requires the admin API key' }, { status: 403 });
+  countMetric('requests_total', { transport, status: 'auth_rejected', status_code: 403 });
+  return Response.json(
+    { error: 'This client_id requires the admin API key', code: 'admin_key_required' },
+    { status: 403 }
+  );
 }
 
 /** Params for {@link dispatchChatRequest} — the chat flow inside the pseudonym scope. */
@@ -2431,6 +2478,7 @@ type ChatDispatchParams = {
   logger: RequestLogger;
   timing: TimingContext;
   requestId: string;
+  keyClass: KeyClass | null;
 };
 
 /**
@@ -2439,7 +2487,7 @@ type ChatDispatchParams = {
  * scope a callback boundary; the behavior is unchanged.
  */
 async function dispatchChatRequest(params: ChatDispatchParams): Promise<Response> {
-  const { request, env, transport, body, logger, timing, requestId } = params;
+  const { request, env, transport, body, logger, timing, requestId, keyClass } = params;
   const validationError = validateChatBody(body, transport);
   if (validationError) {
     logger.warn('chat_validation_failed', {
@@ -2452,7 +2500,7 @@ async function dispatchChatRequest(params: ChatDispatchParams): Promise<Response
     return Response.json({ error: validationError }, { status: 400 });
   }
 
-  const adminClientRejection = checkAdminClientKey(request, env, body, transport, logger);
+  const adminClientRejection = checkAdminClientKey(env, body, transport, keyClass, logger);
   if (adminClientRejection) {
     return adminClientRejection;
   }
@@ -2462,7 +2510,14 @@ async function dispatchChatRequest(params: ChatDispatchParams): Promise<Response
   logger.log('request_received', { user_id: body.user_id, client_id: body.client_id, org, transport, chat_type: body.chat_type ?? 'private', chat_id: body.chat_id, thread_id: body.thread_id });
 
   const { stub, doRequest } = await timePhase(timing, 'kv_and_routing', () =>
-    buildDOChatRequest(request, env, { body, org, transport, logger, requestId })
+    buildDOChatRequest(request, env, {
+      body,
+      org,
+      transport,
+      logger,
+      requestId,
+      isAdmin: isAdminClient(body.client_id) && isSuperAdminClass(keyClass, env),
+    })
   );
   const response = await timePhase(timing, 'do_fetch', () => stub.fetch(doRequest));
 

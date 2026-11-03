@@ -31,13 +31,11 @@ export function isValidLanguageCode(code: string): boolean {
  * client_id values that identify admin-origin callers.
  *
  * These client_ids are hardcoded in the corresponding caller's server-side
- * source (e.g. bt-servant-admin-portal/worker/baruch.ts sets
- * `client_id: "admin-portal"` on every chat relay). Because the bearer-token
- * auth middleware already gates `/api/*`, the set of callers that can reach
- * this code path is bounded to internal services holding ENGINE_API_KEY;
- * deriving the admin bit from client_id — rather than from a self-asserted
- * body flag — ties the signal to which caller it came from rather than what
- * the caller chose to write in JSON.
+ * source (e.g. bt-servant-admin-portal/worker/chat.ts sets
+ * `client_id: "admin-portal"` on every chat relay). client_id alone is not
+ * trusted: the worker grants admin visibility only when the request also
+ * authenticated with a super-admin key (src/utils/admin-auth.ts), and passes
+ * the result to the DO as the server-set `_is_admin` body field.
  */
 const ADMIN_CLIENT_IDS: ReadonlySet<string> = new Set(['admin-portal']);
 

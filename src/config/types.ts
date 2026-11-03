@@ -9,10 +9,11 @@ export interface Env {
   DEFAULT_ORG: string;
 
   /**
-   * `"true"` ⇒ only ADMIN_API_KEY has super-admin authority; ENGINE_API_KEY gets
-   * 403 on admin routes. Anything else (default `"false"`) keeps ENGINE_API_KEY
-   * as super admin during the transition. Has no effect while ADMIN_API_KEY is
-   * unset.
+   * `"true"` (trimmed, case-insensitive) ⇒ only ADMIN_API_KEY has super-admin
+   * authority; ENGINE_API_KEY gets 403 on admin routes. Unset, blank or
+   * `"false"` (default) keeps ENGINE_API_KEY as super admin during the
+   * transition; any other value is logged and not enforced. Has no effect while
+   * ADMIN_API_KEY is unset.
    */
   ADMIN_KEY_REQUIRED?: string;
 

@@ -39,9 +39,10 @@ export function bearerToken(authorizationHeader: string | undefined): string | n
 
 /**
  * The configured admin key, trimmed, or null when it is unset, empty or
- * whitespace-only. Admin clients apply the same rule and send the trimmed
- * value, so the comparison is always against the trimmed secret (a stray
- * newline in the stored secret cannot break or weaken the match).
+ * whitespace-only. The comparison is always against the trimmed secret, so a
+ * stray newline in the stored secret cannot break or weaken the match. Admin
+ * clients (portal, Baruch) apply the same blank rule and send the trimmed
+ * value.
  */
 export function configuredAdminKey(keys: AuthKeys): string | null {
   if (typeof keys.ADMIN_API_KEY !== 'string') return null;
@@ -54,27 +55,66 @@ export function adminKeyConfigured(keys: AuthKeys): boolean {
   return configuredAdminKey(keys) !== null;
 }
 
+/** Parsed `ADMIN_KEY_REQUIRED`. `invalid` is any non-blank value other than true/false. */
+export type AdminKeyRequiredSetting = 'true' | 'false' | 'invalid';
+
+/**
+ * Parse `ADMIN_KEY_REQUIRED`: trimmed and case-insensitive. Unset or blank is
+ * `false`. Any other value is `invalid`, which is NOT enforced (the caller
+ * logs it).
+ */
+export function adminKeyRequiredSetting(keys: AuthKeys): AdminKeyRequiredSetting {
+  const value = (keys.ADMIN_KEY_REQUIRED ?? '').trim().toLowerCase();
+  if (value === 'true') return 'true';
+  if (value === '' || value === 'false') return 'false';
+  return 'invalid';
+}
+
 /**
  * True when the engine key has lost super-admin authority: the flag is
  * `"true"` AND an admin key exists to take its place.
  */
 export function adminKeyEnforced(keys: AuthKeys): boolean {
-  return keys.ADMIN_KEY_REQUIRED === 'true' && adminKeyConfigured(keys);
+  return adminKeyRequiredSetting(keys) === 'true' && adminKeyConfigured(keys);
 }
 
 /**
- * Classify a bearer token. Both comparisons always run (constant-time, no
+ * Whether a token matches ENGINE_API_KEY. Both the stored value and its trimmed
+ * form are accepted: the trimmed form keeps the "same value classifies as
+ * engine" rule true when either secret carries stray whitespace, and the raw
+ * form keeps every token that matched before this change matching now.
+ */
+function matchesEngineKey(token: string, engineKey: string): boolean {
+  const raw = constantTimeCompare(token, engineKey);
+  const trimmedKey = typeof engineKey === 'string' ? engineKey.trim() : '';
+  const trimmed = trimmedKey.length > 0 ? constantTimeCompare(token, trimmedKey) : false;
+  return raw || trimmed;
+}
+
+/**
+ * Classify a bearer token. All comparisons always run (constant-time, no
  * short-circuit on which key matched). If the two keys were ever configured
- * to the same value, the token classifies as `engine`, so a misconfiguration
- * can only withhold admin authority, never grant it to engine-key holders.
+ * to the same value (after trimming), the token classifies as `engine`, so a
+ * misconfiguration can only withhold admin authority, never grant it to
+ * engine-key holders.
  */
 export function classifyToken(token: string, keys: AuthKeys): KeyClass | null {
   const adminKey = configuredAdminKey(keys);
-  const matchesEngine = constantTimeCompare(token, keys.ENGINE_API_KEY);
+  const matchesEngine = matchesEngineKey(token, keys.ENGINE_API_KEY);
   const matchesAdmin = adminKey !== null ? constantTimeCompare(token, adminKey) : false;
   if (matchesEngine) return 'engine';
   if (matchesAdmin) return 'admin';
   return null;
+}
+
+/** Classify an `Authorization` header (null when it is not a non-empty bearer token). */
+export function classifyAuthorization(
+  authorizationHeader: string | undefined,
+  keys: AuthKeys
+): KeyClass | null {
+  const token = bearerToken(authorizationHeader);
+  if (token === null || token.length === 0) return null;
+  return classifyToken(token, keys);
 }
 
 /** Whether a key class carries super-admin authority under the current config. */
@@ -82,14 +122,4 @@ export function isSuperAdminClass(keyClass: KeyClass | null, keys: AuthKeys): bo
   if (keyClass === 'admin') return true;
   if (keyClass === 'engine') return !adminKeyEnforced(keys);
   return false;
-}
-
-/** Convenience: classify the header and decide super-admin authority in one step. */
-export function hasSuperAdminAuthority(
-  authorizationHeader: string | undefined,
-  keys: AuthKeys
-): boolean {
-  const token = bearerToken(authorizationHeader);
-  if (token === null || token.length === 0) return false;
-  return isSuperAdminClass(classifyToken(token, keys), keys);
 }

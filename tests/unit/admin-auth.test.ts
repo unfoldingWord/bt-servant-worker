@@ -7,12 +7,18 @@ import { describe, expect, it } from 'vitest';
 import {
   adminKeyConfigured,
   adminKeyEnforced,
+  adminKeyRequiredSetting,
   bearerToken,
-  configuredAdminKey,
+  classifyAuthorization,
   classifyToken,
-  hasSuperAdminAuthority,
+  configuredAdminKey,
   isSuperAdminClass,
+  type AuthKeys,
 } from '../../src/utils/admin-auth';
+
+/** Classify the header, then decide super-admin authority (what the gates do). */
+const hasSuperAdminAuthority = (header: string | undefined, keys: AuthKeys) =>
+  isSuperAdminClass(classifyAuthorization(header, keys), keys);
 
 const ENGINE = 'engine-key';
 const ADMIN = 'admin-key';
@@ -38,10 +44,9 @@ describe('adminKeyConfigured / adminKeyEnforced', () => {
     expect(adminKeyConfigured(transition)).toBe(true);
   });
 
-  it('enforces only when the flag is exactly "true" and an admin key exists', () => {
+  it('enforces only when the flag is "true" and an admin key exists', () => {
     expect(adminKeyEnforced(transition)).toBe(false);
     expect(adminKeyEnforced(enforced)).toBe(true);
-    expect(adminKeyEnforced({ ...enforced, ADMIN_KEY_REQUIRED: 'TRUE' })).toBe(false);
     expect(adminKeyEnforced({ ...enforced, ADMIN_KEY_REQUIRED: undefined })).toBe(false);
     // Flag on but no admin key: not enforced, so admin is never locked out.
     expect(adminKeyEnforced({ ENGINE_API_KEY: ENGINE, ADMIN_KEY_REQUIRED: 'true' })).toBe(false);
@@ -75,6 +80,69 @@ describe('blank and padded admin keys', () => {
     // The untrimmed form is not the key.
     expect(classifyToken(`  ${ADMIN}\n`, keys)).toBeNull();
     expect(hasSuperAdminAuthority(`Bearer ${ENGINE}`, keys)).toBe(false);
+  });
+});
+
+describe('ADMIN_KEY_REQUIRED parsing', () => {
+  const withFlag = (flag: string | undefined) => ({
+    ENGINE_API_KEY: ENGINE,
+    ADMIN_API_KEY: ADMIN,
+    ADMIN_KEY_REQUIRED: flag,
+  });
+
+  it.each(['true', 'TRUE', 'True', ' true ', 'true\n'])('%j enforces', (flag) => {
+    expect(adminKeyRequiredSetting(withFlag(flag))).toBe('true');
+    expect(adminKeyEnforced(withFlag(flag))).toBe(true);
+  });
+
+  it.each([undefined, '', '  ', 'false', 'FALSE', ' False '])('%j is false', (flag) => {
+    expect(adminKeyRequiredSetting(withFlag(flag))).toBe('false');
+    expect(adminKeyEnforced(withFlag(flag))).toBe(false);
+  });
+
+  it.each(['yes', '1', 'on', 'tru', 'enabled'])('%j is invalid and not enforced', (flag) => {
+    expect(adminKeyRequiredSetting(withFlag(flag))).toBe('invalid');
+    expect(adminKeyEnforced(withFlag(flag))).toBe(false);
+    expect(hasSuperAdminAuthority(`Bearer ${ENGINE}`, withFlag(flag))).toBe(true);
+  });
+});
+
+describe('padded ENGINE_API_KEY', () => {
+  it('accepts both the stored and the trimmed engine value', () => {
+    const keys = { ENGINE_API_KEY: ` ${ENGINE}\n` };
+    expect(classifyToken(ENGINE, keys)).toBe('engine');
+    expect(classifyToken(` ${ENGINE}\n`, keys)).toBe('engine');
+  });
+
+  it('a padded engine secret equal to the admin secret still classifies as engine', () => {
+    const keys = {
+      ENGINE_API_KEY: `  shared-key\n`,
+      ADMIN_API_KEY: 'shared-key',
+      ADMIN_KEY_REQUIRED: 'true',
+    };
+    expect(classifyToken('shared-key', keys)).toBe('engine');
+    expect(hasSuperAdminAuthority('Bearer shared-key', keys)).toBe(false);
+  });
+
+  it('an engine secret equal to a padded admin secret still classifies as engine', () => {
+    const keys = {
+      ENGINE_API_KEY: 'shared-key',
+      ADMIN_API_KEY: '\tshared-key  ',
+      ADMIN_KEY_REQUIRED: 'true',
+    };
+    expect(classifyToken('shared-key', keys)).toBe('engine');
+  });
+
+  it('a blank engine secret never matches a blank token', () => {
+    expect(classifyToken('', { ENGINE_API_KEY: '   ' })).toBeNull();
+  });
+});
+
+describe('classifyAuthorization', () => {
+  it('returns null for a missing, non-bearer or empty bearer header', () => {
+    expect(classifyAuthorization(undefined, { ENGINE_API_KEY: ENGINE })).toBeNull();
+    expect(classifyAuthorization(ENGINE, { ENGINE_API_KEY: ENGINE })).toBeNull();
+    expect(classifyAuthorization('Bearer ', { ENGINE_API_KEY: ENGINE })).toBeNull();
   });
 });
 

@@ -50,6 +50,18 @@ describe('admin key unset (behaviour unchanged)', () => {
     expect(res.status).toBe(200);
   });
 
+  it('a wrong key gets the stable invalid_api_key code', async () => {
+    const res = await SELF.fetch(ADMIN_CONFIG, { headers: bearer('wrong') });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: 'Invalid API key', code: 'invalid_api_key' });
+    const chat = await SELF.fetch('https://worker/api/v1/chat', {
+      method: 'POST',
+      headers: bearer('wrong'),
+      body: '{}',
+    });
+    expect(await chat.json()).toEqual({ error: 'Invalid API key', code: 'invalid_api_key' });
+  });
+
   it('missing bearer → 401, wrong key → 403 (as before)', async () => {
     expect((await SELF.fetch(ADMIN_CONFIG)).status).toBe(401);
     expect((await SELF.fetch(ADMIN_CONFIG, { headers: bearer('wrong') })).status).toBe(403);
@@ -117,7 +129,10 @@ describe('admin key set, ADMIN_KEY_REQUIRED "true" (enforced)', () => {
     ];
     for (const res of await Promise.all(attempts)) {
       expect(res.status).toBe(403);
-      expect(await res.json()).toEqual({ error: 'This route requires the admin API key' });
+      expect(await res.json()).toEqual({
+        error: 'This route requires the admin API key',
+        code: 'admin_key_required',
+      });
     }
   });
 });
@@ -137,7 +152,10 @@ describe('admin key set, ADMIN_KEY_REQUIRED "true": chat and user routes', () =>
       }),
     });
     expect(res.status).toBe(403);
-    expect(await res.json()).toEqual({ error: 'This client_id requires the admin API key' });
+    expect(await res.json()).toEqual({
+      error: 'This client_id requires the admin API key',
+      code: 'admin_key_required',
+    });
   });
 
   it('engine key still works on chat/user routes', async () => {

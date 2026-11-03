@@ -181,7 +181,13 @@ Authorization: Bearer <ENGINE_API_KEY, ADMIN_API_KEY or org-specific admin key>
 | set             | `"false"` (default)  | `ADMIN_API_KEY` or `ENGINE_API_KEY` (transition)                                                                  |
 | set             | `"true"`             | `ADMIN_API_KEY` only; `ENGINE_API_KEY` gets `403` (`auth_rejected`, `reason: admin_key_required`)                 |
 
-Chat and user routes accept either key in every row, with one exception: a chat request with an admin `client_id` (`admin-portal`, which gets admin visibility of unpublished modes and languages) follows the admin-route rule and logs `admin_auth` the same way. Switch-over: set the `ADMIN_API_KEY` secret, point admin clients at it, watch `admin_auth` logs until no `key_class: engine` entries remain, then set `ADMIN_KEY_REQUIRED = "true"` in `wrangler.toml`. An `ADMIN_API_KEY` that is empty or whitespace-only counts as unset, and a set key is compared after trimming surrounding whitespace (the same rule the admin clients apply to the value they send). If `ADMIN_API_KEY` were ever set to the same value as `ENGINE_API_KEY`, that value is treated as the engine key.
+`ADMIN_KEY_REQUIRED` is read trimmed and case-insensitively: `true` enforces; unset, blank or `false` does not. Any other value is not enforced and logs `admin_key_required_invalid_value` (with the value) once per isolate. `"true"` without an admin key logs `admin_key_required_without_admin_key` once per isolate.
+
+Chat and user routes accept either key in every row, with one exception. Admin visibility in chat (unpublished modes and languages, the admin welcome preview) is decided by the worker: it needs an admin `client_id` (`admin-portal`) **and** a key with super-admin authority under the table above. The worker passes the result to the Durable Object as the server-set `_is_admin` body field, overwriting any client-supplied value. An admin `client_id` without such a key gets `403`, and the check logs `admin_auth` the same way as the admin routes.
+
+Switch-over: set the `ADMIN_API_KEY` secret, point admin clients at it, watch `admin_auth` logs until no `key_class: engine` entries remain, then set `ADMIN_KEY_REQUIRED = "true"` in `wrangler.toml`.
+
+Key values: an `ADMIN_API_KEY` that is empty or whitespace-only counts as unset, and a set key is compared after trimming surrounding whitespace. Admin clients apply the same blank rule and send the trimmed value. `ENGINE_API_KEY` matches both its stored and its trimmed value. If the two keys are ever set to the same value (after trimming), that value is treated as the engine key.
 
 ## API Endpoints
 
@@ -211,7 +217,7 @@ Chat and user routes accept either key in every row, with one exception: a chat 
 
 ### Admin Endpoints
 
-All admin endpoints (everything under `/api/v1/admin/*`) require a key with super-admin authority: `ADMIN_API_KEY`, or `ENGINE_API_KEY` while `ADMIN_KEY_REQUIRED` is not `"true"` (see [Authentication](#authentication)). The global `/api/*` middleware accepts only those two keys, so the org-specific `ORG_ADMIN_KEYS` branch of the `/api/v1/admin/orgs/:org/*` gate is not reachable today. Global MCP pool writes and `/api/v1/admin/do/:hexId/snapshot` are super-admin only regardless.
+All admin endpoints (everything under `/api/v1/admin/*`) require a key with super-admin authority: `ADMIN_API_KEY`, or `ENGINE_API_KEY` while `ADMIN_KEY_REQUIRED` is not `"true"` (see [Authentication](#authentication)). The global `/api/*` middleware accepts only those two keys and the `/api/v1/admin/*` gate rejects anything without super-admin authority, so the org-specific `ORG_ADMIN_KEYS` branch of the `/api/v1/admin/orgs/:org/*` gate is not reachable today. Global MCP pool writes and `/api/v1/admin/do/:hexId/snapshot` are super-admin only regardless.
 
 | Endpoint                                                               | Method       | Description                                                                                 |
 | ---------------------------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------- |
@@ -637,16 +643,16 @@ Access control (who can reset a group, who counts as "addressed") is the **gatew
 
 Set in `wrangler.toml` under `[vars]`. The top-level `[vars]` block **is** the production config (the Deploy workflow runs `wrangler deploy` with no `--env` and asserts `ENVIRONMENT = "production"`); `[env.staging.vars]` holds staging's copy.
 
-| Variable                       | Default           | Description                                                                                   |
-| ------------------------------ | ----------------- | --------------------------------------------------------------------------------------------- |
-| `ENVIRONMENT`                  | `"production"`    | Runtime environment label (`"staging"` under `[env.staging]`); used as `service.namespace`    |
-| `MAX_ORCHESTRATION_ITERATIONS` | `"100"`           | Max Claude tool-use loop iterations                                                           |
-| `CODE_EXEC_TIMEOUT_MS`         | `"30000"`         | QuickJS execution timeout (ms)                                                                |
-| `MAX_MCP_CALLS_PER_EXECUTION`  | `"10"`            | Max MCP calls per `execute_code` invocation                                                   |
-| `MAX_MCP_CALLS_PER_REQUEST`    | `"100"`           | Max MCP calls across a whole request                                                          |
-| `DEFAULT_ORG`                  | `"unfoldingWord"` | Fallback org when not specified in request                                                    |
-| `WHATSAPP_NUMBER`              | `"15558196461"`   | WhatsApp business number (E.164 digits, no `+`) for the per-mode `wa.me` share link (#311)    |
-| `ADMIN_KEY_REQUIRED`           | `"false"`         | `"true"` ⇒ admin routes accept only `ADMIN_API_KEY`. No effect while `ADMIN_API_KEY` is unset |
+| Variable                       | Default           | Description                                                                                                       |
+| ------------------------------ | ----------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `ENVIRONMENT`                  | `"production"`    | Runtime environment label (`"staging"` under `[env.staging]`); used as `service.namespace`                        |
+| `MAX_ORCHESTRATION_ITERATIONS` | `"100"`           | Max Claude tool-use loop iterations                                                                               |
+| `CODE_EXEC_TIMEOUT_MS`         | `"30000"`         | QuickJS execution timeout (ms)                                                                                    |
+| `MAX_MCP_CALLS_PER_EXECUTION`  | `"10"`            | Max MCP calls per `execute_code` invocation                                                                       |
+| `MAX_MCP_CALLS_PER_REQUEST`    | `"100"`           | Max MCP calls across a whole request                                                                              |
+| `DEFAULT_ORG`                  | `"unfoldingWord"` | Fallback org when not specified in request                                                                        |
+| `WHATSAPP_NUMBER`              | `"15558196461"`   | WhatsApp business number (E.164 digits, no `+`) for the per-mode `wa.me` share link (#311)                        |
+| `ADMIN_KEY_REQUIRED`           | `"false"`         | `"true"` (trimmed, any case) ⇒ admin routes accept only `ADMIN_API_KEY`. No effect while `ADMIN_API_KEY` is unset |
 
 ### Optional Environment Variables
 

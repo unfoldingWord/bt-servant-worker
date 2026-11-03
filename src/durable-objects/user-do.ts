@@ -108,7 +108,7 @@ import {
   DetectedLanguage,
   UNDETERMINED_LANGUAGE,
 } from '../services/language/index.js';
-import { isAdminClient, isValidLanguageCode, validateChatBody } from '../utils/chat-validation.js';
+import { isValidLanguageCode, validateChatBody } from '../utils/chat-validation.js';
 import { hasClientHistory, sanitizeClientHistory } from '../utils/history-validation.js';
 import { OrgLanguages, resolveEffectiveLanguage } from '../types/languages.js';
 import { InternalQueueEntry } from '../types/queue.js';
@@ -3354,7 +3354,7 @@ export class UserDO {
   }
 
   private async resolvePrompts(body: ChatRequest, logger: RequestLogger) {
-    const isAdmin = isAdminClient(body.client_id);
+    const isAdmin = body._is_admin === true;
     const orgOverrides = body._org_prompt_overrides ?? {};
     const orgModes = body._org_modes ?? { modes: [] };
     const userSelectedMode = await this.getSelectedMode();
@@ -3849,7 +3849,7 @@ export class UserDO {
     activeModeName: string | undefined,
     body: ChatRequest
   ): ModeContext {
-    const isAdmin = isAdminClient(body.client_id);
+    const isAdmin = body._is_admin === true;
     const isGroupChat = this.isGroupChatType(body);
     return {
       availableModes: orgModes.modes.filter((m) => isModeVisible(m, { isGroupChat, isAdmin })),
