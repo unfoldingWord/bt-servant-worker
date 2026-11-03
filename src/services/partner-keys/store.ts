@@ -55,8 +55,8 @@ export type PartnerKeyStoreOp =
   | { op: 'get'; id: string }
   | { op: 'revoke'; id: string; revokedBy?: string }
   | { op: 'rotate'; id: string; createdBy?: string; graceSeconds: number }
-  | { op: 'acquireImportLease'; id: string; holder: string }
-  | { op: 'releaseImportLease'; id: string; holder: string };
+  | { op: 'acquireImportLease'; namespace: string; holder: string }
+  | { op: 'releaseImportLease'; namespace: string; holder: string };
 
 export type CreateOutcome = { record: PartnerKeyRecord; plaintext: string; warnings: string[] };
 
@@ -93,12 +93,16 @@ export function partnerKeyStore(ns: DurableObjectNamespace, requestId: string) {
       ),
     rotate: (id: string, opts: { createdBy?: string; graceSeconds: number }) =>
       call<RotateOutcome>({ op: 'rotate', id, ...opts }),
-    /** Take the key's legacy-import lease for `holder`; false while another import holds it. */
-    acquireImportLease: async (id: string, holder: string) =>
-      (await call<{ acquired: boolean }>({ op: 'acquireImportLease', id, holder })).acquired,
+    /**
+     * Take the legacy-import lease of a user namespace for `holder`; false
+     * while another import holds it. Keyed by namespace, not key id: every key
+     * in a rotation chain shares the namespace (and so the audio partition).
+     */
+    acquireImportLease: async (namespace: string, holder: string) =>
+      (await call<{ acquired: boolean }>({ op: 'acquireImportLease', namespace, holder })).acquired,
     /** Release the lease if `holder` still holds it. */
-    releaseImportLease: async (id: string, holder: string) => {
-      await call<{ released: boolean }>({ op: 'releaseImportLease', id, holder });
+    releaseImportLease: async (namespace: string, holder: string) => {
+      await call<{ released: boolean }>({ op: 'releaseImportLease', namespace, holder });
     },
   };
 }

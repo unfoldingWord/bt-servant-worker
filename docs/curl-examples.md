@@ -689,8 +689,10 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_
   `key_revoked` / `key_expired` (or `status_check_failed`, logged, if the
   status cannot be read). The response is still `200` with every user's
   status.
-- One import per key at a time: while an import of the same key is running,
-  another gets `409` with `code: "import_in_progress"` and does nothing.
+- One import per key chain at a time: while an import into the same user
+  namespace is running (the same key, or another key of its rotation
+  chain), another gets `409` with `code: "import_in_progress"` and does
+  nothing.
   (A run that died without finishing stops blocking after 10 minutes.)
 - Per user, in this order: a read-only check that the destination is empty
   and idle (otherwise `destination_not_empty` / `destination_busy`, with

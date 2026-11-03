@@ -1984,18 +1984,21 @@ app.post(`${PARTNER_KEYS_BASE}/:keyId/_import-legacy-users`, async (c) => {
     if (!key) return c.json({ error: 'API key not found' }, 404);
     const status = partnerKeyStatus(key, Date.now());
     if (status !== 'active') {
+      logger.warn('admin_action', { ...ctx, rejected: `key_${status}` });
       return c.json(
         { error: `This API key is ${status}; import into an active key`, code: `key_${status}` },
         409
       );
     }
-    // One import per key at a time: a concurrent run could delete audio this
-    // one wrote (or is reusing). Released in finally; the TTL covers a crash.
+    // One import per user namespace at a time (a rotation chain shares one):
+    // a concurrent run could delete audio this one wrote (or is reusing).
+    // Released in finally; the TTL covers a crash.
     const holder = crypto.randomUUID();
-    if (!(await keyStore(c).acquireImportLease(keyId, holder))) {
+    if (!(await keyStore(c).acquireImportLease(key.userNamespace, holder))) {
+      logger.warn('admin_action', { ...ctx, rejected: 'import_in_progress' });
       return c.json({ error: IMPORT_IN_PROGRESS_ERROR, code: 'import_in_progress' }, 409);
     }
-    const results = await withImportLease(c, keyId, holder, () =>
+    const results = await withImportLease(c, key.userNamespace, holder, () =>
       importLegacyUsers(c.env, key, body.input, {
         logger,
         requestId: c.get('requestId'),
@@ -2033,7 +2036,7 @@ function countByStatus(results: { status: string }[]): Record<string, number> {
 /** Run `task`, then release the import lease (a failed release is logged; the TTL frees it). */
 async function withImportLease<T>(
   c: Context<AppEnv>,
-  keyId: string,
+  namespace: string,
   holder: string,
   task: () => Promise<T>
 ): Promise<T> {
@@ -2041,10 +2044,10 @@ async function withImportLease<T>(
     return await task();
   } finally {
     try {
-      await keyStore(c).releaseImportLease(keyId, holder);
+      await keyStore(c).releaseImportLease(namespace, holder);
     } catch (error) {
       c.get('logger').error('partner_key_legacy_import_lease_release_failed', error, {
-        key_id: keyId,
+        user_namespace: namespace,
       });
     }
   }

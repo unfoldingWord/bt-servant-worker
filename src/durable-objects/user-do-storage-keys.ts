@@ -4,6 +4,11 @@
  * must never copy them between DOs, admin-portal#354).
  */
 
+/**
+ * The conversation history (an array of ChatHistoryEntry). Copied by the
+ * legacy import, which also rehomes the audio it references (legacy-audio.ts).
+ */
+export const HISTORY_KEY = 'history';
 /** The DO's own identity record; its `do_name` names THIS DO. */
 export const IDENTITY_KEY = 'identity';
 /** Held while a turn runs (see tryAcquireLock / LOCK_STALE_THRESHOLD_MS). */

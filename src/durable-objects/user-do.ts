@@ -94,6 +94,7 @@ import {
   readImportEntries,
 } from './user-data-transfer.js';
 import {
+  HISTORY_KEY,
   IDENTITY_KEY,
   LOCK_STALE_THRESHOLD_MS,
   PROCESSING_LOCK_KEY,
@@ -136,7 +137,6 @@ import { statusUpdate, uiString } from '../i18n/ui-strings.js';
 import { createStatusEmitter, StatusEmitter } from '../i18n/status-emitter.js';
 
 // ── Storage keys ───────────────────────────────────────────────────────────────
-const HISTORY_KEY = 'history';
 const PREFERENCES_KEY = 'preferences';
 const PROMPT_OVERRIDES_KEY = 'prompt_overrides';
 const SELECTED_MODE_KEY = 'selected_mode';

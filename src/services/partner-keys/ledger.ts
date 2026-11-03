@@ -42,6 +42,7 @@
  * timeout is not corrected until the key's next change.
  */
 
+import { DO_STORAGE_MAX_KEYS_PER_CALL } from '../../types/do-storage.js';
 import {
   type PartnerKeyCreateInput,
   type PartnerKeyRecord,
@@ -58,8 +59,6 @@ const PENDING_PREFIX = 'proj:';
 export const PROJECTION_RETRY_MS = 30_000;
 /** Bound on a rotation-chain walk (guards against a cycle in damaged data). */
 const MAX_CHAIN_DEPTH = 50;
-/** DO storage `get` / `put` / `delete` accept at most 128 keys per call. */
-const GET_BATCH = 128;
 /**
  * Bound on each KV operation. The DO runs one operation at a time (its
  * `serialize` chain), so a KV call that never settles would hold every later
@@ -70,8 +69,6 @@ export const KV_OP_TIMEOUT_MS = 10_000;
 /** When the alarm re-puts a key after its last KV timeout (see "Settling"). */
 export const SETTLE_DELAYS_MS: readonly number[] = [60_000, 300_000];
 const SETTLE_PREFIX = 'settle:';
-/** Keys one Durable Object `storage.get([...])` call accepts. */
-const MAX_STORAGE_GET_KEYS = 128;
 /** How many settle re-puts the alarm runs at once. */
 const SETTLE_CONCURRENCY = 10;
 /** Warning returned when a change is committed but auth (KV) does not have it yet. */
@@ -412,8 +409,8 @@ export class PartnerKeyLedger {
       ({ id, requestId }) =>
         [settleKey(id), { at: now, step: 0, requestId } satisfies SettleMarker] as const
     );
-    for (let i = 0; i < fresh.length; i += GET_BATCH) {
-      await this.storage.put(Object.fromEntries(fresh.slice(i, i + GET_BATCH)));
+    for (let i = 0; i < fresh.length; i += DO_STORAGE_MAX_KEYS_PER_CALL) {
+      await this.storage.put(Object.fromEntries(fresh.slice(i, i + DO_STORAGE_MAX_KEYS_PER_CALL)));
     }
   }
 
@@ -516,10 +513,12 @@ export class PartnerKeyLedger {
   /** The entries among `entries` whose KV projection is still owed. */
   private async owedAmong(entries: LedgerEntry[]): Promise<LedgerEntry[]> {
     // Read just these entries' `proj:` markers (a batched get, at most
-    // MAX_STORAGE_GET_KEYS keys per call), not every marker in storage.
+    // DO_STORAGE_MAX_KEYS_PER_CALL keys per call), not every marker in storage.
     const owed = new Set<string>();
-    for (let i = 0; i < entries.length; i += MAX_STORAGE_GET_KEYS) {
-      const keys = entries.slice(i, i + MAX_STORAGE_GET_KEYS).map((e) => pendingKey(e.record.id));
+    for (let i = 0; i < entries.length; i += DO_STORAGE_MAX_KEYS_PER_CALL) {
+      const keys = entries
+        .slice(i, i + DO_STORAGE_MAX_KEYS_PER_CALL)
+        .map((e) => pendingKey(e.record.id));
       for (const key of (await this.storage.get(keys)).keys()) owed.add(key);
     }
     return entries.filter((e) => owed.has(pendingKey(e.record.id)));
@@ -545,8 +544,8 @@ export class PartnerKeyLedger {
       ...issued.map((entry) => [orgKey(entry.record), entry.record.id] as const),
     ];
     await this.storage.transaction(async (txn) => {
-      for (let i = 0; i < entries.length; i += GET_BATCH) {
-        await txn.put(Object.fromEntries(entries.slice(i, i + GET_BATCH)));
+      for (let i = 0; i < entries.length; i += DO_STORAGE_MAX_KEYS_PER_CALL) {
+        await txn.put(Object.fromEntries(entries.slice(i, i + DO_STORAGE_MAX_KEYS_PER_CALL)));
       }
       const due = Date.now() + PROJECTION_RETRY_MS;
       const existing = await txn.getAlarm();
@@ -630,15 +629,17 @@ export class PartnerKeyLedger {
   }
 
   private async deleteMany(keys: string[]): Promise<void> {
-    for (let i = 0; i < keys.length; i += GET_BATCH) {
-      await this.storage.delete(keys.slice(i, i + GET_BATCH));
+    for (let i = 0; i < keys.length; i += DO_STORAGE_MAX_KEYS_PER_CALL) {
+      await this.storage.delete(keys.slice(i, i + DO_STORAGE_MAX_KEYS_PER_CALL));
     }
   }
 
   private async getMany(ids: string[]): Promise<LedgerEntry[]> {
     const out: LedgerEntry[] = [];
-    for (let i = 0; i < ids.length; i += GET_BATCH) {
-      const batch = await this.storage.get<LedgerEntry>(ids.slice(i, i + GET_BATCH).map(recKey));
+    for (let i = 0; i < ids.length; i += DO_STORAGE_MAX_KEYS_PER_CALL) {
+      const batch = await this.storage.get<LedgerEntry>(
+        ids.slice(i, i + DO_STORAGE_MAX_KEYS_PER_CALL).map(recKey)
+      );
       out.push(...batch.values());
     }
     return out;

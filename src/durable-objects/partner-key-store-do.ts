@@ -48,11 +48,13 @@ async function readOp(request: Request, logger: RequestLogger): Promise<PartnerK
 }
 
 /**
- * Legacy-import lease (one import per key at a time): `import-lease:<key id>`.
- * A second import of the same key while one runs could delete audio the
- * first one just wrote (each run's cleanup removes what it wrote, and the
- * other run may already be reusing it). The TTL only covers a run that died
- * without releasing; a live run releases in `finally`.
+ * Legacy-import lease, one import per user namespace at a time:
+ * `import-lease:<userNamespace>`. Keyed by namespace, not key id, because
+ * every key in a rotation chain shares the namespace and so writes the same
+ * audio partition. A second import into it while one runs could delete
+ * audio the first one just wrote (each run's cleanup removes what it wrote,
+ * and the other run may already be reusing it). The TTL only covers a run
+ * that died without releasing; a live run releases in `finally`.
  */
 const IMPORT_LEASE_PREFIX = 'import-lease:';
 export const IMPORT_LEASE_TTL_MS = 10 * 60 * 1000;
@@ -175,8 +177,11 @@ export class PartnerKeyStoreDO {
   }
 
   /** Take the lease unless another holder has it and it has not expired (runs serialized). */
-  private async acquireImportLease(id: string, holder: string): Promise<{ acquired: boolean }> {
-    const key = `${IMPORT_LEASE_PREFIX}${id}`;
+  private async acquireImportLease(
+    namespace: string,
+    holder: string
+  ): Promise<{ acquired: boolean }> {
+    const key = `${IMPORT_LEASE_PREFIX}${namespace}`;
     const now = Date.now();
     const lease = await this.state.storage.get<ImportLease>(key);
     if (lease !== undefined && lease.expiresAt > now) return { acquired: false };
@@ -185,8 +190,11 @@ export class PartnerKeyStoreDO {
   }
 
   /** Delete the lease only if `holder` still holds it (an expired one may have been retaken). */
-  private async releaseImportLease(id: string, holder: string): Promise<{ released: boolean }> {
-    const key = `${IMPORT_LEASE_PREFIX}${id}`;
+  private async releaseImportLease(
+    namespace: string,
+    holder: string
+  ): Promise<{ released: boolean }> {
+    const key = `${IMPORT_LEASE_PREFIX}${namespace}`;
     const lease = await this.state.storage.get<ImportLease>(key);
     if (lease?.holder !== holder) return { released: false };
     await this.state.storage.delete(key);
@@ -212,9 +220,9 @@ export class PartnerKeyStoreDO {
       case 'rotate':
         return ledger.rotate(op.id, { createdBy: op.createdBy, graceSeconds: op.graceSeconds });
       case 'acquireImportLease':
-        return this.acquireImportLease(op.id, op.holder);
+        return this.acquireImportLease(op.namespace, op.holder);
       case 'releaseImportLease':
-        return this.releaseImportLease(op.id, op.holder);
+        return this.releaseImportLease(op.namespace, op.holder);
       default:
         return undefined;
     }

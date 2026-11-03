@@ -28,6 +28,7 @@
  * written.
  */
 
+import { DO_STORAGE_MAX_KEYS_PER_CALL } from '../types/do-storage.js';
 import type { StoredIdentity } from '../types/engine.js';
 import {
   IDENTITY_KEY,
@@ -39,8 +40,6 @@ import {
 
 /** Storage keys that belong to one DO instance or one in-flight turn (shared with user-do.ts). */
 const NOT_COPIED = TRANSIENT_USER_DO_KEYS;
-/** DO storage `put` accepts at most 128 keys per call. */
-const PUT_BATCH = 128;
 
 export type UserDataExport = {
   identity: StoredIdentity | null;
@@ -135,8 +134,8 @@ export async function importUserData(
   return storage.transaction(async (txn): Promise<UserDataImportResult> => {
     const refusal = await importRefusal(txn);
     if (refusal) return refusal;
-    for (let i = 0; i < copied.length; i += PUT_BATCH) {
-      await txn.put(Object.fromEntries(copied.slice(i, i + PUT_BATCH)));
+    for (let i = 0; i < copied.length; i += DO_STORAGE_MAX_KEYS_PER_CALL) {
+      await txn.put(Object.fromEntries(copied.slice(i, i + DO_STORAGE_MAX_KEYS_PER_CALL)));
     }
     return { ok: true, imported: copied.length };
   });

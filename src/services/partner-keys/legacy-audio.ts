@@ -26,11 +26,10 @@
 
 import { audioKeyToUrl, partnerAudioKeyFor, voiceSubmissionKeyToUrl } from '../audio/index.js';
 import type { RequestLogger } from '../../utils/logger.js';
+import { HISTORY_KEY } from '../../durable-objects/user-do-storage-keys.js';
 
 /** The history fields that hold an R2 audio key. */
 const AUDIO_KEY_FIELDS = ['voice_audio_key', 'inbound_voice_audio_key'] as const;
-/** Storage key of the history list in a UserDO. */
-const HISTORY_KEY = 'history';
 /** Objects copied at once. */
 const COPY_CONCURRENCY = 5;
 /** R2 operations one referenced object can take at most: head, get, put. */

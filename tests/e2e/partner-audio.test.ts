@@ -318,48 +318,85 @@ describe('legacy import rehomes audio attachments too', () => {
 const keyStoreStub = () =>
   env.PARTNER_KEY_STORE.get(env.PARTNER_KEY_STORE.idFromName(PARTNER_KEY_STORE_NAME));
 
-async function leaseOf(keyId: string): Promise<unknown> {
+async function leaseOf(namespace: string): Promise<unknown> {
   return runInDurableObject(keyStoreStub(), async (_i, state) =>
-    state.storage.get(`import-lease:${keyId}`)
+    state.storage.get(`import-lease:${namespace}`)
   );
 }
 
-async function plantLease(keyId: string, expiresAt: number): Promise<void> {
+async function plantLease(namespace: string, expiresAt: number): Promise<void> {
   await runInDurableObject(keyStoreStub(), async (_i, state) => {
-    await state.storage.put(`import-lease:${keyId}`, { holder: 'other-run', expiresAt });
+    await state.storage.put(`import-lease:${namespace}`, { holder: 'other-run', expiresAt });
   });
 }
 
-describe('one legacy import per key at a time', () => {
+const importStatus = async (keyId: string) =>
+  SELF.fetch(`${KEYS}/${keyId}/_import-legacy-users`, {
+    method: 'POST',
+    headers: JSON_INTERNAL,
+    body: JSON.stringify({ legacyClientId: 'shema', userIds: ['leg1'] }),
+  });
+
+describe('one legacy import per user namespace (key chain) at a time', () => {
   it('a second import while one holds the lease gets 409 import_in_progress and touches nothing', async () => {
     await seedLegacyUser();
     const { key } = await createKey();
-    await plantLease(key.id, Date.now() + 60_000);
-    const res = await SELF.fetch(`${KEYS}/${key.id}/_import-legacy-users`, {
-      method: 'POST',
-      headers: JSON_INTERNAL,
-      body: JSON.stringify({ legacyClientId: 'shema', userIds: ['leg1'] }),
-    });
+    await plantLease(key.userNamespace, Date.now() + 60_000);
+    const warnings: string[] = [];
+    vi.spyOn(console, 'warn').mockImplementation((line: unknown) => warnings.push(String(line)));
+    const res = await importStatus(key.id);
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ code: 'import_in_progress' });
+    expect(warnings.map((line) => JSON.parse(line) as Record<string, unknown>)).toContainEqual(
+      expect.objectContaining({
+        event: 'admin_action',
+        action: 'import_legacy_users',
+        key_id: key.id,
+        rejected: 'import_in_progress',
+      })
+    );
     const owner = `partner:${key.userNamespace}:leg1`;
     expect(await keysUnder(`audio/${ORG}/${owner}/`)).toEqual([]);
-    expect(await leaseOf(key.id)).toMatchObject({ holder: 'other-run' });
+    expect(await leaseOf(key.userNamespace)).toMatchObject({ holder: 'other-run' });
   });
 
   it('an expired lease (a run that died) does not block, and a finished run releases its lease', async () => {
     await seedLegacyUser();
     const { key } = await createKey();
-    await plantLease(key.id, Date.now() - 1);
+    await plantLease(key.userNamespace, Date.now() - 1);
     expect(await importLeg1(key.id)).toMatchObject({ status: 'copied' });
-    expect(await leaseOf(key.id)).toBeUndefined();
+    expect(await leaseOf(key.userNamespace)).toBeUndefined();
+  });
+});
+
+describe('the import lease covers a whole rotation chain', () => {
+  it('a rotation chain shares the lease: an import on A while B (its successor) holds it gets 409', async () => {
+    await seedLegacyUser();
+    const a = await createKey();
+    const rotated = await SELF.fetch(`${KEYS}/${a.key.id}/_rotate`, {
+      method: 'POST',
+      headers: JSON_INTERNAL,
+      body: JSON.stringify({ graceSeconds: 3600 }),
+    });
+    expect(rotated.status).toBe(200);
+    const b = ((await rotated.json()) as CreateBody).key;
+    expect(b.userNamespace).toBe(a.key.userNamespace);
+
+    // B's import holds the namespace's lease (as it would while running).
+    await plantLease(b.userNamespace, Date.now() + 60_000);
+    for (const keyId of [a.key.id, b.id]) {
+      const res = await importStatus(keyId);
+      expect(res.status, keyId).toBe(409);
+      expect(await res.json()).toMatchObject({ code: 'import_in_progress' });
+    }
+    expect(await keysUnder(`audio/${ORG}/partner:${a.key.userNamespace}:leg1/`)).toEqual([]);
   });
 
-  it('the lease is per key: another key imports while the first is held', async () => {
+  it('a key outside the chain (another namespace) imports while the chain is held', async () => {
     await seedLegacyUser();
     const held = await createKey();
     const free = await createKey();
-    await plantLease(held.key.id, Date.now() + 60_000);
+    await plantLease(held.key.userNamespace, Date.now() + 60_000);
     expect(await importLeg1(free.key.id)).toMatchObject({ status: 'copied' });
   });
 });
