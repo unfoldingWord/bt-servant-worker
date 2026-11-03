@@ -20,8 +20,11 @@ const MAX_SERVER_NAME = 80;
 const NUMBER = /^\d{1,3}$/;
 const NUMBER_RANGE = /^\d{1,3}[-–]\d{1,3}$/;
 const UNSAFE_REFERENCE_CHAR = /[\\/<>{}[\]()"'`$%@!?;|&*#+=~,]/;
-/** Markup and quotes stripped from an operator-configured server name. */
-const UNSAFE_SERVER_CHAR = /[<>"'`]/g;
+/**
+ * Same characters a reference rejects, stripped from an operator-configured
+ * server name. Global, so each use resets `lastIndex` before replacing.
+ */
+const UNSAFE_SERVER_CHAR = /[\\/<>{}[\]()"'`$%@!?;|&*#+=~,]/g;
 
 export interface ToolCallSnapshot {
   name: string;
@@ -199,13 +202,14 @@ function isChapterToken(token: string): boolean {
 
 function displayServerName(name: string | undefined): string | null {
   if (!name) return null;
-  const cleaned = replaceControls(name)
-    .replace(UNSAFE_SERVER_CHAR, ' ')
-    .replace(/[{}]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  const cleaned = stripUnsafeServerChars(replaceControls(name)).replace(/\s+/g, ' ').trim();
   if (!cleaned) return null;
   return cleaned.length > MAX_SERVER_NAME ? cleaned.slice(0, MAX_SERVER_NAME).trim() : cleaned;
+}
+
+function stripUnsafeServerChars(text: string): string {
+  UNSAFE_SERVER_CHAR.lastIndex = 0;
+  return text.replace(UNSAFE_SERVER_CHAR, ' ');
 }
 
 function replaceControls(text: string): string {

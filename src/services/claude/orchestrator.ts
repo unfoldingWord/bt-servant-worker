@@ -3373,6 +3373,7 @@ async function applyToolStatusDecision(
   ctx: OrchestrationContext,
   decision: ToolStatusDecision
 ): Promise<void> {
+  if (ctx.toolStatusClosed) return;
   if (decision.kind === 'emit') {
     await emitDirectStatus(ctx, decision.key, decision.message);
     return;
@@ -3387,7 +3388,10 @@ async function emitDirectStatus(
   key: StatusKey,
   message: string
 ): Promise<void> {
-  if (!ctx.callbacks) return;
+  // Read again in the same turn as the callback. The deferred timer and the
+  // turn's finally only interleave across an await, so this is the last look
+  // before a status can leave.
+  if (ctx.toolStatusClosed || !ctx.callbacks) return;
   try {
     await ctx.callbacks.onStatus({ key, message });
   } catch (error) {

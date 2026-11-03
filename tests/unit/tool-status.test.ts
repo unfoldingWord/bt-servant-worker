@@ -173,6 +173,19 @@ describe('server names on a status line', () => {
     const decision = createToolStatusGate().decide([call('list_resources', {}, markup)], 'en', 0);
     expect(decision).toEqual({ kind: 'fallback', count: 1 });
   });
+
+  it('strips the characters a reference would reject, including newlines', () => {
+    expect(emit([call('list_resources', {}, 'Foo (beta)\nbar')]).message).toBe(
+      'Checking Foo beta bar…'
+    );
+    expect(emit([call('list_resources', {}, 'Foo\\bar')]).message).toBe('Checking Foo bar…');
+    const onlyPunctuation = createToolStatusGate().decide(
+      [call('list_resources', {}, '()\\')],
+      'en',
+      0
+    );
+    expect(onlyPunctuation).toEqual({ kind: 'fallback', count: 1 });
+  });
 });
 
 describe('safe references in a status', () => {

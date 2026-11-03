@@ -192,6 +192,48 @@ describe('QuickJS onHostCalls failure', () => {
   });
 });
 
+describe('QuickJS MCP call limit before status', () => {
+  it('does not announce a batch that would exceed the call limit', async () => {
+    const logger = createTestLogger();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const announced: string[] = [];
+    let ran = 0;
+    const hostFunctions = [
+      {
+        name: 'get_passage',
+        fn: async () => {
+          ran += 1;
+          return 'verse';
+        },
+      },
+    ];
+
+    const result = await executeCode(
+      'const a = get_passage({ reference: "John 3:16" });' +
+        'const b = get_passage({ reference: "Genesis 1" });' +
+        'await Promise.all([a, b]); __result__ = "done";',
+      {
+        timeout_ms: 5000,
+        hostFunctions,
+        maxMcpCalls: 1,
+        onHostCalls: (calls) => {
+          announced.push(...calls.map((call) => call.name));
+        },
+      },
+      logger
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.errorCode).toBe('MCP_CALL_LIMIT_EXCEEDED');
+    expect(announced).toEqual([]);
+    expect(ran).toBe(0);
+    expect(
+      warn.mock.calls.some((call) => String(call[0]).includes('mcp_call_limit_exceeded'))
+    ).toBe(true);
+    warn.mockRestore();
+  });
+});
+
 describe('QuickJS error handling', () => {
   it('should return error for syntax errors', async () => {
     const logger = createTestLogger();

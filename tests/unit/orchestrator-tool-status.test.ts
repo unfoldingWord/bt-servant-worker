@@ -201,6 +201,14 @@ function isPassageStatus(post: Record<string, unknown>): boolean {
   return post.key === 'status_read_passage';
 }
 
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve: () => void = () => {};
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve: () => resolve() };
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   callMCPToolMock.mockReset();
@@ -311,6 +319,42 @@ describe('parallel and sequential tool statuses', () => {
 });
 
 describe('a label dropped when the turn ends first', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('does not send a deferred label after the turn has closed', async () => {
+    vi.useFakeTimers();
+    const gate = deferred();
+    let passageStarted = false;
+    callMCPToolMock.mockImplementation(async (_server: unknown, toolName: string) => {
+      if (toolName === 'th_get_passage') {
+        passageStarted = true;
+        await gate.promise;
+      }
+      return { result: {}, responseTimeMs: 1 };
+    });
+    const sequential =
+      'await get_word_article({ path: "bible/kt/grace" });' +
+      'await th_get_passage({ reference: "John 3:16" });' +
+      '__result__ = "done";';
+    installFetch(codeThenAnswer(sequential), []);
+    const { callbacks, statuses } = createMockCallbacks();
+    const pending = orchestrate('then', options(createMockLogger(), { callbacks }));
+
+    for (let i = 0; i < 30 && !passageStarted; i += 1) {
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(passageStarted).toBe(true);
+    gate.resolve();
+    await pending;
+    await vi.runAllTimersAsync();
+
+    const messages = statuses.map((status) => status.message);
+    expect(messages).toContain('Looking up Translation Words…');
+    expect(messages.join('\n')).not.toContain('John 3:16');
+  });
+
   it('drops a later label when the turn ends before the gap', async () => {
     callMCPToolMock.mockResolvedValue({ result: {}, responseTimeMs: 1 });
     const sequential =

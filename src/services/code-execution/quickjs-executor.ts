@@ -327,6 +327,8 @@ async function processPendingCalls(
   do {
     if (pendingCalls.length > 0) {
       const batch = pendingCalls.splice(0, pendingCalls.length);
+      // The limit is first: this batch will not run, so announcing it would
+      // name work the sandbox is about to reject.
       assertWithinCallLimit(work, batch.length);
       await announceHostCalls(work.logger, work.onHostCalls, batch);
       await Promise.all(
