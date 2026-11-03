@@ -39,6 +39,7 @@ function catalog(): ToolCatalog {
   return {
     tools: [
       tool('th_get_passage', 'translation-helps'),
+      tool('fetch_scripture', 'translation-helps'),
       tool('get_word_article', 'translation-helps'),
       tool('get_academy_article', 'translation-helps'),
       tool('list_resources', 'translation-helps'),
@@ -446,6 +447,21 @@ describe('unmapped tools and locales', () => {
     expect(statuses).toContainEqual({
       key: 'status_lookup_words',
       message: 'Buscando em Translation Words…',
+    });
+  });
+});
+
+describe('a v1 scripture call', () => {
+  it('names the passage built from book, chapter, and verse', async () => {
+    callMCPToolMock.mockResolvedValue({ result: { text: 'verse' }, responseTimeMs: 1 });
+    const code =
+      'await fetch_scripture({ book: "John", chapter: 3, verse: 16 }); __result__ = "done";';
+    installFetch(codeThenAnswer(code), []);
+    const { callbacks, statuses } = createMockCallbacks();
+    await orchestrate('john', options(createMockLogger(), { callbacks }));
+    expect(statuses).toContainEqual({
+      key: 'status_read_passage',
+      message: 'Reading John 3:16…',
     });
   });
 });

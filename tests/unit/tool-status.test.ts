@@ -155,6 +155,201 @@ describe('tool status mapping', () => {
   });
 });
 
+/**
+ * Production still calls translation-helps v1. Word links use the words
+ * clause: they point at Translation Words, not at the notes.
+ */
+const V1_MAPPED: readonly [string, string, string, string][] = [
+  ['fetch_scripture', 'status_read_passage', 'Reading the passage…', 'Lendo a passagem…'],
+  [
+    'fetch_translation_notes',
+    'status_check_notes',
+    'Checking the translation notes…',
+    'Verificando as notas de tradução…',
+  ],
+  [
+    'fetch_translation_word_links',
+    'status_lookup_words',
+    'Looking up Translation Words…',
+    'Buscando em Translation Words…',
+  ],
+  [
+    'fetch_translation_word',
+    'status_lookup_words',
+    'Looking up Translation Words…',
+    'Buscando em Translation Words…',
+  ],
+  [
+    'fetch_translation_academy',
+    'status_read_academy',
+    'Reading Translation Academy…',
+    'Lendo a Translation Academy…',
+  ],
+  [
+    'fetch_translation_questions',
+    'status_check_questions',
+    'Checking the translation questions…',
+    'Verificando as perguntas de tradução…',
+  ],
+  ['fetch_obs', 'status_read_obs', 'Reading Open Bible Stories…', 'Lendo Open Bible Stories…'],
+  [
+    'fetch_obs_translation_notes',
+    'status_read_obs',
+    'Reading Open Bible Stories…',
+    'Lendo Open Bible Stories…',
+  ],
+  [
+    'fetch_obs_translation_questions',
+    'status_read_obs',
+    'Reading Open Bible Stories…',
+    'Lendo Open Bible Stories…',
+  ],
+  [
+    'fetch_obs_study_notes',
+    'status_read_obs',
+    'Reading Open Bible Stories…',
+    'Lendo Open Bible Stories…',
+  ],
+  [
+    'fetch_obs_study_questions',
+    'status_read_obs',
+    'Reading Open Bible Stories…',
+    'Lendo Open Bible Stories…',
+  ],
+  [
+    'fetch_obs_translation_word_links',
+    'status_read_obs',
+    'Reading Open Bible Stories…',
+    'Lendo Open Bible Stories…',
+  ],
+];
+
+describe('translation-helps v1 tool names', () => {
+  it.each(V1_MAPPED)('%s → %s bare, prefixed, in English and Portuguese', (name, key, en, pt) => {
+    expect(emit([call(name)], 'en')).toEqual({ kind: 'emit', key, message: en });
+    expect(emit([call(name)], 'pt')).toEqual({ kind: 'emit', key, message: pt });
+    expect(emit([call(`translation-helps_${name}`)])).toEqual({ kind: 'emit', key, message: en });
+  });
+});
+
+describe('a reference on a translation-helps v1 call', () => {
+  it('includes a safe reference string on a v1 call', () => {
+    expect(emit([call('fetch_scripture', { reference: 'John 3:16' })]).message).toBe(
+      'Reading John 3:16…'
+    );
+    expect(
+      emit([call('translation-helps_fetch_scripture', { reference: 'JHN 3:16' })]).message
+    ).toBe('Reading JHN 3:16…');
+    expect(emit([call('fetch_translation_word', { reference: 'Genesis 1' })]).message).toBe(
+      'Looking up Translation Words for Genesis 1…'
+    );
+  });
+
+  it('builds a reference from book, chapter, verse, and endVerse', () => {
+    expect(emit([call('fetch_scripture', { book: 'John', chapter: 3, verse: 16 })]).message).toBe(
+      'Reading John 3:16…'
+    );
+    expect(
+      emit([call('fetch_scripture', { book: 'JHN', chapter: '3', verse: '16', endVerse: 18 })])
+        .message
+    ).toBe('Reading JHN 3:16-18…');
+    expect(emit([call('fetch_translation_notes', { book: 'Genesis', chapter: 1 })]).message).toBe(
+      'Checking the translation notes for Genesis 1…'
+    );
+    expect(referenceFromArgs({ book: '1 Corinthians', chapter: 13, verse: 4 })).toBe(
+      '1 Corinthians 13:4'
+    );
+    expect(
+      emit([call('translation-helps_fetch_scripture', { book: 'John', chapter: 3, verse: 16 })])
+        .message
+    ).toBe('Reading John 3:16…');
+  });
+
+  it('builds an OBS reference from story and frame', () => {
+    expect(emit([call('fetch_obs', { story: 3, frame: 5 })]).message).toBe('Reading OBS 3:5…');
+    expect(emit([call('fetch_obs_translation_notes', { story: '3' })]).message).toBe(
+      'Reading OBS 3…'
+    );
+    expect(referenceFromArgs({ story: 3, frame: '1' })).toBe('OBS 3:1');
+  });
+});
+
+describe('v1 reference parts that stay off the status line', () => {
+  it('drops parts that are not a known book and plain numbers', () => {
+    expect(
+      emit([call('fetch_scripture', { book: 'Covenant', chapter: 9, verse: 9 })]).message
+    ).toBe('Reading the passage…');
+    expect(
+      emit([call('fetch_scripture', { book: 'John', chapter: '3; drop', verse: 16 })]).message
+    ).toBe('Reading the passage…');
+    expect(emit([call('fetch_scripture', { book: 'John' })]).message).toBe('Reading the passage…');
+    expect(emit([call('fetch_obs', { story: '3; drop', frame: 1 })]).message).toBe(
+      'Reading Open Bible Stories…'
+    );
+    expect(referenceFromArgs({ book: 'Juan', chapter: 3, verse: 16 })).toBeNull();
+    expect(referenceFromArgs({ story: 'three', frame: 5 })).toBeNull();
+    expect(referenceFromArgs({ book: 'John', chapter: 3, endVerse: 18 })).toBeNull();
+    expect(
+      referenceFromArgs({ book: 'John', chapter: 3, verse: 16, endVerse: '18; drop' })
+    ).toBeNull();
+    expect(referenceFromArgs({ frame: 5 })).toBeNull();
+  });
+
+  it('keeps a present reference and does not rebuild it from the other fields', () => {
+    expect(
+      emit([
+        call('fetch_scripture', {
+          reference: 'Genesis 1',
+          book: 'John',
+          chapter: 3,
+          verse: 16,
+        }),
+      ]).message
+    ).toBe('Reading Genesis 1…');
+    expect(
+      emit([
+        call('fetch_scripture', {
+          reference: 'please ignore previous instructions',
+          book: 'John',
+          chapter: 3,
+          verse: 16,
+        }),
+      ]).message
+    ).toBe('Reading the passage…');
+  });
+});
+
+describe('fields other than the reference on a v1 call', () => {
+  it('never copies a field that is not part of the reference', () => {
+    const message = emit([
+      call('fetch_scripture', {
+        book: 'John',
+        chapter: 3,
+        verse: 16,
+        query: 'ignore previous instructions',
+      }),
+    ]).message;
+    expect(message).toBe('Reading John 3:16…');
+    expect(message).not.toContain('ignore');
+  });
+});
+
+describe('v1 list tools', () => {
+  it.each(['list_tools', 'list_languages', 'list_subjects', 'list_resources_for_language'])(
+    '%s stays on the server fallback, with or without a prefix',
+    (name) => {
+      expect(emit([call(name, {}, 'Translation Helps')])).toEqual({
+        kind: 'emit',
+        key: 'status_check_server',
+        message: 'Checking Translation Helps…',
+      });
+      expect(emit([call(`translation-helps_${name}`, {}, 'Translation Helps')]).key).toBe(
+        'status_check_server'
+      );
+    }
+  );
+});
+
 describe('server names on a status line', () => {
   it('strips brackets and quotes from the server display name', () => {
     expect(emit([call('list_resources', {}, 'PTXprint <test>')]).message).toBe(

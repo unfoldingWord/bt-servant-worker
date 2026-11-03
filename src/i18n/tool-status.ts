@@ -3,7 +3,9 @@
  *
  * The label is chosen from the tool name, never from model text. A short
  * Bible or OBS `reference` argument may be included when the book is one the
- * worker already recognizes. Anything else in the arguments is ignored. One
+ * worker already recognizes. A v1 call with no `reference` may be built from
+ * `book` / `chapter` / `verse` / `endVerse`, or from `story` / `frame`, and
+ * then checked the same way. Anything else in the arguments is ignored. One
  * turn says each label at most once, and waits about two seconds between
  * labels. A label held back by that gap is kept until the gap ends.
  */
@@ -102,6 +104,31 @@ const ACTIVITY_ENTRIES: readonly (readonly [string, ActivitySpec])[] = [
     'fetch_obs_study_manual',
     spec('status_read_obs_manual', 'tool_verb_read', 'tool_clause_obs_manual'),
   ],
+  // translation-helps v1. Same clauses as the v2 names above.
+  ['fetch_scripture', passageSpec()],
+  ['fetch_translation_notes', spec('status_check_notes', 'tool_verb_check', 'tool_clause_notes')],
+  ['fetch_translation_word', spec('status_lookup_words', 'tool_verb_lookup', 'tool_clause_words')],
+  // Word links are the passage's Translation Words index, not the notes.
+  [
+    'fetch_translation_word_links',
+    spec('status_lookup_words', 'tool_verb_lookup', 'tool_clause_words'),
+  ],
+  [
+    'fetch_translation_academy',
+    spec('status_read_academy', 'tool_verb_read', 'tool_clause_academy'),
+  ],
+  [
+    'fetch_translation_questions',
+    spec('status_check_questions', 'tool_verb_check', 'tool_clause_questions'),
+  ],
+  ['fetch_obs', obsSpec()],
+  ['fetch_obs_translation_notes', obsSpec()],
+  ['fetch_obs_translation_questions', obsSpec()],
+  ['fetch_obs_study_notes', obsSpec()],
+  ['fetch_obs_study_questions', obsSpec()],
+  ['fetch_obs_translation_word_links', obsSpec()],
+  // list_tools, list_languages, list_subjects, and list_resources_for_language
+  // stay off this map and use the server display name, like list_resources.
 ];
 
 const TOOL_ACTIVITIES: ReadonlyMap<string, ActivitySpec> = new Map(ACTIVITY_ENTRIES);
@@ -125,10 +152,87 @@ function obsSpec(): ActivitySpec {
   };
 }
 
-/** The `reference` argument when it is a short Bible or OBS reference; otherwise null. */
+/**
+ * A short Bible or OBS reference from the arguments, or null.
+ *
+ * A present `reference` is used as-is (and dropped when it is not safe).
+ * With no `reference`, v1's `book` / `chapter` / `verse` / `endVerse` or
+ * `story` / `frame` are joined and then checked by the same rule.
+ */
 export function referenceFromArgs(args: unknown): string | null {
-  if (!isRecord(args) || !Object.hasOwn(args, 'reference')) return null;
-  return safeReference(args.reference);
+  if (!isRecord(args)) return null;
+  if (Object.hasOwn(args, 'reference')) return safeReference(args.reference);
+  return safeReference(referenceFromParts(args));
+}
+
+function referenceFromParts(args: Record<string, unknown>): string | null {
+  if (hasBibleFields(args)) return bibleFromParts(args);
+  if (Object.hasOwn(args, 'story') || Object.hasOwn(args, 'frame')) return obsFromParts(args);
+  return null;
+}
+
+function hasBibleFields(args: Record<string, unknown>): boolean {
+  return (
+    Object.hasOwn(args, 'book') ||
+    Object.hasOwn(args, 'chapter') ||
+    Object.hasOwn(args, 'verse') ||
+    Object.hasOwn(args, 'endVerse')
+  );
+}
+
+/** `book` plus a chapter, optionally `verse` and `endVerse`. Numbers only. */
+function bibleFromParts(args: Record<string, unknown>): string | null {
+  const book = bookToken(args.book);
+  const chapter = optionalNumber(Object.hasOwn(args, 'chapter'), args.chapter);
+  const verse = optionalNumber(Object.hasOwn(args, 'verse'), args.verse);
+  const endVerse = optionalNumber(Object.hasOwn(args, 'endVerse'), args.endVerse);
+  if (!book || chapter === undefined || chapter === null) return null;
+  if (verse === null || endVerse === null) return null;
+  if (endVerse !== undefined && verse === undefined) return null;
+  return `${book} ${passageTail(chapter, verse, endVerse)}`;
+}
+
+function passageTail(
+  chapter: string,
+  verse: string | undefined,
+  endVerse: string | undefined
+): string {
+  if (verse === undefined) return chapter;
+  if (endVerse === undefined) return `${chapter}:${verse}`;
+  return `${chapter}:${verse}-${endVerse}`;
+}
+
+/** `story`, optionally `frame`. Both must be plain numbers. Rendered as OBS. */
+function obsFromParts(args: Record<string, unknown>): string | null {
+  const story = optionalNumber(Object.hasOwn(args, 'story'), args.story);
+  const frame = optionalNumber(Object.hasOwn(args, 'frame'), args.frame);
+  if (story === undefined || story === null || frame === null) return null;
+  if (frame === undefined) return `OBS ${story}`;
+  return `OBS ${story}:${frame}`;
+}
+
+function bookToken(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const text = value.trim().replace(/\s+/g, ' ');
+  return text.length > 0 ? text : null;
+}
+
+/** `undefined` when the field is absent, `null` when it is not a short integer. */
+function optionalNumber(present: boolean, value: unknown): string | null | undefined {
+  if (!present || value === undefined) return undefined;
+  return digitsOnly(value);
+}
+
+function digitsOnly(value: unknown): string | null {
+  if (typeof value === 'number') return integerDigits(value);
+  if (typeof value !== 'string' || !NUMBER.test(value.trim())) return null;
+  return value.trim();
+}
+
+function integerDigits(value: number): string | null {
+  if (!Number.isInteger(value) || value < 0) return null;
+  const text = String(value);
+  return NUMBER.test(text) ? text : null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
