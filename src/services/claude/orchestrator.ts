@@ -288,6 +288,17 @@ function isGetToolDefinitionsInput(input: unknown): input is { tool_names: strin
   );
 }
 
+/**
+ * Text turns must not stream a round until it is known to end the turn (#421).
+ * `accept` is what the SSE parser calls for each delta. Voice forwards
+ * immediately. Text swallows the delta; the iteration emits the finished
+ * text itself once, through `emit`.
+ */
+interface IterationProgress {
+  accept(text: string): void;
+  emit(text: string): void;
+}
+
 interface OrchestrationContext {
   client: Anthropic;
   /** The model REQUESTED for this turn — `routes[0].model`. The served model can differ (#403). */
@@ -330,6 +341,20 @@ interface OrchestrationContext {
   responses: string[];
   /** Index into responses[] where the most recent iteration's text begins. */
   lastIterationStartIndex: number;
+  /**
+   * Text turns hold model deltas until the iteration ends the turn (#421).
+   * Voice turns stream each delta as it arrives.
+   */
+  holdIterationText: boolean;
+  /**
+   * Text turns on a webhook periodic/sentence sender. Deltas reach that sender
+   * while it is held, so a throttle can elapse before the round ends without
+   * posting narration. SSE and the other modes leave this false.
+   */
+  progressGate: boolean;
+  /** Recovery call (#158): answer from what was gathered, and do not run tools. */
+  forceFinalAnswer: boolean;
+  iterationProgress: IterationProgress;
   codeExecTimeout: number;
   maxMcpCalls: number;
   maxMcpResponseSize: number;
@@ -412,6 +437,12 @@ export interface OrchestrationTelemetry {
   route: RouteId;
   /** MCP/host-function calls made this run. */
   mcpCallsMade: number;
+  /**
+   * Non-final text items removed before a text turn reached the user (#421).
+   * Lengths only — the text itself stays out of telemetry. Voice turns are 0.
+   */
+  droppedResponseCount: number;
+  droppedResponseLengths: number[];
   /**
    * Active mode slug at turn START. This is the correct — and only — attribution
    * key for "which mode governed this turn": the system prompt is built once,
@@ -498,9 +529,16 @@ function createTelemetryAccumulator(): TelemetryAccumulator {
 
 /** Result of an orchestration run. */
 export interface OrchestrationResult {
-  /** All text responses from all iterations (for display and history). */
+  /**
+   * Text the user should see. Text turns keep the final iteration only (#421);
+   * that array is what history stores and what `complete` sends. Voice turns
+   * still carry every iteration — TTS slices with `finalIterationStartIndex`.
+   */
   responses: string[];
-  /** Index into responses[] where the final iteration's text begins. */
+  /**
+   * Index into `responses` where the final iteration begins. 0 on text turns,
+   * because `responses` is already the slice. Voice keeps the pre-slice index.
+   */
   finalIterationStartIndex: number;
   /** Per-turn facts for telemetry. Always populated — see `OrchestrationTelemetry`. */
   telemetry: OrchestrationTelemetry;
@@ -1858,9 +1896,145 @@ function sanitizeAssistantContent(
   return cleaned;
 }
 
+function createIterationProgress(
+  hold: boolean,
+  forwardWhileHeld: boolean,
+  direct: ((text: string) => void) | undefined,
+  logger: RequestLogger
+): IterationProgress {
+  const emit = (text: string) => {
+    if (!text || !direct) return;
+    notifyCallback(logger, () => direct(text));
+  };
+  return {
+    // Text turns drop deltas unless a webhook gate is holding them. The
+    // finished iteration emits once, below, or releases that gate.
+    accept(text) {
+      if (!hold || forwardWhileHeld) emit(text);
+    },
+    emit,
+  };
+}
+
+function gateIterationProgress(options: OrchestratorOptions): {
+  callbacks: StreamCallbacks | undefined;
+  iterationProgress: IterationProgress;
+  holdIterationText: boolean;
+  progressGate: boolean;
+} {
+  const holdIterationText = options.isVoiceMessage !== true;
+  const progressGate = holdIterationText && !!options.callbacks?.holdProgress;
+  const iterationProgress = createIterationProgress(
+    holdIterationText,
+    progressGate,
+    options.callbacks?.onProgress,
+    options.logger
+  );
+  const callbacks = options.callbacks
+    ? { ...options.callbacks, onProgress: (text: string) => iterationProgress.accept(text) }
+    : undefined;
+  return { callbacks, iterationProgress, holdIterationText, progressGate };
+}
+
+/**
+ * The separator divides prose from prose. On a tools-first turn (iteration 0
+ * returns tool_use with no text block — the normal shape for a fresh account's
+ * first question) nothing has been streamed yet, so emitting it would put
+ * whitespace ahead of the first word (#410). Text turns swallow the call:
+ * their `onProgress` holds deltas, and only the final iteration is emitted.
+ */
+function prepareIteration(ctx: OrchestrationContext, iteration: number): void {
+  if (iteration === 0) return;
+  // Text turns swallow the separator: their progress is the final answer
+  // only, and a leading newline would land in that answer's cursor (#421).
+  if (!ctx.holdIterationText && ctx.callbacks && ctx.responses.length > 0) {
+    notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress('\n'));
+  }
+  ctx.emitStatus?.('status_preparing');
+}
+
+function iterationEndsTurn(
+  ctx: OrchestrationContext,
+  response: Anthropic.Message,
+  toolCalls: ToolUseBlock[]
+): boolean {
+  if (ctx.forceFinalAnswer) return true;
+  return response.stop_reason === 'end_turn' || toolCalls.length === 0;
+}
+
+function iterationStopReason(
+  ctx: OrchestrationContext,
+  response: Anthropic.Message,
+  toolCalls: ToolUseBlock[]
+): string {
+  if (ctx.forceFinalAnswer) return 'forced_answer';
+  if (response.stop_reason === 'end_turn' || toolCalls.length === 0) {
+    return response.stop_reason === 'end_turn' ? 'end_turn' : 'no_tool_calls';
+  }
+  return 'continuing';
+}
+
+/** Send the current iteration's text. No-op for voice, which already streamed it. */
+function emitHeldIteration(ctx: OrchestrationContext): void {
+  if (!ctx.holdIterationText) return;
+  if (ctx.progressGate) {
+    // Deltas were already forwarded into the held sender. Releasing posts
+    // only a throttle snapshot; emitting the join again would duplicate it.
+    ctx.callbacks?.holdProgress?.('release');
+    return;
+  }
+  ctx.iterationProgress.emit(ctx.responses.slice(ctx.lastIterationStartIndex).join('\n'));
+}
+
+function finishIteration(
+  ctx: OrchestrationContext,
+  iteration: number,
+  iterStart: number,
+  response: Anthropic.Message,
+  toolCalls: ToolUseBlock[]
+): boolean {
+  emitHeldIteration(ctx);
+  ctx.logger.log('iteration_end', {
+    iteration,
+    reason: iterationStopReason(ctx, response, toolCalls),
+    total_duration_ms: Date.now() - iterStart,
+  });
+  return true;
+}
+
+async function continueAfterTools(
+  ctx: OrchestrationContext,
+  response: Anthropic.Message,
+  toolCalls: ToolUseBlock[],
+  iteration: number,
+  iterStart: number
+): Promise<boolean> {
+  // This round is not the answer. Drop anything the sender is holding so a
+  // throttle that already elapsed cannot post the narration (#421).
+  if (ctx.progressGate) ctx.callbacks?.holdProgress?.('discard');
+  ctx.emitStatus?.('status_executing_tools', { n: toolCalls.length });
+  const toolResults = await executeIterationTools(toolCalls, ctx, iteration, iterStart);
+  ctx.messages.push({ role: 'assistant', content: response.content as Anthropic.ContentBlock[] });
+  ctx.messages.push({ role: 'user', content: toolResults });
+  // Text turns must not ship this round as a progress message (#421).
+  if (!ctx.holdIterationText) {
+    notifyCallback(ctx.logger, () =>
+      ctx.callbacks?.onIterationComplete?.(ctx.responses.join('\n'))
+    );
+  }
+  ctx.logger.log('iteration_end', {
+    iteration,
+    reason: 'continuing',
+    tool_calls_executed: toolCalls.length,
+    total_duration_ms: Date.now() - iterStart,
+  });
+  return false;
+}
+
 function processIteration(ctx: OrchestrationContext, iteration: number): Promise<boolean> {
   return withSpan('iteration', { iteration }, async () => {
     const iterStart = Date.now();
+    if (ctx.progressGate) ctx.callbacks?.holdProgress?.('hold');
     ctx.logger.log('iteration_start', { iteration, message_count: ctx.messages.length });
     ctx.logger.log('claude_request', {
       ...(ctx.turnId ? { turn_id: ctx.turnId } : {}),
@@ -1869,54 +2043,19 @@ function processIteration(ctx: OrchestrationContext, iteration: number): Promise
       system_stable_hash: ctx.systemStableHash,
       system_stable_chars: ctx.systemStable.length,
     });
-
-    if (iteration > 0) {
-      // The separator divides prose from prose. On a tools-first turn (iteration 0
-      // returns tool_use with no text block — the normal shape for a fresh account's
-      // first question) nothing has been streamed yet, so emitting it would put
-      // whitespace ahead of the first word: stream consumers that treat `progress`
-      // as "the answer has started" blank out for the whole tool phase, and the
-      // streamed text diverges from the final joined `responses` (#410).
-      // `ctx.responses` only ever holds non-whitespace blocks (extractTextResponses),
-      // so a non-empty array means real prose has already gone out.
-      if (ctx.callbacks && ctx.responses.length > 0) {
-        notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress('\n'));
-      }
-      // Status stays unconditional — the tool phase should still narrate itself.
-      ctx.emitStatus?.('status_preparing');
-    }
+    prepareIteration(ctx, iteration);
 
     const response = await callClaudeForIteration(ctx, iteration, iterStart);
     response.content = sanitizeAssistantContent(response.content, ctx.logger);
     const toolCalls = extractToolCalls(response.content);
     reportClaudeResponse(ctx, { iteration, response, toolCalls, iterStart });
-
     ctx.lastIterationStartIndex = ctx.responses.length;
     ctx.responses.push(...extractTextResponses(response.content));
 
-    if (response.stop_reason === 'end_turn' || toolCalls.length === 0) {
-      ctx.logger.log('iteration_end', {
-        iteration,
-        reason: response.stop_reason === 'end_turn' ? 'end_turn' : 'no_tool_calls',
-        total_duration_ms: Date.now() - iterStart,
-      });
-      return true;
+    if (iterationEndsTurn(ctx, response, toolCalls)) {
+      return finishIteration(ctx, iteration, iterStart, response, toolCalls);
     }
-
-    ctx.emitStatus?.('status_executing_tools', { n: toolCalls.length });
-    const toolResults = await executeIterationTools(toolCalls, ctx, iteration, iterStart);
-    ctx.messages.push({ role: 'assistant', content: response.content as Anthropic.ContentBlock[] });
-    ctx.messages.push({ role: 'user', content: toolResults });
-    notifyCallback(ctx.logger, () =>
-      ctx.callbacks?.onIterationComplete?.(ctx.responses.join('\n'))
-    );
-    ctx.logger.log('iteration_end', {
-      iteration,
-      reason: 'continuing',
-      tool_calls_executed: toolCalls.length,
-      total_duration_ms: Date.now() - iterStart,
-    });
-    return false;
+    return continueAfterTools(ctx, response, toolCalls, iteration, iterStart);
   });
 }
 
@@ -2182,12 +2321,39 @@ function defaultRouteHealthStore(env: Env, logger: RequestLogger): RouteHealthSt
   return createMemoryRouteHealthStore();
 }
 
+/** Text turns hold model text until the round is known to end (#421). */
+function iterationGateState(
+  options: OrchestratorOptions
+): Pick<
+  OrchestrationContext,
+  | 'holdIterationText'
+  | 'progressGate'
+  | 'forceFinalAnswer'
+  | 'iterationProgress'
+  | 'callbacks'
+  | 'emitStatus'
+> {
+  const gated = gateIterationProgress(options);
+  return {
+    holdIterationText: gated.holdIterationText,
+    progressGate: gated.progressGate,
+    forceFinalAnswer: false,
+    iterationProgress: gated.iterationProgress,
+    callbacks: gated.callbacks,
+    emitStatus: createStatusEmitter(
+      gated.callbacks,
+      options.preferences.response_language,
+      options.logger
+    ),
+  };
+}
+
 function createOrchestrationContext(
   userMessage: string,
   options: OrchestratorOptions,
   config: ReturnType<typeof parseEnvConfig>
 ): OrchestrationContext {
-  const { env, catalog, history, preferences, orgConfig, logger, callbacks } = options;
+  const { env, catalog, history, preferences, orgConfig, logger } = options;
   const locale = preferences.response_language;
   const rawPromptValues = options.resolvedPromptValues ?? DEFAULT_PROMPT_VALUES;
   const { values: strippedValues, languageDocument } = stripPromptComments(
@@ -2213,15 +2379,14 @@ function createOrchestrationContext(
     messages: buildSeedMessages(userMessage, options, llmMax),
     responses: [],
     lastIterationStartIndex: 0,
+    ...iterationGateState(options),
     ...executionLimits(config),
     mcpCallsMade: { count: 0 },
     turnId: options.turnId,
     telemetry: createTelemetryAccumulator(),
     catalog,
     logger,
-    callbacks,
     locale,
-    emitStatus: createStatusEmitter(callbacks, locale, logger),
     healthTracker: createHealthTracker(),
     memoryStore: options.memoryStore,
     modeContext: options.modeContext,
@@ -2258,38 +2423,38 @@ async function runOrchestrationLoop(
       max_iterations: maxIterations,
       last_iteration: lastIteration,
     });
-    // User-facing notice for hitting MAX_ORCHESTRATION_ITERATIONS. Without it
-    // the user sees only whatever Claude streamed in the final iteration —
-    // typically a mid-thought like "Let me fix by adding fontsize too:" — with
-    // no sign the bot has stopped (observed live 2026-04-30, request
-    // `de4c4d28-…`). Pushed through `onProgress` so it reaches the chat client
-    // now, AND appended to `ctx.responses` so it persists in history and the
-    // next turn does not see the partial mid-thought as the previous reply.
-    // Text: `notice_max_iterations` in `src/i18n/ui-strings.ts`, localized (#405).
-    const notice = uiString(ctx.locale, 'notice_max_iterations');
-    notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress(notice));
-    ctx.responses.push(notice);
+    // `notice_max_iterations` (localized, #405) tells the user the step limit
+    // stopped the turn. Voice already streamed the last round, so the notice
+    // follows it now. Text keeps that round — it is narration — and
+    // ensureUserFacingText answers once with tools off before the same notice
+    // (#421). The notice is stored on `responses` either way, so the next turn
+    // does not treat a partial mid-thought as the previous reply.
+    if (!ctx.holdIterationText) {
+      emitHeldIteration(ctx);
+      appendMaxIterationsNotice(ctx);
+    }
   }
   ctx.logger.log('orchestration_loop_end', {
     exit_reason: exitReason,
     last_iteration: lastIteration,
   });
   // Surface the loop's own locals onto the context so they can escape the run.
-  // Without this they reach only the metric below, which is a no-op on the
-  // alarm-drained path (see UserDO.alarm / runWithMetricsSuppressed).
+  // The metric is recorded after a possible recovery call (#158), which is a
+  // no-op on the alarm-drained path (see UserDO.alarm / runWithMetricsSuppressed).
   ctx.telemetry.iterations = lastIteration + 1;
   ctx.telemetry.exitReason = exitReason;
+}
 
-  // Iterations actually run this request (lastIteration is 0-based), labeled by how
-  // the loop exited — bounded reason enum, no ids.
-  recordMetric('orchestration_iterations', lastIteration + 1, {
-    reason: exitReason,
+/**
+ * Iterations actually run this request, labeled by how the loop exited.
+ * Bounded reason enum, no ids. Includes a #158 recovery call when one ran.
+ */
+function recordIterationMetric(ctx: OrchestrationContext): void {
+  recordMetric('orchestration_iterations', ctx.telemetry.iterations, {
+    reason: ctx.telemetry.exitReason,
     model: ctx.model,
     ...(ctx.activeMode ? { mode: ctx.activeMode } : {}),
   });
-
-  // Log health summary at end of orchestration
-  logOrchestrationSummary(ctx);
 }
 
 function logOrchestrationSummary(ctx: OrchestrationContext): void {
@@ -2372,19 +2537,138 @@ export async function orchestrate(
 
   try {
     await runOrchestrationLoop(ctx, config.maxIterations);
+    await ensureUserFacingText(ctx);
+    recordIterationMetric(ctx);
+    logOrchestrationSummary(ctx);
   } catch (error) {
     handleOrchestrationError(error, ctx.logger);
   }
 
+  return publishOrchestrationResult(ctx);
+}
+
+/**
+ * Recovery instruction for a turn whose final round had no text (#158).
+ * Appended to the last user turn so the API still sees alternating roles.
+ * The language clause matches the turn's `response_language`, the same value
+ * the system prompt uses when it asks the model to respond in that language.
+ */
+function forcedAnswerInstruction(locale: string): string {
+  return (
+    'Answer the user now from what you already gathered in this turn. ' +
+    'Do not call any tools. Do not describe your process. Write the answer itself. ' +
+    `Respond in ${locale}.`
+  );
+}
+
+function finalIterationTexts(ctx: OrchestrationContext): string[] {
+  return ctx.responses.slice(ctx.lastIterationStartIndex).filter((text) => text.trim());
+}
+
+function appendForcedAnswerInstruction(messages: Anthropic.MessageParam[], locale: string): void {
+  const instruction = forcedAnswerInstruction(locale);
+  const last = messages.at(-1);
+  if (!last || last.role !== 'user') {
+    messages.push({ role: 'user', content: instruction });
+    return;
+  }
+  if (typeof last.content === 'string') {
+    last.content = `${last.content}\n\n${instruction}`;
+    return;
+  }
+  last.content = [...last.content, { type: 'text', text: instruction }];
+}
+
+function appendMaxIterationsNotice(ctx: OrchestrationContext): void {
+  const notice = uiString(ctx.locale, 'notice_max_iterations');
+  ctx.iterationProgress.emit(notice);
+  ctx.responses.push(notice);
+}
+
+function appendEmptyAnswer(ctx: OrchestrationContext): void {
+  const apology = uiString(ctx.locale, 'notice_empty_answer');
+  ctx.logger.warn('empty_final_answer', {
+    iterations: ctx.telemetry.iterations,
+    recovery: 'apology',
+    response_chars: apology.length,
+  });
+  ctx.lastIterationStartIndex = ctx.responses.length;
+  ctx.responses.push(apology);
+  ctx.iterationProgress.emit(apology);
+}
+
+async function runForcedAnswer(ctx: OrchestrationContext): Promise<void> {
+  appendForcedAnswerInstruction(ctx.messages, ctx.locale);
+  const savedTools = ctx.tools;
+  ctx.tools = [];
+  ctx.forceFinalAnswer = true;
+  const iteration = ctx.telemetry.iterations;
+  ctx.logger.log('empty_final_answer', { recovery: 'forced_reply', iteration });
+  try {
+    await processIteration(ctx, iteration);
+    ctx.telemetry.iterations = iteration + 1;
+  } finally {
+    ctx.forceFinalAnswer = false;
+    ctx.tools = savedTools;
+  }
+}
+
+/**
+ * Text turns must not end on narration (#158, #421).
+ *
+ * One extra model call, with tools off, when the final slice is empty. That
+ * call does not count against `MAX_ORCHESTRATION_ITERATIONS` and runs at most
+ * once. Hitting the cap is the same shape: the unfinished round is narration,
+ * so it is dropped, the same call answers, and `notice_max_iterations` follows
+ * the answer. An empty recovery sends the apology instead of the dropped text.
+ * Voice is unchanged: TTS already skips an empty final slice.
+ */
+async function ensureUserFacingText(ctx: OrchestrationContext): Promise<void> {
+  if (!ctx.holdIterationText) return;
+  const capped = ctx.telemetry.exitReason === 'max_iterations';
+  if (capped) {
+    // Leave the unfinished round in `responses` ahead of the cut so the drop
+    // is counted. Do not emit it.
+    ctx.lastIterationStartIndex = ctx.responses.length;
+  }
+  if (finalIterationTexts(ctx).length === 0) {
+    await runForcedAnswer(ctx);
+    if (finalIterationTexts(ctx).length === 0) appendEmptyAnswer(ctx);
+  }
+  if (capped) appendMaxIterationsNotice(ctx);
+}
+
+/**
+ * What history stores and what `complete` sends.
+ *
+ * Dropping the earlier rounds changes follow-up turns: the next user message
+ * sees only the final answer as the assistant's previous turn. Tool results
+ * were never stored in history, so that part is unchanged. A follow-up can
+ * no longer continue from a "let me look that up" line that was the only
+ * text the user had been shown.
+ */
+function publishOrchestrationResult(ctx: OrchestrationContext): OrchestrationResult {
+  const dropped = ctx.holdIterationText ? ctx.responses.slice(0, ctx.lastIterationStartIndex) : [];
+  if (ctx.holdIterationText) {
+    ctx.logger.log('intermediate_responses_dropped', {
+      count: dropped.length,
+      lengths: dropped.map((text) => text.length),
+    });
+  }
   return {
-    responses: ctx.responses,
-    finalIterationStartIndex: ctx.lastIterationStartIndex,
-    telemetry: buildOrchestrationTelemetry(ctx),
+    responses: ctx.holdIterationText
+      ? ctx.responses.slice(ctx.lastIterationStartIndex)
+      : ctx.responses,
+    finalIterationStartIndex: ctx.holdIterationText ? 0 : ctx.lastIterationStartIndex,
+    telemetry: buildOrchestrationTelemetry(ctx, dropped),
   };
 }
 
 /** Collapse the mutable accumulator plus static context into the exported shape. */
-function buildOrchestrationTelemetry(ctx: OrchestrationContext): OrchestrationTelemetry {
+function buildOrchestrationTelemetry(
+  ctx: OrchestrationContext,
+  dropped: string[]
+): OrchestrationTelemetry {
   return {
     model: ctx.model,
     iterations: ctx.telemetry.iterations,
@@ -2398,6 +2682,8 @@ function buildOrchestrationTelemetry(ctx: OrchestrationContext): OrchestrationTe
     mode: ctx.activeMode,
     modeSwitchedTo: ctx.telemetry.modeSwitchedTo,
     toolCalls: ctx.telemetry.toolCalls,
+    droppedResponseCount: dropped.length,
+    droppedResponseLengths: dropped.map((text) => text.length),
   };
 }
 

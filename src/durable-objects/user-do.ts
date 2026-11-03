@@ -603,6 +603,10 @@ function buildChatTurnPayload(
     exit_reason: turn.orchestration.exitReason,
     stop_reason: turn.orchestration.finalStopReason,
     mcp_calls_made: turn.orchestration.mcpCallsMade,
+    // #421: how much non-final text was kept off the user-facing reply.
+    // Lengths only — the narration itself is not telemetry.
+    dropped_response_count: turn.orchestration.droppedResponseCount,
+    dropped_response_lengths: turn.orchestration.droppedResponseLengths,
     input_tokens: usage.input_tokens,
     output_tokens: usage.output_tokens,
     cache_creation_input_tokens: usage.cache_creation_input_tokens,
