@@ -417,27 +417,22 @@ export class PartnerKeyLedger {
    * Schedule the alarm for the earliest owed work: a retry
    * (PROJECTION_RETRY_MS) while any `proj:` marker remains, and each settle
    * re-put's due time. Only ever moves an existing alarm EARLIER; with nothing
-   * owed at all, the alarm is dropped.
+   * owed at all, the alarm is dropped. Returns whether anything is owed (the
+   * one place that question is answered; the DO's failed-alarm path calls
+   * this too).
    */
-  private async armAlarm(now: number): Promise<void> {
+  async armAlarm(now = Date.now()): Promise<boolean> {
     const dues = [...(await this.listSettles()).values()].map((m) => settleWake(m, now));
     const owed = await this.storage.list({ prefix: PENDING_PREFIX, limit: 1 });
     if (owed.size > 0) dues.push(now + PROJECTION_RETRY_MS);
     if (dues.length === 0) {
       await this.storage.deleteAlarm();
-      return;
+      return false;
     }
     const due = Math.min(...dues);
     const existing = await this.storage.getAlarm();
     if (existing === null || existing > due) await this.storage.setAlarm(due);
-  }
-
-  /** True while any projection or settle re-put is owed (the alarm must stay scheduled). */
-  async hasOwedProjections(): Promise<boolean> {
-    for (const prefix of [PENDING_PREFIX, SETTLE_PREFIX]) {
-      if ((await this.storage.list({ prefix, limit: 1 })).size > 0) return true;
-    }
-    return false;
+    return true;
   }
 
   /** Every `proj:` marker, with the request id to log its retry under. */
@@ -510,8 +505,8 @@ export class PartnerKeyLedger {
 
   /** The entries among `entries` whose KV projection is still owed. */
   private async owedAmong(entries: LedgerEntry[]): Promise<LedgerEntry[]> {
-    const markers = await this.storage.get(entries.map((e) => pendingKey(e.record.id)));
-    return entries.filter((e) => markers.has(pendingKey(e.record.id)));
+    const owedIds = new Set((await this.listOwed()).map((o) => o.id));
+    return entries.filter((e) => owedIds.has(e.record.id));
   }
 
   /**

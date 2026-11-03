@@ -18,7 +18,7 @@
  */
 
 import type { Env } from '../config/types.js';
-import { PartnerKeyLedger, PROJECTION_RETRY_MS } from '../services/partner-keys/ledger.js';
+import { PartnerKeyLedger } from '../services/partner-keys/ledger.js';
 import {
   flushLogTelemetry,
   flushMetricTelemetry,
@@ -118,10 +118,8 @@ export class PartnerKeyStoreDO {
   /** After a failed alarm: make sure a retry is still scheduled while anything is owed. */
   private async keepAlarmWhileOwed(logger: RequestLogger): Promise<void> {
     try {
-      const owed = await this.ledger(logger, ALARM_REQUEST_ID).hasOwedProjections();
-      if (owed && (await this.state.storage.getAlarm()) === null) {
-        await this.state.storage.setAlarm(Date.now() + PROJECTION_RETRY_MS);
-      }
+      const owed = await this.ledger(logger, ALARM_REQUEST_ID).armAlarm();
+      logger.log('partner_key_projection_alarm_rearmed', { owed });
     } catch (error) {
       logger.error('partner_key_projection_alarm_rearm_failed', error);
     }

@@ -74,7 +74,13 @@ import {
   upsertServer,
 } from './utils/mcp-servers.js';
 import { resolveOrgFromBody } from './utils/org.js';
-import { chatIdProblem, MAX_CHAT_ID_LENGTH, validateChatBody } from './utils/chat-validation.js';
+import {
+  chatIdProblem,
+  isReservedPartnerId,
+  MAX_CHAT_ID_LENGTH,
+  reservedPartnerIdError,
+  validateChatBody,
+} from './utils/chat-validation.js';
 import {
   applyPartnerChatPolicy,
   isPartnerRouteAllowed,
@@ -363,6 +369,15 @@ app.post('/api/v1/chat/stream', async (c) => {
 
 app.post('/api/v1/chat/callback', async (c) => {
   return handleChatRequest(c.req.raw, c.env, 'callback', c.var);
+});
+
+// The non-admin user routes never address a partner's DO: an id in the
+// reserved `partner:` form is a 400 here, the same rule validateChatBody
+// applies to chat bodies. Super-admin /api/v1/admin/* routes may still
+// address partner DOs (that is how support manages them).
+app.use('/api/v1/orgs/:org/users/:userId/*', async (c, next) => {
+  if (!isReservedPartnerId(c.req.param('userId'))) return next();
+  return c.json({ error: reservedPartnerIdError('userId') }, 400);
 });
 
 // User endpoints with org scope (new paths)
@@ -1946,6 +1961,11 @@ app.post(`${PARTNER_KEYS_BASE}/:keyId/_import-legacy-users`, async (c) => {
     const results = await importLegacyUsers(c.env, key, body.input, {
       logger,
       requestId: c.get('requestId'),
+      // Re-read from the store before each batch; a key that is gone counts as revoked.
+      currentStatus: async () => {
+        const now = await keyStore(c).get(keyId);
+        return now ? partnerKeyStatus(now, Date.now()) : 'revoked';
+      },
     });
     const counts = Object.fromEntries(
       results.reduce(

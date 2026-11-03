@@ -126,15 +126,43 @@ export interface ChatValidationOptions {
  * keys, and would otherwise address that partner's DOs directly.
  */
 function validateNoPartnerIds(body: ChatRequest): string | null {
-  const reserved = (value: unknown) =>
-    typeof value === 'string' && value.startsWith(PARTNER_CLIENT_ID_PREFIX);
-  if (reserved(body.user_id)) {
-    return `user_id must not start with '${PARTNER_CLIENT_ID_PREFIX}' (reserved for partner API keys)`;
-  }
-  if (reserved(groupSegment(body))) {
-    return `chat_id (joined with thread_id as in the group's name) must not start with '${PARTNER_CLIENT_ID_PREFIX}' (reserved for partner API keys)`;
+  if (isReservedPartnerId(body.user_id)) return reservedPartnerIdError('user_id');
+  if (isReservedPartnerId(groupSegment(body))) {
+    return reservedPartnerIdError("chat_id (joined with thread_id as in the group's name)");
   }
   return null;
+}
+
+/**
+ * THE reserved-id rule (admin-portal#354), shared by validateChatBody and the
+ * non-admin user routes: an id in the `partner:...` form names a partner's
+ * DO, and only the worker writes that form (for partner keys). Super-admin
+ * admin routes may still address those DOs; nothing else may.
+ */
+export function isReservedPartnerId(value: unknown): boolean {
+  return typeof value === 'string' && value.startsWith(PARTNER_CLIENT_ID_PREFIX);
+}
+
+/** The 400 message for a reserved id in `field`. */
+export function reservedPartnerIdError(field: string): string {
+  return `${field} must not start with '${PARTNER_CLIENT_ID_PREFIX}' (reserved for partner API keys)`;
+}
+
+/**
+ * Characters a user id may not contain if it must stay addressable as the
+ * `:userId` path segment of the user routes (`/orgs/:org/users/:userId/...`,
+ * admin and non-admin). Those routes have no character validator: Hono
+ * percent-decodes the segment, so any id works when its caller encodes it.
+ * But `/` `?` `#` `\` change the URL's structure and `%` changes its
+ * decoding whenever a caller builds the path without encoding the id (the
+ * admin portal's chat history/memory proxies do), so partner user ids
+ * exclude them.
+ */
+export const USER_PATH_UNSAFE_CHARACTERS: readonly string[] = ['/', '?', '#', '%', '\\'];
+
+/** True when `value` contains no USER_PATH_UNSAFE_CHARACTERS. */
+export function isPathAddressableUserId(value: string): boolean {
+  return !USER_PATH_UNSAFE_CHARACTERS.some((char) => value.includes(char));
 }
 
 /**

@@ -29,14 +29,18 @@
  */
 
 import type { Env } from '../../config/types.js';
-import { readBodyObject, type PartnerKeyRecord } from '../../types/partner-keys.js';
+import {
+  readBodyObject,
+  type PartnerKeyRecord,
+  type PartnerKeyStatus,
+} from '../../types/partner-keys.js';
 import type {
   UserDataExport,
   UserDataImportResult,
 } from '../../durable-objects/user-data-transfer.js';
 import type { RequestLogger } from '../../utils/logger.js';
 import { PARTNER_CLIENT_ID_PREFIX } from '../../utils/chat-validation.js';
-import { isValidPartnerIdentifier, scopePartnerSubject } from './policy.js';
+import { isValidPartnerIdentifier, isValidPartnerUserId, scopePartnerSubject } from './policy.js';
 
 export const MAX_LEGACY_IMPORT_USERS = 100;
 const MAX_LEGACY_CLIENT_ID_LENGTH = 64;
@@ -53,6 +57,8 @@ export type LegacyImportStatus =
   | 'destination_not_empty'
   | 'destination_busy'
   | 'source_busy'
+  | 'key_revoked'
+  | 'key_expired'
   | 'failed';
 
 export type LegacyImportResult = { userId: string; status: LegacyImportStatus; entries?: number };
@@ -71,7 +77,7 @@ function areImportUserIds(userIds: unknown): userIds is string[] {
     Array.isArray(userIds) &&
     userIds.length > 0 &&
     userIds.length <= MAX_LEGACY_IMPORT_USERS &&
-    userIds.every(isValidPartnerIdentifier) &&
+    userIds.every(isValidPartnerUserId) &&
     new Set(userIds).size === userIds.length
   );
 }
@@ -168,11 +174,25 @@ export async function importLegacyUsers(
   env: Env,
   key: PartnerKeyRecord,
   input: LegacyImportInput,
-  opts: { logger: RequestLogger; requestId: string }
+  opts: {
+    logger: RequestLogger;
+    requestId: string;
+    /** The key's status NOW (re-read before each batch). */
+    currentStatus: () => Promise<PartnerKeyStatus>;
+  }
 ): Promise<LegacyImportResult[]> {
   const ctx = { env, key, legacyClientId: input.legacyClientId, requestId: opts.requestId };
   const results: LegacyImportResult[] = [];
   for (let i = 0; i < input.userIds.length; i += IMPORT_CONCURRENCY) {
+    // A revoke (or the grace running out) during a long import stops it:
+    // the users not yet copied are reported `key_revoked` / `key_expired`.
+    const status = await opts.currentStatus();
+    if (status !== 'active') {
+      opts.logger.warn('partner_key_legacy_import_stopped', { key_id: key.id, status });
+      const stopped = `key_${status}` as const;
+      results.push(...input.userIds.slice(i).map((userId) => ({ userId, status: stopped })));
+      break;
+    }
     const batch = input.userIds.slice(i, i + IMPORT_CONCURRENCY);
     const settled = await Promise.allSettled(batch.map((userId) => copyOneUser(ctx, userId)));
     settled.forEach((outcome, j) => {

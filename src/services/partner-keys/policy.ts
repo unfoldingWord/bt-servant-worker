@@ -22,7 +22,13 @@
 import type { PartnerKeyRecord } from '../../types/partner-keys.js';
 import type { ChatRequest } from '../../types/engine.js';
 import { codePointLength, hasLineBreakOrControl } from '../../types/single-line.js';
-import { chatIdProblem, MAX_CHAT_ID_LENGTH, partnerClientId } from '../../utils/chat-validation.js';
+import {
+  chatIdProblem,
+  isPathAddressableUserId,
+  MAX_CHAT_ID_LENGTH,
+  partnerClientId,
+  USER_PATH_UNSAFE_CHARACTERS,
+} from '../../utils/chat-validation.js';
 
 /** Who made an /api/* request, as established by the auth middleware. */
 export type Principal = { kind: 'internal' } | { kind: 'partner'; key: PartnerKeyRecord };
@@ -121,9 +127,6 @@ function checkAudio(body: Record<string, unknown>): PartnerPolicyResult | null {
   );
 }
 
-/** Max length of a partner-supplied identifier (user_id, chat_id, thread_id), in code points. */
-export const MAX_PARTNER_ID_LENGTH = 256;
-
 /**
  * A partner's chat_id / thread_id name a group DO and must stay manageable
  * through the admin group routes, so they use the characters those routes
@@ -141,7 +144,7 @@ function maxGroupIdLength(field: 'chat_id' | 'thread_id', key: PartnerKeyRecord)
 }
 
 /**
- * A non-empty single-line string of at most MAX_PARTNER_ID_LENGTH code
+ * A non-empty single-line string of at most MAX_CHAT_ID_LENGTH (256) code
  * points, with no leading or trailing whitespace (refused, never trimmed:
  * ` alice` and `alice` would otherwise be two different users).
  */
@@ -150,8 +153,27 @@ export function isValidPartnerIdentifier(value: unknown): value is string {
     typeof value === 'string' &&
     value.length > 0 &&
     value.trim() === value &&
-    codePointLength(value) <= MAX_PARTNER_ID_LENGTH &&
+    codePointLength(value) <= MAX_CHAT_ID_LENGTH &&
     !hasLineBreakOrControl(value)
+  );
+}
+
+/**
+ * A partner user_id: a valid identifier that also stays addressable as the
+ * `:userId` segment of the user routes (no USER_PATH_UNSAFE_CHARACTERS).
+ */
+export function isValidPartnerUserId(value: unknown): value is string {
+  return isValidPartnerIdentifier(value) && isPathAddressableUserId(value);
+}
+
+/** user_id beyond the general rule: addressable in the user routes. */
+function checkUserIdPath(value: unknown): PartnerPolicyResult | null {
+  if (typeof value !== 'string' || isPathAddressableUserId(value)) return null;
+  const listed = USER_PATH_UNSAFE_CHARACTERS.map((char) => `'${char}'`).join(', ');
+  return reject(
+    400,
+    'partner_user_id',
+    `user_id must not contain ${listed}: it must stay addressable in the /users/:userId routes`
   );
 }
 
@@ -166,7 +188,7 @@ function checkIdentifier(
   return reject(
     400,
     `partner_${field}`,
-    `${field} ${required ? 'is required and ' : ''}must be a non-empty single-line string of at most ${MAX_PARTNER_ID_LENGTH} characters, without leading or trailing whitespace`
+    `${field} ${required ? 'is required and ' : ''}must be a non-empty single-line string of at most ${MAX_CHAT_ID_LENGTH} characters, without leading or trailing whitespace`
   );
 }
 
@@ -198,6 +220,7 @@ function checkIdentifiers(
 ): PartnerPolicyResult | null {
   return (
     checkIdentifier(body.user_id, 'user_id', true) ??
+    checkUserIdPath(body.user_id) ??
     checkIdentifier(body.chat_id, 'chat_id', false) ??
     checkIdentifier(body.thread_id, 'thread_id', false) ??
     checkGroupId(body.chat_id, 'chat_id', key) ??

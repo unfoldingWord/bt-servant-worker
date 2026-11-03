@@ -9,7 +9,6 @@
 import { describe, expect, it } from 'vitest';
 import {
   applyPartnerChatPolicy,
-  MAX_PARTNER_ID_LENGTH,
   MAX_PARTNER_SPEAKER_LENGTH,
   isPartnerRouteAllowed,
   principalKeyId,
@@ -25,7 +24,7 @@ import {
   sanitizeSpeaker,
   speakerPrefix,
 } from '../../src/services/claude/system-prompt.js';
-import { validateChatBody } from '../../src/utils/chat-validation.js';
+import { MAX_CHAT_ID_LENGTH, validateChatBody } from '../../src/utils/chat-validation.js';
 import type { ChatRequest } from '../../src/types/engine.js';
 import {
   DEFAULT_ROTATION_GRACE_SECONDS,
@@ -356,10 +355,10 @@ describe('toPublicPartnerKey', () => {
 describe('partner identifiers are bounded and single-line', () => {
   it.each([
     [{ user_id: 'a\nb' }, 'partner_user_id'],
-    [{ user_id: 'u'.repeat(MAX_PARTNER_ID_LENGTH + 1) }, 'partner_user_id'],
+    [{ user_id: 'u'.repeat(MAX_CHAT_ID_LENGTH + 1) }, 'partner_user_id'],
     [{ chat_id: 'g\r1' }, 'partner_chat_id'],
     [{ thread_id: 't\u2028x' }, 'partner_thread_id'],
-    [{ thread_id: 't'.repeat(MAX_PARTNER_ID_LENGTH + 1) }, 'partner_thread_id'],
+    [{ thread_id: 't'.repeat(MAX_CHAT_ID_LENGTH + 1) }, 'partner_thread_id'],
   ])('rejects %o', (fields, reason) => {
     expect(applyPartnerChatPolicy(chat(fields), KEY)).toMatchObject({
       ok: false,
@@ -368,7 +367,7 @@ describe('partner identifiers are bounded and single-line', () => {
   });
 
   it('counts the length cap in code points (an astral id of 256 code points is fine)', () => {
-    const astral = '\u{1F600}'.repeat(MAX_PARTNER_ID_LENGTH);
+    const astral = '\u{1F600}'.repeat(MAX_CHAT_ID_LENGTH);
     expect(applyPartnerChatPolicy(chat({ user_id: astral }), KEY).ok).toBe(true);
   });
 
@@ -652,5 +651,23 @@ describe('validateChatBody: partner-form ids are reserved for partner callers', 
       validateChatBody(body({ user_id: 'partner:pk_1:u1', _caller: 'partner' }), 'final')
     ).toBeNull();
     expect(validateChatBody(body({ user_id: 'x-partner:u1' }), 'final')).toBeNull();
+  });
+});
+
+describe('partner user_id stays addressable in the /users/:userId routes', () => {
+  it.each(['a/b', 'a?b', 'a#b', '50%', 'a\\b'])('refuses %s with a clear 400', (userId) => {
+    const result = applyPartnerChatPolicy(chat({ user_id: userId }), KEY);
+    expect(result).toMatchObject({
+      ok: false,
+      rejection: { status: 400, reason: 'partner_user_id' },
+    });
+    if (result.ok) return;
+    expect(result.rejection.error).toContain('/users/:userId');
+  });
+
+  it('accepts emails, phone numbers and UUIDs', () => {
+    for (const userId of ['ann@example.org', '+15551234567', crypto.randomUUID(), 'Ann B.']) {
+      expect(applyPartnerChatPolicy(chat({ user_id: userId }), KEY).ok).toBe(true);
+    }
   });
 });

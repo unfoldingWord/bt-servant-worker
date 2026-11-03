@@ -16,6 +16,16 @@
  *
  * Both routes are internal to the UserDO (a DO has no public address); the
  * worker reaches them only from the super-admin import route.
+ *
+ * The copy travels as JSON (export response, import request body), so every
+ * copied value must survive a JSON round-trip. Today every UserDO value is
+ * JSON data: strings, booleans, finite numbers, and plain objects/arrays of
+ * those (history, preferences, memory, prompt overrides, mode/language
+ * selections, welcome flags — all built from JSON request bodies or
+ * primitives). A value that is not (a Date, a Map, binary data, undefined,
+ * NaN...) would arrive changed, so the export refuses it instead: the copy
+ * fails for that user (`failed`, logged with the key name) and nothing is
+ * written.
  */
 
 import type { StoredIdentity } from '../types/engine.js';
@@ -89,6 +99,12 @@ export async function exportUserData(
     for (const range of copiedRanges()) {
       entries.push(...(await txn.list(range)));
     }
+    const unsafe = entries.find(([, value]) => !isJsonSafe(value));
+    if (unsafe) {
+      throw new Error(
+        `storage value '${unsafe[0]}' does not survive a JSON round-trip; not copied`
+      );
+    }
     const identity = (await txn.get<StoredIdentity>(IDENTITY_KEY)) ?? null;
     return { identity, entries };
   });
@@ -122,4 +138,19 @@ export async function importUserData(
     }
     return { ok: true, imported: copied.length };
   });
+}
+
+/**
+ * True when `value` is JSON data that a JSON round-trip returns unchanged:
+ * null, a string, a boolean, a finite number, or an array / plain object of
+ * those (no undefined members, no other prototypes).
+ */
+export function isJsonSafe(value: unknown): boolean {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return true;
+  if (typeof value === 'number') return Number.isFinite(value);
+  if (Array.isArray(value)) return value.every(isJsonSafe);
+  if (typeof value !== 'object') return false;
+  const proto: unknown = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) return false;
+  return Object.values(value).every((member) => member !== undefined && isJsonSafe(member));
 }

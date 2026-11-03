@@ -1074,3 +1074,57 @@ describe('legacy user import: never takes or leaves the turn lock', () => {
     expect((await historyOf(`user:${ORG}:partner:${key.userNamespace}:k2`)).total_count).toBe(1);
   });
 });
+
+describe('non-admin user routes refuse reserved partner ids; admin routes do not', () => {
+  const ORG_R = 'org-354-user-routes';
+  const userPath = (userId: string, rest: string) =>
+    `https://worker/api/v1/orgs/${ORG_R}/users/${encodeURIComponent(userId)}${rest}`;
+
+  it('GET/PUT preferences and GET history answer 400 for a partner-form userId', async () => {
+    const reserved = 'partner:pk_0123456789abcdef:u1';
+    const calls = [
+      SELF.fetch(userPath(reserved, '/history'), { headers: INTERNAL }),
+      SELF.fetch(userPath(reserved, '/preferences'), { headers: INTERNAL }),
+      SELF.fetch(userPath(reserved, '/preferences'), {
+        method: 'PUT',
+        headers: JSON_INTERNAL,
+        body: JSON.stringify({ response_language: 'en' }),
+      }),
+    ];
+    for (const res of await Promise.all(calls)) {
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toContain("'partner:'");
+    }
+    const normal = await SELF.fetch(userPath('ann', '/history'), { headers: INTERNAL });
+    expect(normal.status).toBe(200);
+  });
+
+  it('the super-admin admin routes still address a partner user (support)', async () => {
+    const reserved = 'partner:pk_0123456789abcdef:u1';
+    const url = `https://worker/api/v1/admin/orgs/${ORG_R}/users/${encodeURIComponent(reserved)}/memory`;
+    const res = await SELF.fetch(url, { headers: INTERNAL });
+    expect(res.status).toBe(200);
+  });
+});
+
+describe('legacy import refuses values that would not survive the JSON copy', () => {
+  it('reports failed (logged) and writes nothing when a source value is not JSON data', async () => {
+    expect((await internalChat('shema', 'j1', 'json source')).status).toBe(200);
+    await runInDurableObject(
+      env.USER_DO.get(env.USER_DO.idFromName(`user:${ORG}:j1`)),
+      (_i, state) => state.storage.put('odd_value', new Date(0))
+    );
+    const { key } = await createKey(ORG);
+    const res = await importUsers(key.id, { legacyClientId: 'shema', userIds: ['j1'] });
+    expect(((await res.json()) as { results: unknown[] }).results).toEqual([
+      { userId: 'j1', status: 'failed' },
+    ]);
+    expect((await historyOf(`user:${ORG}:partner:${key.userNamespace}:j1`)).total_count).toBe(0);
+  });
+
+  it('refuses a userId that would not be addressable in the user routes', async () => {
+    const { key } = await createKey(ORG);
+    const res = await importUsers(key.id, { legacyClientId: 'shema', userIds: ['a/b'] });
+    expect(res.status).toBe(400);
+  });
+});

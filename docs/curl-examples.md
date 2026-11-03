@@ -680,7 +680,13 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_
   transaction inside that user's DO, refused while a turn holds its lock or
   anything is queued; the import never takes the lock itself); retry later. `failed` is logged.
 - The key must be active: a revoked or expired key gets `409`
-  (`key_revoked` / `key_expired`).
+  (`key_revoked` / `key_expired`). The status is checked again before each
+  batch of 5 users: if the key is revoked (or its grace runs out) during the
+  import, the import stops and the users not yet copied are reported
+  `key_revoked` / `key_expired`.
+- Every copied value must survive a JSON round-trip (all UserDO data is JSON
+  today). If one does not, that user is `failed` (logged with the storage key)
+  and nothing is written.
 - The source is not changed or deleted. Each user is copied once, as it is
   at that moment: a turn the app sends with the shared key after that user's
   export is NOT copied. Cut-over runbook, in this order:
@@ -715,7 +721,9 @@ those two routes:
   Unicode line/paragraph separators and invisible format characters. Leading
   or trailing whitespace is refused, not trimmed. `chat_id` and `thread_id`
   may use only letters, digits, `_`, `.` and `-` (no `:`: the group
-  conversation name joins them with `:`). `chat_id` is stored with the
+  conversation name joins them with `:`). `user_id` may not contain `/`, `?`,
+  `#`, `%` or `\`, so every partner user stays addressable in the
+  `/users/:userId` routes. `chat_id` is stored with the
   key's prefix, so it may be at most 228 characters (256 minus the prefix);
   `thread_id` up to 256.
 - `speaker` may be at most 256 characters (longer is `400`,
@@ -739,7 +747,10 @@ those two routes:
   users can never reach another app's or a WhatsApp user's conversation.
   That form is reserved: an `ENGINE_API_KEY` caller sending a `user_id`, or a
   `chat_id` (joined with `thread_id` as `<chat_id>:<thread_id>`, as in the
-  group's name), that starts with `partner:` gets a `400`.
+  group's name), that starts with `partner:` gets a `400`; so does a
+  `partner:`-form `:userId` on the non-admin user routes
+  (`/api/v1/orgs/:org/users/:userId/preferences` and `/history`). The
+  super-admin `/api/v1/admin/...` routes may still address partner users.
 
 ```bash
 export PARTNER_KEY="bts_..."   # from the create response
