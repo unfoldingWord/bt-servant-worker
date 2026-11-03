@@ -639,13 +639,25 @@ describe('partner text never reaches the prompt raw', () => {
 });
 
 describe('speaker length', () => {
-  it('rejects a speaker over 256 characters; stores a long internal one cut to 64', async () => {
-    const { apiKey } = await createKey('org-354-speaker-len');
+  it('rejects a partner speaker over 256 characters; stores a long one cut to 64', async () => {
+    const { apiKey, key } = await createKey('org-354-speaker-len');
     const long = chatBody({ chat_type: 'group', chat_id: 'g1', speaker: 's'.repeat(257) });
     const res = await postChat(apiKey, long);
     expect(res.status).toBe(400);
     expect(((await res.json()) as { error: string }).error).toContain('speaker');
 
+    const ok = chatBody({ chat_type: 'group', chat_id: 'g2', speaker: `Ann\n${'n'.repeat(200)}` });
+    expect((await postChat(apiKey, ok)).status).toBe(200);
+    const group = `group:org-354-speaker-len:partner:${key.userNamespace}:g2`;
+    const stored = await runInDurableObject(
+      env.USER_DO.get(env.USER_DO.idFromName(group)),
+      async (_i, state) => state.storage.get<{ speaker?: string }[]>('history')
+    );
+    expect(stored?.at(-1)?.speaker).toBe(`Ann ${'n'.repeat(60)}`);
+  });
+
+  it('stores a long internal speaker exactly as sent (no change for internal clients)', async () => {
+    const speaker = `Ann [team]\n${'n'.repeat(400)}`;
     const internal = await SELF.fetch(CHAT, {
       method: 'POST',
       headers: JSON_INTERNAL,
@@ -656,7 +668,7 @@ describe('speaker length', () => {
           user_id: 'long-speaker',
           chat_type: 'group',
           chat_id: 'g-long',
-          speaker: `Ann\n${'n'.repeat(400)}`,
+          speaker,
         })
       ),
     });
@@ -665,7 +677,7 @@ describe('speaker length', () => {
       env.USER_DO.get(env.USER_DO.idFromName('group:internal-354-speaker-len:g-long')),
       async (_i, state) => state.storage.get<{ speaker?: string }[]>('history')
     );
-    expect(stored?.at(-1)?.speaker).toBe(`Ann ${'n'.repeat(60)}`);
+    expect(stored?.at(-1)?.speaker).toBe(speaker);
   });
 });
 
@@ -706,6 +718,15 @@ describe('internal callers cannot name partner users or groups', () => {
         org: 'org-354-reserved',
         chat_type: 'group',
         chat_id: `partner:${ns}:g1`,
+      }),
+      // The reviewer's input: joined as resolveDOId joins them, these name
+      // partner group `partner:<ns>:team1`.
+      chatBody({
+        client_id: 'telegram',
+        org: 'org-354-reserved',
+        chat_type: 'supergroup',
+        chat_id: 'partner',
+        thread_id: `${ns}:team1`,
       }),
     ];
     for (const body of bodies) {

@@ -519,8 +519,9 @@ unchanged. These admin endpoints accept **only** `ENGINE_API_KEY`.
 - **Tag.** The last 11 characters are an HMAC tag made with the
   `PARTNER_KEY_TAG_SECRET` secret. Auth checks it before any KV read, so a
   random or guessed token never costs a lookup. Without that secret partner
-  keys can be neither issued nor used, and changing it invalidates every
-  issued key.
+  keys can be neither issued nor used (every partner token gets `403 Invalid
+API key`, and the misconfiguration is logged once per isolate), and
+  changing it invalidates every issued key.
 - List and get return the record (`id`, `prefix`, `name`, `app`, `org`,
   `createdBy`, `createdAt`, `scopes`, `userNamespace`, `status`, and when set
   `revokedAt`, `revokedBy`, `rotatedFrom`, `rotatedTo`, `termsVersion`,
@@ -718,10 +719,10 @@ those two routes:
   key's prefix, so it may be at most 228 characters (256 minus the prefix);
   `thread_id` up to 256.
 - `speaker` may be at most 256 characters (longer is `400`,
-  `partner_speaker`). It then gets the same treatment as for every other
-  client: brackets removed, line breaks and controls flattened to one space,
-  and capped at 64 characters before it is stored, logged or reaches the
-  prompt.
+  `partner_speaker`). A partner's speaker is then normalized before it is
+  stored, logged or reaches the prompt: brackets removed, line breaks and
+  controls flattened to one space, capped at 64 characters. (Internal
+  clients' speakers are stored as sent; the prompt sanitizes every speaker.)
 - `progress_callback_url` (and the other callback fields) are refused (`400`,
   the existing `/chat` and `/chat/stream` validation, worded for partners as
   "progress callbacks are not available with partner API keys").
@@ -736,8 +737,9 @@ those two routes:
 - Inside the worker `user_id` becomes
   `partner:<userNamespace>:<user_id>` (and `chat_id` likewise), so a partner's
   users can never reach another app's or a WhatsApp user's conversation.
-  That form is reserved: an `ENGINE_API_KEY` caller sending a `user_id` or
-  `chat_id` that starts with `partner:` gets a `400`.
+  That form is reserved: an `ENGINE_API_KEY` caller sending a `user_id`, or a
+  `chat_id` (joined with `thread_id` as `<chat_id>:<thread_id>`, as in the
+  group's name), that starts with `partner:` gets a `400`.
 
 ```bash
 export PARTNER_KEY="bts_..."   # from the create response

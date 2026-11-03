@@ -22,11 +22,7 @@
 import type { PartnerKeyRecord } from '../../types/partner-keys.js';
 import type { ChatRequest } from '../../types/engine.js';
 import { codePointLength, hasLineBreakOrControl } from '../../types/single-line.js';
-import {
-  CHAT_ID_PATTERN,
-  MAX_CHAT_ID_LENGTH,
-  partnerClientId,
-} from '../../utils/chat-validation.js';
+import { chatIdProblem, MAX_CHAT_ID_LENGTH, partnerClientId } from '../../utils/chat-validation.js';
 
 /** Who made an /api/* request, as established by the auth middleware. */
 export type Principal = { kind: 'internal' } | { kind: 'partner'; key: PartnerKeyRecord };
@@ -181,16 +177,14 @@ function checkGroupId(
   key: PartnerKeyRecord
 ): PartnerPolicyResult | null {
   if (typeof value !== 'string') return null;
-  if (!CHAT_ID_PATTERN.test(value) || value.includes(':')) {
-    return reject(
-      400,
-      `partner_${field}`,
-      `${field} may contain only letters, digits, '_', '.' and '-' (no ':' or other characters)`
-    );
-  }
   const max = maxGroupIdLength(field, key);
-  if (value.length <= max) return null;
-  return reject(400, `partner_${field}`, `${field} must be at most ${max} characters`);
+  const problem = chatIdProblem(value, { maxLength: max, allowColon: false });
+  if (problem === null) return null;
+  const error =
+    problem === 'too_long'
+      ? `${field} must be at most ${max} characters`
+      : `${field} may contain only letters, digits, '_', '.' and '-' (no ':' or other characters)`;
+  return reject(400, `partner_${field}`, error);
 }
 
 /**
@@ -212,7 +206,7 @@ function checkIdentifiers(
   );
 }
 
-/** Longest `speaker` a partner may send (code points); it is then cut to 64 for everyone. */
+/** Longest `speaker` a partner may send (code points); the UserDO then stores it cut to 64. */
 export const MAX_PARTNER_SPEAKER_LENGTH = 256;
 
 /**
@@ -241,7 +235,7 @@ function checkSpeakerType(speaker: unknown): PartnerPolicyResult | null {
  * - org forced to the key's org; client_id set by the server;
  * - user_id / chat_id namespaced;
  * - org_id, voice_format (no TTS for partners) and a null chat_id dropped.
- * `speaker` is not special-cased: sanitizeSpeaker flattens it for every caller.
+ * `speaker` is bounded here (256); the UserDO normalizes a partner's speaker (normalizeSpeaker).
  */
 export function applyPartnerChatPolicy(
   raw: Record<string, unknown>,

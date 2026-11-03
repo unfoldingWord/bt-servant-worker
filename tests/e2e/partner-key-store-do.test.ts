@@ -511,3 +511,73 @@ describe('a timed-out put that lands late is overwritten by the settle re-puts',
     expect(await withLedger(async (_l, s) => s.get(settle))).toBeUndefined();
   });
 });
+
+/** A ledger with a chosen KV, request id and logger, and a 20 ms KV timeout. */
+const ledgerAs = (
+  storage: DurableObjectStorage,
+  target: KVNamespace,
+  requestId: string,
+  logger = createMockLogger()
+) =>
+  new PartnerKeyLedger({
+    storage,
+    kv: target,
+    tagSecret: SECRET,
+    logger,
+    requestId,
+    kvTimeoutMs: 20,
+  });
+
+describe('settle bookkeeping: logging and request ids', () => {
+  it('logs a timed-out put when it finally lands, with key_id and the request id', async () => {
+    const late = latePutKv(kv);
+    const logger = createMockLogger();
+    const created = await withLedger((_l, s) =>
+      ledgerAs(s, late.kv, REQUEST_ID, logger).create(INPUT)
+    );
+    late.land();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(logger.warn).toHaveBeenCalledWith('partner_key_projection_late_settle', {
+      key_id: created.record.id,
+      request_id: REQUEST_ID,
+      outcome: 'stored',
+    });
+  });
+
+  it("a settle created by an alarm retry keeps the owing marker's request id", async () => {
+    const created = await withLedger((l) => l.create(INPUT), failingKv); // owed by REQUEST_ID
+    await withLedger((_l, s) =>
+      ledgerAs(s, hangingKv, 'alarm').retryProjections(loggersById().loggerFor)
+    );
+    const marker = await withLedger(async (_l, s) => s.get(`settle:${created.record.id}`));
+    expect(marker).toMatchObject({ step: 0, requestId: REQUEST_ID });
+  });
+});
+
+describe('settle re-puts run concurrently', () => {
+  it('runs due settle re-puts concurrently, not one at a time', async () => {
+    const first = await withLedger((_l, s) => ledgerAs(s, hangingKv, REQUEST_ID).create(INPUT));
+    const second = await withLedger((_l, s) => ledgerAs(s, hangingKv, REQUEST_ID).create(INPUT));
+    // Each put answers only once BOTH are in flight: one at a time would time out.
+    const waiting: (() => void)[] = [];
+    const pairKv = {
+      put: (key: string, value: string) =>
+        new Promise<void>((resolve) => {
+          waiting.push(() => {
+            kv.store.set(key, value);
+            resolve();
+          });
+          if (waiting.length === 2) waiting.splice(0).forEach((go) => go());
+        }),
+    } as unknown as KVNamespace;
+    const later = Date.now() + (SETTLE_DELAYS_MS[0] ?? 0) + 1000;
+    await withLedger((_l, s) =>
+      ledgerAs(s, pairKv, 'alarm').retryProjections(loggersById().loggerFor, later)
+    );
+    for (const created of [first, second]) {
+      expect(await projected(created.plaintext)).toEqual(created.record);
+      const marker = await withLedger(async (_l, s) => s.get(`settle:${created.record.id}`));
+      expect(marker).toMatchObject({ step: 1 });
+    }
+  });
+});

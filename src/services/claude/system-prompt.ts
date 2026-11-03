@@ -100,9 +100,10 @@ export function sanitizeSpeaker(name: unknown): string | undefined {
 }
 
 /**
- * The speaker as the UserDO stores and logs it, for EVERY caller: the same
- * flattening as sanitizeSpeaker (so at most 64 code points), but nothing to
- * show (blank, or not a string) → undefined, so no name is stored at all.
+ * A partner's speaker as the UserDO stores and logs it: the same flattening
+ * as sanitizeSpeaker (so at most 64 code points), but nothing to show (blank,
+ * or not a string) → undefined, so no name is stored at all. Internal
+ * callers' speaker is stored as sent (the prompt sanitizes it either way).
  */
 export function normalizeSpeaker(name: unknown): string | undefined {
   if (typeof name !== 'string') return undefined;

@@ -126,15 +126,45 @@ export interface ChatValidationOptions {
  * keys, and would otherwise address that partner's DOs directly.
  */
 function validateNoPartnerIds(body: ChatRequest): string | null {
-  const ids: [string, unknown][] = [
-    ['user_id', body.user_id],
-    ['chat_id', body.chat_id],
-  ];
-  for (const [field, value] of ids) {
-    if (typeof value === 'string' && value.startsWith(PARTNER_CLIENT_ID_PREFIX)) {
-      return `${field} must not start with '${PARTNER_CLIENT_ID_PREFIX}' (reserved for partner API keys)`;
-    }
+  const reserved = (value: unknown) =>
+    typeof value === 'string' && value.startsWith(PARTNER_CLIENT_ID_PREFIX);
+  if (reserved(body.user_id)) {
+    return `user_id must not start with '${PARTNER_CLIENT_ID_PREFIX}' (reserved for partner API keys)`;
   }
+  if (reserved(groupSegment(body))) {
+    return `chat_id (joined with thread_id as in the group's name) must not start with '${PARTNER_CLIENT_ID_PREFIX}' (reserved for partner API keys)`;
+  }
+  return null;
+}
+
+/**
+ * The group part of a group DO's name, joined exactly as resolveDOId joins
+ * it: `<chat_id>:<thread_id>` when a thread_id is given, else `<chat_id>`.
+ * Checked as a whole, so `chat_id: 'partner'` + `thread_id: '<ns>:g'` cannot
+ * name partner group `partner:<ns>:g` either.
+ */
+function groupSegment(body: ChatRequest): string | undefined {
+  if (typeof body.chat_id !== 'string') return undefined;
+  return body.thread_id ? `${body.chat_id}:${String(body.thread_id)}` : body.chat_id;
+}
+
+/** Why a chat_id / thread_id is unusable as a group DO name segment, or null. */
+export type ChatIdProblem = 'missing' | 'too_long' | 'invalid_characters';
+
+/**
+ * The ONE chat_id / thread_id shape check, shared by the admin group routes
+ * (validateChatIdParam) and the partner chat policy (checkGroupId): present,
+ * at most `maxLength` characters (MAX_CHAT_ID_LENGTH by default), and only
+ * CHAT_ID_PATTERN characters — minus ':' when `allowColon` is false.
+ */
+export function chatIdProblem(
+  value: string,
+  opts: { maxLength?: number; allowColon?: boolean } = {}
+): ChatIdProblem | null {
+  if (!value) return 'missing';
+  if (value.length > (opts.maxLength ?? MAX_CHAT_ID_LENGTH)) return 'too_long';
+  if (!CHAT_ID_PATTERN.test(value)) return 'invalid_characters';
+  if (opts.allowColon === false && value.includes(':')) return 'invalid_characters';
   return null;
 }
 

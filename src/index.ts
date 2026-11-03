@@ -74,7 +74,7 @@ import {
   upsertServer,
 } from './utils/mcp-servers.js';
 import { resolveOrgFromBody } from './utils/org.js';
-import { CHAT_ID_PATTERN, MAX_CHAT_ID_LENGTH, validateChatBody } from './utils/chat-validation.js';
+import { chatIdProblem, MAX_CHAT_ID_LENGTH, validateChatBody } from './utils/chat-validation.js';
 import {
   applyPartnerChatPolicy,
   isPartnerRouteAllowed,
@@ -253,20 +253,25 @@ async function authenticatePartner(
  * look-alike always gets "Invalid API key", never the "not permitted" answer
  * that would tell it the token's shape passed.
  */
+/** Whether this isolate has already logged the missing PARTNER_KEY_TAG_SECRET. */
+let tagSecretMissingLogged = false;
+
 async function partnerPreflight(c: Context<AppEnv>, token: string): Promise<Response | null> {
   if (!looksLikePartnerKey(token)) return rejectAuth(c, 403, 'invalid_token');
   const keyPrefix = { key_prefix: partnerKeyPrefix(token) };
   const secret = c.env.PARTNER_KEY_TAG_SECRET;
   if (!secret) {
-    c.get('logger').error(
-      'partner_key_tag_secret_missing',
-      new Error('PARTNER_KEY_TAG_SECRET unset')
-    );
-    countMetric('auth_rejections_total', {
-      reason: 'partner_tag_secret_missing',
-      status_code: 503,
-    });
-    return c.json({ error: 'Authentication temporarily unavailable' }, 503);
+    // Misconfiguration: no partner key can be verified, so none is valid.
+    // Logged as an error once per isolate (not once per request); each
+    // request is still an ordinary, counted auth rejection.
+    if (!tagSecretMissingLogged) {
+      tagSecretMissingLogged = true;
+      c.get('logger').error(
+        'partner_key_tag_secret_missing',
+        new Error('PARTNER_KEY_TAG_SECRET unset')
+      );
+    }
+    return rejectAuth(c, 403, 'partner_tag_secret_missing', keyPrefix);
   }
   if (!(await hasValidPartnerKeyTag(token, secret))) {
     return rejectAuth(c, 403, 'invalid_partner_key_tag', keyPrefix);
@@ -2573,10 +2578,10 @@ function doChatPathForTransport(transport: ChatTransport): string {
 
 /** Validate a chat_id or thread_id path parameter. Returns an error string or null. */
 function validateChatIdParam(value: string, paramName: string): string | null {
-  if (!value) return `${paramName} is required`;
-  if (value.length > MAX_CHAT_ID_LENGTH)
-    return `${paramName} must be <= ${MAX_CHAT_ID_LENGTH} characters`;
-  if (!CHAT_ID_PATTERN.test(value)) return `${paramName} contains invalid characters`;
+  const problem = chatIdProblem(value);
+  if (problem === 'missing') return `${paramName} is required`;
+  if (problem === 'too_long') return `${paramName} must be <= ${MAX_CHAT_ID_LENGTH} characters`;
+  if (problem === 'invalid_characters') return `${paramName} contains invalid characters`;
   return null;
 }
 

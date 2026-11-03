@@ -121,6 +121,7 @@ import {
 import {
   callerAllowsAudio,
   callerIsAdmin,
+  isPartnerCaller,
   isValidLanguageCode,
   validateChatBody,
 } from '../utils/chat-validation.js';
@@ -1045,12 +1046,16 @@ export class UserDO {
       return { error: Response.json({ error: validationError }, { status: 400 }) };
     }
 
-    // One normalized speaker (flattened, at most 64 code points, absent when
-    // blank or not a string) for everything downstream: history, logs, the
-    // queue, the voice-submission path and the prompt.
-    const speaker = normalizeSpeaker(body.speaker);
-    if (speaker === undefined) delete body.speaker;
-    else body.speaker = speaker;
+    // Partner callers only: one normalized speaker (flattened, at most 64 code
+    // points, absent when blank) for everything downstream — history, logs,
+    // the queue and the prompt. Internal callers' speaker is stored and logged
+    // exactly as sent, as before #354; the prompt still renders it through
+    // sanitizeSpeaker.
+    if (isPartnerCaller(body._caller)) {
+      const speaker = normalizeSpeaker(body.speaker);
+      if (speaker === undefined) delete body.speaker;
+      else body.speaker = speaker;
+    }
     return { body };
   }
 

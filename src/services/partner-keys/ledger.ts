@@ -70,6 +70,8 @@ export const KV_OP_TIMEOUT_MS = 10_000;
 /** When the alarm re-puts a key after its last KV timeout (see "Settling"). */
 export const SETTLE_DELAYS_MS: readonly number[] = [60_000, 300_000];
 const SETTLE_PREFIX = 'settle:';
+/** How many settle re-puts the alarm runs at once. */
+const SETTLE_CONCURRENCY = 10;
 /** Warning returned when a change is committed but auth (KV) does not have it yet. */
 export const AUTH_UPDATE_PENDING = 'auth_update_pending';
 
@@ -322,7 +324,7 @@ export class PartnerKeyLedger {
     const results = await Promise.allSettled(
       owed.map((o) => {
         const entry = entries.get(o.id);
-        return entry ? this.putProjection(entry) : Promise.resolve();
+        return entry ? this.putProjection(entry, o.requestId) : Promise.resolve();
       })
     );
     const failed = owed.filter((o, i) => {
@@ -335,51 +337,71 @@ export class PartnerKeyLedger {
       logger.log('partner_key_projection_retried', { key_id: o.id, found: entries.has(o.id) });
       return false;
     });
+    // A settle created here keeps the owing `proj:` marker's request id.
     await this.recordSettles(
-      owed.filter((_o, i) => isTimeout(results.at(i))).map((o) => o.id),
+      owed.filter((_o, i) => isTimeout(results.at(i))),
       now
     );
-    await this.deleteMany(owed.filter((o) => !failed.includes(o)).map((o) => pendingKey(o.id)));
+    const failedSet = new Set(failed);
+    await this.deleteMany(owed.filter((o) => !failedSet.has(o)).map((o) => pendingKey(o.id)));
     await this.runDueSettles(loggerFor, now);
     await this.armAlarm(now);
     return { retried: owed.length, remaining: failed.length };
   }
 
   /**
-   * Re-put the CURRENT record of every key whose settle re-put is due. A
-   * success advances the marker (cleared after the last delay); a timeout
-   * restarts it; any other failure leaves it for the next alarm.
+   * Re-put the CURRENT record of every key whose settle re-put is due,
+   * SETTLE_CONCURRENCY at a time. A success advances the marker (cleared
+   * after the last delay); a timeout restarts it; any other failure leaves
+   * it for the next alarm.
    */
   private async runDueSettles(
     loggerFor: (requestId: string) => RequestLogger,
     now: number
   ): Promise<void> {
     const due = [...(await this.listSettles())].filter(([, m]) => settleDueAt(m) <= now);
-    for (const [id, marker] of due) {
+    for (let i = 0; i < due.length; i += SETTLE_CONCURRENCY) {
+      const batch = due.slice(i, i + SETTLE_CONCURRENCY);
+      await Promise.allSettled(
+        batch.map(([id, marker]) => this.settleOne(id, marker, loggerFor(marker.requestId), now))
+      );
+    }
+  }
+
+  /** One settle re-put; never throws (its outcome is logged and recorded). */
+  private async settleOne(
+    id: string,
+    marker: SettleMarker,
+    logger: RequestLogger,
+    now: number
+  ): Promise<void> {
+    try {
       const entry = await this.get(id);
-      const logger = loggerFor(marker.requestId);
-      try {
-        if (entry) await this.putProjection(entry);
-        const step = marker.step + 1;
-        if (step < SETTLE_DELAYS_MS.length)
-          await this.storage.put(settleKey(id), { ...marker, step });
-        else await this.storage.delete(settleKey(id));
-        logger.log('partner_key_projection_settled', { key_id: id, step });
-      } catch (error) {
-        logger.error('partner_key_projection_settle_failed', error, { key_id: id });
-        if (error instanceof KvTimeoutError) await this.recordSettles([id], now);
+      if (entry) await this.putProjection(entry, marker.requestId);
+      const step = marker.step + 1;
+      if (step < SETTLE_DELAYS_MS.length) {
+        await this.storage.put(settleKey(id), { ...marker, step });
+      } else {
+        await this.storage.delete(settleKey(id));
+      }
+      logger.log('partner_key_projection_settled', { key_id: id, step });
+    } catch (error) {
+      logger.error('partner_key_projection_settle_failed', error, { key_id: id });
+      if (error instanceof KvTimeoutError) {
+        await this.recordSettles([{ id, requestId: marker.requestId }], now);
       }
     }
   }
 
-  /** Record (or restart) the settle obligation of each key whose KV put timed out. */
-  private async recordSettles(ids: string[], now: number): Promise<void> {
-    if (ids.length === 0) return;
-    const markers = await this.storage.get<SettleMarker>(ids.map(settleKey));
-    const fresh = ids.map((id) => {
-      const requestId = markers.get(settleKey(id))?.requestId ?? this.requestId;
-      return [settleKey(id), { at: now, step: 0, requestId } satisfies SettleMarker] as const;
-    });
+  /**
+   * Record (or restart) the settle obligation of each key whose KV put timed
+   * out, under the request that owes it.
+   */
+  private async recordSettles(owed: Owed[], now: number): Promise<void> {
+    const fresh = owed.map(
+      ({ id, requestId }) =>
+        [settleKey(id), { at: now, step: 0, requestId } satisfies SettleMarker] as const
+    );
     for (let i = 0; i < fresh.length; i += GET_BATCH) {
       await this.storage.put(Object.fromEntries(fresh.slice(i, i + GET_BATCH)));
     }
@@ -531,8 +553,12 @@ export class PartnerKeyLedger {
     try {
       const { failed, timedOut } = await this.putProjections(changed);
       const now = Date.now();
-      await this.recordSettles(timedOut, now);
-      const succeeded = changed.map((e) => e.record.id).filter((id) => !failed.includes(id));
+      await this.recordSettles(
+        timedOut.map((id) => ({ id, requestId: this.requestId })),
+        now
+      );
+      const failedSet = new Set(failed);
+      const succeeded = changed.map((e) => e.record.id).filter((id) => !failedSet.has(id));
       await this.deleteMany(succeeded.map(pendingKey));
       await this.armAlarm(now);
       return failed.length > 0 ? [AUTH_UPDATE_PENDING] : [];
@@ -551,7 +577,9 @@ export class PartnerKeyLedger {
   private async putProjections(
     entries: LedgerEntry[]
   ): Promise<{ failed: string[]; timedOut: string[] }> {
-    const results = await Promise.allSettled(entries.map((entry) => this.putProjection(entry)));
+    const results = await Promise.allSettled(
+      entries.map((entry) => this.putProjection(entry, this.requestId))
+    );
     const failed: string[] = [];
     const timedOut: string[] = [];
     for (const [i, result] of results.entries()) {
@@ -568,10 +596,23 @@ export class PartnerKeyLedger {
   /**
    * The auth projection of one key: its public record at `key:<sha256>`.
    * Rejects after `kvTimeoutMs` if KV has not answered (a projection failure).
+   * A put that timed out is still watched: when it finally settles or
+   * rejects, that is logged (`partner_key_projection_late_settle`) under the
+   * owing request id, so a late overwrite can be traced.
    */
-  private putProjection({ record, hash }: LedgerEntry): Promise<void> {
+  private putProjection({ record, hash }: LedgerEntry, requestId: string): Promise<void> {
     const put = this.kv.put(`${PARTNER_KEY_KV_PREFIX}${hash}`, JSON.stringify(record));
-    return withTimeout(put, this.kvTimeoutMs, 'KV put');
+    const fields = { key_id: record.id, request_id: requestId };
+    return withTimeout(put, this.kvTimeoutMs, 'KV put', (error) => {
+      if (error === undefined) {
+        this.logger.warn('partner_key_projection_late_settle', { ...fields, outcome: 'stored' });
+      } else {
+        this.logger.error('partner_key_projection_late_settle', error, {
+          ...fields,
+          outcome: 'rejected',
+        });
+      }
+    });
   }
 
   private async deleteMany(keys: string[]): Promise<void> {
@@ -595,11 +636,32 @@ function isTimeout(result: PromiseSettledResult<unknown> | undefined): boolean {
   return result?.status === 'rejected' && result.reason instanceof KvTimeoutError;
 }
 
-/** `op`, or a KvTimeoutError once `ms` pass without it settling (the timer is always cleared). */
-function withTimeout<T>(op: Promise<T>, ms: number, what: string): Promise<T> {
+/**
+ * `op`, or a KvTimeoutError once `ms` pass without it settling (the timer is
+ * always cleared). If it timed out, `onLate` is called once `op` finally
+ * settles: with no argument when it resolved, with the error when it rejected.
+ */
+function withTimeout<T>(
+  op: Promise<T>,
+  ms: number,
+  what: string,
+  onLate: (error?: unknown) => void
+): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
   const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => reject(new KvTimeoutError(`${what} timed out after ${ms} ms`)), ms);
+    timer = setTimeout(() => {
+      timedOut = true;
+      reject(new KvTimeoutError(`${what} timed out after ${ms} ms`));
+    }, ms);
   });
+  op.then(
+    () => {
+      if (timedOut) onLate();
+    },
+    (error: unknown) => {
+      if (timedOut) onLate(error);
+    }
+  );
   return Promise.race([op, timeout]).finally(() => clearTimeout(timer));
 }
