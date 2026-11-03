@@ -669,18 +669,62 @@ describe('speaker length', () => {
   });
 });
 
-describe('route check happens before the key lookup', () => {
-  it('a partner-shaped token on an admin route is refused as not permitted, logged by prefix', async () => {
-    const token = `bts_0000abcd_${'A'.repeat(43)}_${'A'.repeat(11)}`; // not a stored key
+describe('the route allowlist is checked only after the key is authenticated', () => {
+  it('a forged look-alike on an admin route gets Invalid API key, never "not permitted"', async () => {
+    const token = `bts_0000abcd_${'A'.repeat(43)}_${'A'.repeat(11)}`; // forged tag
     const res = await SELF.fetch(KEYS, { headers: { Authorization: `Bearer ${token}` } });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toEqual({ error: 'Invalid API key' });
+    expect(findLog(capture.warnLogs, 'auth_rejected')?.payload).toMatchObject({
+      reason: 'invalid_partner_key_tag',
+      key_prefix: 'bts_0000abcd',
+    });
+  });
+
+  it('a real partner key on an admin route is refused as not permitted, logged by key id', async () => {
+    const { apiKey, key } = await createKey('org-354-route');
+    const res = await SELF.fetch(KEYS, { headers: { Authorization: `Bearer ${apiKey}` } });
     expect(res.status).toBe(403);
     expect(await res.json()).toEqual({
       error: 'This API key is not permitted to call this endpoint',
     });
     expect(findLog(capture.warnLogs, 'auth_rejected')?.payload).toMatchObject({
       reason: 'partner_route_forbidden',
-      key_prefix: 'bts_0000abcd',
+      key_id: key.id,
     });
+  });
+});
+
+describe('internal callers cannot name partner users or groups', () => {
+  it('refuses a partner-form user_id or chat_id from an internal caller with 400', async () => {
+    const { key } = await createKey('org-354-reserved');
+    const ns = key.userNamespace;
+    const bodies = [
+      chatBody({ client_id: 'web', org: 'org-354-reserved', user_id: `partner:${ns}:alice` }),
+      chatBody({
+        client_id: 'telegram',
+        org: 'org-354-reserved',
+        chat_type: 'group',
+        chat_id: `partner:${ns}:g1`,
+      }),
+    ];
+    for (const body of bodies) {
+      const res = await SELF.fetch(CHAT, {
+        method: 'POST',
+        headers: JSON_INTERNAL,
+        body: JSON.stringify(body),
+      });
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toContain("'partner:'");
+    }
+    expect(capture.calls).toHaveLength(0);
+  });
+
+  it('the partner path still works (its prefix is added before validation)', async () => {
+    const { apiKey } = await createKey('org-354-reserved-ok');
+    const group = chatBody({ chat_type: 'group', chat_id: 'g1' });
+    expect((await postChat(apiKey, chatBody())).status).toBe(200);
+    expect((await postChat(apiKey, group)).status).toBe(200);
   });
 });
 

@@ -161,7 +161,7 @@ describe('applyPartnerChatPolicy refusals', () => {
       expect(result.ok).toBe(true);
       if (!result.ok) return;
       expect(result.body).not.toHaveProperty('voice_format');
-      expect(validateChatBody(result.body, 'final')).toBeNull();
+      expect(validateChatBody(result.body, 'final', { caller: 'partner' })).toBeNull();
     }
   );
 
@@ -171,8 +171,10 @@ describe('applyPartnerChatPolicy refusals', () => {
     const result = applyPartnerChatPolicy(chat({ progress_callback_url: 'https://x' }), KEY);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(validateChatBody(result.body, 'final')).toContain('progress_callback_url');
-    expect(validateChatBody(result.body, 'stream')).toContain('progress_callback_url');
+    for (const transport of ['final', 'stream'] as const) {
+      const error = validateChatBody(result.body, transport, { caller: 'partner' });
+      expect(error).toContain('progress_callback_url');
+    }
   });
 
   it.each([123, '', undefined, null])('rejects a non-string or empty user_id (%o)', (userId) => {
@@ -617,5 +619,38 @@ describe('speaker length', () => {
     for (const value of ['', '  \n ', 42, null, undefined]) {
       expect(normalizeSpeaker(value)).toBeUndefined();
     }
+  });
+});
+
+describe('validateChatBody: partner-form ids are reserved for partner callers', () => {
+  const body = (extra: Record<string, unknown>) =>
+    ({
+      client_id: 'web',
+      user_id: 'u1',
+      message: 'hi',
+      message_type: 'text',
+      ...extra,
+    }) as unknown as ChatRequest;
+
+  it('refuses them for an internal caller (explicit, from _caller, or by default)', () => {
+    const partnerUser = body({ user_id: 'partner:pk_1:u1' });
+    const partnerGroup = body({ chat_type: 'group', chat_id: 'partner:pk_1:g1' });
+    for (const caller of ['internal', undefined] as const) {
+      expect(validateChatBody(partnerUser, 'final', { caller })).toContain('user_id');
+      expect(validateChatBody(partnerGroup, 'final', { caller })).toContain('chat_id');
+    }
+    // An explicit internal caller wins over a body claiming to be a partner.
+    const spoofed = body({ user_id: 'partner:pk_1:u1', _caller: 'partner' });
+    expect(validateChatBody(spoofed, 'final', { caller: 'internal' })).toContain('user_id');
+  });
+
+  it('accepts them for a partner caller, and other ids for anyone', () => {
+    expect(
+      validateChatBody(body({ user_id: 'partner:pk_1:u1' }), 'final', { caller: 'partner' })
+    ).toBeNull();
+    expect(
+      validateChatBody(body({ user_id: 'partner:pk_1:u1', _caller: 'partner' }), 'final')
+    ).toBeNull();
+    expect(validateChatBody(body({ user_id: 'x-partner:u1' }), 'final')).toBeNull();
   });
 });

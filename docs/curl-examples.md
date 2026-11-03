@@ -680,8 +680,14 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_
   anything is queued; the import never takes the lock itself); retry later. `failed` is logged.
 - The key must be active: a revoked or expired key gets `409`
   (`key_revoked` / `key_expired`).
-- The source is not changed or deleted. Run the import at the switch: turns
-  the app still sends with the shared key afterwards are not copied.
+- The source is not changed or deleted. Each user is copied once, as it is
+  at that moment: a turn the app sends with the shared key after that user's
+  export is NOT copied. Cut-over runbook, in this order:
+  1. Stop the app's shared-key traffic (pause the app, or put it in
+     maintenance).
+  2. Run the import, and re-run it for any user reported `source_busy` /
+     `destination_busy` until each is `copied` (or a status you accept).
+  3. Switch the app to the partner key and resume traffic.
 - `userIds`: 1-100 distinct ids, each valid as a partner `user_id`.
 - Only shared-key users can be imported: a `legacyClientId` starting with
   `partner:`, or a `userId` containing `partner:`, is a `400`, so one
@@ -691,8 +697,10 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_
 
 A partner key may call **only** `POST /api/v1/chat` and
 `POST /api/v1/chat/stream`. Every other `/api/*` route answers `403`
-(`This API key is not permitted to call this endpoint`), checked before the
-key is even looked up. On those two routes:
+(`This API key is not permitted to call this endpoint`). That answer is given
+only once the key is authenticated (tag checked, key found and active); a
+forged or unknown look-alike gets `403 Invalid API key` on every route. On
+those two routes:
 
 - `org` / `org_id` may be omitted or `null` (the key's org applies) or equal
   the key's org; any other value is a `400`.
@@ -728,6 +736,8 @@ key is even looked up. On those two routes:
 - Inside the worker `user_id` becomes
   `partner:<userNamespace>:<user_id>` (and `chat_id` likewise), so a partner's
   users can never reach another app's or a WhatsApp user's conversation.
+  That form is reserved: an `ENGINE_API_KEY` caller sending a `user_id` or
+  `chat_id` that starts with `partner:` gets a `400`.
 
 ```bash
 export PARTNER_KEY="bts_..."   # from the create response

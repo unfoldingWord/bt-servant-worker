@@ -12,6 +12,9 @@
  *   proj:<key id>         → { requestId }      (KV projection still owed, and
  *                                                the request that owes it, so
  *                                                alarm retries log under it)
+ *   settle:<key id>       → { at, step, requestId } (a KV put for the key timed
+ *                                                out at `at` and may still land
+ *                                                late; see "Settling" below)
  *
  * Auth projection: chat-time auth must stay one fast KV read, so after each
  * committed change the ledger writes the record to API_KEYS `key:<sha256>` —
@@ -27,6 +30,16 @@
  * can turn the operation into an error: projection problems only add
  * `warnings: ['auth_update_pending']`. Auth sees the change within KV's
  * propagation window (~60s, misses cached too), as before.
+ *
+ * Settling: a KV put that times out (KV_OP_TIMEOUT_MS) is not cancelled — it
+ * may still land later and overwrite a newer projection (an "active" record
+ * landing after the revocation's put). So a timeout also records a `settle:`
+ * obligation for that key. The alarm re-puts the key's CURRENT ledger record
+ * SETTLE_DELAYS_MS after the last timeout (~60s, then ~5min) and only then
+ * clears it; a later successful projection does not clear it. Residual
+ * window: a stale put that lands is visible to auth until the next settle
+ * re-put (plus KV propagation), and one that lands more than ~5min after its
+ * timeout is not corrected until the key's next change.
  */
 
 import {
@@ -54,6 +67,9 @@ const GET_BATCH = 128;
  * failure instead (the key stays owed and the alarm retries it).
  */
 export const KV_OP_TIMEOUT_MS = 10_000;
+/** When the alarm re-puts a key after its last KV timeout (see "Settling"). */
+export const SETTLE_DELAYS_MS: readonly number[] = [60_000, 300_000];
+const SETTLE_PREFIX = 'settle:';
 /** Warning returned when a change is committed but auth (KV) does not have it yet. */
 export const AUTH_UPDATE_PENDING = 'auth_update_pending';
 
@@ -62,6 +78,14 @@ export type LedgerEntry = { record: PartnerKeyRecord; hash: string };
 
 /** Value of a `proj:` marker: the request that owes the projection. */
 type PendingMarker = { requestId: string };
+
+/** Value of a `settle:` marker: last KV timeout, re-puts done, owing request. */
+type SettleMarker = { at: number; step: number; requestId: string };
+
+/** A KV operation that did not settle within the timeout (it may still land). */
+export class KvTimeoutError extends Error {
+  override name = 'KvTimeoutError';
+}
 
 /** One owed projection, with the request id its retries are logged under. */
 type Owed = { id: string; requestId: string };
@@ -106,6 +130,16 @@ export type RotateOutcome =
 const recKey = (id: string) => `${REC_PREFIX}${id}`;
 const orgKey = (record: PartnerKeyRecord) => `${ORG_PREFIX}${record.org}:${record.id}`;
 const pendingKey = (id: string) => `${PENDING_PREFIX}${id}`;
+const settleKey = (id: string) => `${SETTLE_PREFIX}${id}`;
+
+/** When a settle marker's next re-put is due. */
+const settleDueAt = (marker: SettleMarker) => marker.at + (SETTLE_DELAYS_MS.at(marker.step) ?? 0);
+
+/** When to wake for a settle marker; an overdue one (a re-put failed) retries after PROJECTION_RETRY_MS. */
+function settleWake(marker: SettleMarker, now: number): number {
+  const due = settleDueAt(marker);
+  return due > now ? due : now + PROJECTION_RETRY_MS;
+}
 
 function withRevocation(entry: LedgerEntry, stamp: RevocationStamp): LedgerEntry {
   const record: PartnerKeyRecord = {
@@ -272,12 +306,14 @@ export class PartnerKeyLedger {
   }
 
   /**
-   * Alarm: write every still-owed projection to KV; re-arm while any remain.
-   * Each key's outcome is logged under the request that owes it
-   * (`loggerFor(requestId)`), so a retry correlates with the admin action.
+   * Alarm: write every still-owed projection to KV, then run the settle
+   * re-puts that are due; re-arm for whatever remains. Each key's outcome is
+   * logged under the request that owes it (`loggerFor(requestId)`), so a
+   * retry correlates with the admin action. `now` is injectable for tests.
    */
   async retryProjections(
-    loggerFor: (requestId: string) => RequestLogger
+    loggerFor: (requestId: string) => RequestLogger,
+    now = Date.now()
   ): Promise<{ retried: number; remaining: number }> {
     const owed = await this.listOwed();
     const entries = new Map(
@@ -299,14 +335,87 @@ export class PartnerKeyLedger {
       logger.log('partner_key_projection_retried', { key_id: o.id, found: entries.has(o.id) });
       return false;
     });
+    await this.recordSettles(
+      owed.filter((_o, i) => isTimeout(results.at(i))).map((o) => o.id),
+      now
+    );
     await this.deleteMany(owed.filter((o) => !failed.includes(o)).map((o) => pendingKey(o.id)));
-    if (failed.length > 0) await this.storage.setAlarm(Date.now() + PROJECTION_RETRY_MS);
+    await this.runDueSettles(loggerFor, now);
+    await this.armAlarm(now);
     return { retried: owed.length, remaining: failed.length };
   }
 
-  /** True while any projection is owed (the alarm must stay scheduled). */
+  /**
+   * Re-put the CURRENT record of every key whose settle re-put is due. A
+   * success advances the marker (cleared after the last delay); a timeout
+   * restarts it; any other failure leaves it for the next alarm.
+   */
+  private async runDueSettles(
+    loggerFor: (requestId: string) => RequestLogger,
+    now: number
+  ): Promise<void> {
+    const due = [...(await this.listSettles())].filter(([, m]) => settleDueAt(m) <= now);
+    for (const [id, marker] of due) {
+      const entry = await this.get(id);
+      const logger = loggerFor(marker.requestId);
+      try {
+        if (entry) await this.putProjection(entry);
+        const step = marker.step + 1;
+        if (step < SETTLE_DELAYS_MS.length)
+          await this.storage.put(settleKey(id), { ...marker, step });
+        else await this.storage.delete(settleKey(id));
+        logger.log('partner_key_projection_settled', { key_id: id, step });
+      } catch (error) {
+        logger.error('partner_key_projection_settle_failed', error, { key_id: id });
+        if (error instanceof KvTimeoutError) await this.recordSettles([id], now);
+      }
+    }
+  }
+
+  /** Record (or restart) the settle obligation of each key whose KV put timed out. */
+  private async recordSettles(ids: string[], now: number): Promise<void> {
+    if (ids.length === 0) return;
+    const markers = await this.storage.get<SettleMarker>(ids.map(settleKey));
+    const fresh = ids.map((id) => {
+      const requestId = markers.get(settleKey(id))?.requestId ?? this.requestId;
+      return [settleKey(id), { at: now, step: 0, requestId } satisfies SettleMarker] as const;
+    });
+    for (let i = 0; i < fresh.length; i += GET_BATCH) {
+      await this.storage.put(Object.fromEntries(fresh.slice(i, i + GET_BATCH)));
+    }
+  }
+
+  /** Every settle marker, by key id. */
+  private async listSettles(): Promise<Map<string, SettleMarker>> {
+    const markers = await this.storage.list<SettleMarker>({ prefix: SETTLE_PREFIX });
+    return new Map([...markers].map(([key, m]) => [key.slice(SETTLE_PREFIX.length), m]));
+  }
+
+  /**
+   * Schedule the alarm for the earliest owed work: a retry
+   * (PROJECTION_RETRY_MS) while any `proj:` marker remains, and each settle
+   * re-put's due time. Only ever moves an existing alarm EARLIER; with nothing
+   * owed at all, the alarm is dropped.
+   */
+  private async armAlarm(now: number): Promise<void> {
+    const dues = [...(await this.listSettles()).values()].map((m) => settleWake(m, now));
+    const owed = await this.storage.list({ prefix: PENDING_PREFIX, limit: 1 });
+    if (owed.size > 0) dues.push(now + PROJECTION_RETRY_MS);
+    if (dues.length === 0) {
+      await this.storage.deleteAlarm();
+      return;
+    }
+    const due = Math.min(...dues);
+    const existing = await this.storage.getAlarm();
+    if (existing === null || existing > due) await this.storage.setAlarm(due);
+  }
+
+  /** True while any projection or settle re-put is owed (the alarm must stay scheduled). */
   async hasOwedProjections(): Promise<boolean> {
-    return (await this.storage.list({ prefix: PENDING_PREFIX, limit: 1 })).size > 0;
+    for (const prefix of [PENDING_PREFIX, SETTLE_PREFIX]) {
+      if ((await this.storage.list({ prefix, limit: 1 })).size > 0) return true;
+    }
+    return false;
   }
 
   /** Every `proj:` marker, with the request id to log its retry under. */
@@ -420,12 +529,13 @@ export class PartnerKeyLedger {
    */
   private async project(changed: LedgerEntry[]): Promise<string[]> {
     try {
-      const failed = await this.putProjections(changed);
+      const { failed, timedOut } = await this.putProjections(changed);
+      const now = Date.now();
+      await this.recordSettles(timedOut, now);
       const succeeded = changed.map((e) => e.record.id).filter((id) => !failed.includes(id));
       await this.deleteMany(succeeded.map(pendingKey));
-      if (failed.length > 0) return [AUTH_UPDATE_PENDING];
-      await this.clearAlarmIfNothingOwed();
-      return [];
+      await this.armAlarm(now);
+      return failed.length > 0 ? [AUTH_UPDATE_PENDING] : [];
     } catch (error) {
       this.logger.error('partner_key_projection_bookkeeping_failed', error, {
         key_ids: changed.map((e) => e.record.id),
@@ -434,23 +544,25 @@ export class PartnerKeyLedger {
     }
   }
 
-  /** Drop the retry alarm once no projection is owed (avoids a no-op wake-up). */
-  private async clearAlarmIfNothingOwed(): Promise<void> {
-    if (!(await this.hasOwedProjections())) await this.storage.deleteAlarm();
-  }
-
-  /** Put each record at `key:<hash>`; returns the ids whose put failed (logged). */
-  private async putProjections(entries: LedgerEntry[]): Promise<string[]> {
+  /**
+   * Put each record at `key:<hash>`; returns the ids whose put failed
+   * (logged), and among them those that timed out (they may still land).
+   */
+  private async putProjections(
+    entries: LedgerEntry[]
+  ): Promise<{ failed: string[]; timedOut: string[] }> {
     const results = await Promise.allSettled(entries.map((entry) => this.putProjection(entry)));
     const failed: string[] = [];
+    const timedOut: string[] = [];
     for (const [i, result] of results.entries()) {
       const record = entries.at(i)?.record;
       if (result.status === 'rejected' && record) {
         failed.push(record.id);
+        if (isTimeout(result)) timedOut.push(record.id);
         this.logger.error('partner_key_projection_failed', result.reason, { key_id: record.id });
       }
     }
-    return failed;
+    return { failed, timedOut };
   }
 
   /**
@@ -478,11 +590,16 @@ export class PartnerKeyLedger {
   }
 }
 
-/** `op`, or a rejection once `ms` pass without it settling (the timer is always cleared). */
+/** True for a rejection caused by a KV timeout. */
+function isTimeout(result: PromiseSettledResult<unknown> | undefined): boolean {
+  return result?.status === 'rejected' && result.reason instanceof KvTimeoutError;
+}
+
+/** `op`, or a KvTimeoutError once `ms` pass without it settling (the timer is always cleared). */
 function withTimeout<T>(op: Promise<T>, ms: number, what: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms} ms`)), ms);
+    timer = setTimeout(() => reject(new KvTimeoutError(`${what} timed out after ${ms} ms`)), ms);
   });
   return Promise.race([op, timeout]).finally(() => clearTimeout(timer));
 }

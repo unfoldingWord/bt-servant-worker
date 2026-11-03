@@ -22,6 +22,7 @@ import type { PartnerKeyStoreDO } from '../../src/durable-objects/partner-key-st
 import {
   AUTH_UPDATE_PENDING,
   PartnerKeyLedger,
+  SETTLE_DELAYS_MS,
   type LedgerEntry,
 } from '../../src/services/partner-keys/ledger';
 import { partnerKeyStatus, type PartnerKeyRecord } from '../../src/types/partner-keys';
@@ -451,5 +452,62 @@ describe('a KV call that never settles times out as a projection failure', () =>
     }));
     expect(state.marker).toEqual({ requestId: REQUEST_ID });
     expect(state.alarm).not.toBeNull();
+  });
+});
+
+/** A KV put that does not answer until `land()`, which then writes it to `target`. */
+function latePutKv(target: FakeKV): { kv: KVNamespace; land: () => void } {
+  const pending: (() => void)[] = [];
+  const put = (key: string, value: string) =>
+    new Promise<void>((resolve) => {
+      pending.push(() => {
+        target.store.set(key, value);
+        resolve();
+      });
+    });
+  const land = () => pending.splice(0).forEach((write) => write());
+  return { kv: { put } as unknown as KVNamespace, land };
+}
+
+describe('a timed-out put that lands late is overwritten by the settle re-puts', () => {
+  const ledgerWith = (storage: DurableObjectStorage, target: KVNamespace) =>
+    new PartnerKeyLedger({
+      storage,
+      kv: target,
+      tagSecret: SECRET,
+      logger: createMockLogger(),
+      requestId: REQUEST_ID,
+      kvTimeoutMs: 20,
+    });
+
+  it('restores the revoked state at +60s and clears the obligation after +5min', async () => {
+    const late = latePutKv(kv);
+    const created = await withLedger((_l, s) => ledgerWith(s, late.kv).create(INPUT));
+    expect(created.warnings).toEqual([AUTH_UPDATE_PENDING]);
+    const settle = `settle:${created.record.id}`;
+    const marker = await withLedger(async (_l, s) => s.get<{ at: number; step: number }>(settle));
+    expect(marker).toMatchObject({ step: 0 });
+
+    // Revoke succeeds; its success must NOT clear the settle obligation.
+    expect((await withLedger((l) => l.revoke(created.record.id)))?.warnings).toEqual([]);
+    expect(await withLedger(async (_l, s) => s.get(settle))).toMatchObject({ step: 0 });
+    expect(await withLedger(async (_l, s) => s.getAlarm())).not.toBeNull();
+
+    late.land(); // create's stale "active" put lands after the revocation
+    expect((await projected(created.plaintext))?.revokedAt).toBeUndefined();
+
+    const at = marker?.at ?? 0;
+    const [first = 0, last = 0] = SETTLE_DELAYS_MS;
+    const retry = (now: number) =>
+      withLedger((l) => l.retryProjections(loggersById().loggerFor, now));
+    await retry(at + first - 1); // not due yet
+    expect((await projected(created.plaintext))?.revokedAt).toBeUndefined();
+    await retry(at + first);
+    expect((await projected(created.plaintext))?.revokedAt).toBeDefined();
+    expect(await withLedger(async (_l, s) => s.get(settle))).toMatchObject({ step: 1 });
+
+    await retry(at + last);
+    expect((await projected(created.plaintext))?.revokedAt).toBeDefined();
+    expect(await withLedger(async (_l, s) => s.get(settle))).toBeUndefined();
   });
 });

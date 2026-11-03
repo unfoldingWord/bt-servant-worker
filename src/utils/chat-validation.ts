@@ -111,6 +111,31 @@ export interface ChatValidationOptions {
    * Default true.
    */
   callbackAvailable?: boolean;
+  /**
+   * Who authenticated. Defaults to the body's `_caller` (stamped by the
+   * worker for the DO), else internal. Only a partner caller may send a
+   * `partner:`-form user_id / chat_id: the worker writes that form itself
+   * when it namespaces a partner request, before validation runs.
+   */
+  caller?: ChatCaller;
+}
+
+/**
+ * An internal caller may not name a partner user or group (admin-portal#354):
+ * `partner:<namespace>:...` ids are written only by the worker for partner
+ * keys, and would otherwise address that partner's DOs directly.
+ */
+function validateNoPartnerIds(body: ChatRequest): string | null {
+  const ids: [string, unknown][] = [
+    ['user_id', body.user_id],
+    ['chat_id', body.chat_id],
+  ];
+  for (const [field, value] of ids) {
+    if (typeof value === 'string' && value.startsWith(PARTNER_CLIENT_ID_PREFIX)) {
+      return `${field} must not start with '${PARTNER_CLIENT_ID_PREFIX}' (reserved for partner API keys)`;
+    }
+  }
+  return null;
 }
 
 /** Validate an optional ISO 639-1 language code. */
@@ -271,6 +296,10 @@ export function validateChatBody(
 ): string | null {
   const coreError = validateCoreFields(body);
   if (coreError) return coreError;
+  if (!isPartnerCaller(options.caller ?? body._caller)) {
+    const partnerIdError = validateNoPartnerIds(body);
+    if (partnerIdError) return partnerIdError;
+  }
 
   const transportError = validateTransportFields(
     body,

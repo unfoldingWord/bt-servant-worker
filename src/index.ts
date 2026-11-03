@@ -5,7 +5,7 @@
  * MCP server config is stored in KV and passed to DOs via request body.
  */
 
-import { Hono, type Context, type MiddlewareHandler } from 'hono';
+import { Hono, type Context } from 'hono';
 import { Env } from './config/types.js';
 import { APP_VERSION } from './generated/version.js';
 import { UserDO as UserDOClass } from './durable-objects/index.js';
@@ -183,7 +183,6 @@ app.get('/public/ptxprint/*', async (c) => servePublicPtxprintObject(c.req.path,
  */
 const NOT_PERMITTED_REASONS: ReadonlySet<string> = new Set([
   'partner_route_forbidden',
-  'partner_admin_forbidden',
   'super_admin_required',
 ]);
 
@@ -246,18 +245,17 @@ async function authenticatePartner(
 
 /**
  * Everything checked about a non-internal token BEFORE any KV read, so a junk
- * token, a guessed one, or a real one on a route partners may never call
- * costs no I/O: the shape, the route allowlist, then the keyed tag (an HMAC
+ * token or a guessed one costs no I/O: the shape, then the keyed tag (an HMAC
  * only PARTNER_KEY_TAG_SECRET can produce; see key-material.ts). The display
  * prefix (`bts_<8 hex>`) is not secret and is logged for attribution.
- * Returns the rejection, or null to go on to the lookup.
+ * Returns the rejection, or null to go on to the lookup. The route allowlist
+ * is checked only AFTER the key is authenticated, so a forged or unknown
+ * look-alike always gets "Invalid API key", never the "not permitted" answer
+ * that would tell it the token's shape passed.
  */
 async function partnerPreflight(c: Context<AppEnv>, token: string): Promise<Response | null> {
   if (!looksLikePartnerKey(token)) return rejectAuth(c, 403, 'invalid_token');
   const keyPrefix = { key_prefix: partnerKeyPrefix(token) };
-  if (!isPartnerRouteAllowed(c.req.method, c.req.path)) {
-    return rejectAuth(c, 403, 'partner_route_forbidden', keyPrefix);
-  }
   const secret = c.env.PARTNER_KEY_TAG_SECRET;
   if (!secret) {
     c.get('logger').error(
@@ -307,38 +305,32 @@ app.use('/api/*', async (c, next) => {
   if (refused) return refused;
   const auth = await authenticatePartner(c, token);
   if (!auth.ok) return auth.response;
+  if (!isPartnerRouteAllowed(c.req.method, c.req.path)) {
+    return rejectAuth(c, 403, 'partner_route_forbidden', { key_id: auth.key.id });
+  }
   c.set('principal', { kind: 'partner', key: auth.key });
   return next();
 });
 
-// Second fence for every admin route: only the internal principal, whatever
-// the allowlist above says. A partner key is already stopped there; this keeps
-// the invariant next to the admin surface if that allowlist is ever widened.
-app.use('/api/v1/admin/*', async (c, next) => {
-  if (c.get('principal')?.kind !== 'internal') {
-    return rejectAuth(c, 403, 'partner_admin_forbidden', {
-      key_id: principalKeyId(c.get('principal')),
-    });
-  }
-  return next();
-});
-
 /**
- * Who may administer partner keys (create, list, get, revoke, rotate, legacy
- * import): the super-admin. Today that is the internal principal
- * (ENGINE_API_KEY). This predicate and the guard below are the ONE place to
- * change when the admin key split lands.
+ * Who may call ANY /api/v1/admin/* route (configs, prompts, partner key
+ * administration, legacy import): the super-admin. Today that is the
+ * internal principal (ENGINE_API_KEY). This predicate and its ONE middleware
+ * registration below are the only place to change when the admin key split
+ * lands. A partner key never gets here (the route allowlist above refuses it
+ * first); this keeps the invariant next to the admin surface if that
+ * allowlist is ever widened.
  */
 function isSuperAdmin(principal: Principal | undefined): boolean {
   return principal?.kind === 'internal';
 }
 
-const superAdminOnly: MiddlewareHandler<AppEnv> = async (c, next) => {
+app.use('/api/v1/admin/*', async (c, next) => {
   if (isSuperAdmin(c.get('principal'))) return next();
   return rejectAuth(c, 403, 'super_admin_required', {
     key_id: principalKeyId(c.get('principal')),
   });
-};
+});
 
 /** The per-request values a chat handler takes from the auth middleware. */
 type ChatRequestContext = AppEnv['Variables'];
@@ -1763,15 +1755,13 @@ app.get('/api/v1/admin/do/:hexId/snapshot', async (c) => {
 
 // ── Partner API keys (admin-portal#354) ──────────────────────────────────────
 //
-// ENGINE_API_KEY only (the /api/v1/admin/* guard above refuses partner keys).
+// Super-admin only (the one /api/v1/admin/* guard, isSuperAdmin, above).
 // Org-agnostic paths, like the DO snapshot route, because a super admin lists
 // across orgs; `?org=` filters. Responses go through toPublicPartnerKey, which
 // never carries the hash; the plaintext appears only in the create and rotate
 // responses, as `apiKey`, and cannot be fetched again.
 
 const PARTNER_KEYS_BASE = '/api/v1/admin/api-keys';
-app.use(PARTNER_KEYS_BASE, superAdminOnly);
-app.use(`${PARTNER_KEYS_BASE}/*`, superAdminOnly);
 
 /** On every response that carries a plaintext key: no cache may keep a copy. */
 const NO_STORE_HEADERS = { 'Cache-Control': 'no-store' } as const;
@@ -1953,10 +1943,10 @@ app.post(`${PARTNER_KEYS_BASE}/:keyId/_import-legacy-users`, async (c) => {
       requestId: c.get('requestId'),
     });
     const counts = Object.fromEntries(
-      [...new Set(results.map((r) => r.status))].map((status) => [
-        status,
-        results.filter((r) => r.status === status).length,
-      ])
+      results.reduce(
+        (m, r) => m.set(r.status, (m.get(r.status) ?? 0) + 1),
+        new Map<string, number>()
+      )
     );
     logger.log('admin_action', {
       ...ctx,
@@ -2802,6 +2792,7 @@ async function dispatchChatRequest(params: ChatDispatchParams): Promise<Response
   const keyId = principalKeyId(principal);
   const validationError = validateChatBody(body, transport, {
     callbackAvailable: caller !== 'partner',
+    caller,
   });
   if (validationError) {
     logger.warn('chat_validation_failed', {
