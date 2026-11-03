@@ -3354,6 +3354,10 @@ export class UserDO {
   }
 
   private async resolvePrompts(body: ChatRequest, logger: RequestLogger) {
+    // Admin visibility comes only from the worker-set `_is_admin` (client_id
+    // AND an admin-capable key). Fails closed: a body without it, such as a
+    // queued entry written before the worker started setting the field, is
+    // treated as non-admin.
     const isAdmin = body._is_admin === true;
     const orgOverrides = body._org_prompt_overrides ?? {};
     const orgModes = body._org_modes ?? { modes: [] };
@@ -3849,6 +3853,7 @@ export class UserDO {
     activeModeName: string | undefined,
     body: ChatRequest
   ): ModeContext {
+    // Worker-set only; absent (e.g. an older queued entry) ⇒ non-admin.
     const isAdmin = body._is_admin === true;
     const isGroupChat = this.isGroupChatType(body);
     return {

@@ -323,32 +323,10 @@ route today.
 **Authentication.** Every `/api/*` request must carry `ENGINE_API_KEY` or
 `ADMIN_API_KEY` — the global middleware accepts nothing else. Admin routes need
 super-admin authority: `ADMIN_API_KEY`, or `ENGINE_API_KEY` while
-`ADMIN_KEY_REQUIRED` is not `"true"` (README "Authentication"), and the MCP
-write routes refuse anything else (403). The `ORG_ADMIN_KEYS` mechanism
-below is defined in code but not currently reachable; it is kept here as a
-reference for the org-scoped routes, not as a way to reach the global pool.
-
-### Setting Up Org-Specific Admin Keys
-
-To allow delegated administration for specific organizations, store admin keys in the `ORG_ADMIN_KEYS` KV namespace:
-
-```bash
-# Create the KV namespace (one-time setup)
-npx wrangler kv:namespace create ORG_ADMIN_KEYS
-
-# Add the namespace ID to wrangler.toml (replace placeholder-id-for-dev)
-
-# Set an org-specific admin key
-npx wrangler kv:key put --binding=ORG_ADMIN_KEYS "unfoldingWord" "your-org-specific-api-key"
-
-# List all org keys
-npx wrangler kv:key list --binding=ORG_ADMIN_KEYS
-```
-
-Clients would then use the org-specific key instead of the super admin key —
-but see **Authentication** above: today every `/api/*` request must carry
-`ENGINE_API_KEY` or `ADMIN_API_KEY`, so all examples below use `$API_KEY`
-(use the admin key for the admin routes).
+`ADMIN_KEY_REQUIRED` is unset, blank or `"false"` (README "Authentication"),
+and the MCP write routes refuse anything else (403). Values stored in the
+`ORG_ADMIN_KEYS` KV namespace are not accepted as bearer tokens. All examples
+below use `$API_KEY`; use the admin key for the admin routes.
 
 ### List MCP Servers
 

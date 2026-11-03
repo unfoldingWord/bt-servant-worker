@@ -14,7 +14,6 @@
  */
 
 import { MCPServerConfig, MCPServerConfigPublic, MCPServerWrite } from '../types/mcp.js';
-import { isSuperAdminClass, type AuthKeys, type KeyClass } from './admin-auth.js';
 import { RequestLogger } from './logger.js';
 import { MCP_GLOBAL_KEY } from './mcp-validation.js';
 
@@ -412,15 +411,15 @@ export function describeLeftoverLegacyKeys(pool: McpServerPool): string | null {
 
 /**
  * Writes to the global pool are super-admin only: an org-scoped admin key must
- * never be able to replace every org's pool. Takes the key class the `/api/*`
- * middleware resolved for this request and returns the 403 message, or null
- * when that class carries super-admin authority (ADMIN_API_KEY, or
- * ENGINE_API_KEY while the admin key is not enforced; see admin-auth.ts). Pure
- * so it can be unit-tested even though the upstream middlewares already reject
- * other tokens.
+ * never be able to replace every org's pool. Takes the super-admin authority
+ * the `/api/*` middleware computed for this request (from the guarded
+ * classifier, so an empty or blank bearer token is never super admin) and
+ * returns the 403 message, or null when the request has that authority. Kept
+ * as a second fence next to the shared store even though the
+ * `/api/v1/admin/*` gate already rejects everything else upstream.
  */
-export function poolWriteAuthError(keyClass: KeyClass | null, keys: AuthKeys): string | null {
-  if (isSuperAdminClass(keyClass, keys)) return null;
+export function poolWriteAuthError(superAdmin: boolean): string | null {
+  if (superAdmin) return null;
   return 'Writing the global MCP server pool requires the super admin key';
 }
 

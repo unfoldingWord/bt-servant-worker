@@ -48,9 +48,10 @@ DEFAULT_ORG = "unfoldingWord"
 # link in first-contact welcomes (#311). Non-secret, so it lives in [vars], not
 # a wrangler secret. Same var/value the portal reads for its share panel.
 WHATSAPP_NUMBER = "15558196461"
-# Admin key enforcement. "true" => only the ADMIN_API_KEY secret may use the
-# admin routes; "false" keeps ENGINE_API_KEY accepted there during the switch-
-# over. No effect while ADMIN_API_KEY is unset. See README "Authentication".
+# Admin key enforcement. "false" (or unset/blank) keeps ENGINE_API_KEY accepted
+# on the admin routes during the switch-over; "true" (or any other value: fails
+# closed) means only the ADMIN_API_KEY secret may use them. No effect while
+# ADMIN_API_KEY is unset. See README "Authentication".
 ADMIN_KEY_REQUIRED = "false"
 
 # KV Namespaces

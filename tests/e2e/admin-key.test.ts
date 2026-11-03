@@ -37,6 +37,35 @@ async function fetchWith(
   return res;
 }
 
+describe('empty bearer and unset secrets through the real middleware', () => {
+  const noKeys = {
+    ENGINE_API_KEY: undefined as unknown as string,
+    ADMIN_API_KEY: undefined,
+  };
+
+  it.each([
+    ['unset ENGINE_API_KEY', noKeys],
+    ['empty ENGINE_API_KEY', { ENGINE_API_KEY: '', ADMIN_API_KEY: '' }],
+    ['configured keys', { ADMIN_API_KEY: ADMIN }],
+  ])('"Bearer " never authenticates (%s)', async (_label, cfg) => {
+    for (const url of [ADMIN_CONFIG, USER_PREFS, DO_SNAPSHOT]) {
+      for (const header of ['Bearer ', 'Bearer   ', 'Bearer \t']) {
+        const res = await fetchWith(cfg, url, { headers: { Authorization: header } });
+        // Fetch trims header values, so these arrive as a bare "Bearer" (401).
+        expect(res.status).toBe(401);
+      }
+    }
+  });
+
+  it('with no secrets set, no token authenticates', async () => {
+    for (const key of ['undefined', 'null', 'x']) {
+      const res = await fetchWith(noKeys, ADMIN_CONFIG, { headers: bearer(key) });
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ error: 'Invalid API key', code: 'invalid_api_key' });
+    }
+  });
+});
+
 describe('admin key unset (behaviour unchanged)', () => {
   it('engine key reaches admin and chat/user routes', async () => {
     expect((await SELF.fetch(ADMIN_CONFIG, { headers: bearer(ENGINE) })).status).toBe(200);

@@ -9,16 +9,17 @@ import {
   adminKeyEnforced,
   adminKeyRequiredSetting,
   bearerToken,
-  classifyAuthorization,
   classifyToken,
   configuredAdminKey,
   isSuperAdminClass,
   type AuthKeys,
 } from '../../src/utils/admin-auth';
 
-/** Classify the header, then decide super-admin authority (what the gates do). */
-const hasSuperAdminAuthority = (header: string | undefined, keys: AuthKeys) =>
-  isSuperAdminClass(classifyAuthorization(header, keys), keys);
+/** Parse + classify the header, then decide super-admin authority (what `/api/*` does). */
+function hasSuperAdminAuthority(header: string | undefined, keys: AuthKeys): boolean {
+  const token = bearerToken(header);
+  return token !== null && isSuperAdminClass(classifyToken(token, keys), keys);
+}
 
 const ENGINE = 'engine-key';
 const ADMIN = 'admin-key';
@@ -100,10 +101,20 @@ describe('ADMIN_KEY_REQUIRED parsing', () => {
     expect(adminKeyEnforced(withFlag(flag))).toBe(false);
   });
 
-  it.each(['yes', '1', 'on', 'tru', 'enabled'])('%j is invalid and not enforced', (flag) => {
-    expect(adminKeyRequiredSetting(withFlag(flag))).toBe('invalid');
-    expect(adminKeyEnforced(withFlag(flag))).toBe(false);
-    expect(hasSuperAdminAuthority(`Bearer ${ENGINE}`, withFlag(flag))).toBe(true);
+  it.each(['yes', '1', 'on', 'tru', 'enabled', 'no', '0'])(
+    '%j is invalid and enforces (fails closed)',
+    (flag) => {
+      expect(adminKeyRequiredSetting(withFlag(flag))).toBe('invalid');
+      expect(adminKeyEnforced(withFlag(flag))).toBe(true);
+      expect(hasSuperAdminAuthority(`Bearer ${ENGINE}`, withFlag(flag))).toBe(false);
+      expect(hasSuperAdminAuthority(`Bearer ${ADMIN}`, withFlag(flag))).toBe(true);
+    }
+  );
+
+  it('an invalid value without an admin key is not enforced (no lockout)', () => {
+    const keys = { ENGINE_API_KEY: ENGINE, ADMIN_KEY_REQUIRED: 'yes' };
+    expect(adminKeyEnforced(keys)).toBe(false);
+    expect(hasSuperAdminAuthority(`Bearer ${ENGINE}`, keys)).toBe(true);
   });
 });
 
@@ -138,11 +149,32 @@ describe('padded ENGINE_API_KEY', () => {
   });
 });
 
-describe('classifyAuthorization', () => {
-  it('returns null for a missing, non-bearer or empty bearer header', () => {
-    expect(classifyAuthorization(undefined, { ENGINE_API_KEY: ENGINE })).toBeNull();
-    expect(classifyAuthorization(ENGINE, { ENGINE_API_KEY: ENGINE })).toBeNull();
-    expect(classifyAuthorization('Bearer ', { ENGINE_API_KEY: ENGINE })).toBeNull();
+describe('guarded classifier: blank tokens and unset secrets', () => {
+  const noEngine = { ENGINE_API_KEY: undefined as unknown as string };
+
+  it.each(['', ' ', '   ', '\t', '\n'])('a blank token %j never classifies', (token) => {
+    expect(classifyToken(token, unset)).toBeNull();
+    expect(classifyToken(token, enforced)).toBeNull();
+    expect(classifyToken(token, noEngine)).toBeNull();
+    expect(classifyToken(token, { ENGINE_API_KEY: '' })).toBeNull();
+    expect(classifyToken(token, { ENGINE_API_KEY: token })).toBeNull();
+  });
+
+  it.each([
+    ['unset', undefined],
+    ['empty', ''],
+    ['whitespace-only', '   '],
+  ])('an %s ENGINE_API_KEY matches nothing', (_label, value) => {
+    const keys = { ENGINE_API_KEY: value as unknown as string };
+    for (const token of ['x', 'undefined', 'null', ' ', '']) {
+      expect(classifyToken(token, keys)).toBeNull();
+    }
+  });
+
+  it('an empty bearer header is never super admin, even with no secrets set', () => {
+    expect(hasSuperAdminAuthority('Bearer ', noEngine)).toBe(false);
+    expect(hasSuperAdminAuthority('Bearer ', { ENGINE_API_KEY: '' })).toBe(false);
+    expect(hasSuperAdminAuthority(undefined, noEngine)).toBe(false);
   });
 });
 

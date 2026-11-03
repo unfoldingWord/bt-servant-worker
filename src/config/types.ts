@@ -12,8 +12,8 @@ export interface Env {
    * `"true"` (trimmed, case-insensitive) ⇒ only ADMIN_API_KEY has super-admin
    * authority; ENGINE_API_KEY gets 403 on admin routes. Unset, blank or
    * `"false"` (default) keeps ENGINE_API_KEY as super admin during the
-   * transition; any other value is logged and not enforced. Has no effect while
-   * ADMIN_API_KEY is unset.
+   * transition; any other value is logged and enforces (fails closed). Has no
+   * effect while ADMIN_API_KEY is unset.
    */
   ADMIN_KEY_REQUIRED?: string;
 

@@ -885,26 +885,11 @@ describe('describeLeftoverLegacyKeys', () => {
 });
 
 describe('poolWriteAuthError', () => {
-  const engineOnly = { ENGINE_API_KEY: 'engine-key' };
-  const withAdmin = { ENGINE_API_KEY: 'engine-key', ADMIN_API_KEY: 'admin-key' };
-  const enforced = { ...withAdmin, ADMIN_KEY_REQUIRED: 'true' };
-
-  it('accepts the engine key class when no admin key is configured', () => {
-    expect(poolWriteAuthError('engine', engineOnly)).toBeNull();
+  it('accepts a request with super-admin authority', () => {
+    expect(poolWriteAuthError(true)).toBeNull();
   });
 
-  it('accepts the admin key class, and the engine key class until enforcement', () => {
-    expect(poolWriteAuthError('admin', withAdmin)).toBeNull();
-    expect(poolWriteAuthError('engine', withAdmin)).toBeNull();
-    expect(poolWriteAuthError('admin', enforced)).toBeNull();
-  });
-
-  it('rejects the engine key class once the admin key is enforced', () => {
-    expect(poolWriteAuthError('engine', enforced)).toContain('super admin');
-  });
-
-  it('rejects an unclassified token (org-scoped or unknown key)', () => {
-    expect(poolWriteAuthError(null, engineOnly)).toContain('super admin');
-    expect(poolWriteAuthError(null, withAdmin)).toContain('super admin');
+  it('rejects a request without it', () => {
+    expect(poolWriteAuthError(false)).toContain('super admin');
   });
 });

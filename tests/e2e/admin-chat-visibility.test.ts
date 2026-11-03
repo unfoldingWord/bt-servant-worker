@@ -110,13 +110,20 @@ describe('ADMIN_KEY_REQUIRED value warning', () => {
     vi.restoreAllMocks();
   });
 
-  it('an invalid value is not enforced and is logged once per isolate', async () => {
+  it('an invalid value fails closed (enforces) and is logged once per isolate', async () => {
     const warnSpy = vi.spyOn(console, 'warn');
     const cfg = { ADMIN_API_KEY: ADMIN, ADMIN_KEY_REQUIRED: 'yes' };
-    const headers = { Authorization: `Bearer ${ENGINE}` };
     for (let i = 0; i < 3; i++) {
-      const res = await run(cfg, new Request(ADMIN_CONFIG, { headers }));
-      expect(res.status).toBe(200);
+      const engine = await run(
+        cfg,
+        new Request(ADMIN_CONFIG, { headers: { Authorization: `Bearer ${ENGINE}` } })
+      );
+      expect(engine.status).toBe(403);
+      const admin = await run(
+        cfg,
+        new Request(ADMIN_CONFIG, { headers: { Authorization: `Bearer ${ADMIN}` } })
+      );
+      expect(admin.status).toBe(200);
     }
     const logged = warnSpy.mock.calls
       .map((args) => String(args[0]))
