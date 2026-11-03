@@ -48,7 +48,16 @@ import { validateResourceLanguage } from './types/resources.js';
 import { synthesizeModeDocument } from './types/mode-markdown.js';
 import { readAllPublishedModes } from './utils/cross-org-modes.js';
 import { stripControlChars } from './types/prompt-overrides.js';
-import { constantTimeCompare } from './utils/crypto.js';
+import {
+  adminKeyConfigured,
+  adminKeyEnforced,
+  adminKeyEqualsEngineKey,
+  adminKeyRequiredSetting,
+  bearerToken,
+  classifyToken,
+  isSuperAdminClass,
+  type KeyClass,
+} from './utils/admin-auth.js';
 import { ValidationError } from './utils/errors.js';
 import { getAudio, VOICE_SUBMISSION_PREFIX } from './services/audio/index.js';
 import { createRequestLogger, type RequestLogger } from './utils/logger.js';
@@ -74,7 +83,7 @@ import {
   upsertServer,
 } from './utils/mcp-servers.js';
 import { resolveOrgFromBody } from './utils/org.js';
-import { validateChatBody } from './utils/chat-validation.js';
+import { isAdminClient, validateChatBody } from './utils/chat-validation.js';
 import { instrument, instrumentDO } from '@microlabs/otel-cf-workers';
 import {
   resolveTelemetryConfig,
@@ -95,7 +104,23 @@ export { validateChatBody };
 export const UserDO = instrumentDO(UserDOClass, resolveTelemetryConfig);
 export { PartnerKeyStoreDO } from './durable-objects/partner-key-store-do.js';
 
-const app = new Hono<{ Bindings: Env }>();
+/**
+ * Per-request values set by the `/api/*` auth middleware: the key class the
+ * bearer token matched (never the key), whether that key carries super-admin
+ * authority under the current config, and the request id + logger every later
+ * middleware and route logs through.
+ */
+type AppEnv = {
+  Bindings: Env;
+  Variables: {
+    keyClass: KeyClass | null;
+    superAdmin: boolean;
+    requestId: string;
+    logger: RequestLogger;
+  };
+};
+
+const app = new Hono<AppEnv>();
 
 // Telemetry (M2): tee structured logs to OTLP and flush this isolate's buffered
 // records at the request boundary. Registered first so its `finally` wraps every
@@ -141,13 +166,23 @@ app.get('/health', (c) => c.json({ status: 'healthy', version: APP_VERSION }));
 // Bucket: PTXPRINT_BUCKET (defined in wrangler.toml).
 app.get('/public/ptxprint/*', async (c) => servePublicPtxprintObject(c.req.path, c.env));
 
-// Auth middleware for all /api routes
+// Auth middleware for all /api routes. Accepts ENGINE_API_KEY or (when
+// configured) ADMIN_API_KEY, and is the one place the bearer token is
+// classified (through the guarded classifyToken: a blank token or an unset
+// secret never matches). The key class and the super-admin authority derived
+// from it are stored on the context (`keyClass`, `superAdmin`) for the admin
+// gate, the MCP pool fence and the chat admin check. It also mints the request
+// id + logger that later middlewares and routes log through.
 app.use('/api/*', async (c, next) => {
-  const authHeader = c.req.header('Authorization');
+  const requestId = crypto.randomUUID();
+  const logger = createRequestLogger(requestId);
+  c.set('requestId', requestId);
+  c.set('logger', logger);
 
-  if (!authHeader?.startsWith('Bearer ')) {
+  const presented = bearerToken(c.req.header('Authorization'));
+  if (presented === null) {
     // Observable rejection: never silently drop a 401. Token value is never logged.
-    createRequestLogger(crypto.randomUUID()).warn('auth_rejected', {
+    logger.warn('auth_rejected', {
       reason: 'missing_bearer',
       status: 401,
       path: c.req.path,
@@ -157,18 +192,21 @@ app.use('/api/*', async (c, next) => {
     return c.json({ error: 'Authorization header with Bearer token required' }, 401);
   }
 
-  const token = authHeader.slice(7);
-  if (!constantTimeCompare(token, c.env.ENGINE_API_KEY)) {
-    createRequestLogger(crypto.randomUUID()).warn('auth_rejected', {
+  const keyClass = classifyToken(presented, c.env);
+  if (keyClass === null) {
+    logger.warn('auth_rejected', {
       reason: 'invalid_token',
       status: 403,
       path: c.req.path,
       method: c.req.method,
     });
     countMetric('auth_rejections_total', { reason: 'invalid_token', status_code: 403 });
-    return c.json({ error: 'Invalid API key' }, 403);
+    // `code` is the stable, machine-readable reason; `error` text is unchanged.
+    return c.json({ error: 'Invalid API key', code: 'invalid_api_key' }, 403);
   }
 
+  c.set('keyClass', keyClass);
+  c.set('superAdmin', isSuperAdminClass(keyClass, c.env));
   return next();
 });
 
@@ -186,34 +224,34 @@ app.use('/api/*', async (c, next) => {
 // - POST /api/v1/chat/callback  → 202 + webhook delivery; requires
 //                                  progress_callback_url and message_key.
 app.post('/api/v1/chat', async (c) => {
-  return handleChatRequest(c.req.raw, c.env, 'final');
+  return handleChatRequest(c.req.raw, c.env, 'final', chatAuth(c));
 });
 
 app.post('/api/v1/chat/stream', async (c) => {
-  return handleChatRequest(c.req.raw, c.env, 'stream');
+  return handleChatRequest(c.req.raw, c.env, 'stream', chatAuth(c));
 });
 
 app.post('/api/v1/chat/callback', async (c) => {
-  return handleChatRequest(c.req.raw, c.env, 'callback');
+  return handleChatRequest(c.req.raw, c.env, 'callback', chatAuth(c));
 });
 
 // User endpoints with org scope (new paths)
 app.get('/api/v1/orgs/:org/users/:userId/preferences', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/preferences');
+  return handleUserRequest(c, org, userId, '/preferences');
 });
 
 app.put('/api/v1/orgs/:org/users/:userId/preferences', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/preferences');
+  return handleUserRequest(c, org, userId, '/preferences');
 });
 
 app.get('/api/v1/orgs/:org/users/:userId/history', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/history');
+  return handleUserRequest(c, org, userId, '/history');
 });
 
 // Audio serving endpoint — serves TTS audio from R2
@@ -224,7 +262,7 @@ app.get('/api/v1/audio/*', async (c) => {
     return c.json({ error: 'Invalid audio key' }, 400);
   }
 
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
   try {
     const object = await getAudio(c.env.AUDIO_BUCKET, audioKey, logger);
     if (!object) {
@@ -270,7 +308,7 @@ app.get('/api/v1/voice-submissions/*', async (c) => {
     return c.json({ error: 'Invalid voice-submission key' }, 400);
   }
 
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
   try {
     const object = await getAudio(c.env.AUDIO_BUCKET, key, logger);
     if (!object) {
@@ -302,34 +340,92 @@ app.get('/api/v1/voice-submissions/*', async (c) => {
   }
 });
 
-// Admin auth middleware - validates org-specific or super admin access.
-// NOTE: auth rejections for these routes are already gated and logged
-// (auth_rejected) by the global `/api/*` middleware above, which runs first. A
-// request only reaches here after presenting a valid ENGINE_API_KEY, so the
-// rejection branches below are effectively unreachable and deliberately do not
-// re-log — the global middleware is the single place auth failures are recorded.
-app.use('/api/v1/admin/orgs/:org/*', async (c, next) => {
-  const org = c.req.param('org');
-  const authHeader = c.req.header('Authorization');
+/** Auth context the chat routes hand to {@link handleChatRequest}. */
+type ChatAuth = AppEnv['Variables'];
 
-  if (!authHeader?.startsWith('Bearer ')) {
-    return c.json({ error: 'Authorization header with Bearer token required' }, 401);
+function chatAuth(c: Context<AppEnv>): ChatAuth {
+  return {
+    keyClass: c.get('keyClass'),
+    superAdmin: c.get('superAdmin'),
+    requestId: c.get('requestId'),
+    logger: c.get('logger'),
+  };
+}
+
+// Once-per-isolate flags for admin-key config warnings, so a misconfiguration is
+// visible in logs without repeating on every admin request.
+let warnedAdminKeyRequiredInvalid = false;
+let warnedAdminKeyRequiredWithoutKey = false;
+let warnedAdminKeyEqualsEngineKey = false;
+
+/**
+ * Log, once per isolate each: an ADMIN_KEY_REQUIRED value that is neither true
+ * nor false (treated as "true": fails closed); an enforcing value with no
+ * ADMIN_API_KEY (not enforced, so nobody is locked out); and an ADMIN_API_KEY
+ * equal to ENGINE_API_KEY (treated as the engine key). The flag value is
+ * config, not a secret, so it is logged as-is; key values never are.
+ */
+function warnOnAdminKeyConfig(env: Env, logger: RequestLogger): void {
+  const setting = adminKeyRequiredSetting(env);
+  if (setting === 'invalid' && !warnedAdminKeyRequiredInvalid) {
+    warnedAdminKeyRequiredInvalid = true;
+    logger.warn('admin_key_required_invalid_value', {
+      value: env.ADMIN_KEY_REQUIRED,
+      detail: 'ADMIN_KEY_REQUIRED must be "true" or "false"; treated as "true"',
+    });
   }
+  if (setting !== 'false' && !adminKeyConfigured(env) && !warnedAdminKeyRequiredWithoutKey) {
+    warnedAdminKeyRequiredWithoutKey = true;
+    logger.warn('admin_key_required_without_admin_key', {
+      detail: 'ADMIN_KEY_REQUIRED enforces but ADMIN_API_KEY is not set; not enforced',
+    });
+  }
+  if (!warnedAdminKeyEqualsEngineKey && adminKeyEqualsEngineKey(env)) {
+    warnedAdminKeyEqualsEngineKey = true;
+    logger.warn('admin_key_equals_engine_key', {
+      detail: 'ADMIN_API_KEY equals ENGINE_API_KEY; it is treated as the engine key',
+    });
+  }
+}
 
-  const token = authHeader.slice(7);
+// Admin surface gate - every route under /api/v1/admin/* (org-scoped config
+// routes, group/thread routes, global MCP pool, DO snapshots). Runs after the
+// global `/api/*` middleware, which has already rejected any token that is not
+// ENGINE_API_KEY or ADMIN_API_KEY and stored `keyClass` / `superAdmin`.
+//
+// Super-admin authority: ADMIN_API_KEY always; ENGINE_API_KEY only while the
+// admin key is not enforced (ADMIN_KEY_REQUIRED unset, blank or "false", or no
+// ADMIN_API_KEY configured). Everything else gets 403 here; this gate is the
+// only auth check on the admin routes. Each admin request logs `admin_auth`
+// with the key class (never the key) so ENGINE_API_KEY admin use can be
+// watched down to zero before the flag is flipped.
+app.use('/api/v1/admin/*', async (c, next) => {
+  const keyClass = c.get('keyClass');
+  const logger = c.get('logger');
+  warnOnAdminKeyConfig(c.env, logger);
 
-  // Check super admin (ENGINE_API_KEY) first
-  if (constantTimeCompare(token, c.env.ENGINE_API_KEY)) {
+  if (c.get('superAdmin')) {
+    logger.log('admin_auth', {
+      key_class: keyClass,
+      enforced: adminKeyEnforced(c.env),
+      path: c.req.path,
+      method: c.req.method,
+    });
     return next();
   }
 
-  // Check org-specific admin key from KV
-  const orgAdminKey = await c.env.ORG_ADMIN_KEYS.get(org);
-  if (orgAdminKey && constantTimeCompare(token, orgAdminKey)) {
-    return next();
-  }
-
-  return c.json({ error: 'Unauthorized for this organization' }, 403);
+  logger.warn('auth_rejected', {
+    reason: 'admin_key_required',
+    key_class: keyClass,
+    status: 403,
+    path: c.req.path,
+    method: c.req.method,
+  });
+  countMetric('auth_rejections_total', { reason: 'admin_key_required', status_code: 403 });
+  return c.json(
+    { error: 'This route requires the admin API key', code: 'admin_key_required' },
+    403
+  );
 });
 
 // Admin endpoints for MCP server management - now using KV directly.
@@ -344,7 +440,7 @@ app.use('/api/v1/admin/orgs/:org/*', async (c, next) => {
 app.get('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
   const org = c.req.param('org');
   const discover = c.req.query('discover') === 'true';
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   const orgError = validateOrgNotReserved(org);
   if (orgError) {
@@ -437,7 +533,7 @@ function poolStateFields(defaultOrg: string, pool: McpServerPool) {
  * (admin-portal#153/#154).
  */
 function poolNotMigratedResponse(
-  c: Context<{ Bindings: Env }>,
+  c: Context<AppEnv>,
   logger: RequestLogger,
   action: string,
   org: string,
@@ -467,21 +563,17 @@ function poolNotMigratedResponse(
 /**
  * Common guard for the three pool write routes: the reserved-org 400 and the
  * super-admin 403 (poolWriteAuthError). Today the global `/api/*` middleware
- * already accepts nothing but ENGINE_API_KEY, so the 403 is a second fence
- * rather than a live gate — it keeps the invariant next to the shared store in
- * case org-scoped admin keys are ever honoured upstream.
+ * and the `/api/v1/admin/*` gate already admit only super-admin keys here, so
+ * the 403 is a second fence rather than a live gate — it keeps the invariant
+ * next to the shared store in case org-scoped admin keys are ever honoured
+ * upstream.
  */
-function rejectMcpWrite(
-  c: Context<{ Bindings: Env }>,
-  logger: RequestLogger,
-  action: string,
-  org: string
-) {
+function rejectMcpWrite(c: Context<AppEnv>, logger: RequestLogger, action: string, org: string) {
   const orgError = validateOrgNotReserved(org);
   if (orgError) {
     return c.json({ error: orgError }, 400);
   }
-  const authError = poolWriteAuthError(c.req.header('Authorization'), c.env.ENGINE_API_KEY);
+  const authError = poolWriteAuthError(c.get('superAdmin'));
   if (authError === null) {
     return null;
   }
@@ -491,7 +583,7 @@ function rejectMcpWrite(
 
 app.put('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
   const org = c.req.param('org');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   const rejected = rejectMcpWrite(c, logger, 'replace_mcp_servers', org);
   if (rejected) {
@@ -588,7 +680,7 @@ async function readServerWriteBody(
 
 app.post('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
   const org = c.req.param('org');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   const rejected = rejectMcpWrite(c, logger, 'add_mcp_server', org);
   if (rejected) {
@@ -645,7 +737,7 @@ app.post('/api/v1/admin/orgs/:org/mcp-servers', async (c) => {
 app.delete('/api/v1/admin/orgs/:org/mcp-servers/:serverId', async (c) => {
   const org = c.req.param('org');
   const serverId = c.req.param('serverId');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   const rejected = rejectMcpWrite(c, logger, 'remove_mcp_server', org);
   if (rejected) {
@@ -698,7 +790,7 @@ app.use('/api/v1/admin/orgs/:org/config', async (c, next) => {
 
 app.get('/api/v1/admin/orgs/:org/config', async (c) => {
   const org = c.req.param('org');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   try {
     const stored = (await c.env.ORG_CONFIG.get<OrgConfig>(org, 'json')) ?? {};
@@ -719,7 +811,7 @@ app.get('/api/v1/admin/orgs/:org/config', async (c) => {
 
 app.put('/api/v1/admin/orgs/:org/config', async (c) => {
   const org = c.req.param('org');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
   const updates = (await c.req.json()) as OrgConfig;
 
   const validationError = validateOrgConfig(updates);
@@ -760,7 +852,7 @@ app.put('/api/v1/admin/orgs/:org/config', async (c) => {
 
 app.delete('/api/v1/admin/orgs/:org/config', async (c) => {
   const org = c.req.param('org');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   try {
     await c.env.ORG_CONFIG.delete(org);
@@ -778,7 +870,7 @@ app.delete('/api/v1/admin/orgs/:org/config', async (c) => {
 // are only substituted at runtime in the chat path (via applyTemplateVariables in user-session).
 app.get('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
   const org = c.req.param('org');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   try {
     const overrides = (await c.env.PROMPT_OVERRIDES.get<PromptOverrides>(org, 'json')) ?? {};
@@ -798,7 +890,7 @@ app.get('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
 
 app.put('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
   const org = c.req.param('org');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
   const updates = await c.req.json();
 
   const validationError = validatePromptOverrides(updates);
@@ -829,7 +921,7 @@ app.put('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
 
 app.delete('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
   const org = c.req.param('org');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   try {
     await c.env.PROMPT_OVERRIDES.delete(org);
@@ -849,7 +941,7 @@ app.delete('/api/v1/admin/orgs/:org/prompt-overrides', async (c) => {
 // Admin endpoints for org-level mode management
 app.get('/api/v1/admin/orgs/:org/modes', async (c) => {
   const org = c.req.param('org');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   try {
     const orgModes = (await c.env.PROMPT_OVERRIDES.get<OrgModes>(`${org}:modes`, 'json')) ?? {
@@ -867,7 +959,7 @@ app.get('/api/v1/admin/orgs/:org/modes', async (c) => {
 app.get('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
   const org = c.req.param('org');
   const modeName = c.req.param('modeName');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   const nameError = validateModeName(modeName);
   if (nameError) {
@@ -896,7 +988,7 @@ app.get('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
 app.put('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
   const org = c.req.param('org');
   const modeName = c.req.param('modeName');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   const nameError = validateModeName(modeName);
   if (nameError) {
@@ -941,7 +1033,7 @@ app.put('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
 app.delete('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
   const org = c.req.param('org');
   const modeName = c.req.param('modeName');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   const nameError = validateModeName(modeName);
   if (nameError) {
@@ -990,7 +1082,7 @@ function modeOpStatus(code: 'not_found' | 'conflict' | 'invalid'): 404 | 409 | 4
 app.post('/api/v1/admin/orgs/:org/modes/:modeName/_rename', async (c) => {
   const org = c.req.param('org');
   const modeName = c.req.param('modeName');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   const nameError = validateModeName(modeName);
   if (nameError) return c.json({ error: nameError }, 400);
@@ -1019,7 +1111,7 @@ app.post('/api/v1/admin/orgs/:org/modes/:modeName/_rename', async (c) => {
 app.post('/api/v1/admin/orgs/:org/modes/:modeName/_clone', async (c) => {
   const org = c.req.param('org');
   const modeName = c.req.param('modeName');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   const nameError = validateModeName(modeName);
   if (nameError) return c.json({ error: nameError }, 400);
@@ -1054,7 +1146,7 @@ app.post('/api/v1/admin/orgs/:org/modes/:modeName/_clone', async (c) => {
 app.post('/api/v1/admin/orgs/:org/modes/:modeName/_retire', async (c) => {
   const org = c.req.param('org');
   const modeName = c.req.param('modeName');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   const nameError = validateModeName(modeName);
   if (nameError) return c.json({ error: nameError }, 400);
@@ -1113,7 +1205,7 @@ async function readJsonBody(
 // Admin endpoints for org-level language management
 app.get('/api/v1/admin/orgs/:org/languages', async (c) => {
   const org = c.req.param('org');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   try {
     const orgLanguages = (await c.env.PROMPT_OVERRIDES.get<OrgLanguages>(
@@ -1138,7 +1230,7 @@ app.get('/api/v1/admin/orgs/:org/languages', async (c) => {
 app.get('/api/v1/admin/orgs/:org/languages/:languageName', async (c) => {
   const org = c.req.param('org');
   const languageName = c.req.param('languageName');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   const nameError = validateLanguageName(languageName);
   if (nameError) {
@@ -1168,7 +1260,7 @@ app.get('/api/v1/admin/orgs/:org/languages/:languageName', async (c) => {
 app.put('/api/v1/admin/orgs/:org/languages/:languageName', async (c) => {
   const org = c.req.param('org');
   const languageName = c.req.param('languageName');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   const nameError = validateLanguageName(languageName);
   if (nameError) {
@@ -1223,7 +1315,7 @@ app.put('/api/v1/admin/orgs/:org/languages/:languageName', async (c) => {
 app.delete('/api/v1/admin/orgs/:org/languages/:languageName', async (c) => {
   const org = c.req.param('org');
   const languageName = c.req.param('languageName');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   const nameError = validateLanguageName(languageName);
   if (nameError) {
@@ -1281,7 +1373,7 @@ app.delete('/api/v1/admin/orgs/:org/languages/:languageName', async (c) => {
 // LANGUAGE_NAME_PATTERN and would collide with `/languages/:languageName`.
 app.get('/api/v1/admin/orgs/:org/languages-default', async (c) => {
   const org = c.req.param('org');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   try {
     const orgLanguages = (await c.env.PROMPT_OVERRIDES.get<OrgLanguages>(
@@ -1302,7 +1394,7 @@ app.get('/api/v1/admin/orgs/:org/languages-default', async (c) => {
 
 app.put('/api/v1/admin/orgs/:org/languages-default', async (c) => {
   const org = c.req.param('org');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   const parsed = await readJsonBody(c.req.raw, logger, { action: 'set_default_language', org });
   if (!parsed.ok) {
@@ -1358,7 +1450,7 @@ app.put('/api/v1/admin/orgs/:org/languages-default', async (c) => {
 app.get('/api/v1/admin/orgs/:org/resources', async (c) => {
   const org = c.req.param('org');
   const language = c.req.query('language');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   const orgError = validateOrgNotReserved(org);
   if (orgError) {
@@ -1403,7 +1495,7 @@ app.get('/api/v1/admin/orgs/:org/resources', async (c) => {
 // Admin endpoints for per-org language scaffold
 app.get('/api/v1/admin/orgs/:org/language-scaffold', async (c) => {
   const org = c.req.param('org');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   try {
     const stored = await c.env.PROMPT_OVERRIDES.get<LanguageScaffold>(
@@ -1427,7 +1519,7 @@ app.get('/api/v1/admin/orgs/:org/language-scaffold', async (c) => {
 
 app.put('/api/v1/admin/orgs/:org/language-scaffold', async (c) => {
   const org = c.req.param('org');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
   const body = await c.req.json();
 
   const validationError = validateLanguageScaffold(body);
@@ -1455,7 +1547,7 @@ app.put('/api/v1/admin/orgs/:org/language-scaffold', async (c) => {
 
 app.delete('/api/v1/admin/orgs/:org/language-scaffold', async (c) => {
   const org = c.req.param('org');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
 
   try {
     await c.env.PROMPT_OVERRIDES.delete(`${org}:language-scaffold`);
@@ -1475,58 +1567,58 @@ app.delete('/api/v1/admin/orgs/:org/language-scaffold', async (c) => {
 app.get('/api/v1/admin/orgs/:org/users/:userId/mode', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/mode');
+  return handleUserRequest(c, org, userId, '/mode');
 });
 
 app.put('/api/v1/admin/orgs/:org/users/:userId/mode', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/mode');
+  return handleUserRequest(c, org, userId, '/mode');
 });
 
 app.delete('/api/v1/admin/orgs/:org/users/:userId/mode', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/mode');
+  return handleUserRequest(c, org, userId, '/mode');
 });
 
 // Admin endpoints for user-level prompt overrides (routed to DO)
 app.get('/api/v1/admin/orgs/:org/users/:userId/prompt-overrides', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/prompt-overrides');
+  return handleUserRequest(c, org, userId, '/prompt-overrides');
 });
 
 app.put('/api/v1/admin/orgs/:org/users/:userId/prompt-overrides', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/prompt-overrides');
+  return handleUserRequest(c, org, userId, '/prompt-overrides');
 });
 
 app.delete('/api/v1/admin/orgs/:org/users/:userId/prompt-overrides', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/prompt-overrides');
+  return handleUserRequest(c, org, userId, '/prompt-overrides');
 });
 
 // Admin endpoints for user memory (routed to DO)
 app.get('/api/v1/admin/orgs/:org/users/:userId/memory', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/memory');
+  return handleUserRequest(c, org, userId, '/memory');
 });
 
 app.delete('/api/v1/admin/orgs/:org/users/:userId/memory', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/memory');
+  return handleUserRequest(c, org, userId, '/memory');
 });
 
 // Admin endpoint for user history (routed to DO)
 app.delete('/api/v1/admin/orgs/:org/users/:userId/history', async (c) => {
   const org = c.req.param('org');
   const userId = c.req.param('userId');
-  return handleUserRequest(c.req.raw, c.env, org, userId, '/history');
+  return handleUserRequest(c, org, userId, '/history');
 });
 
 // Admin endpoint: open a DO directly by the 64-hex object id the Cloudflare
@@ -1537,11 +1629,11 @@ app.delete('/api/v1/admin/orgs/:org/users/:userId/history', async (c) => {
 // retroactively enumerable. Reaches the DO's own /identity and /history
 // handlers; identity is null for DOs that predate identity persistence and
 // have not chatted since. Super-admin only: the path sits outside
-// /api/v1/admin/orgs/*, so the global /api/* middleware (ENGINE_API_KEY)
-// is the sole gate.
+// /api/v1/admin/orgs/*, so the global /api/* middleware plus the
+// /api/v1/admin/* super-admin gate are what protect it.
 app.get('/api/v1/admin/do/:hexId/snapshot', async (c) => {
   const hexId = c.req.param('hexId');
-  const logger = createRequestLogger(crypto.randomUUID());
+  const logger = c.get('logger');
   if (!/^[0-9a-f]{64}$/.test(hexId)) {
     logger.warn('admin_do_snapshot_rejected', {
       reason: 'malformed_hex_id',
@@ -1594,17 +1686,15 @@ app.get('/api/v1/admin/do/:hexId/snapshot', async (c) => {
 // ── Group/thread admin helpers ──────────────────────────────────────────────────
 
 /** Handle a group admin request with chatId validation. */
-function handleGroupRequest(
-  c: { req: { raw: Request; param: (k: string) => string }; env: Env },
-  doPath: string
-) {
-  const org = c.req.param('org');
-  const chatId = c.req.param('chatId');
+function handleGroupRequest(c: Context<AppEnv>, doPath: string) {
+  const org = c.req.param('org') ?? '';
+  const chatId = c.req.param('chatId') ?? '';
   const chatIdError = validateChatIdParam(chatId, 'chatId');
   if (chatIdError) return Promise.resolve(Response.json({ error: chatIdError }, { status: 400 }));
   return handleDORequest({
     request: c.req.raw,
     env: c.env,
+    logger: c.get('logger'),
     org,
     doKey: `group:${org}:${chatId}`,
     doPath,
@@ -1612,13 +1702,10 @@ function handleGroupRequest(
 }
 
 /** Handle a thread admin request with chatId + threadId validation. */
-function handleThreadRequest(
-  c: { req: { raw: Request; param: (k: string) => string }; env: Env },
-  doPath: string
-) {
-  const org = c.req.param('org');
-  const chatId = c.req.param('chatId');
-  const threadId = c.req.param('threadId');
+function handleThreadRequest(c: Context<AppEnv>, doPath: string) {
+  const org = c.req.param('org') ?? '';
+  const chatId = c.req.param('chatId') ?? '';
+  const threadId = c.req.param('threadId') ?? '';
   const chatIdError = validateChatIdParam(chatId, 'chatId');
   if (chatIdError) return Promise.resolve(Response.json({ error: chatIdError }, { status: 400 }));
   const threadIdError = validateChatIdParam(threadId, 'threadId');
@@ -1627,6 +1714,7 @@ function handleThreadRequest(
   return handleDORequest({
     request: c.req.raw,
     env: c.env,
+    logger: c.get('logger'),
     org,
     doKey: `group:${org}:${chatId}:${threadId}`,
     doPath,
@@ -2224,6 +2312,8 @@ async function buildDOChatRequest(
     transport: ChatTransport;
     logger: ReturnType<typeof createRequestLogger>;
     requestId?: string;
+    /** Admin visibility, decided here from client_id AND the authenticated key class. */
+    isAdmin: boolean;
   }
 ): Promise<{ stub: DurableObjectStub; doRequest: Request }> {
   const { body, org, transport, logger } = opts;
@@ -2269,6 +2359,10 @@ async function buildDOChatRequest(
       // AFTER the spread, so a client-supplied `_edge_country` in the inbound
       // body is always overwritten and can never reach telemetry.
       _edge_country: (request.cf as { country?: string } | undefined)?.country,
+      // Admin visibility, decided by the worker from client_id AND the key the
+      // request authenticated with. Set AFTER the spread so a client-supplied
+      // `_is_admin` is always overwritten; the DO reads only this field.
+      _is_admin: opts.isAdmin,
     }),
   });
 
@@ -2278,10 +2372,10 @@ async function buildDOChatRequest(
 async function handleChatRequest(
   request: Request,
   env: Env,
-  transport: ChatTransport
+  transport: ChatTransport,
+  auth: ChatAuth
 ): Promise<Response> {
-  const requestId = crypto.randomUUID();
-  const logger = createRequestLogger(requestId);
+  const { logger } = auth;
   const timing = createTimingContext();
 
   let body: ChatRequest;
@@ -2311,9 +2405,8 @@ async function handleChatRequest(
           env,
           transport,
           body,
-          logger,
           timing,
-          requestId,
+          auth,
         });
       } catch (error) {
         return respondToChatRequestError(error, transport, timing, logger);
@@ -2328,15 +2421,56 @@ async function handleChatRequest(
   );
 }
 
+/** Outcome of {@link checkAdminClientKey}: a 403 to return, or the `_is_admin` value. */
+type AdminClientCheck = { rejection: Response } | { isAdmin: boolean };
+
+/**
+ * A chat request whose `client_id` marks it as admin-origin (`isAdminClient`)
+ * asks for admin visibility (unpublished modes and languages, admin welcome
+ * preview). That is a super-admin capability, so it follows the same key rule
+ * as `/api/v1/admin/*` (the `superAdmin` the `/api/*` middleware computed).
+ * Returns a 403 when an admin client lacks that authority; otherwise the
+ * `_is_admin` value the DO gets (true only for an admin client with it). Logs
+ * `admin_auth` with the key class so the switch-over can be watched.
+ */
+function checkAdminClientKey(
+  env: Env,
+  body: ChatRequest,
+  transport: ChatTransport,
+  auth: ChatAuth
+): AdminClientCheck {
+  if (!isAdminClient(body.client_id)) return { isAdmin: false };
+  const { logger, keyClass } = auth;
+  warnOnAdminKeyConfig(env, logger);
+  const fields = { key_class: keyClass, enforced: adminKeyEnforced(env), transport };
+  if (auth.superAdmin) {
+    logger.log('admin_auth', { ...fields, path: 'chat', client_id: body.client_id });
+    return { isAdmin: true };
+  }
+  logger.warn('auth_rejected', {
+    ...fields,
+    reason: 'admin_key_required',
+    status: 403,
+    client_id: body.client_id,
+  });
+  countMetric('auth_rejections_total', { reason: 'admin_key_required', status_code: 403 });
+  countMetric('requests_total', { transport, status: 'auth_rejected', status_code: 403 });
+  const rejection = Response.json(
+    { error: 'This client_id requires the admin API key', code: 'admin_key_required' },
+    { status: 403 }
+  );
+  return { rejection };
+}
+
 /** Params for {@link dispatchChatRequest} — the chat flow inside the pseudonym scope. */
 type ChatDispatchParams = {
   request: Request;
   env: Env;
   transport: ChatTransport;
   body: ChatRequest;
-  logger: RequestLogger;
   timing: TimingContext;
-  requestId: string;
+  /** Key class, super-admin authority, request id and request logger (from `/api/*`). */
+  auth: ChatAuth;
 };
 
 /**
@@ -2345,7 +2479,8 @@ type ChatDispatchParams = {
  * scope a callback boundary; the behavior is unchanged.
  */
 async function dispatchChatRequest(params: ChatDispatchParams): Promise<Response> {
-  const { request, env, transport, body, logger, timing, requestId } = params;
+  const { request, env, transport, body, timing, auth } = params;
+  const { logger, requestId } = auth;
   const validationError = validateChatBody(body, transport);
   if (validationError) {
     logger.warn('chat_validation_failed', {
@@ -2358,12 +2493,24 @@ async function dispatchChatRequest(params: ChatDispatchParams): Promise<Response
     return Response.json({ error: validationError }, { status: 400 });
   }
 
+  const adminCheck = checkAdminClientKey(env, body, transport, auth);
+  if ('rejection' in adminCheck) {
+    return adminCheck.rejection;
+  }
+
   const org = resolveOrgFromBody(body, env.DEFAULT_ORG);
   // prettier-ignore
   logger.log('request_received', { user_id: body.user_id, client_id: body.client_id, org, transport, chat_type: body.chat_type ?? 'private', chat_id: body.chat_id, thread_id: body.thread_id });
 
   const { stub, doRequest } = await timePhase(timing, 'kv_and_routing', () =>
-    buildDOChatRequest(request, env, { body, org, transport, logger, requestId })
+    buildDOChatRequest(request, env, {
+      body,
+      org,
+      transport,
+      logger,
+      requestId,
+      isAdmin: adminCheck.isAdmin,
+    })
   );
   const response = await timePhase(timing, 'do_fetch', () => stub.fetch(doRequest));
 
@@ -2410,6 +2557,8 @@ function respondToChatRequestError(
 interface DORequestParams {
   request: Request;
   env: Env;
+  /** The request logger from the `/api/*` middleware (same request id). */
+  logger: RequestLogger;
   org: string;
   doKey: string;
   doPath: string;
@@ -2422,16 +2571,15 @@ interface DORequestParams {
  * Routes to the DO identified by doKey (e.g. "user:org:userId" or "group:org:chatId").
  */
 async function handleDORequest(params: DORequestParams): Promise<Response> {
-  const { request, env, org, doKey, doPath, userId } = params;
-  const requestId = crypto.randomUUID();
-  const logger = createRequestLogger(requestId, userId);
+  const { request, env, logger, org, doKey, doPath, userId } = params;
   const start = Date.now();
 
   if (!org) {
     return Response.json({ error: 'org is required in path' }, { status: 400 });
   }
 
-  logger.log('do_request_received', { do_key: doKey, org, path: doPath, method: request.method });
+  // prettier-ignore
+  logger.log('do_request_received', { do_key: doKey, org, path: doPath, method: request.method, user_id: userId });
 
   const doId = env.USER_DO.idFromName(doKey);
   const stub = env.USER_DO.get(doId);
@@ -2450,6 +2598,7 @@ async function handleDORequest(params: DORequestParams): Promise<Response> {
 
   const response = await stub.fetch(doRequest);
   logger.log('do_request_complete', {
+    user_id: userId,
     path: doPath,
     status: response.status,
     duration_ms: Date.now() - start,
@@ -2501,8 +2650,7 @@ async function servePublicPtxprintObject(path: string, env: Env): Promise<Respon
 
 /** Convenience wrapper for user-scoped DO requests. */
 async function handleUserRequest(
-  request: Request,
-  env: Env,
+  c: Context<AppEnv>,
   org: string,
   userId: string,
   doPath: string
@@ -2510,5 +2658,13 @@ async function handleUserRequest(
   if (!userId) {
     return Response.json({ error: 'user_id is required in path' }, { status: 400 });
   }
-  return handleDORequest({ request, env, org, doKey: `user:${org}:${userId}`, doPath, userId });
+  return handleDORequest({
+    request: c.req.raw,
+    env: c.env,
+    logger: c.get('logger'),
+    org,
+    doKey: `user:${org}:${userId}`,
+    doPath,
+    userId,
+  });
 }

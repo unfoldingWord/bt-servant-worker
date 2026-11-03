@@ -150,6 +150,13 @@ export interface ChatRequest {
   _edge_country?: string;
 
   /**
+   * Internal: admin visibility (unpublished modes/languages, admin welcome
+   * preview), decided by the worker from `client_id` AND the key the request
+   * authenticated with (not from client). The worker always overwrites it.
+   */
+  _is_admin?: boolean;
+
+  /**
    * Internal: transport this request arrived on, stamped by the DO's chat
    * dispatcher so queued entries retain it when drained later (not from
    * client).

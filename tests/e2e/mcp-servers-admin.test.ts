@@ -423,6 +423,39 @@ describe('super-admin fence on writes', () => {
   });
 });
 
+describe('pool writes refuse every non-super-admin token form', () => {
+  const ORG_KEY = 'org-admin-key-pool-forms';
+  afterEach(async () => {
+    await env.ORG_ADMIN_KEYS.delete(ORG_A);
+  });
+
+  // Each form goes through the real `/api/*` middleware and admin gate.
+  const forms: [string, Record<string, string>][] = [
+    ['org-scoped KV key', { Authorization: `Bearer ${ORG_KEY}` }],
+    ['prefix of the engine key', { Authorization: 'Bearer test-api' }],
+    ['missing Bearer prefix', { Authorization: 'test-api-key' }],
+    ['empty token', { Authorization: 'Bearer ' }],
+    ['no header', {}],
+  ];
+
+  it.each(forms)('%s cannot write the global pool', async (_label, auth) => {
+    await env.ORG_ADMIN_KEYS.put(ORG_A, ORG_KEY);
+    await seedGlobal([server('keep')]);
+    const headers = { ...auth, 'Content-Type': 'application/json' };
+
+    const attempts = [
+      SELF.fetch(base(ORG_A), { method: 'PUT', headers, body: '[]' }),
+      SELF.fetch(base(ORG_A), { method: 'POST', headers, body: JSON.stringify(server('x')) }),
+      SELF.fetch(`${base(ORG_A)}/keep`, { method: 'DELETE', headers }),
+    ];
+    for (const res of await Promise.all(attempts)) {
+      expect([401, 403]).toContain(res.status);
+    }
+    expect((await readKey(MCP_GLOBAL_KEY))?.map((s) => s.id)).toEqual(['keep']);
+    await env.MCP_SERVERS.delete(MCP_GLOBAL_KEY);
+  });
+});
+
 describe('reserved key guard', () => {
   const reserved = base(MCP_GLOBAL_KEY);
 
