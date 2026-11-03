@@ -99,6 +99,8 @@ export function callerAllowsAudio(caller: ChatCaller | undefined): boolean {
  * through those routes.
  */
 export const CHAT_ID_PATTERN = /^[\w.:-]+$/;
+/** Max length of a chat_id or thread_id path parameter on the admin group routes. */
+export const MAX_CHAT_ID_LENGTH = 256;
 
 /** Options for {@link validateChatBody}. */
 export interface ChatValidationOptions {

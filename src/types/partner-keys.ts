@@ -231,7 +231,7 @@ export function validatePartnerKeyCreate(
 }
 
 /** Reject a non-object body and any key outside `allowed`. Absent/null body → `{}`. */
-function readBodyObject(
+export function readBodyObject(
   body: unknown,
   allowed: ReadonlySet<string>
 ): { ok: true; record: Record<string, unknown> } | { ok: false; error: string } {

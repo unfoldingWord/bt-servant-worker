@@ -21,22 +21,35 @@
  *   in the key's org — so a wrong id can't pull in someone else's user.
  * - `destination_not_empty`: the partner key has already been used for this
  *   user; the import never overwrites a conversation.
+ * - `destination_busy`: a turn is running or queued in the destination; the
+ *   check and write run under the destination's own turn lock. Retry later.
  * The source is never modified, so a re-run (or a mistake) loses nothing.
  */
 
 import type { Env } from '../../config/types.js';
-import type { PartnerKeyRecord } from '../../types/partner-keys.js';
-import type { UserDataExport } from '../../durable-objects/user-data-transfer.js';
+import { readBodyObject, type PartnerKeyRecord } from '../../types/partner-keys.js';
+import type {
+  UserDataExport,
+  UserDataImportResult,
+} from '../../durable-objects/user-data-transfer.js';
 import type { RequestLogger } from '../../utils/logger.js';
 import { isValidPartnerIdentifier, scopePartnerSubject } from './policy.js';
 
 export const MAX_LEGACY_IMPORT_USERS = 100;
 const MAX_LEGACY_CLIENT_ID_LENGTH = 64;
+/** Users copied at once (each copy is two UserDO requests). */
+const IMPORT_CONCURRENCY = 5;
+const IMPORT_FIELDS: ReadonlySet<string> = new Set(['legacyClientId', 'userIds']);
 
 export type LegacyImportInput = { legacyClientId: string; userIds: string[] };
 
 export type LegacyImportStatus =
-  'copied' | 'not_found' | 'client_mismatch' | 'destination_not_empty' | 'failed';
+  | 'copied'
+  | 'not_found'
+  | 'client_mismatch'
+  | 'destination_not_empty'
+  | 'destination_busy'
+  | 'failed';
 
 export type LegacyImportResult = { userId: string; status: LegacyImportStatus; entries?: number };
 
@@ -55,13 +68,9 @@ function areImportUserIds(userIds: unknown): userIds is string[] {
 export function readLegacyImportBody(
   body: unknown
 ): { ok: true; input: LegacyImportInput } | { ok: false; error: string } {
-  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
-    return { ok: false, error: 'Request body must be a JSON object' };
-  }
-  const { legacyClientId, userIds, ...unknown } = body as Record<string, unknown>;
-  if (Object.keys(unknown).length > 0) {
-    return { ok: false, error: `Unknown field(s): ${Object.keys(unknown).join(', ')}` };
-  }
+  const parsed = readBodyObject(body, IMPORT_FIELDS);
+  if (!parsed.ok) return parsed;
+  const { legacyClientId, userIds } = parsed.record;
   if (
     !isValidPartnerIdentifier(legacyClientId) ||
     legacyClientId.length > MAX_LEGACY_CLIENT_ID_LENGTH
@@ -71,8 +80,7 @@ export function readLegacyImportBody(
       error: `legacyClientId must be a single-line string of 1-${MAX_LEGACY_CLIENT_ID_LENGTH} characters`,
     };
   }
-  const idsOk = areImportUserIds(userIds);
-  if (!idsOk) {
+  if (!areImportUserIds(userIds)) {
     return {
       ok: false,
       error: `userIds must be 1-${MAX_LEGACY_IMPORT_USERS} distinct user ids, each a valid partner user_id`,
@@ -95,52 +103,67 @@ function ownedByLegacyClient(
   );
 }
 
-function userDo(env: Env, name: string): DurableObjectStub {
-  return env.USER_DO.get(env.USER_DO.idFromName(name));
+/** What one copy needs: the bindings, the key, the request id to forward. */
+type ImportContext = {
+  env: Env;
+  key: PartnerKeyRecord;
+  legacyClientId: string;
+  requestId: string;
+};
+
+function userDoFetch(ctx: ImportContext, name: string, init: RequestInit = {}) {
+  const stub = ctx.env.USER_DO.get(ctx.env.USER_DO.idFromName(name));
+  const headers = { ...(init.headers as Record<string, string>), 'X-Request-ID': ctx.requestId };
+  return stub.fetch('https://user-do/admin/user-data', { ...init, headers });
 }
 
-async function copyOneUser(
-  env: Env,
-  key: PartnerKeyRecord,
-  legacyClientId: string,
-  userId: string
-): Promise<LegacyImportResult> {
-  const source = await userDo(env, `user:${key.org}:${userId}`).fetch(
-    'https://user-do/admin/user-data'
-  );
+async function copyOneUser(ctx: ImportContext, userId: string): Promise<LegacyImportResult> {
+  const { key } = ctx;
+  const source = await userDoFetch(ctx, `user:${key.org}:${userId}`);
   if (!source.ok) throw new Error(`source export failed with ${source.status}`);
   const exported = (await source.json()) as UserDataExport;
   if (exported.identity === null) return { userId, status: 'not_found' };
-  if (!ownedByLegacyClient(exported.identity, key.org, legacyClientId)) {
+  if (!ownedByLegacyClient(exported.identity, key.org, ctx.legacyClientId)) {
     return { userId, status: 'client_mismatch' };
   }
-  const destName = `user:${key.org}:${scopePartnerSubject(key, userId)}`;
-  const dest = await userDo(env, destName).fetch('https://user-do/admin/user-data', {
+  const dest = await userDoFetch(ctx, `user:${key.org}:${scopePartnerSubject(key, userId)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ entries: exported.entries }),
   });
-  if (dest.status === 409) return { userId, status: 'destination_not_empty' };
-  if (!dest.ok) throw new Error(`destination import failed with ${dest.status}`);
-  const { imported } = (await dest.json()) as { imported: number };
-  return { userId, status: 'copied', entries: imported };
+  const result = (await dest.json()) as UserDataImportResult;
+  if (result.ok) return { userId, status: 'copied', entries: result.imported };
+  if (dest.status === 409) return { userId, status: result.reason };
+  throw new Error(`destination import failed with ${dest.status}`);
 }
 
-/** Copy each named user, one at a time. A failure is logged and reported for that user only. */
+/**
+ * Copy each named user, IMPORT_CONCURRENCY at a time, results in input order.
+ * A failure is logged (with the user id) and reported for that user only.
+ */
 export async function importLegacyUsers(
   env: Env,
   key: PartnerKeyRecord,
   input: LegacyImportInput,
-  logger: RequestLogger
+  opts: { logger: RequestLogger; requestId: string }
 ): Promise<LegacyImportResult[]> {
+  const ctx = { env, key, legacyClientId: input.legacyClientId, requestId: opts.requestId };
   const results: LegacyImportResult[] = [];
-  for (const userId of input.userIds) {
-    try {
-      results.push(await copyOneUser(env, key, input.legacyClientId, userId));
-    } catch (error) {
-      logger.error('partner_key_legacy_import_user_failed', error, { key_id: key.id });
+  for (let i = 0; i < input.userIds.length; i += IMPORT_CONCURRENCY) {
+    const batch = input.userIds.slice(i, i + IMPORT_CONCURRENCY);
+    const settled = await Promise.allSettled(batch.map((userId) => copyOneUser(ctx, userId)));
+    settled.forEach((outcome, j) => {
+      const userId = batch.at(j) ?? '';
+      if (outcome.status === 'fulfilled') {
+        results.push(outcome.value);
+        return;
+      }
+      opts.logger.error('partner_key_legacy_import_user_failed', outcome.reason, {
+        key_id: key.id,
+        user_id: userId,
+      });
       results.push({ userId, status: 'failed' });
-    }
+    });
   }
   return results;
 }

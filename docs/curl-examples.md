@@ -535,8 +535,7 @@ unchanged. These admin endpoints accept **only** `ENGINE_API_KEY`.
   `403` until its cached miss expires). To replace a key without a gap,
   prefer rotation with a grace period over create-then-revoke.
 - List and get read the Durable Object, so they are always current and the
-  list is always complete. Revoked keys are kept for audit. The list keeps a
-  `"truncated"` field for compatibility; it is always `false`.
+  list is always complete. Revoked keys are kept for audit.
 
 ### Create a Key
 
@@ -578,7 +577,7 @@ curl "http://localhost:$PORT/api/v1/admin/api-keys" -H "Authorization: Bearer $A
 curl "http://localhost:$PORT/api/v1/admin/api-keys?org=bcs" -H "Authorization: Bearer $API_KEY"
 ```
 
-**Response (200):** `{"org": "bcs" | null, "keys": [...records], "truncated": false}`
+**Response (200):** `{"org": "bcs" | null, "keys": [...records]}`
 
 ### Get One Key
 
@@ -627,6 +626,19 @@ revocations are written in one atomic step. `warnings` is `[]`, or
 (see above). The body is optional:
 `{"createdBy": "...", "graceSeconds": 86400}`.
 
+**A lost response.** The plaintext is never stored, so a create or rotate
+response that does not arrive cannot be fetched again. Recover like this:
+
+- **Lost rotate response:** `GET` the old key; its `rotatedTo` is the new key
+  id (a repeated rotate of the old key also answers `409` with
+  `"code": "already_rotated"` and `"rotatedTo"`). Rotate that new key id to
+  get a fresh `apiKey`. Keep a grace period: the old key keeps working through
+  its own grace window meanwhile. `"graceSeconds": 0` removes this safety net,
+  because it revokes the old key at once, so a lost grace-0 response leaves
+  the partner with no working key until the new key is rotated.
+- **Lost create response:** nobody has the key. Find it in the list, revoke it
+  (or rotate it) and use the new `apiKey`.
+
 ```bash
 curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_rotate" \
   -H "Authorization: Bearer $API_KEY" \
@@ -660,7 +672,11 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_
   equals `legacyClientId`. Otherwise the status is `client_mismatch`, or
   `not_found` when there is no identity record. `destination_not_empty` means
   the partner key has already been used for that user; nothing is
-  overwritten. `failed` is logged.
+  overwritten. `destination_busy` means a turn is running or queued for that
+  user under the partner key (the check and the write take the same lock a
+  turn does); retry later. `failed` is logged.
+- The key must be active: a revoked or expired key gets `409`
+  (`key_revoked` / `key_expired`).
 - The source is not changed or deleted. Run the import at the switch: turns
   the app still sends with the shared key afterwards are not copied.
 - `userIds`: 1-100 distinct ids, each valid as a partner `user_id`.
@@ -680,9 +696,13 @@ key is even looked up. On those two routes:
   prompt (which says only "a partner app").
 - `user_id`, `chat_id` and `thread_id` must be single-line strings of at most
   256 characters (`400` otherwise; `null` counts as absent for the optional
-  two). Single-line excludes all control characters (C0 and C1) and the
-  Unicode line/paragraph separators. `chat_id` and `thread_id` must not
-  contain `:` (the group conversation name joins them with `:`).
+  two). Single-line excludes all control characters (C0 and C1), the
+  Unicode line/paragraph separators and invisible format characters. Leading
+  or trailing whitespace is refused, not trimmed. `chat_id` and `thread_id`
+  may use only letters, digits, `_`, `.` and `-` (no `:`: the group
+  conversation name joins them with `:`). `chat_id` is stored with the
+  key's prefix, so it may be at most 228 characters (256 minus the prefix);
+  `thread_id` up to 256.
 - `speaker` gets the same treatment as for every other client: brackets
   removed, line breaks and controls flattened to one space, capped at 64
   characters, before it reaches the prompt.

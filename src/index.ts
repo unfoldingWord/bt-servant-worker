@@ -5,7 +5,7 @@
  * MCP server config is stored in KV and passed to DOs via request body.
  */
 
-import { Hono, type Context } from 'hono';
+import { Hono, type Context, type MiddlewareHandler } from 'hono';
 import { Env } from './config/types.js';
 import { APP_VERSION } from './generated/version.js';
 import { UserDO as UserDOClass } from './durable-objects/index.js';
@@ -74,7 +74,7 @@ import {
   upsertServer,
 } from './utils/mcp-servers.js';
 import { resolveOrgFromBody } from './utils/org.js';
-import { CHAT_ID_PATTERN, validateChatBody } from './utils/chat-validation.js';
+import { CHAT_ID_PATTERN, MAX_CHAT_ID_LENGTH, validateChatBody } from './utils/chat-validation.js';
 import {
   applyPartnerChatPolicy,
   isPartnerRouteAllowed,
@@ -184,6 +184,7 @@ app.get('/public/ptxprint/*', async (c) => servePublicPtxprintObject(c.req.path,
 const NOT_PERMITTED_REASONS: ReadonlySet<string> = new Set([
   'partner_route_forbidden',
   'partner_admin_forbidden',
+  'super_admin_required',
 ]);
 
 /** Observable auth rejection: one log line + one counter, never the token value. */
@@ -321,6 +322,23 @@ app.use('/api/v1/admin/*', async (c, next) => {
   }
   return next();
 });
+
+/**
+ * Who may administer partner keys (create, list, get, revoke, rotate, legacy
+ * import): the super-admin. Today that is the internal principal
+ * (ENGINE_API_KEY). This predicate and the guard below are the ONE place to
+ * change when the admin key split lands.
+ */
+function isSuperAdmin(principal: Principal | undefined): boolean {
+  return principal?.kind === 'internal';
+}
+
+const superAdminOnly: MiddlewareHandler<AppEnv> = async (c, next) => {
+  if (isSuperAdmin(c.get('principal'))) return next();
+  return rejectAuth(c, 403, 'super_admin_required', {
+    key_id: principalKeyId(c.get('principal')),
+  });
+};
 
 /** The per-request values a chat handler takes from the auth middleware. */
 type ChatRequestContext = AppEnv['Variables'];
@@ -1752,6 +1770,8 @@ app.get('/api/v1/admin/do/:hexId/snapshot', async (c) => {
 // responses, as `apiKey`, and cannot be fetched again.
 
 const PARTNER_KEYS_BASE = '/api/v1/admin/api-keys';
+app.use(PARTNER_KEYS_BASE, superAdminOnly);
+app.use(`${PARTNER_KEYS_BASE}/*`, superAdminOnly);
 
 /** On every response that carries a plaintext key: no cache may keep a copy. */
 const NO_STORE_HEADERS = { 'Cache-Control': 'no-store' } as const;
@@ -1811,13 +1831,8 @@ app.get(PARTNER_KEYS_BASE, async (c) => {
       org: org ?? null,
       count: records.length,
     });
-    // The DO list is always complete; `truncated` stays (always false) for
-    // contract stability with clients written against the KV-index list.
-    return c.json({
-      org: org ?? null,
-      keys: records.map((r) => toPublicPartnerKey(r)),
-      truncated: false,
-    });
+    // The DO list is always complete (no paging).
+    return c.json({ org: org ?? null, keys: records.map((r) => toPublicPartnerKey(r)) });
   } catch (error) {
     logger.error('admin_action', error, { action: 'list_api_keys', org: org ?? null });
     return c.json({ error: 'Failed to list API keys' }, 500);
@@ -1926,7 +1941,17 @@ app.post(`${PARTNER_KEYS_BASE}/:keyId/_import-legacy-users`, async (c) => {
   try {
     const key = await keyStore(c).get(keyId);
     if (!key) return c.json({ error: 'API key not found' }, 404);
-    const results = await importLegacyUsers(c.env, key, body.input, logger);
+    const status = partnerKeyStatus(key, Date.now());
+    if (status !== 'active') {
+      return c.json(
+        { error: `This API key is ${status}; import into an active key`, code: `key_${status}` },
+        409
+      );
+    }
+    const results = await importLegacyUsers(c.env, key, body.input, {
+      logger,
+      requestId: c.get('requestId'),
+    });
     const counts = Object.fromEntries(
       [...new Set(results.map((r) => r.status))].map((status) => [
         status,
@@ -1958,8 +1983,15 @@ function rotateRefusal(c: Context<AppEnv>, result: Exclude<RotateOutcome, { stat
         409
       );
     case 'already_rotated':
+      // Also the recovery path for a rotate response lost in transit: the new
+      // key's plaintext is never stored, so the way back is to rotate the
+      // successor (with a grace, which leaves this key working meanwhile).
       return c.json(
-        { error: `This key was already rotated to ${result.rotatedTo}; rotate that key instead` },
+        {
+          error: `This key was already rotated to ${result.rotatedTo}. If the response with that key's apiKey was lost, rotate ${result.rotatedTo} (keep a grace period: graceSeconds 0 would also revoke this key)`,
+          code: 'already_rotated',
+          rotatedTo: result.rotatedTo,
+        },
         409
       );
   }
@@ -2548,9 +2580,6 @@ function doChatPathForTransport(transport: ChatTransport): string {
       return '/chat/callback';
   }
 }
-
-/** Max length for chat_id and thread_id path parameters. */
-const MAX_CHAT_ID_LENGTH = 256;
 
 /** Validate a chat_id or thread_id path parameter. Returns an error string or null. */
 function validateChatIdParam(value: string, paramName: string): string | null {

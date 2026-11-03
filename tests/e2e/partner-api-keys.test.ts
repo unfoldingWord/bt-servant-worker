@@ -678,12 +678,12 @@ describe('responses that carry a plaintext key are not cacheable', () => {
     expect(((await rotate.json()) as { warnings: string[] }).warnings).toEqual([]);
   });
 
-  it('the list reports truncated: false when every index page was read', async () => {
-    await createKey('org-354-truncated');
+  it('the list response is just org and keys (no paging fields)', async () => {
+    await createKey('org-354-listshape');
     const list = (await (
-      await SELF.fetch(`${KEYS}?org=org-354-truncated`, { headers: INTERNAL })
-    ).json()) as { truncated: boolean };
-    expect(list.truncated).toBe(false);
+      await SELF.fetch(`${KEYS}?org=org-354-listshape`, { headers: INTERNAL })
+    ).json()) as Record<string, unknown>;
+    expect(Object.keys(list).sort()).toEqual(['keys', 'org']);
   });
 });
 
@@ -820,5 +820,74 @@ describe('legacy user import: access and validation', () => {
       userIds: ['u1'],
     });
     expect(missing.status).toBe(404);
+  });
+});
+
+describe('recovering from a lost rotate response', () => {
+  it('a second rotate of the old key names the successor; rotating the successor recovers', async () => {
+    const { key, apiKey } = await createKey('org-354-lost-rotate');
+    const lost = (await (await rotateKey(key.id)).json()) as RotateBody; // response "lost"
+    const again = await rotateKey(key.id);
+    expect(again.status).toBe(409);
+    const body = (await again.json()) as { error: string; code: string; rotatedTo: string };
+    expect(body).toMatchObject({ code: 'already_rotated', rotatedTo: lost.key.id });
+    expect(body.error).toContain(`rotate ${lost.key.id}`);
+
+    const recovered = await rotateKey(lost.key.id);
+    expect(recovered.status).toBe(200);
+    const fresh = (await recovered.json()) as RotateBody;
+    expect((await postChat(fresh.apiKey, chatBody())).status).toBe(200);
+    expect((await postChat(apiKey, chatBody())).status).toBe(200); // still in its grace
+  });
+});
+
+describe('legacy user import: concurrency, key status and what is copied', () => {
+  const putInUserDo = (name: string, entries: Record<string, unknown>) =>
+    runInDurableObject(env.USER_DO.get(env.USER_DO.idFromName(name)), async (_i, state) => {
+      await state.storage.put(entries);
+    });
+
+  it('refuses while a turn holds the destination lock or anything is queued', async () => {
+    expect((await internalChat('shema', 'b1', 'busy one')).status).toBe(200);
+    expect((await internalChat('shema', 'b2', 'busy two')).status).toBe(200);
+    const { key } = await createKey(ORG);
+    const ns = key.userNamespace;
+    await putInUserDo(`user:${ORG}:partner:${ns}:b1`, { _processing_lock: Date.now() });
+    await putInUserDo(`user:${ORG}:partner:${ns}:b2`, { queue: [{ message_id: 'm1' }] });
+    const res = await importUsers(key.id, { legacyClientId: 'shema', userIds: ['b1', 'b2'] });
+    expect(((await res.json()) as { results: unknown[] }).results).toEqual([
+      { userId: 'b1', status: 'destination_busy' },
+      { userId: 'b2', status: 'destination_busy' },
+    ]);
+  });
+
+  it('refuses a revoked key with 409', async () => {
+    const { key } = await createKey(ORG);
+    await SELF.fetch(`${KEYS}/${key.id}/_revoke`, { method: 'POST', headers: INTERNAL });
+    const res = await importUsers(key.id, { legacyClientId: 'shema', userIds: ['u1'] });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ code: 'key_revoked' });
+  });
+
+  it('does not copy the lock, the queue or the identity record', async () => {
+    expect((await internalChat('shema', 'q1', 'queued source')).status).toBe(200);
+    await putInUserDo(`user:${ORG}:q1`, {
+      queue_inflight: { bytes: 1, at: 1 },
+      extra_note: 'kept',
+    });
+    const { key } = await createKey(ORG);
+    const res = await importUsers(key.id, { legacyClientId: 'shema', userIds: ['q1'] });
+    expect(((await res.json()) as { results: { status: string }[] }).results[0]?.status).toBe(
+      'copied'
+    );
+    const keys = await runInDurableObject(
+      env.USER_DO.get(env.USER_DO.idFromName(`user:${ORG}:partner:${key.userNamespace}:q1`)),
+      async (_i, state) => [...(await state.storage.list()).keys()]
+    );
+    expect(keys).toContain('history');
+    expect(keys).toContain('extra_note');
+    for (const excluded of ['identity', 'queue_inflight', '_processing_lock', 'queue']) {
+      expect(keys).not.toContain(excluded);
+    }
   });
 });

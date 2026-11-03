@@ -22,7 +22,11 @@
 import type { PartnerKeyRecord } from '../../types/partner-keys.js';
 import type { ChatRequest } from '../../types/engine.js';
 import { codePointLength, hasLineBreakOrControl } from '../../types/single-line.js';
-import { CHAT_ID_PATTERN, partnerClientId } from '../../utils/chat-validation.js';
+import {
+  CHAT_ID_PATTERN,
+  MAX_CHAT_ID_LENGTH,
+  partnerClientId,
+} from '../../utils/chat-validation.js';
 
 /** Who made an /api/* request, as established by the auth middleware. */
 export type Principal = { kind: 'internal' } | { kind: 'partner'; key: PartnerKeyRecord };
@@ -127,23 +131,29 @@ export const MAX_PARTNER_ID_LENGTH = 256;
 /**
  * A partner's chat_id / thread_id name a group DO and must stay manageable
  * through the admin group routes, so they use the characters those routes
- * accept (CHAT_ID_PATTERN) MINUS ':'. Group DO names are
+ * accept (CHAT_ID_PATTERN) MINUS ':', and fit their length limit once stored:
+ * chat_id is stored as `partner:<ns>:<chat_id>`, so it gets 256 minus that
+ * prefix; thread_id is stored as sent. Group DO names are
  * `group:<org>:<chat_id>[:<thread_id>]` (resolveDOId), so a ':' could make two
  * different (chat, thread) pairs produce the same name — `a:b` + `c` vs
  * `a` + `b:c`. (user_id is the last segment of its DO name, so it cannot
  * collide that way and keeps the general single-line rule.)
  */
-const GROUP_ID_FIELDS: ReadonlySet<string> = new Set(['chat_id', 'thread_id']);
-
-function isPartnerGroupId(value: string): boolean {
-  return CHAT_ID_PATTERN.test(value) && !value.includes(':');
+function maxGroupIdLength(field: 'chat_id' | 'thread_id', key: PartnerKeyRecord): number {
+  const prefix = field === 'chat_id' ? scopePartnerSubject(key, '').length : 0;
+  return MAX_CHAT_ID_LENGTH - prefix;
 }
 
-/** A non-empty single-line string of at most MAX_PARTNER_ID_LENGTH code points. */
+/**
+ * A non-empty single-line string of at most MAX_PARTNER_ID_LENGTH code
+ * points, with no leading or trailing whitespace (refused, never trimmed:
+ * ` alice` and `alice` would otherwise be two different users).
+ */
 export function isValidPartnerIdentifier(value: unknown): value is string {
   return (
     typeof value === 'string' &&
     value.length > 0 &&
+    value.trim() === value &&
     codePointLength(value) <= MAX_PARTNER_ID_LENGTH &&
     !hasLineBreakOrControl(value)
   );
@@ -156,21 +166,31 @@ function checkIdentifier(
   required: boolean
 ): PartnerPolicyResult | null {
   if (!isPresent(value) && !required) return null;
-  if (!isValidPartnerIdentifier(value)) {
-    return reject(
-      400,
-      `partner_${field}`,
-      `${field} ${required ? 'is required and ' : ''}must be a non-empty single-line string of at most ${MAX_PARTNER_ID_LENGTH} characters`
-    );
-  }
-  if (GROUP_ID_FIELDS.has(field) && !isPartnerGroupId(value)) {
+  if (isValidPartnerIdentifier(value)) return null;
+  return reject(
+    400,
+    `partner_${field}`,
+    `${field} ${required ? 'is required and ' : ''}must be a non-empty single-line string of at most ${MAX_PARTNER_ID_LENGTH} characters, without leading or trailing whitespace`
+  );
+}
+
+/** chat_id / thread_id beyond the general rule: admin-route characters minus ':', and length. */
+function checkGroupId(
+  value: unknown,
+  field: 'chat_id' | 'thread_id',
+  key: PartnerKeyRecord
+): PartnerPolicyResult | null {
+  if (typeof value !== 'string') return null;
+  if (!CHAT_ID_PATTERN.test(value) || value.includes(':')) {
     return reject(
       400,
       `partner_${field}`,
       `${field} may contain only letters, digits, '_', '.' and '-' (no ':' or other characters)`
     );
   }
-  return null;
+  const max = maxGroupIdLength(field, key);
+  if (value.length <= max) return null;
+  return reject(400, `partner_${field}`, `${field} must be at most ${max} characters`);
 }
 
 /**
@@ -178,11 +198,16 @@ function checkIdentifier(
  * chat_id so the namespacing below always applies, and all three because they
  * reach DO names and logs. (Internal callers keep validateChatBody's rules.)
  */
-function checkIdentifiers(body: Record<string, unknown>): PartnerPolicyResult | null {
+function checkIdentifiers(
+  body: Record<string, unknown>,
+  key: PartnerKeyRecord
+): PartnerPolicyResult | null {
   return (
     checkIdentifier(body.user_id, 'user_id', true) ??
     checkIdentifier(body.chat_id, 'chat_id', false) ??
     checkIdentifier(body.thread_id, 'thread_id', false) ??
+    checkGroupId(body.chat_id, 'chat_id', key) ??
+    checkGroupId(body.thread_id, 'thread_id', key) ??
     checkSpeakerType(body.speaker)
   );
 }
@@ -206,7 +231,7 @@ export function applyPartnerChatPolicy(
   raw: Record<string, unknown>,
   key: PartnerKeyRecord
 ): PartnerPolicyResult {
-  const failure = checkAudio(raw) ?? checkOrg(raw, key.org) ?? checkIdentifiers(raw);
+  const failure = checkAudio(raw) ?? checkOrg(raw, key.org) ?? checkIdentifiers(raw, key);
   if (failure) return failure;
 
   const { org_id: _orgId, voice_format: _voiceFormat, chat_id: _chatId, ...rest } = raw;

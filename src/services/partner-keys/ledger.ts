@@ -53,8 +53,8 @@ export const AUTH_UPDATE_PENDING = 'auth_update_pending';
 /** A stored key: its record and the SHA-256 of its plaintext (its KV key). */
 export type LedgerEntry = { record: PartnerKeyRecord; hash: string };
 
-/** Value of a `proj:` marker. (`true` was the round-6 shape; read for safety.) */
-type PendingMarker = { requestId: string } | true;
+/** Value of a `proj:` marker: the request that owes the projection. */
+type PendingMarker = { requestId: string };
 
 /** One owed projection, with the request id its retries are logged under. */
 type Owed = { id: string; requestId: string };
@@ -192,15 +192,16 @@ export class PartnerKeyLedger {
    * window, so revoking the current key really cuts the partner off.
    * Idempotent: an already-revoked key is returned with `alreadyRevoked: true`
    * and nothing new is committed (its chain was killed when it was revoked).
-   * If that revocation's KV projection is still owed, this call re-attempts
-   * it, so the caller learns whether auth has the revocation yet.
+   * Any KV projection still owed for the key OR its predecessors (the chain
+   * that revocation killed) is re-attempted, so the caller learns whether
+   * auth has the whole revocation yet.
    */
   async revoke(id: string, revokedBy?: string): Promise<RevokeOutcome | null> {
     const entry = await this.get(id);
     if (!entry) return null;
     if (entry.record.revokedAt !== undefined) {
-      const owed = (await this.storage.get(pendingKey(id))) !== undefined;
-      const warnings = owed ? await this.project([entry]) : [];
+      const owed = await this.owedAmong([entry, ...(await this.predecessorChain(entry.record))]);
+      const warnings = owed.length > 0 ? await this.project(owed) : [];
       return { record: entry.record, alreadyRevoked: true, revokedIds: [], warnings };
     }
     const now = Date.now();
@@ -301,8 +302,7 @@ export class PartnerKeyLedger {
     const markers = await this.storage.list<PendingMarker>({ prefix: PENDING_PREFIX });
     return [...markers].map(([key, marker]) => ({
       id: key.slice(PENDING_PREFIX.length),
-      // A marker without a request id (older shape) logs under its own key: deterministic.
-      requestId: marker === true ? key : marker.requestId,
+      requestId: marker.requestId,
     }));
   }
 
@@ -347,6 +347,25 @@ export class PartnerKeyLedger {
       successor = entry.record;
     }
     return found;
+  }
+
+  /** Every linked predecessor of `key` (any status), nearest first. */
+  private async predecessorChain(key: PartnerKeyRecord): Promise<LedgerEntry[]> {
+    const chain: LedgerEntry[] = [];
+    let successor = key;
+    for (let depth = 0; depth < MAX_CHAIN_DEPTH && successor.rotatedFrom; depth++) {
+      const entry = await this.get(successor.rotatedFrom);
+      if (!entry || entry.record.rotatedTo !== successor.id) break;
+      chain.push(entry);
+      successor = entry.record;
+    }
+    return chain;
+  }
+
+  /** The entries among `entries` whose KV projection is still owed. */
+  private async owedAmong(entries: LedgerEntry[]): Promise<LedgerEntry[]> {
+    const markers = await this.storage.get(entries.map((e) => pendingKey(e.record.id)));
+    return entries.filter((e) => markers.has(pendingKey(e.record.id)));
   }
 
   /**

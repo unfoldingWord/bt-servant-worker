@@ -86,7 +86,7 @@ import {
   ValidationError,
 } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
-import { exportUserData, importUserData } from './user-data-transfer.js';
+import { exportUserData, importUserData, type UserDataImportResult } from './user-data-transfer.js';
 import { countryFromPhoneUserId } from '../utils/phone-country.js';
 import { applyTemplateVariables } from '../utils/template.js';
 import { createTimingContext, timePhase, TimingContext } from '../utils/timing.js';
@@ -4007,11 +4007,27 @@ export class UserDO {
       'import_user_data',
       async () => {
         const { entries } = (await request.json()) as { entries: [string, unknown][] };
-        const result = await importUserData(this.state.storage, entries);
+        const result = await this.importUnderTurnLock(entries);
         return Response.json(result, { status: result.ok ? 200 : 409 });
       },
       storageErrorResponse
     );
+  }
+
+  /**
+   * Run a legacy import under the same lock a chat turn takes, so no turn can
+   * start or be mid-flight while the emptiness check and the write happen. A
+   * turn in progress or anything queued → `destination_busy` (retry later).
+   */
+  private async importUnderTurnLock(entries: [string, unknown][]): Promise<UserDataImportResult> {
+    if (!(await this.tryAcquireLock())) return { ok: false, reason: 'destination_busy' };
+    try {
+      const queued = (await this.state.storage.get<InternalQueueEntry[]>(QUEUE_KEY)) ?? [];
+      if (queued.length > 0) return { ok: false, reason: 'destination_busy' };
+      return await importUserData(this.state.storage, entries);
+    } finally {
+      await this.releaseLock();
+    }
   }
 
   private async handleGetPromptOverrides(): Promise<Response> {

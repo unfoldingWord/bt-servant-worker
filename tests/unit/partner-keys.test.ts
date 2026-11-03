@@ -520,3 +520,39 @@ describe('speaker type', () => {
     expect(validateChatBody(chat({ speaker: 42 }) as unknown as ChatRequest, 'final')).toBeNull();
   });
 });
+
+describe('partner identifier whitespace and stored length', () => {
+  it.each([' alice', 'alice ', '   ', '\talice'])(
+    'refuses user_id %j (never trimmed)',
+    (userId) => {
+      expect(applyPartnerChatPolicy(chat({ user_id: userId }), KEY)).toMatchObject({
+        ok: false,
+        rejection: {
+          status: 400,
+          reason: 'partner_user_id',
+          error: expect.stringContaining('without leading or trailing whitespace'),
+        },
+      });
+    }
+  );
+
+  it('caps chat_id so `partner:<ns>:<chat_id>` fits the admin routes (256 - prefix)', () => {
+    const prefix = `partner:${KEY.userNamespace}:`.length; // 28 for a pk_<16 hex> namespace
+    const max = 256 - prefix;
+    const group = (chatId: string) => chat({ chat_type: 'group', chat_id: chatId });
+    expect(applyPartnerChatPolicy(group('c'.repeat(max)), KEY).ok).toBe(true);
+    expect(applyPartnerChatPolicy(group('c'.repeat(max + 1)), KEY)).toMatchObject({
+      ok: false,
+      rejection: {
+        status: 400,
+        reason: 'partner_chat_id',
+        error: `chat_id must be at most ${max} characters`,
+      },
+    });
+  });
+
+  it('thread_id is stored as sent, so it keeps the full 256', () => {
+    const fields = { chat_type: 'supergroup', chat_id: 'g1', thread_id: 't'.repeat(256) };
+    expect(applyPartnerChatPolicy(chat(fields), KEY).ok).toBe(true);
+  });
+});

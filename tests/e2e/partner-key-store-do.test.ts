@@ -400,3 +400,23 @@ describe('the DO alarm', () => {
     expect(await withLedger(async (_l, s) => s.getAlarm())).not.toBeNull();
   });
 });
+
+describe('re-revoking re-attempts the owed projections of the whole killed chain', () => {
+  it('reports pending while KV fails, then settles the key and its predecessor', async () => {
+    const a = await withLedger((l) => l.create(INPUT));
+    const toB = await withLedger((l) => l.rotate(a.record.id, { graceSeconds: 3600 }));
+    if (toB.status !== 'ok') throw new Error(toB.status);
+    const first = await withLedger((l) => l.revoke(toB.record.id), failingKv);
+    expect(first?.revokedIds).toEqual([toB.record.id, a.record.id]);
+
+    const again = await withLedger((l) => l.revoke(toB.record.id), failingKv);
+    expect(again).toMatchObject({ alreadyRevoked: true, warnings: ['auth_update_pending'] });
+
+    const settled = await withLedger((l) => l.revoke(toB.record.id));
+    expect(settled?.warnings).toEqual([]);
+    expect((await projected(a.plaintext))?.revokedAt).toBeDefined();
+    expect((await projected(toB.plaintext))?.revokedAt).toBeDefined();
+    const owed = await withLedger(async (_l, s) => (await s.list({ prefix: 'proj:' })).size);
+    expect(owed).toBe(0);
+  });
+});
