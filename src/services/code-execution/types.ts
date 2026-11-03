@@ -36,6 +36,15 @@ export interface HostFunction {
   fn: (...args: unknown[]) => Promise<unknown>;
 }
 
+/** A host call that is about to run, before its result exists. */
+export interface HostCallStart {
+  name: string;
+  args: unknown[];
+}
+
+/** Told which host calls a sandbox batch is about to run. Must not reject the batch. */
+export type HostCallListener = (calls: readonly HostCallStart[]) => Promise<void> | void;
+
 /**
  * Options for code execution
  */
@@ -44,4 +53,10 @@ export interface CodeExecutionOptions {
   hostFunctions: HostFunction[];
   /** Maximum number of MCP calls allowed per execution (default: 10) */
   maxMcpCalls?: number;
+  /**
+   * Called once per batch of host calls, before they run. Parallel calls in
+   * one batch are reported together. Failures are logged by the executor and
+   * do not fail the sandbox.
+   */
+  onHostCalls?: HostCallListener;
 }

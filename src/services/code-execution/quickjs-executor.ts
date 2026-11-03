@@ -11,7 +11,13 @@
 import { getQuickJSWASMModule, QuickJSContext } from '@cf-wasm/quickjs/workerd';
 import { CodeExecutionError, MCPCallLimitError, TimeoutError } from '../../utils/errors.js';
 import { RequestLogger, summarizeArgs } from '../../utils/logger.js';
-import { CodeExecutionOptions, CodeExecutionResult, ConsoleLog, HostFunction } from './types.js';
+import {
+  CodeExecutionOptions,
+  CodeExecutionResult,
+  ConsoleLog,
+  HostCallListener,
+  HostFunction,
+} from './types.js';
 import { withSpan, withSpanSync, countMetric, recordMetric } from '../telemetry/index.js';
 
 /**
@@ -290,30 +296,58 @@ async function executePendingCall(
  * Process all pending MCP calls in batches until no more remain.
  * @throws {MCPCallLimitError} If a batch would exceed the configured limit
  */
+interface PendingWork {
+  mcpCounter: MCPCallCounter;
+  logger: RequestLogger;
+  budget: { startTime: number; timeoutMs: number };
+  onHostCalls?: HostCallListener | undefined;
+}
+
+async function announceHostCalls(
+  logger: RequestLogger,
+  onHostCalls: HostCallListener | undefined,
+  batch: PendingCall[]
+): Promise<void> {
+  if (!onHostCalls) return;
+  try {
+    await onHostCalls(batch.map((call) => ({ name: call.fn.name, args: call.args })));
+  } catch (error) {
+    logger.warn('tool_status_failed', {
+      error: error instanceof Error ? error.message : String(error),
+      call_count: batch.length,
+    });
+  }
+}
+
 async function processPendingCalls(
   vm: QuickJSContext,
   pendingCalls: PendingCall[],
-  mcpCounter: MCPCallCounter,
-  logger: RequestLogger,
-  budget: { startTime: number; timeoutMs: number }
+  work: PendingWork
 ): Promise<void> {
   do {
     if (pendingCalls.length > 0) {
       const batch = pendingCalls.splice(0, pendingCalls.length);
-      if (mcpCounter.count + batch.length > mcpCounter.limit) {
-        logger.warn('mcp_call_limit_exceeded', {
-          calls_made: mcpCounter.count,
-          calls_attempted: mcpCounter.count + batch.length,
-          limit: mcpCounter.limit,
-        });
-        throw new MCPCallLimitError(mcpCounter.count, mcpCounter.limit);
-      }
+      // The limit is first: this batch will not run, so announcing it would
+      // name work the sandbox is about to reject.
+      assertWithinCallLimit(work, batch.length);
+      await announceHostCalls(work.logger, work.onHostCalls, batch);
       await Promise.all(
-        batch.map((call) => executePendingCall(vm, call, mcpCounter, logger, budget))
+        batch.map((call) => executePendingCall(vm, call, work.mcpCounter, work.logger, work.budget))
       );
     }
     vm.runtime.executePendingJobs();
   } while (pendingCalls.length > 0);
+}
+
+function assertWithinCallLimit(work: PendingWork, batchLength: number): void {
+  const { mcpCounter, logger } = work;
+  if (mcpCounter.count + batchLength <= mcpCounter.limit) return;
+  logger.warn('mcp_call_limit_exceeded', {
+    calls_made: mcpCounter.count,
+    calls_attempted: mcpCounter.count + batchLength,
+    limit: mcpCounter.limit,
+  });
+  throw new MCPCallLimitError(mcpCounter.count, mcpCounter.limit);
 }
 
 function createInterruptHandler(startTime: number, timeoutMs: number) {
@@ -500,9 +534,11 @@ async function runCodeInVM(ctx: VMExecutionContext): Promise<unknown> {
     ctx.vm.runtime.executePendingJobs();
   });
   await withSpan('code_exec.pending_calls', {}, () =>
-    processPendingCalls(ctx.vm, pendingCalls, ctx.mcpCounter, ctx.logger, {
-      startTime,
-      timeoutMs: ctx.options.timeout_ms,
+    processPendingCalls(ctx.vm, pendingCalls, {
+      mcpCounter: ctx.mcpCounter,
+      logger: ctx.logger,
+      budget: { startTime, timeoutMs: ctx.options.timeout_ms },
+      onHostCalls: ctx.options.onHostCalls,
     })
   );
   checkExecutionError(ctx.vm, ctx.logger);

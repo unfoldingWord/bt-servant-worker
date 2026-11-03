@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   executeCode,
   createMCPHostFunctions,
@@ -113,6 +113,124 @@ describe('QuickJS createMCPHostFunctions', () => {
     expect(hostFunctions.length).toBe(2);
     expect(hostFunctions[0].name).toBe('tool1');
     expect(hostFunctions[1].name).toBe('tool2');
+  });
+});
+
+describe('QuickJS onHostCalls is awaited before the batch', () => {
+  it('awaits the listener before the host function runs', async () => {
+    const logger = createTestLogger();
+    const order: string[] = [];
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const hostFunctions = [
+      {
+        name: 'get_passage',
+        fn: async () => {
+          order.push('tool');
+          return { ok: true };
+        },
+      },
+    ];
+
+    const pending = executeCode(
+      'await get_passage({ reference: "John 3:16" }); __result__ = "done";',
+      {
+        timeout_ms: 5000,
+        hostFunctions,
+        onHostCalls: async () => {
+          order.push('status-start');
+          await gate;
+          order.push('status-end');
+        },
+      },
+      logger
+    );
+
+    await vi.waitFor(() => expect(order).toContain('status-start'));
+    expect(order).not.toContain('tool');
+    release();
+    const result = await pending;
+
+    expect(result.success).toBe(true);
+    expect(result.result).toBe('done');
+    expect(order).toEqual(['status-start', 'status-end', 'tool']);
+  });
+});
+
+describe('QuickJS onHostCalls failure', () => {
+  it('logs tool_status_failed and still runs the sandbox when the listener throws', async () => {
+    const logger = createTestLogger();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const hostFunctions = [
+      {
+        name: 'get_passage',
+        fn: async () => 'kept-going',
+      },
+    ];
+
+    const result = await executeCode(
+      'const value = await get_passage({ reference: "John 3:16" }); __result__ = value;',
+      {
+        timeout_ms: 5000,
+        hostFunctions,
+        onHostCalls: () => {
+          throw new Error('status broke');
+        },
+      },
+      logger
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.result).toBe('kept-going');
+    expect(warn.mock.calls.some((call) => String(call[0]).includes('tool_status_failed'))).toBe(
+      true
+    );
+    expect(warn.mock.calls.some((call) => String(call[0]).includes('status broke'))).toBe(true);
+    warn.mockRestore();
+  });
+});
+
+describe('QuickJS MCP call limit before status', () => {
+  it('does not announce a batch that would exceed the call limit', async () => {
+    const logger = createTestLogger();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const announced: string[] = [];
+    let ran = 0;
+    const hostFunctions = [
+      {
+        name: 'get_passage',
+        fn: async () => {
+          ran += 1;
+          return 'verse';
+        },
+      },
+    ];
+
+    const result = await executeCode(
+      'const a = get_passage({ reference: "John 3:16" });' +
+        'const b = get_passage({ reference: "Genesis 1" });' +
+        'await Promise.all([a, b]); __result__ = "done";',
+      {
+        timeout_ms: 5000,
+        hostFunctions,
+        maxMcpCalls: 1,
+        onHostCalls: (calls) => {
+          announced.push(...calls.map((call) => call.name));
+        },
+      },
+      logger
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.errorCode).toBe('MCP_CALL_LIMIT_EXCEEDED');
+    expect(announced).toEqual([]);
+    expect(ran).toBe(0);
+    expect(
+      warn.mock.calls.some((call) => String(call[0]).includes('mcp_call_limit_exceeded'))
+    ).toBe(true);
+    warn.mockRestore();
   });
 });
 
