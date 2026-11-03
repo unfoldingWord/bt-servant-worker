@@ -201,17 +201,7 @@ function validateEnumFields(body: ChatRequest): string | null {
   if (body.chat_type && !VALID_CHAT_TYPES.has(body.chat_type)) {
     return `Invalid chat_type: ${body.chat_type}. Must be one of: private, group, supergroup`;
   }
-  return validateVoiceFormat(body.voice_format) ?? validateSpeaker(body.speaker);
-}
-
-/**
- * `speaker` (group chats) is optional; `null` is absent. Anything else must be
- * a string — it is rendered through sanitizeSpeaker into the prompt and used
- * as a storage path segment, so a number or object would fail later anyway.
- */
-function validateSpeaker(speaker: unknown): string | null {
-  if (speaker === undefined || speaker === null || typeof speaker === 'string') return null;
-  return 'speaker must be a string';
+  return validateVoiceFormat(body.voice_format);
 }
 
 /**

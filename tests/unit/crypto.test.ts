@@ -4,6 +4,7 @@ import {
   bytesToBase64Url,
   bytesToHex,
   constantTimeCompare,
+  hmacSha256,
   sha256Hex,
 } from '../../src/utils/crypto.js';
 
@@ -55,5 +56,27 @@ describe('bytesToBase64 / bytesToBase64Url', () => {
     const big = new Uint8Array(100_000).map((_, i) => i % 256);
     const decoded = Uint8Array.from(atob(bytesToBase64(big)), (c) => c.charCodeAt(0));
     expect(decoded).toEqual(big);
+  });
+});
+
+describe('hmacSha256', () => {
+  // RFC 4231 test case 2.
+  const EXPECTED = '5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843';
+
+  it('matches the RFC 4231 vector, also on a second (cached-key) call', async () => {
+    expect(bytesToHex(await hmacSha256('Jefe', 'what do ya want for nothing?'))).toBe(EXPECTED);
+    expect(bytesToHex(await hmacSha256('Jefe', 'what do ya want for nothing?'))).toBe(EXPECTED);
+  });
+
+  it('keys the cache on the secret: a different secret gives a different MAC', async () => {
+    const data = 'what do ya want for nothing?';
+    const other = bytesToHex(await hmacSha256('not-Jefe', data));
+    expect(other).not.toBe(EXPECTED);
+    expect(bytesToHex(await hmacSha256('Jefe', data))).toBe(EXPECTED);
+  });
+
+  it('stays correct past the cache bound (cleared and refilled)', async () => {
+    for (let i = 0; i < 20; i++) await hmacSha256(`secret-${i}`, 'x');
+    expect(bytesToHex(await hmacSha256('Jefe', 'what do ya want for nothing?'))).toBe(EXPECTED);
   });
 });

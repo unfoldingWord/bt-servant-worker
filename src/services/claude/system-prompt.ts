@@ -2,7 +2,8 @@
  * System prompt builder for Claude orchestration
  */
 
-import { ChatHistoryEntry } from '../../types/engine.js';
+import { ChatCaller, ChatHistoryEntry } from '../../types/engine.js';
+import { callerAllowsAudio, isPartnerCaller } from '../../utils/chat-validation.js';
 import { PromptSlot } from '../../types/prompt-overrides.js';
 import { toSingleLine } from '../../types/single-line.js';
 import { UnmatchedTrigger } from '../classifier/index.js';
@@ -54,17 +55,13 @@ interface SystemPromptOptions {
   groupContext?: GroupChatContext | undefined;
   isVoiceMessage?: boolean | undefined;
   /**
-   * Whether audio replies are available this turn. Default true. `false`
-   * (partner API keys, text-only — admin-portal#354) drops the
-   * `request_audio` guidance, matching the tools omitted by buildAllTools.
-   */
-  audioEnabled?: boolean | undefined;
-  /**
-   * True when the request came with a partner API key (from `_caller`, the
-   * single source of truth). The Client Platform section then says only "a
+   * Who authenticated the request (`_caller`, the single source of truth;
+   * absent = internal). For a partner API key (admin-portal#354) the prompt
+   * drops the `request_audio` guidance (callerAllowsAudio — matching the tools
+   * omitted by buildAllTools) and the Client Platform section says only "a
    * partner app"; the server-set client_id is never interpolated.
    */
-  partnerCaller?: boolean | undefined;
+  caller?: ChatCaller | undefined;
   /** Per-turn language document to inject into the system prompt */
   languageDocument?: string | undefined;
   /** Set when the user's whole message was routing triggers. */
@@ -353,7 +350,7 @@ function pushMiddleSections(
   sections: string[],
   resolvedPromptValues: Required<Record<PromptSlot, string>>,
   catalog: ToolCatalog,
-  opts: Pick<SystemPromptOptions, 'memoryTOC' | 'isVoiceMessage' | 'memoryEnabled' | 'audioEnabled'>
+  opts: Pick<SystemPromptOptions, 'memoryTOC' | 'isVoiceMessage' | 'memoryEnabled' | 'caller'>
 ): void {
   const { memoryTOC, isVoiceMessage } = opts;
   // #392: with memory suppressed, the model is told nothing about memory —
@@ -364,7 +361,7 @@ function pushMiddleSections(
     if (memoryTOC) sections.push(memoryTOC);
   }
   // Text-only callers are never told audio exists (the tool is not registered).
-  if (opts.audioEnabled !== false) sections.push(AUDIO_GUIDANCE);
+  if (callerAllowsAudio(opts.caller)) sections.push(AUDIO_GUIDANCE);
   if (catalog.tools.some((t) => t.serverId === 'ptxprint-mcp')) {
     sections.push(PTXPRINT_FLOW_GUIDANCE);
   }
@@ -452,15 +449,8 @@ export function buildSystemPromptBlocks(
   resolvedPromptValues: Required<Record<PromptSlot, string>>,
   options?: SystemPromptOptions
 ): SystemPromptBlocks {
-  const {
-    memoryTOC,
-    memoryEnabled,
-    clientId,
-    groupContext,
-    isVoiceMessage,
-    audioEnabled,
-    partnerCaller,
-  } = options ?? {};
+  const { memoryTOC, memoryEnabled, clientId, groupContext, isVoiceMessage, caller } =
+    options ?? {};
 
   // ── Cacheable: derived only from org/mode config and the MCP catalog ──
   const stableSections: string[] = [
@@ -477,7 +467,7 @@ export function buildSystemPromptBlocks(
   // recovering those tokens needs actual prompt reordering and is deliberately
   // out of scope here (see docs/plans/prompt-caching.md).
   const sections: string[] = [
-    buildClientSection(clientId, resolvedPromptValues.client_instructions, partnerCaller === true),
+    buildClientSection(clientId, resolvedPromptValues.client_instructions, isPartnerCaller(caller)),
   ];
 
   const groupSection = buildGroupSection(groupContext);
@@ -493,7 +483,7 @@ export function buildSystemPromptBlocks(
     memoryTOC,
     isVoiceMessage,
     memoryEnabled,
-    audioEnabled,
+    caller,
   });
   sections.push(...buildConditionalSections(preferences, history));
   sections.push(RESOURCE_AVAILABILITY_RULES);

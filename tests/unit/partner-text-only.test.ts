@@ -5,7 +5,7 @@
  * - callerAllowsAudio: the single predicate the DO reads from `body._caller`;
  * - buildAllTools / buildExecuteCodeTool with `hasAudio: false`: no tool that
  *   yields an audio URL is offered or named;
- * - the system prompt with `audioEnabled: false`: no request_audio guidance;
+ * - the system prompt for `caller: 'partner'`: no request_audio guidance;
  * - validateChatBody's callback-field message for partners does not point at
  *   /api/v1/chat/callback, while the internal message is unchanged.
  *
@@ -67,10 +67,10 @@ describe('audio tools for text-only callers', () => {
 });
 
 describe('system prompt for text-only callers', () => {
-  it('omits the request_audio guidance only when audioEnabled is false', () => {
+  it('omits the request_audio guidance only for a partner caller', () => {
     const internal = buildSystemPrompt(catalog, prefs, [], DEFAULT_PROMPT_VALUES);
     const textOnly = buildSystemPrompt(catalog, prefs, [], DEFAULT_PROMPT_VALUES, {
-      audioEnabled: false,
+      caller: 'partner',
     });
     expect(internal).toContain('request_audio');
     expect(textOnly).not.toContain('request_audio');

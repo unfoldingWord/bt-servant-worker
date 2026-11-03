@@ -33,7 +33,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { trace } from '@opentelemetry/api';
 import { Env } from '../../config/types.js';
-import { bytesToHex } from '../../utils/crypto.js';
+import { bytesToHex, hmacSha256 } from '../../utils/crypto.js';
 
 /**
  * The current request's pseudonym, scoped to its async call tree. Empty outside a
@@ -64,16 +64,7 @@ function withoutPseudonym<T>(fn: () => Promise<T>): Promise<T> {
  * two systems are structurally comparable but cryptographically unlinkable.
  */
 export async function hashUserId(salt: string, clientId: string, userId: string): Promise<string> {
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    'raw',
-    enc.encode(salt),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign']
-  );
-  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(`${clientId}:${userId}`));
-  return bytesToHex(new Uint8Array(sig));
+  return bytesToHex(await hmacSha256(salt, `${clientId}:${userId}`));
 }
 
 /**

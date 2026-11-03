@@ -11,7 +11,8 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { Env } from '../../config/types.js';
 import { AudioContext, VOICE_SUBMISSION_PREFIX, voiceSubmissionKeyToUrl } from '../audio/index.js';
-import { ChatHistoryEntry, StreamCallbacks } from '../../types/engine.js';
+import { ChatCaller, ChatHistoryEntry, StreamCallbacks } from '../../types/engine.js';
+import { callerAllowsAudio } from '../../utils/chat-validation.js';
 import { uiString } from '../../i18n/ui-strings.js';
 import { createStatusEmitter, StatusEmitter } from '../../i18n/status-emitter.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig } from '../../types/org-config.js';
@@ -197,14 +198,12 @@ interface OrchestratorOptions {
    */
   memoryEnabled?: boolean | undefined;
   /**
-   * Whether audio is available this turn. Default true. `false` (partner API
-   * keys are text-only, admin-portal#354) removes the audio tools, their prompt
-   * guidance, and refuses them at dispatch should the model name one anyway.
-   * The DO derives it from `callerAllowsAudio(body._caller)`.
+   * Who authenticated the request (the DO passes `body._caller`; absent =
+   * internal). Partner API keys are text-only (admin-portal#354): via
+   * callerAllowsAudio this removes the audio tools and their prompt guidance,
+   * and refuses them at dispatch should the model name one anyway.
    */
-  audioEnabled?: boolean | undefined;
-  /** True for partner-key requests (DO: `isPartnerCaller(body._caller)`); see SystemPromptOptions. */
-  partnerCaller?: boolean | undefined;
+  caller?: ChatCaller | undefined;
   modeContext?: ModeContext | undefined;
   audioContext?: AudioContext | undefined;
   attachmentsContext?: AttachmentsContext | undefined;
@@ -372,7 +371,7 @@ interface OrchestrationContext {
   modeContext: ModeContext | undefined;
   audioContext: AudioContext | undefined;
   attachmentsContext: AttachmentsContext | undefined;
-  /** False for text-only callers (partner API keys); see OrchestratorOptions.audioEnabled. */
+  /** callerAllowsAudio(options.caller): false for text-only callers (partner API keys). */
   audioEnabled: boolean;
   workerOrigin: string;
   /** The org scope for this request. Used by `read_r2_object` / `attach_audio` to
@@ -2150,7 +2149,7 @@ function turnTools(catalog: ToolCatalog, options: OrchestratorOptions): Anthropi
   return buildAllTools(catalog, {
     hasModes: (options.modeContext?.availableModes.length ?? 0) > 0,
     hasMemory: hasMemoryForTurn(options),
-    hasAudio: options.audioEnabled !== false,
+    hasAudio: callerAllowsAudio(options.caller),
   });
 }
 
@@ -2202,7 +2201,7 @@ function createOrchestrationContext(
   const llmMax = orgConfig?.max_history_llm ?? DEFAULT_ORG_CONFIG.max_history_llm;
 
   // prettier-ignore
-  const systemBlocks = buildSystemPromptBlocks(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, memoryEnabled: hasMemoryForTurn(options), audioEnabled: options.audioEnabled !== false, partnerCaller: options.partnerCaller === true, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument, triggerOnly: options.triggerOnly, unmatchedTriggers: options.unmatchedTriggers, addressedToBot: options.addressedToBot, inboundVoiceKey: options.inboundVoiceKey });
+  const systemBlocks = buildSystemPromptBlocks(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, memoryEnabled: hasMemoryForTurn(options), caller: options.caller, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument, triggerOnly: options.triggerOnly, unmatchedTriggers: options.unmatchedTriggers, addressedToBot: options.addressedToBot, inboundVoiceKey: options.inboundVoiceKey });
 
   return {
     client: new Anthropic({ apiKey: env.ANTHROPIC_API_KEY }),
@@ -2230,7 +2229,7 @@ function createOrchestrationContext(
     modeContext: options.modeContext,
     audioContext: options.audioContext,
     attachmentsContext: options.attachmentsContext,
-    audioEnabled: options.audioEnabled !== false,
+    audioEnabled: callerAllowsAudio(options.caller),
     workerOrigin: options.workerOrigin ?? '',
     org: options.org ?? options.env.DEFAULT_ORG,
     env: options.env,

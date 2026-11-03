@@ -131,6 +131,27 @@ describe('ENGINE_API_KEY is unchanged', () => {
     expect(list.status).toBe(200);
   });
 
+  it('an internal non-string speaker in a group chat is dropped and noted, never a 400', async () => {
+    const res = await SELF.fetch(CHAT, {
+      method: 'POST',
+      headers: JSON_INTERNAL,
+      body: JSON.stringify(
+        chatBody({
+          client_id: 'telegram',
+          org: 'internal-354-speaker',
+          chat_type: 'group',
+          chat_id: 'g1',
+          speaker: 42,
+        })
+      ),
+    });
+    expect(res.status).toBe(200);
+    expect(findLog(capture.logs, 'chat_speaker_ignored')?.payload).toMatchObject({
+      reason: 'not_a_string',
+      type: 'number',
+    });
+  });
+
   it('lets an internal caller use any org and admin-portal client_id', async () => {
     const res = await SELF.fetch(CHAT, {
       method: 'POST',

@@ -57,15 +57,34 @@ export function bytesToBase64Url(bytes: Uint8Array): string {
   return bytesToBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-/** HMAC-SHA-256 of `data` (UTF-8) under `secret` (UTF-8), as raw bytes. */
-export async function hmacSha256(secret: string, data: string): Promise<Uint8Array> {
-  const encoder = new TextEncoder();
+/**
+ * Imported HMAC keys, per isolate, keyed on the secret. The secrets are a
+ * handful of wrangler secrets (partner key tag, telemetry salt), so the map
+ * stays tiny; it is cleared if it ever grows past the bound. Only resolved
+ * CryptoKeys are cached (never a pending promise), so no request awaits a
+ * promise created by another request. Two concurrent first uses may both
+ * import; that is harmless.
+ */
+const hmacKeys = new Map<string, CryptoKey>();
+const MAX_CACHED_HMAC_KEYS = 8;
+
+async function hmacKey(secret: string): Promise<CryptoKey> {
+  const cached = hmacKeys.get(secret);
+  if (cached) return cached;
   const key = await crypto.subtle.importKey(
     'raw',
-    encoder.encode(secret),
+    new TextEncoder().encode(secret),
     { name: 'HMAC', hash: 'SHA-256' },
     false,
     ['sign']
   );
-  return new Uint8Array(await crypto.subtle.sign('HMAC', key, encoder.encode(data)));
+  if (hmacKeys.size >= MAX_CACHED_HMAC_KEYS) hmacKeys.clear();
+  hmacKeys.set(secret, key);
+  return key;
+}
+
+/** HMAC-SHA-256 of `data` (UTF-8) under `secret` (UTF-8), as raw bytes. */
+export async function hmacSha256(secret: string, data: string): Promise<Uint8Array> {
+  const key = await hmacKey(secret);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data)));
 }

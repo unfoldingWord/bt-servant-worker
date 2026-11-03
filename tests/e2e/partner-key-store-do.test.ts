@@ -42,6 +42,34 @@ const failingKv = {
   },
 } as unknown as KVNamespace;
 
+/** A KV binding whose put never settles: the DO "dies" mid-projection. */
+function stallingKv(): { kv: KVNamespace; putCalled: Promise<void> } {
+  let signal: () => void = () => undefined;
+  const putCalled = new Promise<void>((resolve) => {
+    signal = resolve;
+  });
+  const put = () => {
+    signal();
+    return new Promise<void>(() => undefined);
+  };
+  return { kv: { put } as unknown as KVNamespace, putCalled };
+}
+
+const failDelete = async () => {
+  throw new Error('storage delete failed');
+};
+
+/** Real DO storage, except `delete` fails (projection bookkeeping breaks after commit). */
+function storageWithFailingDelete(storage: DurableObjectStorage): DurableObjectStorage {
+  return new Proxy(storage, {
+    get(target, prop) {
+      if (prop === 'delete') return failDelete;
+      const value: unknown = Reflect.get(target, prop);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
 /** Run `fn` with a ledger over the DO's real storage (and a chosen KV). */
 function withLedger<T>(
   fn: (ledger: PartnerKeyLedger, storage: DurableObjectStorage) => Promise<T>,
@@ -227,5 +255,55 @@ describe('KV projection failure is retried by the DO alarm', () => {
     expect(revoked?.warnings).toEqual([]);
     expect(await withLedger(async (_l, s) => s.get(`proj:${created.record.id}`))).toBeUndefined();
     expect((await projected(created.plaintext))?.revokedAt).toBeDefined();
+  });
+});
+
+describe('a committed change always has its projection owed', () => {
+  it('a revoke whose KV write never completes is still owed (marker + alarm in the commit) and the alarm projects it', async () => {
+    const created = await withLedger((l) => l.create(INPUT));
+    const { id } = created.record;
+    const stalled = stallingKv();
+    const snapshot = await runInDurableObject(stub(), async (_i, state) => {
+      const ledger = new PartnerKeyLedger(state.storage, stalled.kv, SECRET, createMockLogger());
+      void ledger.revoke(id); // never finishes: as if the DO died after its commit
+      await stalled.putCalled;
+      return {
+        entry: await state.storage.get<LedgerEntry>(`rec:${id}`),
+        marker: await state.storage.get(`proj:${id}`),
+        alarm: await state.storage.getAlarm(),
+      };
+    });
+    expect(snapshot.entry?.record.revokedAt).toBeDefined();
+    expect(snapshot.marker).toBe(true);
+    expect(snapshot.alarm).not.toBeNull();
+    // KV (what auth reads) still says active until the owed projection runs.
+    expect((await projected(created.plaintext))?.revokedAt).toBeUndefined();
+
+    expect(await withLedger((l) => l.retryProjections())).toEqual({ retried: 1, remaining: 0 });
+    expect((await projected(created.plaintext))?.revokedAt).toBeDefined();
+  });
+
+  it('a clean change leaves nothing owed and no alarm', async () => {
+    const created = await withLedger((l) => l.create(INPUT));
+    const state = await withLedger(async (_l, s) => ({
+      owed: (await s.list({ prefix: 'proj:' })).size,
+      alarm: await s.getAlarm(),
+    }));
+    expect(created.warnings).toEqual([]);
+    expect(state).toEqual({ owed: 0, alarm: null });
+  });
+});
+
+describe('after the commit nothing can fail create', () => {
+  it('bookkeeping errors still return the plaintext, with auth_update_pending', async () => {
+    const created = await runInDurableObject(stub(), async (_i, state) => {
+      const storage = storageWithFailingDelete(state.storage);
+      return new PartnerKeyLedger(storage, kv.asKV(), SECRET, createMockLogger()).create(INPUT);
+    });
+    expect(created.plaintext).toMatch(/^bts_/);
+    expect(created.warnings).toEqual(['auth_update_pending']);
+    // The KV put itself succeeded; the marker stays for the alarm (an idempotent re-put).
+    expect(await projected(created.plaintext)).toEqual(created.record);
+    expect(await withLedger(async (_l, s) => s.get(`proj:${created.record.id}`))).toBe(true);
   });
 });

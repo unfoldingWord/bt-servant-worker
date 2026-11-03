@@ -194,20 +194,20 @@ describe('sanitizeSpeaker flattens every caller to one line (not only partners)'
 });
 
 describe('buildSystemPrompt - partner app label comes from the caller, not client_id', () => {
-  const build = (clientId: string, partnerCaller?: boolean) =>
+  const build = (clientId: string, caller?: 'partner' | 'internal') =>
     buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES, {
       clientId,
-      ...(partnerCaller === undefined ? {} : { partnerCaller }),
+      ...(caller === undefined ? {} : { caller }),
     });
 
   it('an internal caller with a partner:-prefixed client_id is not labelled a partner app', () => {
-    const prompt = build('partner:abc');
+    const prompt = build('partner:abc', 'internal');
     expect(prompt).toContain('The user is communicating via: partner:abc');
     expect(prompt).not.toContain('a partner app');
   });
 
   it('a partner caller is labelled, and its client_id is not shown', () => {
-    const prompt = build('partner:abc', true);
+    const prompt = build('partner:abc', 'partner');
     expect(prompt).toContain('The user is communicating via: a partner app (text chat)');
     expect(prompt).not.toContain('partner:abc');
   });

@@ -450,12 +450,19 @@ describe('key labels are single-line', () => {
   );
 });
 
-describe('speaker type (all callers)', () => {
-  it('validateChatBody refuses a non-string speaker; null and strings pass', () => {
-    const body = (speaker: unknown) => chat({ speaker }) as unknown as ChatRequest;
-    expect(validateChatBody(body(42), 'final')).toBe('speaker must be a string');
-    expect(validateChatBody(body({ name: 'x' }), 'final')).toBe('speaker must be a string');
-    expect(validateChatBody(body(null), 'final')).toBeNull();
-    expect(validateChatBody(body('Ann'), 'final')).toBeNull();
+describe('speaker type', () => {
+  it('a partner non-string speaker is a 400; null and strings pass', () => {
+    for (const speaker of [42, { name: 'x' }, ['a']]) {
+      expect(applyPartnerChatPolicy(chat({ speaker }), KEY)).toMatchObject({
+        ok: false,
+        rejection: { status: 400, reason: 'partner_speaker' },
+      });
+    }
+    expect(applyPartnerChatPolicy(chat({ speaker: null }), KEY).ok).toBe(true);
+    expect(applyPartnerChatPolicy(chat({ speaker: 'Ann' }), KEY).ok).toBe(true);
+  });
+
+  it('validateChatBody (shared with internal callers) does not refuse a non-string speaker', () => {
+    expect(validateChatBody(chat({ speaker: 42 }) as unknown as ChatRequest, 'final')).toBeNull();
   });
 });

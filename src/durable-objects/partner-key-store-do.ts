@@ -22,15 +22,22 @@ import { PartnerKeyLedger } from '../services/partner-keys/ledger.js';
 import type { PartnerKeyStoreOp } from '../services/partner-keys/store.js';
 import { createRequestLogger, type RequestLogger } from '../utils/logger.js';
 
-/** The operation in a request body, or null when it is not a JSON object with an `op`. */
-async function readOp(request: Request): Promise<PartnerKeyStoreOp | null> {
+/**
+ * The operation in a request body, or null (logged) when the body is not JSON
+ * or not an object with an `op`. Only the worker calls this DO, so either is
+ * a bug worth seeing in the logs.
+ */
+async function readOp(request: Request, logger: RequestLogger): Promise<PartnerKeyStoreOp | null> {
+  let body: unknown;
   try {
-    const body: unknown = await request.json();
-    const ok = typeof body === 'object' && body !== null && 'op' in body;
-    return ok ? (body as PartnerKeyStoreOp) : null;
-  } catch {
+    body = await request.json();
+  } catch (error) {
+    logger.error('partner_key_store_bad_request', error, { reason: 'invalid_json' });
     return null;
   }
+  if (typeof body === 'object' && body !== null && 'op' in body) return body as PartnerKeyStoreOp;
+  logger.warn('partner_key_store_bad_request', { reason: 'not_an_operation' });
+  return null;
 }
 
 export class PartnerKeyStoreDO {
@@ -43,7 +50,7 @@ export class PartnerKeyStoreDO {
 
   async fetch(request: Request): Promise<Response> {
     const logger = createRequestLogger(request.headers.get('X-Request-ID') ?? crypto.randomUUID());
-    const op = await readOp(request);
+    const op = await readOp(request, logger);
     if (!op) return Response.json({ error: 'Body must be a JSON operation' }, { status: 400 });
     try {
       const result = await this.serialize(() => this.run(op, logger));

@@ -167,8 +167,15 @@ function checkIdentifiers(body: Record<string, unknown>): PartnerPolicyResult | 
   return (
     checkIdentifier(body.user_id, 'user_id', true) ??
     checkIdentifier(body.chat_id, 'chat_id', false) ??
-    checkIdentifier(body.thread_id, 'thread_id', false)
+    checkIdentifier(body.thread_id, 'thread_id', false) ??
+    checkSpeakerType(body.speaker)
   );
+}
+
+/** `speaker` is optional text (`null` = absent); sanitizeSpeaker does the rest. */
+function checkSpeakerType(speaker: unknown): PartnerPolicyResult | null {
+  if (!isPresent(speaker) || typeof speaker === 'string') return null;
+  return reject(400, 'partner_speaker', 'speaker must be a string');
 }
 
 /**

@@ -13,12 +13,18 @@
  *
  * Auth projection: chat-time auth must stay one fast KV read, so after each
  * committed change the ledger writes the record to API_KEYS `key:<sha256>` —
- * one put per changed key, never a read-modify-write. If a put fails (KV
- * error, or KV's one-write-per-second-per-key limit), the key is marked
- * `proj:` and the DO alarm retries (retryProjections) until KV has it. The DO
- * state stays authoritative meanwhile; the response says so in `warnings`
- * (`auth_update_pending`). Auth then sees the change within KV's propagation
- * window (~60s, misses cached too), as before.
+ * one put per changed key, never a read-modify-write.
+ *
+ * The projection is owed from the moment of the commit, never after it: the
+ * same atomic commit that changes the records also writes a `proj:` marker
+ * for each changed key and sets the alarm. A marker is deleted only after its
+ * KV put succeeded. So if the DO dies after the commit, or a put fails (KV
+ * error, or KV's one-write-per-second-per-key limit), the alarm still
+ * projects the change (retryProjections) — a revocation can never be
+ * committed without its KV update recorded as owed. After the commit nothing
+ * can turn the operation into an error: projection problems only add
+ * `warnings: ['auth_update_pending']`. Auth sees the change within KV's
+ * propagation window (~60s, misses cached too), as before.
  */
 
 import {
@@ -283,42 +289,67 @@ export class PartnerKeyLedger {
     return found;
   }
 
-  /** One atomic write of every changed record and its org-index entry. */
+  /**
+   * One atomic commit: every changed record, its org-index entry, a `proj:`
+   * marker per key (its KV projection is owed from this instant) and the
+   * retry alarm, all in one storage transaction — so no record change can be
+   * committed without its owed projection and the alarm that will deliver it.
+   */
   private async commit(changed: LedgerEntry[]): Promise<void> {
-    const entries: Record<string, unknown> = {};
-    for (const entry of changed) {
-      entries[recKey(entry.record.id)] = entry;
-      entries[orgKey(entry.record)] = entry.record.id;
-    }
-    await this.storage.put(entries);
+    const entries = changed.flatMap((entry) => [
+      [recKey(entry.record.id), entry] as const,
+      [orgKey(entry.record), entry.record.id] as const,
+      [pendingKey(entry.record.id), true] as const,
+    ]);
+    await this.storage.transaction(async (txn) => {
+      for (let i = 0; i < entries.length; i += GET_BATCH) {
+        await txn.put(Object.fromEntries(entries.slice(i, i + GET_BATCH)));
+      }
+      await txn.setAlarm(Date.now() + PROJECTION_RETRY_MS);
+    });
   }
 
   /**
-   * Project changed records to KV for auth. Failures are owed (`proj:`) and
-   * retried by the alarm; returns the warnings for the response.
+   * After the commit: put each changed record to KV and settle its marker.
+   * NEVER throws — the change is committed and, for create/rotate, the
+   * plaintext must still reach the caller. Anything that goes wrong here
+   * leaves the markers in place for the alarm and returns the warning.
    */
   private async project(changed: LedgerEntry[]): Promise<string[]> {
-    const failed = await this.putProjections(changed);
-    const succeeded = changed.map((e) => e.record.id).filter((id) => !failed.includes(id));
-    // A key owed from an earlier failure is settled by this newer write.
-    await this.deleteMany(succeeded.map(pendingKey));
-    if (failed.length === 0) return [];
-    await this.storage.put(Object.fromEntries(failed.map((id) => [pendingKey(id), true])));
-    if ((await this.storage.getAlarm()) === null) {
-      await this.storage.setAlarm(Date.now() + PROJECTION_RETRY_MS);
+    try {
+      const failed = await this.putProjections(changed);
+      const succeeded = changed.map((e) => e.record.id).filter((id) => !failed.includes(id));
+      await this.deleteMany(succeeded.map(pendingKey));
+      if (failed.length > 0) return [AUTH_UPDATE_PENDING];
+      await this.clearAlarmIfNothingOwed();
+      return [];
+    } catch (error) {
+      this.logger.error('partner_key_projection_bookkeeping_failed', error, {
+        key_ids: changed.map((e) => e.record.id),
+      });
+      return [AUTH_UPDATE_PENDING];
     }
-    return [AUTH_UPDATE_PENDING];
+  }
+
+  /** Drop the retry alarm once no projection is owed (avoids a no-op wake-up). */
+  private async clearAlarmIfNothingOwed(): Promise<void> {
+    const owed = await this.storage.list({ prefix: PENDING_PREFIX, limit: 1 });
+    if (owed.size === 0) await this.storage.deleteAlarm();
   }
 
   /** Put each record at `key:<hash>`; returns the ids whose put failed (logged). */
   private async putProjections(entries: LedgerEntry[]): Promise<string[]> {
+    const results = await Promise.allSettled(
+      entries.map(({ record, hash }) =>
+        this.kv.put(`${PARTNER_KEY_KV_PREFIX}${hash}`, JSON.stringify(record))
+      )
+    );
     const failed: string[] = [];
-    for (const { record, hash } of entries) {
-      try {
-        await this.kv.put(`${PARTNER_KEY_KV_PREFIX}${hash}`, JSON.stringify(record));
-      } catch (error) {
+    for (const [i, result] of results.entries()) {
+      const record = entries.at(i)?.record;
+      if (result.status === 'rejected' && record) {
         failed.push(record.id);
-        this.logger.error('partner_key_projection_failed', error, { key_id: record.id });
+        this.logger.error('partner_key_projection_failed', result.reason, { key_id: record.id });
       }
     }
     return failed;

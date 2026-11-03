@@ -111,7 +111,6 @@ import {
 import {
   callerAllowsAudio,
   callerIsAdmin,
-  isPartnerCaller,
   isValidLanguageCode,
   validateChatBody,
 } from '../utils/chat-validation.js';
@@ -486,14 +485,6 @@ export function clientHistoryReceipt(
  */
 export function neutralizeModelWelcome(body: ChatRequest, emittingWelcome: boolean): boolean {
   return emittingWelcome || body.suppress_welcome === true;
-}
-
-/** What the orchestrator derives from who called (the server-set `_caller`). */
-function callerOrchOpts(body: ChatRequest): { audioEnabled: boolean; partnerCaller: boolean } {
-  return {
-    audioEnabled: callerAllowsAudio(body._caller),
-    partnerCaller: isPartnerCaller(body._caller),
-  };
 }
 
 /**
@@ -3780,7 +3771,7 @@ export class UserDO {
       modeContext: this.buildModeContext(orgModes, activeModeName, body),
       audioContext,
       attachmentsContext,
-      ...callerOrchOpts(body),
+      caller: body._caller,
       workerOrigin,
       clientId: body.client_id,
       groupContext,
