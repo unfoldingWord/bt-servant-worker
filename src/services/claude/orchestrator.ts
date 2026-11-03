@@ -12,8 +12,14 @@ import Anthropic from '@anthropic-ai/sdk';
 import { Env } from '../../config/types.js';
 import { AudioContext, VOICE_SUBMISSION_PREFIX, voiceSubmissionKeyToUrl } from '../audio/index.js';
 import { ChatHistoryEntry, StreamCallbacks } from '../../types/engine.js';
-import { uiString } from '../../i18n/ui-strings.js';
+import { uiString, type StatusKey } from '../../i18n/ui-strings.js';
 import { createStatusEmitter, StatusEmitter } from '../../i18n/status-emitter.js';
+import {
+  createToolStatusGate,
+  type ToolCallSnapshot,
+  type ToolStatusDecision,
+  type ToolStatusGate,
+} from '../../i18n/tool-status.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig } from '../../types/org-config.js';
 import {
   DEFAULT_PROMPT_VALUES,
@@ -39,11 +45,16 @@ import {
   RouteHealthStore,
 } from './route-health.js';
 import { UnmatchedTrigger } from '../classifier/index.js';
-import { createMCPHostFunctions, executeCode } from '../code-execution/index.js';
+import {
+  createMCPHostFunctions,
+  executeCode,
+  type HostCallStart,
+} from '../code-execution/index.js';
 import { withSpan, recordSpanError, countMetric, recordMetric } from '../telemetry/index.js';
 import {
   callMCPTool,
   createHealthTracker,
+  findTool,
   getHealthSummary,
   getToolNames,
   HealthTracker,
@@ -382,6 +393,8 @@ interface OrchestrationContext {
   locale: string;
   /** `callbacks.onStatus` bound to `locale`; `undefined` when there are no callbacks. */
   emitStatus?: StatusEmitter | undefined;
+  /** One per turn. Text turns use it to name the tool being called (#28). */
+  toolStatus: ToolStatusGate;
   healthTracker: HealthTracker;
   memoryStore: UserMemoryStore | undefined;
   modeContext: ModeContext | undefined;
@@ -2001,7 +2014,11 @@ async function continueAfterTools(
   // This round is not the answer. Drop anything the sender is holding so a
   // throttle that already elapsed cannot post the narration (#421).
   if (ctx.progressGate) ctx.callbacks?.holdProgress?.('discard');
-  ctx.emitStatus?.('status_executing_tools', { n: toolCalls.length });
+  // execute_code reports its own status from the host calls inside it (#28).
+  // Voice turns keep the generic line; they already stream the model's text.
+  if (!textTurnNamesItsTools(ctx, toolCalls)) {
+    ctx.emitStatus?.('status_executing_tools', { n: toolCalls.length });
+  }
   const toolResults = await executeIterationTools(toolCalls, ctx, iteration, iterStart);
   ctx.messages.push({ role: 'assistant', content: response.content as Anthropic.ContentBlock[] });
   ctx.messages.push({ role: 'user', content: toolResults });
@@ -2322,6 +2339,7 @@ function iterationGateState(
   | 'iterationProgress'
   | 'callbacks'
   | 'emitStatus'
+  | 'toolStatus'
 > {
   const gated = gateIterationProgress(options);
   return {
@@ -2335,7 +2353,13 @@ function iterationGateState(
       options.preferences.response_language,
       options.logger
     ),
+    toolStatus: createToolStatusGate(),
   };
+}
+
+/** Text turns name MCP calls inside execute_code. Other rounds keep the generic line. */
+function textTurnNamesItsTools(ctx: OrchestrationContext, toolCalls: ToolUseBlock[]): boolean {
+  return ctx.holdIterationText && toolCalls.every((call) => call.name === 'execute_code');
 }
 
 function createOrchestrationContext(
@@ -3289,19 +3313,106 @@ function createSandboxToolCaller(
   };
 }
 
+async function runSandbox(code: string, ctx: OrchestrationContext) {
+  const sawHostCall = { value: false };
+  const toolNames = [...getToolNames(ctx.catalog), ...SANDBOX_INTERNAL_TOOLS];
+  const hostFunctions = createMCPHostFunctions(createSandboxToolCaller(ctx), toolNames);
+  const result = await executeCode(
+    code,
+    {
+      timeout_ms: ctx.codeExecTimeout,
+      hostFunctions,
+      maxMcpCalls: ctx.maxMcpCalls,
+      onHostCalls: (calls) => noteHostCalls(ctx, calls, sawHostCall),
+    },
+    ctx.logger
+  );
+  if (!sawHostCall.value) await publishIdleToolStatus(ctx);
+  return result;
+}
+
+function noteHostCalls(
+  ctx: OrchestrationContext,
+  calls: readonly HostCallStart[],
+  sawHostCall: { value: boolean }
+): Promise<void> {
+  sawHostCall.value = true;
+  return publishToolStatus(ctx, calls);
+}
+
+async function publishToolStatus(
+  ctx: OrchestrationContext,
+  calls: readonly HostCallStart[]
+): Promise<void> {
+  if (!ctx.holdIterationText) return;
+  const decision = ctx.toolStatus.decide(toolSnapshots(ctx, calls), ctx.locale, Date.now());
+  ctx.logger.log('tool_status', { kind: decision.kind, tools: calls.map((call) => call.name) });
+  await applyToolStatusDecision(ctx, decision);
+}
+
+async function publishIdleToolStatus(ctx: OrchestrationContext): Promise<void> {
+  if (!ctx.holdIterationText) return;
+  const decision = ctx.toolStatus.noteIdle(Date.now());
+  ctx.logger.log('tool_status', { kind: decision.kind, tools: [] });
+  await applyToolStatusDecision(ctx, decision);
+}
+
+async function applyToolStatusDecision(
+  ctx: OrchestrationContext,
+  decision: ToolStatusDecision
+): Promise<void> {
+  if (decision.kind === 'emit') {
+    await emitDirectStatus(ctx, decision.key, decision.message);
+    return;
+  }
+  if (decision.kind === 'fallback') {
+    await ctx.emitStatus?.('status_executing_tools', { n: decision.count });
+  }
+}
+
+async function emitDirectStatus(
+  ctx: OrchestrationContext,
+  key: StatusKey,
+  message: string
+): Promise<void> {
+  if (!ctx.callbacks) return;
+  try {
+    await ctx.callbacks.onStatus({ key, message });
+  } catch (error) {
+    ctx.logger.warn('status_callback_failed', {
+      key,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function toolSnapshots(
+  ctx: OrchestrationContext,
+  calls: readonly HostCallStart[]
+): ToolCallSnapshot[] {
+  return calls.map((call) => snapshotOf(ctx, call));
+}
+
+function snapshotOf(ctx: OrchestrationContext, call: HostCallStart): ToolCallSnapshot {
+  const serverName = serverDisplayName(ctx, call.name);
+  const args = call.args.length === 1 ? call.args[0] : undefined;
+  return serverName === undefined
+    ? { name: call.name, args }
+    : { name: call.name, args, serverName };
+}
+
+function serverDisplayName(ctx: OrchestrationContext, toolName: string): string | undefined {
+  const serverId = findTool(ctx.catalog, toolName)?.serverId;
+  if (!serverId) return undefined;
+  const name = ctx.catalog.serverMap.get(serverId)?.name;
+  return typeof name === 'string' && name.trim() ? name : undefined;
+}
+
 async function handleExecuteCode(
   input: { code: string },
   ctx: OrchestrationContext
 ): Promise<unknown> {
-  const mcpToolNames = getToolNames(ctx.catalog);
-  const toolNames = [...mcpToolNames, ...SANDBOX_INTERNAL_TOOLS];
-  const hostFunctions = createMCPHostFunctions(createSandboxToolCaller(ctx), toolNames);
-
-  const result = await executeCode(
-    input.code,
-    { timeout_ms: ctx.codeExecTimeout, hostFunctions, maxMcpCalls: ctx.maxMcpCalls },
-    ctx.logger
-  );
+  const result = await runSandbox(input.code, ctx);
 
   if (!result.success) {
     // Handle MCP call limit exceeded with structured error and guidance
