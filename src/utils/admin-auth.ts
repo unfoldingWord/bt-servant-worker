@@ -37,9 +37,21 @@ export function bearerToken(authorizationHeader: string | undefined): string | n
   return authorizationHeader.slice(7);
 }
 
-/** True when a dedicated admin key is configured (non-empty). */
+/**
+ * The configured admin key, trimmed, or null when it is unset, empty or
+ * whitespace-only. Admin clients apply the same rule and send the trimmed
+ * value, so the comparison is always against the trimmed secret (a stray
+ * newline in the stored secret cannot break or weaken the match).
+ */
+export function configuredAdminKey(keys: AuthKeys): string | null {
+  if (typeof keys.ADMIN_API_KEY !== 'string') return null;
+  const trimmed = keys.ADMIN_API_KEY.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/** True when a dedicated admin key is configured (non-blank after trimming). */
 export function adminKeyConfigured(keys: AuthKeys): boolean {
-  return typeof keys.ADMIN_API_KEY === 'string' && keys.ADMIN_API_KEY.length > 0;
+  return configuredAdminKey(keys) !== null;
 }
 
 /**
@@ -57,10 +69,9 @@ export function adminKeyEnforced(keys: AuthKeys): boolean {
  * can only withhold admin authority, never grant it to engine-key holders.
  */
 export function classifyToken(token: string, keys: AuthKeys): KeyClass | null {
+  const adminKey = configuredAdminKey(keys);
   const matchesEngine = constantTimeCompare(token, keys.ENGINE_API_KEY);
-  const matchesAdmin = adminKeyConfigured(keys)
-    ? constantTimeCompare(token, keys.ADMIN_API_KEY ?? '')
-    : false;
+  const matchesAdmin = adminKey !== null ? constantTimeCompare(token, adminKey) : false;
   if (matchesEngine) return 'engine';
   if (matchesAdmin) return 'admin';
   return null;

@@ -57,6 +57,28 @@ describe('admin key unset (behaviour unchanged)', () => {
   });
 });
 
+describe('blank or padded ADMIN_API_KEY', () => {
+  it.each(['', '   ', '\n'])(
+    'blank %j counts as unset: engine key keeps admin, flag has no effect',
+    async (value) => {
+      const cfg = { ADMIN_API_KEY: value, ADMIN_KEY_REQUIRED: 'true' };
+      expect((await fetchWith(cfg, ADMIN_CONFIG, { headers: bearer(ENGINE) })).status).toBe(200);
+      // A blank token can never match a blank secret. (Fetch trims header
+      // values, so "Bearer " arrives as "Bearer" and is a missing bearer.)
+      expect(
+        (await fetchWith(cfg, ADMIN_CONFIG, { headers: { Authorization: 'Bearer ' } })).status
+      ).toBe(401);
+      expect((await fetchWith(cfg, ADMIN_CONFIG, { headers: bearer(value) })).status).not.toBe(200);
+    }
+  );
+
+  it('a padded secret matches the trimmed key the clients send', async () => {
+    const cfg = { ADMIN_API_KEY: ` ${ADMIN}\n`, ADMIN_KEY_REQUIRED: 'true' };
+    expect((await fetchWith(cfg, ADMIN_CONFIG, { headers: bearer(ADMIN) })).status).toBe(200);
+    expect((await fetchWith(cfg, ADMIN_CONFIG, { headers: bearer(ENGINE) })).status).toBe(403);
+  });
+});
+
 describe('admin key set, ADMIN_KEY_REQUIRED "false" (transition)', () => {
   const cfg = { ADMIN_API_KEY: ADMIN, ADMIN_KEY_REQUIRED: 'false' };
 

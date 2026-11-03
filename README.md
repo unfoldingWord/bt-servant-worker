@@ -181,7 +181,7 @@ Authorization: Bearer <ENGINE_API_KEY, ADMIN_API_KEY or org-specific admin key>
 | set             | `"false"` (default)  | `ADMIN_API_KEY` or `ENGINE_API_KEY` (transition)                                                                  |
 | set             | `"true"`             | `ADMIN_API_KEY` only; `ENGINE_API_KEY` gets `403` (`auth_rejected`, `reason: admin_key_required`)                 |
 
-Chat and user routes accept either key in every row, with one exception: a chat request with an admin `client_id` (`admin-portal`, which gets admin visibility of unpublished modes and languages) follows the admin-route rule and logs `admin_auth` the same way. Switch-over: set the `ADMIN_API_KEY` secret, point admin clients at it, watch `admin_auth` logs until no `key_class: engine` entries remain, then set `ADMIN_KEY_REQUIRED = "true"` in `wrangler.toml`. If `ADMIN_API_KEY` were ever set to the same value as `ENGINE_API_KEY`, that value is treated as the engine key.
+Chat and user routes accept either key in every row, with one exception: a chat request with an admin `client_id` (`admin-portal`, which gets admin visibility of unpublished modes and languages) follows the admin-route rule and logs `admin_auth` the same way. Switch-over: set the `ADMIN_API_KEY` secret, point admin clients at it, watch `admin_auth` logs until no `key_class: engine` entries remain, then set `ADMIN_KEY_REQUIRED = "true"` in `wrangler.toml`. An `ADMIN_API_KEY` that is empty or whitespace-only counts as unset, and a set key is compared after trimming surrounding whitespace (the same rule the admin clients apply to the value they send). If `ADMIN_API_KEY` were ever set to the same value as `ENGINE_API_KEY`, that value is treated as the engine key.
 
 ## API Endpoints
 

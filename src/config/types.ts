@@ -59,8 +59,9 @@ export interface Env {
   ENGINE_API_KEY: string;
   /**
    * Dedicated key for the admin routes (`/api/v1/admin/*`). Also passes the
-   * global `/api/*` check. Unset ⇒ behaviour as before the split: the engine
-   * key is super admin. See src/utils/admin-auth.ts.
+   * global `/api/*` check. Unset, empty or whitespace-only ⇒ behaviour as
+   * before the split: the engine key is super admin. Compared trimmed. See
+   * src/utils/admin-auth.ts.
    */
   ADMIN_API_KEY?: string;
   OPENAI_API_KEY: string;

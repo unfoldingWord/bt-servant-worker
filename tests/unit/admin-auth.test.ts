@@ -8,6 +8,7 @@ import {
   adminKeyConfigured,
   adminKeyEnforced,
   bearerToken,
+  configuredAdminKey,
   classifyToken,
   hasSuperAdminAuthority,
   isSuperAdminClass,
@@ -44,6 +45,36 @@ describe('adminKeyConfigured / adminKeyEnforced', () => {
     expect(adminKeyEnforced({ ...enforced, ADMIN_KEY_REQUIRED: undefined })).toBe(false);
     // Flag on but no admin key: not enforced, so admin is never locked out.
     expect(adminKeyEnforced({ ENGINE_API_KEY: ENGINE, ADMIN_KEY_REQUIRED: 'true' })).toBe(false);
+  });
+});
+
+describe('blank and padded admin keys', () => {
+  it.each([undefined, '', ' ', '   ', '\n', ' \t\n '])(
+    'treats %j as not configured (behaviour unchanged, flag has no effect)',
+    (value) => {
+      const keys = { ENGINE_API_KEY: ENGINE, ADMIN_API_KEY: value, ADMIN_KEY_REQUIRED: 'true' };
+      expect(configuredAdminKey(keys)).toBeNull();
+      expect(adminKeyConfigured(keys)).toBe(false);
+      expect(adminKeyEnforced(keys)).toBe(false);
+      expect(hasSuperAdminAuthority(`Bearer ${ENGINE}`, keys)).toBe(true);
+      expect(classifyToken('', keys)).toBeNull();
+      expect(classifyToken(' ', keys)).toBeNull();
+    }
+  );
+
+  it('compares against the trimmed secret', () => {
+    const keys = {
+      ENGINE_API_KEY: ENGINE,
+      ADMIN_API_KEY: `  ${ADMIN}\n`,
+      ADMIN_KEY_REQUIRED: 'true',
+    };
+    expect(configuredAdminKey(keys)).toBe(ADMIN);
+    expect(adminKeyEnforced(keys)).toBe(true);
+    expect(classifyToken(ADMIN, keys)).toBe('admin');
+    expect(hasSuperAdminAuthority(`Bearer ${ADMIN}`, keys)).toBe(true);
+    // The untrimmed form is not the key.
+    expect(classifyToken(`  ${ADMIN}\n`, keys)).toBeNull();
+    expect(hasSuperAdminAuthority(`Bearer ${ENGINE}`, keys)).toBe(false);
   });
 });
 
