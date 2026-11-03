@@ -47,6 +47,17 @@ async function readOp(request: Request, logger: RequestLogger): Promise<PartnerK
   return null;
 }
 
+/**
+ * Legacy-import lease (one import per key at a time): `import-lease:<key id>`.
+ * A second import of the same key while one runs could delete audio the
+ * first one just wrote (each run's cleanup removes what it wrote, and the
+ * other run may already be reusing it). The TTL only covers a run that died
+ * without releasing; a live run releases in `finally`.
+ */
+const IMPORT_LEASE_PREFIX = 'import-lease:';
+export const IMPORT_LEASE_TTL_MS = 10 * 60 * 1000;
+type ImportLease = { holder: string; expiresAt: number };
+
 /** Request id used when the worker sent none (it always does); never random. */
 const NO_REQUEST_ID = 'partner-key-store:no-request-id';
 /** Request id for alarm-level events not tied to one owed key; never random. */
@@ -89,7 +100,7 @@ export class PartnerKeyStoreDO {
     await runWithMetricsSuppressed(async () => {
       try {
         await this.serialize(() =>
-          this.ledger(logger, ALARM_REQUEST_ID).retryProjections(createRequestLogger)
+          this.ledger(logger, ALARM_REQUEST_ID, 'alarm').retryProjections(createRequestLogger)
         );
       } catch (error) {
         logger.error('partner_key_projection_alarm_failed', error);
@@ -120,7 +131,7 @@ export class PartnerKeyStoreDO {
   /** After a failed alarm: make sure a retry is still scheduled while anything is owed. */
   private async keepAlarmWhileOwed(logger: RequestLogger): Promise<void> {
     try {
-      const owed = await this.ledger(logger, ALARM_REQUEST_ID).armAlarm();
+      const owed = await this.ledger(logger, ALARM_REQUEST_ID, 'alarm').armAlarm();
       logger.log('partner_key_projection_alarm_rearmed', { owed });
     } catch (error) {
       logger.error('partner_key_projection_alarm_rearm_failed', error);
@@ -137,23 +148,49 @@ export class PartnerKeyStoreDO {
     return run;
   }
 
-  private ledger(logger: RequestLogger, requestId: string): PartnerKeyLedger {
+  /**
+   * The ledger for one operation. A timed-out KV put that settles later is
+   * logged then, so that work is kept alive with waitUntil. From fetch its
+   * line is then flushed, as fetch flushes its own. From the alarm it is not:
+   * the alarm's rule is no OTLP flush (outbound fetch is blocked there), and
+   * the tail worker forwards alarm logs.
+   */
+  private ledger(
+    logger: RequestLogger,
+    requestId: string,
+    context: 'fetch' | 'alarm' = 'fetch'
+  ): PartnerKeyLedger {
+    const flush = () => {
+      flushLogTelemetry((promise) => this.state.waitUntil(promise));
+      flushMetricTelemetry((promise) => this.state.waitUntil(promise));
+    };
     return new PartnerKeyLedger({
       storage: this.state.storage,
       kv: this.env.API_KEYS,
       tagSecret: this.env.PARTNER_KEY_TAG_SECRET,
       logger,
       requestId,
-      // A timed-out KV put that settles later is logged then: keep that work
-      // alive and flush its line, as the fetch handler does for its own.
-      afterResponse: (work) =>
-        this.state.waitUntil(
-          work.then(() => {
-            flushLogTelemetry((promise) => this.state.waitUntil(promise));
-            flushMetricTelemetry((promise) => this.state.waitUntil(promise));
-          })
-        ),
+      afterResponse: (work) => this.state.waitUntil(context === 'alarm' ? work : work.then(flush)),
     });
+  }
+
+  /** Take the lease unless another holder has it and it has not expired (runs serialized). */
+  private async acquireImportLease(id: string, holder: string): Promise<{ acquired: boolean }> {
+    const key = `${IMPORT_LEASE_PREFIX}${id}`;
+    const now = Date.now();
+    const lease = await this.state.storage.get<ImportLease>(key);
+    if (lease !== undefined && lease.expiresAt > now) return { acquired: false };
+    await this.state.storage.put(key, { holder, expiresAt: now + IMPORT_LEASE_TTL_MS });
+    return { acquired: true };
+  }
+
+  /** Delete the lease only if `holder` still holds it (an expired one may have been retaken). */
+  private async releaseImportLease(id: string, holder: string): Promise<{ released: boolean }> {
+    const key = `${IMPORT_LEASE_PREFIX}${id}`;
+    const lease = await this.state.storage.get<ImportLease>(key);
+    if (lease?.holder !== holder) return { released: false };
+    await this.state.storage.delete(key);
+    return { released: true };
   }
 
   /** Dispatch one operation; undefined for an unknown op. */
@@ -174,6 +211,10 @@ export class PartnerKeyStoreDO {
         return ledger.revoke(op.id, op.revokedBy);
       case 'rotate':
         return ledger.rotate(op.id, { createdBy: op.createdBy, graceSeconds: op.graceSeconds });
+      case 'acquireImportLease':
+        return this.acquireImportLease(op.id, op.holder);
+      case 'releaseImportLease':
+        return this.releaseImportLease(op.id, op.holder);
       default:
         return undefined;
     }

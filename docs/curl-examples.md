@@ -689,30 +689,44 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_
   `key_revoked` / `key_expired` (or `status_check_failed`, logged, if the
   status cannot be read). The response is still `200` with every user's
   status.
+- One import per key at a time: while an import of the same key is running,
+  another gets `409` with `code: "import_in_progress"` and does nothing.
+  (A run that died without finishing stops blocking after 10 minutes.)
 - Per user, in this order: a read-only check that the destination is empty
   and idle (otherwise `destination_not_empty` / `destination_busy`, with
   nothing copied), the source export, the audio copy, then the write (which
   checks the destination again).
 - Audio the copied history references (`voice_audio_key` TTS replies,
-  `inbound_voice_audio_key` voice messages) is copied in R2, streamed, into
-  the partner's partition (`audio/<org>/partner:<ns>:<user_id>/...`,
+  `inbound_voice_audio_key` voice messages, and each audio entry of
+  `attachments[]`) is copied in R2, streamed, into the partner's partition
+  (`audio/<org>/partner:<ns>:<user_id>/...`,
   `voice-submissions/<org>/partner:<ns>:<user_id>/...`), and the keys in the
-  copied history are rewritten, so the partner key can download it. Source
+  copied history are rewritten (for an attachment, its `r2_key` and `url`),
+  so the partner key can download it. Source
   objects are not changed. A copy that already exists (from an earlier run)
   is reused, never overwritten. Each copied user's result carries
   `audio: { copied, existing, missing }`.
   - A source object that no longer exists keeps its history entry without
-    the audio key (logged, `missing`).
+    the audio key, or without that attachment (logged, `missing`).
   - Any other copy failure fails the user: `audio_copy_failed`, nothing
     written to the destination, and only the objects this run created are
     removed. Re-run to retry.
+  - Copies are removed only when the destination definitely did not take
+    the write (a `destination_not_empty` / `destination_busy` refusal, or a
+    body refused before any write). If the write's outcome is unknown (the
+    request failed, or the answer was not a readable result), the user is
+    `import_outcome_unknown` (logged) and the copies are kept: re-running
+    reports `destination_not_empty` if the write landed, or imports again
+    reusing those copies if it did not.
 - One request does at most 800 R2 and Durable Object operations (a margin
   under Cloudflare's per-request subrequest limit). Users that would not fit,
   and every user after them, are reported `deferred`; re-run the import with
   those ids to continue.
 - Every copied value must survive a JSON round-trip (all UserDO data is JSON
-  today). If one does not, that user is `failed` (logged with the storage key)
-  and nothing is written.
+  today). An object member that is `undefined` is dropped (it carries
+  nothing either way). Anything else that would not survive (a `Date`,
+  `Map`, `Set`, binary data, `NaN` or `Infinity`, a function) makes that
+  user `failed` (logged with the storage key), and nothing is written.
 - The source is not changed or deleted. Each user is copied once, as it is
   at that moment: a turn the app sends with the shared key after that user's
   export is NOT copied. Cut-over runbook, in this order:

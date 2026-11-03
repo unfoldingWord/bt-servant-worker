@@ -54,7 +54,9 @@ export type PartnerKeyStoreOp =
   | { op: 'list'; org?: string }
   | { op: 'get'; id: string }
   | { op: 'revoke'; id: string; revokedBy?: string }
-  | { op: 'rotate'; id: string; createdBy?: string; graceSeconds: number };
+  | { op: 'rotate'; id: string; createdBy?: string; graceSeconds: number }
+  | { op: 'acquireImportLease'; id: string; holder: string }
+  | { op: 'releaseImportLease'; id: string; holder: string };
 
 export type CreateOutcome = { record: PartnerKeyRecord; plaintext: string; warnings: string[] };
 
@@ -91,5 +93,12 @@ export function partnerKeyStore(ns: DurableObjectNamespace, requestId: string) {
       ),
     rotate: (id: string, opts: { createdBy?: string; graceSeconds: number }) =>
       call<RotateOutcome>({ op: 'rotate', id, ...opts }),
+    /** Take the key's legacy-import lease for `holder`; false while another import holds it. */
+    acquireImportLease: async (id: string, holder: string) =>
+      (await call<{ acquired: boolean }>({ op: 'acquireImportLease', id, holder })).acquired,
+    /** Release the lease if `holder` still holds it. */
+    releaseImportLease: async (id: string, holder: string) => {
+      await call<{ released: boolean }>({ op: 'releaseImportLease', id, holder });
+    },
   };
 }

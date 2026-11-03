@@ -13,6 +13,7 @@ import { env, runInDurableObject, SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PublicPartnerKey } from '../../src/types/partner-keys';
 import { setupAnthropicFetchCapture } from '../helpers/anthropic-capture.js';
+import { PARTNER_KEY_STORE_NAME } from '../../src/services/partner-keys/store';
 
 vi.mock('@anthropic-ai/sdk', () => ({ default: vi.fn() }));
 vi.mock('../../src/services/audio/cloudflare-stt.js', () => ({
@@ -262,5 +263,103 @@ describe('re-running the legacy import never deletes audio an earlier run wrote'
     const res = await used.fetch('https://user-do/admin/user-data/importable');
     expect(res.status).toBe(409);
     expect(await res.json()).toEqual({ ok: false, reason: 'destination_not_empty' });
+  });
+});
+
+describe('legacy import rehomes audio attachments too', () => {
+  it("rewrites an audio attachment's r2_key and url, drops a missing one, leaves others alone", async () => {
+    await seedLegacyUser();
+    const story = `voice-submissions/${ORG}/grp1/amara/story.ogg`;
+    const gone = `voice-submissions/${ORG}/grp1/amara/gone.ogg`;
+    await putAudio(story);
+    const pdf = { type: 'pdf', url: 'https://worker/x.pdf', filename: 'x.pdf', size_bytes: 1 };
+    const source = env.USER_DO.get(env.USER_DO.idFromName(`user:${ORG}:leg1`));
+    await runInDurableObject(source, async (_i, state) => {
+      const history = (await state.storage.get<Record<string, unknown>[]>('history')) ?? [];
+      history.push({
+        user_message: 'play it',
+        assistant_response: 'here',
+        timestamp: 4,
+        attachments: [
+          {
+            type: 'audio',
+            r2_key: story,
+            url: `${W}/api/v1/voice-submissions/${story}`,
+            mime_type: 'audio/ogg',
+          },
+          { type: 'audio', r2_key: gone, url: `${W}/api/v1/voice-submissions/${gone}` },
+          pdf,
+        ],
+      });
+      await state.storage.put('history', history);
+    });
+    const { key, apiKey } = await createKey();
+    expect(await importLeg1(key.id)).toMatchObject({
+      status: 'copied',
+      audio: { copied: 3, existing: 0, missing: 2 },
+    });
+    const owner = `partner:${key.userNamespace}:leg1`;
+    const history = await historyOf(`user:${ORG}:${owner}`);
+    const copy = `voice-submissions/${ORG}/${owner}/amara/story.ogg`;
+    expect(history.at(-1)?.attachments).toEqual([
+      {
+        type: 'audio',
+        r2_key: copy,
+        url: `${W}/api/v1/voice-submissions/${copy}`,
+        mime_type: 'audio/ogg',
+      },
+      pdf,
+    ]);
+    expect((await get(`/api/v1/voice-submissions/${copy}`, apiKey)).status).toBe(200);
+    expect(await env.AUDIO_BUCKET.head(story)).not.toBeNull();
+  });
+});
+
+const keyStoreStub = () =>
+  env.PARTNER_KEY_STORE.get(env.PARTNER_KEY_STORE.idFromName(PARTNER_KEY_STORE_NAME));
+
+async function leaseOf(keyId: string): Promise<unknown> {
+  return runInDurableObject(keyStoreStub(), async (_i, state) =>
+    state.storage.get(`import-lease:${keyId}`)
+  );
+}
+
+async function plantLease(keyId: string, expiresAt: number): Promise<void> {
+  await runInDurableObject(keyStoreStub(), async (_i, state) => {
+    await state.storage.put(`import-lease:${keyId}`, { holder: 'other-run', expiresAt });
+  });
+}
+
+describe('one legacy import per key at a time', () => {
+  it('a second import while one holds the lease gets 409 import_in_progress and touches nothing', async () => {
+    await seedLegacyUser();
+    const { key } = await createKey();
+    await plantLease(key.id, Date.now() + 60_000);
+    const res = await SELF.fetch(`${KEYS}/${key.id}/_import-legacy-users`, {
+      method: 'POST',
+      headers: JSON_INTERNAL,
+      body: JSON.stringify({ legacyClientId: 'shema', userIds: ['leg1'] }),
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ code: 'import_in_progress' });
+    const owner = `partner:${key.userNamespace}:leg1`;
+    expect(await keysUnder(`audio/${ORG}/${owner}/`)).toEqual([]);
+    expect(await leaseOf(key.id)).toMatchObject({ holder: 'other-run' });
+  });
+
+  it('an expired lease (a run that died) does not block, and a finished run releases its lease', async () => {
+    await seedLegacyUser();
+    const { key } = await createKey();
+    await plantLease(key.id, Date.now() - 1);
+    expect(await importLeg1(key.id)).toMatchObject({ status: 'copied' });
+    expect(await leaseOf(key.id)).toBeUndefined();
+  });
+
+  it('the lease is per key: another key imports while the first is held', async () => {
+    await seedLegacyUser();
+    const held = await createKey();
+    const free = await createKey();
+    await plantLease(held.key.id, Date.now() + 60_000);
+    expect(await importLeg1(free.key.id)).toMatchObject({ status: 'copied' });
   });
 });

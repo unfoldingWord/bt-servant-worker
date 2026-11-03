@@ -1989,27 +1989,29 @@ app.post(`${PARTNER_KEYS_BASE}/:keyId/_import-legacy-users`, async (c) => {
         409
       );
     }
-    const results = await importLegacyUsers(c.env, key, body.input, {
-      logger,
-      requestId: c.get('requestId'),
-      // Re-read from the store before each batch; a key that is gone counts as revoked.
-      currentStatus: async () => {
-        const now = await keyStore(c).get(keyId);
-        return now ? partnerKeyStatus(now, Date.now()) : 'revoked';
-      },
-    });
-    const counts = Object.fromEntries(
-      results.reduce(
-        (m, r) => m.set(r.status, (m.get(r.status) ?? 0) + 1),
-        new Map<string, number>()
-      )
+    // One import per key at a time: a concurrent run could delete audio this
+    // one wrote (or is reusing). Released in finally; the TTL covers a crash.
+    const holder = crypto.randomUUID();
+    if (!(await keyStore(c).acquireImportLease(keyId, holder))) {
+      return c.json({ error: IMPORT_IN_PROGRESS_ERROR, code: 'import_in_progress' }, 409);
+    }
+    const results = await withImportLease(c, keyId, holder, () =>
+      importLegacyUsers(c.env, key, body.input, {
+        logger,
+        requestId: c.get('requestId'),
+        // Re-read from the store before each batch; a key that is gone counts as revoked.
+        currentStatus: async () => {
+          const now = await keyStore(c).get(keyId);
+          return now ? partnerKeyStatus(now, Date.now()) : 'revoked';
+        },
+      })
     );
     logger.log('admin_action', {
       ...ctx,
       org: key.org,
       legacy_client_id: body.input.legacyClientId,
       requested: body.input.userIds.length,
-      counts,
+      counts: countByStatus(results),
     });
     return c.json({ keyId: key.id, org: key.org, results });
   } catch (error) {
@@ -2017,6 +2019,36 @@ app.post(`${PARTNER_KEYS_BASE}/:keyId/_import-legacy-users`, async (c) => {
     return c.json({ error: 'Failed to import legacy users' }, 500);
   }
 });
+
+const IMPORT_IN_PROGRESS_ERROR =
+  'An import for this API key is already running; retry when it finishes';
+
+/** How many users ended in each status, for the summary log line. */
+function countByStatus(results: { status: string }[]): Record<string, number> {
+  return Object.fromEntries(
+    results.reduce((m, r) => m.set(r.status, (m.get(r.status) ?? 0) + 1), new Map<string, number>())
+  );
+}
+
+/** Run `task`, then release the import lease (a failed release is logged; the TTL frees it). */
+async function withImportLease<T>(
+  c: Context<AppEnv>,
+  keyId: string,
+  holder: string,
+  task: () => Promise<T>
+): Promise<T> {
+  try {
+    return await task();
+  } finally {
+    try {
+      await keyStore(c).releaseImportLease(keyId, holder);
+    } catch (error) {
+      c.get('logger').error('partner_key_legacy_import_lease_release_failed', error, {
+        key_id: keyId,
+      });
+    }
+  }
+}
 
 /** HTTP response for a rotation that did not happen. */
 function rotateRefusal(c: Context<AppEnv>, result: Exclude<RotateOutcome, { status: 'ok' }>) {
@@ -2908,9 +2940,10 @@ async function handleDORequest(c: Context<AppEnv>, params: DORequestParams): Pro
   const { org, doKey, doPath, userId } = params;
   const request = c.req.raw;
   const env = c.env;
-  // The request's id and logger from the /api/* middleware, so these lines
-  // correlate with its auth line.
-  const logger = c.get('logger');
+  // The request id from the /api/* middleware, so these lines correlate with
+  // its auth line; for a user route the logger is bound to the user id, so
+  // every line below carries it.
+  const logger = userId ? createRequestLogger(c.get('requestId'), userId) : c.get('logger');
   const start = Date.now();
 
   if (!org) {
@@ -2926,7 +2959,6 @@ async function handleDORequest(c: Context<AppEnv>, params: DORequestParams): Pro
     org,
     path: doPath,
     method: request.method,
-    ...(userId ? { user_id: userId } : {}),
   });
 
   const doId = env.USER_DO.idFromName(doKey);

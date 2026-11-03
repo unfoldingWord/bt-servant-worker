@@ -25,7 +25,15 @@
  *   DO. The export and the check-and-write each run as one storage
  *   transaction inside that DO, which no turn can interleave with, and are
  *   refused while a turn holds its lock or anything is queued. Retry later.
+ * - `import_outcome_unknown`: the destination write may or may not have
+ *   happened (the request failed, or the answer was not a readable import
+ *   result). The user's copied audio is KEPT (it may now be referenced) and
+ *   this is logged; a re-run reports `destination_not_empty` if the write
+ *   landed, or imports again and reuses that audio if it did not.
  * The source is never modified, so a re-run (or a mistake) loses nothing.
+ * Audio this run copied is removed only when the destination DEFINITELY
+ * did not take the write: an explicit 409 refusal, or a 400 (the body was
+ * refused before any write).
  */
 
 import type { Env } from '../../config/types.js';
@@ -34,10 +42,7 @@ import {
   type PartnerKeyRecord,
   type PartnerKeyStatus,
 } from '../../types/partner-keys.js';
-import type {
-  UserDataExport,
-  UserDataImportResult,
-} from '../../durable-objects/user-data-transfer.js';
+import type { UserDataExport } from '../../durable-objects/user-data-transfer.js';
 import type { RequestLogger } from '../../utils/logger.js';
 import {
   isReservedPartnerId,
@@ -84,6 +89,7 @@ export type LegacyImportStatus =
   | 'key_expired'
   | 'status_check_failed'
   | 'audio_copy_failed'
+  | 'import_outcome_unknown'
   | 'deferred'
   | 'failed';
 
@@ -260,36 +266,79 @@ async function copyWithAudio(
     });
     return { userId, status: 'audio_copy_failed' };
   }
-  try {
-    const result = await importInto(ctx, userId, audio.entries);
-    if (result.ok) {
-      return { userId, status: 'copied', entries: result.imported, audio: audio.counts };
-    }
-    await removeRehomedAudio(env.AUDIO_BUCKET, audio.written, logger);
-    return { userId, status: result.reason };
-  } catch (error) {
-    await removeRehomedAudio(env.AUDIO_BUCKET, audio.written, logger);
-    throw error;
+  const outcome = await importInto(ctx, userId, audio.entries);
+  switch (outcome.kind) {
+    case 'imported':
+      return { userId, status: 'copied', entries: outcome.imported, audio: audio.counts };
+    case 'refused':
+      await removeRehomedAudio(env.AUDIO_BUCKET, audio.written, logger);
+      return { userId, status: outcome.status };
+    case 'unknown':
+      logger.error('partner_key_legacy_import_outcome_unknown', outcome.error, {
+        key_id: key.id,
+        user_id: userId,
+        audio_kept: audio.written.length,
+      });
+      return { userId, status: 'import_outcome_unknown', audio: audio.counts };
   }
 }
 
-/** PUT `entries` into the user's partner DO; the import result, or a throw. */
+/** What the destination write did, as far as the answer shows. */
+type ImportOutcome =
+  | { kind: 'imported'; imported: number }
+  /** Definitely not written. */
+  | { kind: 'refused'; status: 'destination_not_empty' | 'destination_busy' | 'failed' }
+  /** May or may not have been written. */
+  | { kind: 'unknown'; error: unknown };
+
+const REFUSAL_REASONS: ReadonlySet<unknown> = new Set([
+  'destination_not_empty',
+  'destination_busy',
+]);
+
+/** PUT `entries` into the user's partner DO. Never throws: the outcome says what is known. */
 async function importInto(
   ctx: ImportContext,
   userId: string,
   entries: [string, unknown][]
-): Promise<UserDataImportResult> {
-  const dest = await userDoFetch(ctx, destinationOf(ctx, userId), {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ entries }),
-  });
-  // Status first: only a 200 or a 409 carries an import result (a storage
-  // error answers 500 with an error body, which is not one).
-  if (dest.status !== 200 && dest.status !== 409) {
-    throw new Error(`destination import failed with ${dest.status}`);
+): Promise<ImportOutcome> {
+  let dest: Response;
+  let body: unknown;
+  try {
+    dest = await userDoFetch(ctx, destinationOf(ctx, userId), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ entries }),
+    });
+    // A 400 is the DO refusing the body before its write transaction starts.
+    if (dest.status === 400) {
+      ctx.logger.warn('partner_key_legacy_import_body_refused', {
+        key_id: ctx.key.id,
+        user_id: userId,
+      });
+      return { kind: 'refused', status: 'failed' };
+    }
+    body = await dest.json();
+  } catch (error) {
+    return { kind: 'unknown', error };
   }
-  return (await dest.json()) as UserDataImportResult;
+  return readImportOutcome(dest.status, body);
+}
+
+/** Only a well-formed 200 or 409 import result is definite; anything else is unknown. */
+function readImportOutcome(status: number, body: unknown): ImportOutcome {
+  type Fields = { ok?: unknown; imported?: unknown; reason?: unknown };
+  const result: Fields = typeof body === 'object' && body !== null ? (body as Fields) : {};
+  if (status === 200 && result.ok === true && typeof result.imported === 'number') {
+    return { kind: 'imported', imported: result.imported };
+  }
+  if (status === 409 && result.ok === false && REFUSAL_REASONS.has(result.reason)) {
+    return {
+      kind: 'refused',
+      status: result.reason as 'destination_not_empty' | 'destination_busy',
+    };
+  }
+  return { kind: 'unknown', error: new Error(`unexpected import answer (status ${status})`) };
 }
 
 /**

@@ -1,15 +1,16 @@
 /**
  * Legacy user import (admin-portal#354): how one copy reads the destination
- * DO's answer. Only a 200 or a 409 carries an import result; any other
- * status (a storage error answers 500 with a plain error body) is a failure
- * for that user, decided from the status before the body is parsed.
+ * DO's answer. Only a well-formed 200 (imported) or 409 (an explicit
+ * refusal) is definite, and a 400 is a refusal before any write. Anything
+ * else (a failed request, a 5xx, an unreadable or unknown answer) is
+ * `import_outcome_unknown`: the write may have landed, so audio is kept.
  */
 
 import { describe, expect, it, vi } from 'vitest';
 import { rehomeHistoryAudio } from '../../src/services/partner-keys/legacy-audio.js';
 import { partnerAudioKeyFor } from '../../src/services/audio/r2-storage.js';
 import type { Env } from '../../src/config/types.js';
-import { isJsonSafe, readImportEntries } from '../../src/durable-objects/user-data-transfer.js';
+import { readImportEntries, toJsonSafe } from '../../src/durable-objects/user-data-transfer.js';
 import {
   importLegacyUsers,
   LEGACY_IMPORT_OPERATION_BUDGET,
@@ -56,14 +57,49 @@ const run = (env: Env) =>
     { logger: createMockLogger(), requestId: 'req-1', currentStatus: active }
   );
 
-describe('importLegacyUsers reads the destination status before its body', () => {
-  it('a 500 with a non-JSON body is reported as failed, not a parse error', async () => {
-    const env = envWithDestination(() => new Response('storage exploded', { status: 500 }));
-    expect(await run(env)).toEqual([{ userId: 'u1', status: 'failed' }]);
+const NO_AUDIO = { copied: 0, existing: 0, missing: 0 };
+const unknownOutcome = [{ userId: 'u1', status: 'import_outcome_unknown', audio: NO_AUDIO }];
+
+describe('importLegacyUsers: only a definite answer is definite', () => {
+  it('a 500 (JSON or not) is an unknown outcome, never read as a result', async () => {
+    const text = envWithDestination(() => new Response('storage exploded', { status: 500 }));
+    expect(await run(text)).toEqual(unknownOutcome);
+    const json = envWithDestination(() =>
+      Response.json({ ok: true, imported: 9 }, { status: 500 })
+    );
+    expect(await run(json)).toEqual(unknownOutcome);
   });
 
-  it('a 500 with a JSON body is still failed (never read as a result)', async () => {
-    const env = envWithDestination(() => Response.json({ ok: true, imported: 9 }, { status: 500 }));
+  it('a failed request, an unreadable 200 and an unknown 409 reason are unknown outcomes', async () => {
+    const thrown = envWithDestination(() => {
+      throw new Error('network');
+    });
+    expect(await run(thrown)).toEqual(unknownOutcome);
+    const unreadable = envWithDestination(() => new Response('not json', { status: 200 }));
+    expect(await run(unreadable)).toEqual(unknownOutcome);
+    const oddReason = envWithDestination(() =>
+      Response.json({ ok: false, reason: 'something_else' }, { status: 409 })
+    );
+    expect(await run(oddReason)).toEqual(unknownOutcome);
+  });
+
+  it('logs an unknown outcome with the key and user', async () => {
+    const logger = createMockLogger();
+    await importLegacyUsers(
+      envWithDestination(() => new Response('x', { status: 503 })),
+      KEY,
+      { legacyClientId: 'shema', userIds: ['u1'] },
+      { logger, requestId: 'req-1', currentStatus: active }
+    );
+    expect(logger.error).toHaveBeenCalledWith(
+      'partner_key_legacy_import_outcome_unknown',
+      expect.any(Error),
+      { key_id: KEY.id, user_id: 'u1', audio_kept: 0 }
+    );
+  });
+
+  it('a 400 (body refused before any write) is failed', async () => {
+    const env = envWithDestination(() => Response.json({ error: 'bad' }, { status: 400 }));
     expect(await run(env)).toEqual([{ userId: 'u1', status: 'failed' }]);
   });
 
@@ -76,6 +112,53 @@ describe('importLegacyUsers reads the destination status before its body', () =>
     expect(await run(ok)).toEqual([
       { userId: 'u1', status: 'copied', entries: 1, audio: { copied: 0, existing: 0, missing: 0 } },
     ]);
+  });
+});
+
+/** Import u1, whose history references one TTS object, against `dest`; did its partner copy survive? */
+async function importWithAudio(dest: () => Response) {
+  const objects = new Map<string, Uint8Array>([['audio/bcs/u1/t.opus', new Uint8Array([1])]]);
+  const bucket = {
+    head: async (key: string) => (objects.has(key) ? {} : null),
+    get: async (key: string) => (objects.has(key) ? { body: objects.get(key) } : null),
+    put: async (key: string, body: Uint8Array) => void objects.set(key, body),
+    delete: async (keys: string[]) => keys.forEach((key) => objects.delete(key)),
+  };
+  const source = {
+    ...SOURCE,
+    entries: [['history', [{ voice_audio_key: 'audio/bcs/u1/t.opus' }]]],
+  };
+  const env = {
+    AUDIO_BUCKET: bucket,
+    USER_DO: {
+      idFromName: (name: string) => name,
+      get: () => ({
+        fetch: async (_url: string, init?: RequestInit) =>
+          init?.method === 'PUT' ? dest() : Response.json(source),
+      }),
+    },
+  } as unknown as Env;
+  const [result] = await run(env);
+  return { result, kept: objects.has(`audio/bcs/partner:${KEY.userNamespace}:u1/t.opus`) };
+}
+
+describe('importLegacyUsers: copied audio and the write outcome', () => {
+  it('keeps the copies on an unknown outcome', async () => {
+    const unknown = await importWithAudio(() => new Response('x', { status: 500 }));
+    expect(unknown.result).toEqual({
+      userId: 'u1',
+      status: 'import_outcome_unknown',
+      audio: { copied: 1, existing: 0, missing: 0 },
+    });
+    expect(unknown.kept).toBe(true);
+  });
+
+  it('removes the copies on a definite refusal', async () => {
+    const refused = await importWithAudio(() =>
+      Response.json({ ok: false, reason: 'destination_not_empty' }, { status: 409 })
+    );
+    expect(refused.result).toEqual({ userId: 'u1', status: 'destination_not_empty' });
+    expect(refused.kept).toBe(false);
   });
 });
 
@@ -120,23 +203,41 @@ describe('importLegacyUsers re-checks the key before each batch', () => {
   });
 });
 
-describe('isJsonSafe: what the legacy copy can carry', () => {
-  it('accepts JSON data and refuses anything a JSON round-trip would change', () => {
+describe('toJsonSafe: what the legacy copy can carry', () => {
+  it('accepts JSON data unchanged', () => {
     const ok = [null, 'a', true, 0, -1.5, [], [1, 'x'], {}, { a: { b: [null] } }];
-    for (const value of ok) expect(isJsonSafe(value)).toBe(true);
+    for (const value of ok) expect(toJsonSafe(value)).toEqual({ ok: true, value });
+  });
+
+  it('drops undefined object members, at any depth, and keeps the rest', () => {
+    expect(toJsonSafe({ a: undefined, b: 1, c: { d: undefined, e: [{ f: undefined }] } })).toEqual({
+      ok: true,
+      value: { b: 1, c: { e: [{}] } },
+    });
+    const normalized = toJsonSafe({ a: undefined, b: 1 });
+    expect(normalized.ok && Object.keys(normalized.value as object)).toEqual(['b']);
+  });
+
+  it('refuses anything a JSON round-trip would change', () => {
     const notOk = [
       undefined,
       Number.NaN,
       Infinity,
+      -Infinity,
       new Date(0),
       new Map(),
       new Set(),
+      new ArrayBuffer(1),
       new Uint8Array(1),
-      { a: undefined },
+      () => 1,
       [() => 1],
+      [undefined],
+      { a: Number.NaN },
+      { a: new Date(0) },
       BigInt(1),
+      Symbol('s'),
     ];
-    for (const value of notOk) expect(isJsonSafe(value)).toBe(false);
+    for (const value of notOk) expect(toJsonSafe(value)).toEqual({ ok: false });
   });
 });
 

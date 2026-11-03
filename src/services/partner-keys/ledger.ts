@@ -70,6 +70,8 @@ export const KV_OP_TIMEOUT_MS = 10_000;
 /** When the alarm re-puts a key after its last KV timeout (see "Settling"). */
 export const SETTLE_DELAYS_MS: readonly number[] = [60_000, 300_000];
 const SETTLE_PREFIX = 'settle:';
+/** Keys one Durable Object `storage.get([...])` call accepts. */
+const MAX_STORAGE_GET_KEYS = 128;
 /** How many settle re-puts the alarm runs at once. */
 const SETTLE_CONCURRENCY = 10;
 /** Warning returned when a change is committed but auth (KV) does not have it yet. */
@@ -513,8 +515,14 @@ export class PartnerKeyLedger {
 
   /** The entries among `entries` whose KV projection is still owed. */
   private async owedAmong(entries: LedgerEntry[]): Promise<LedgerEntry[]> {
-    const owedIds = new Set((await this.listOwed()).map((o) => o.id));
-    return entries.filter((e) => owedIds.has(e.record.id));
+    // Read just these entries' `proj:` markers (a batched get, at most
+    // MAX_STORAGE_GET_KEYS keys per call), not every marker in storage.
+    const owed = new Set<string>();
+    for (let i = 0; i < entries.length; i += MAX_STORAGE_GET_KEYS) {
+      const keys = entries.slice(i, i + MAX_STORAGE_GET_KEYS).map((e) => pendingKey(e.record.id));
+      for (const key of (await this.storage.get(keys)).keys()) owed.add(key);
+    }
+    return entries.filter((e) => owed.has(pendingKey(e.record.id)));
   }
 
   /**

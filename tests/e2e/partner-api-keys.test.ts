@@ -1104,6 +1104,19 @@ describe('non-admin user routes refuse reserved partner ids; admin routes do not
     expect(normal.status).toBe(200);
   });
 
+  it('logs every DO-route line with the user id, under one request id', async () => {
+    const lines: string[] = [];
+    vi.spyOn(console, 'log').mockImplementation((line: unknown) => lines.push(String(line)));
+    const res = await SELF.fetch(userPath('ann', '/history'), { headers: INTERNAL });
+    expect(res.status).toBe(200);
+    const events = lines
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((e) => e.event === 'do_request_received' || e.event === 'do_request_complete');
+    expect(events.map((e) => e.event)).toEqual(['do_request_received', 'do_request_complete']);
+    for (const e of events) expect(e.user_id).toBe('ann');
+    expect(events[0]?.request_id).toBe(events[1]?.request_id);
+  });
+
   it('the super-admin admin routes still address a partner user (support)', async () => {
     const reserved = 'partner:pk_0123456789abcdef:u1';
     const url = `https://worker/api/v1/admin/orgs/${ORG_R}/users/${encodeURIComponent(reserved)}/memory`;

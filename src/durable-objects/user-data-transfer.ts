@@ -99,14 +99,16 @@ export async function exportUserData(
     for (const range of copiedRanges()) {
       entries.push(...(await txn.list(range)));
     }
-    const unsafe = entries.find(([, value]) => !isJsonSafe(value));
-    if (unsafe) {
-      throw new Error(
-        `storage value '${unsafe[0]}' does not survive a JSON round-trip; not copied`
-      );
+    const normalized: [string, unknown][] = [];
+    for (const [key, value] of entries) {
+      const safe = toJsonSafe(value);
+      if (!safe.ok) {
+        throw new Error(`storage value '${key}' does not survive a JSON round-trip; not copied`);
+      }
+      normalized.push([key, safe.value]);
     }
     const identity = (await txn.get<StoredIdentity>(IDENTITY_KEY)) ?? null;
-    return { identity, entries };
+    return { identity, entries: normalized };
   });
 }
 
@@ -140,19 +142,51 @@ export async function importUserData(
   });
 }
 
+export type JsonSafe = { ok: true; value: unknown } | { ok: false };
+const NOT_JSON_SAFE: JsonSafe = { ok: false };
+
 /**
- * True when `value` is JSON data that a JSON round-trip returns unchanged:
- * null, a string, a boolean, a finite number, or an array / plain object of
- * those (no undefined members, no other prototypes).
+ * `value` as JSON data that a JSON round-trip returns unchanged, or not ok.
+ * Allowed: null, a string, a boolean, a finite number, and arrays / plain
+ * objects of those. An object member that is `undefined` is dropped: JSON
+ * drops it and structured clone keeps it, so either way it carries nothing.
+ * Refused: NaN and ±Infinity, functions, symbols, bigints, any other
+ * prototype (Date, Map, Set, ArrayBuffer, ...), and `undefined` as a value
+ * or an array element (JSON would turn the element into null).
  */
-export function isJsonSafe(value: unknown): boolean {
-  if (value === null || typeof value === 'string' || typeof value === 'boolean') return true;
-  if (typeof value === 'number') return Number.isFinite(value);
-  if (Array.isArray(value)) return value.every(isJsonSafe);
-  if (typeof value !== 'object') return false;
+export function toJsonSafe(value: unknown): JsonSafe {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') {
+    return { ok: true, value };
+  }
+  if (typeof value === 'number')
+    return Number.isFinite(value) ? { ok: true, value } : NOT_JSON_SAFE;
+  if (Array.isArray(value)) return jsonSafeArray(value);
+  if (typeof value !== 'object') return NOT_JSON_SAFE;
   const proto: unknown = Object.getPrototypeOf(value);
-  if (proto !== Object.prototype && proto !== null) return false;
-  return Object.values(value).every((member) => member !== undefined && isJsonSafe(member));
+  if (proto !== Object.prototype && proto !== null) return NOT_JSON_SAFE;
+  return jsonSafeObject(value);
+}
+
+function jsonSafeArray(value: unknown[]): JsonSafe {
+  const out: unknown[] = [];
+  // Array.from turns holes into undefined, which is refused like JSON's null.
+  for (const element of Array.from(value)) {
+    const safe = toJsonSafe(element);
+    if (!safe.ok) return NOT_JSON_SAFE;
+    out.push(safe.value);
+  }
+  return { ok: true, value: out };
+}
+
+function jsonSafeObject(value: object): JsonSafe {
+  const members: [string, unknown][] = [];
+  for (const [name, member] of Object.entries(value)) {
+    if (member === undefined) continue;
+    const safe = toJsonSafe(member);
+    if (!safe.ok) return NOT_JSON_SAFE;
+    members.push([name, safe.value]);
+  }
+  return { ok: true, value: Object.fromEntries(members) };
 }
 
 /**
