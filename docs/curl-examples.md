@@ -686,14 +686,27 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_
   `key_revoked` / `key_expired` (or `status_check_failed`, logged, if the
   status cannot be read). The response is still `200` with every user's
   status.
+- Per user, in this order: a read-only check that the destination is empty
+  and idle (otherwise `destination_not_empty` / `destination_busy`, with
+  nothing copied), the source export, the audio copy, then the write (which
+  checks the destination again).
 - Audio the copied history references (`voice_audio_key` TTS replies,
-  `inbound_voice_audio_key` voice messages) is copied in R2 into the
-  partner's partition (`audio/<org>/partner:<ns>:<user_id>/...`,
-  `voice-submissions/<org>/partner:<ns>:<user_id>/...`) and the keys in the
-  copied history are rewritten, so the partner key can download it. The
-  source objects are not changed. A missing object, or one whose copy fails,
-  keeps its history entry without the audio key (logged). Each copied user's
-  result carries `audio: { copied, failed, missing }`.
+  `inbound_voice_audio_key` voice messages) is copied in R2, streamed, into
+  the partner's partition (`audio/<org>/partner:<ns>:<user_id>/...`,
+  `voice-submissions/<org>/partner:<ns>:<user_id>/...`), and the keys in the
+  copied history are rewritten, so the partner key can download it. Source
+  objects are not changed. A copy that already exists (from an earlier run)
+  is reused, never overwritten. Each copied user's result carries
+  `audio: { copied, existing, missing }`.
+  - A source object that no longer exists keeps its history entry without
+    the audio key (logged, `missing`).
+  - Any other copy failure fails the user: `audio_copy_failed`, nothing
+    written to the destination, and only the objects this run created are
+    removed. Re-run to retry.
+- One request does at most 800 R2 and Durable Object operations (a margin
+  under Cloudflare's per-request subrequest limit). Users that would not fit,
+  and every user after them, are reported `deferred`; re-run the import with
+  those ids to continue.
 - Every copied value must survive a JSON round-trip (all UserDO data is JSON
   today). If one does not, that user is `failed` (logged with the storage key)
   and nothing is written.

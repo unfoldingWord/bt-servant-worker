@@ -41,12 +41,29 @@ import type {
 import type { RequestLogger } from '../../utils/logger.js';
 import { isReservedPartnerId, PARTNER_PREFIX } from '../../types/partner-namespace.js';
 import { isValidPartnerIdentifier, isValidPartnerUserId, scopePartnerSubject } from './policy.js';
-import { type AudioCopyCounts, rehomeHistoryAudio, removeRehomedAudio } from './legacy-audio.js';
+import {
+  type AudioCopyCounts,
+  R2_OPERATIONS_PER_AUDIO_OBJECT,
+  referencedAudioKeys,
+  rehomeHistoryAudio,
+  removeRehomedAudio,
+} from './legacy-audio.js';
 
 export const MAX_LEGACY_IMPORT_USERS = 100;
 const MAX_LEGACY_CLIENT_ID_LENGTH = 64;
-/** Users copied at once (each copy is two UserDO requests). */
+/** Users copied at once. */
 const IMPORT_CONCURRENCY = 5;
+/**
+ * R2 + Durable Object operations one import request may spend. Cloudflare
+ * caps subrequests per Worker invocation (Workers Paid: 10,000 by default;
+ * Workers Free: 50 — developers.cloudflare.com/workers/platform/limits, which
+ * counts R2 and KV calls; Durable Object calls are counted here as well, to
+ * be safe). 800 leaves a wide margin for the rest of the request. Users that
+ * do not fit are reported `deferred`; re-running the import continues.
+ */
+export const LEGACY_IMPORT_OPERATION_BUDGET = 800;
+/** Durable Object calls per user: destination preflight, source export, destination import. */
+const DO_OPERATIONS_PER_USER = 3;
 const IMPORT_FIELDS: ReadonlySet<string> = new Set(['legacyClientId', 'userIds']);
 
 export type LegacyImportInput = { legacyClientId: string; userIds: string[] };
@@ -61,6 +78,8 @@ export type LegacyImportStatus =
   | 'key_revoked'
   | 'key_expired'
   | 'status_check_failed'
+  | 'audio_copy_failed'
+  | 'deferred'
   | 'failed';
 
 export type LegacyImportResult = {
@@ -142,40 +161,109 @@ type ImportContext = {
   legacyClientId: string;
   requestId: string;
   logger: RequestLogger;
+  budget: OperationBudget;
 };
 
-function userDoFetch(ctx: ImportContext, name: string, init: RequestInit = {}) {
-  const stub = ctx.env.USER_DO.get(ctx.env.USER_DO.idFromName(name));
-  const headers = { ...(init.headers as Record<string, string>), 'X-Request-ID': ctx.requestId };
-  return stub.fetch('https://user-do/admin/user-data', { ...init, headers });
+/**
+ * The operations left for this request (LEGACY_IMPORT_OPERATION_BUDGET).
+ * Once a user does not fit, every user not yet started is deferred too.
+ */
+class OperationBudget {
+  private stopped = false;
+  constructor(private remaining: number) {}
+
+  /** Reserve operations for something NEW (a user, a batch); refused once stopped. */
+  start(count: number): boolean {
+    return !this.stopped && this.take(count);
+  }
+
+  /** Reserve more for a user already under way; refused only when it does not fit. */
+  take(count: number): boolean {
+    if (count > this.remaining) {
+      this.stopped = true;
+      return false;
+    }
+    this.remaining -= count;
+    return true;
+  }
 }
 
+function userDoFetch(
+  ctx: ImportContext,
+  name: string,
+  init: RequestInit = {},
+  path = '/admin/user-data'
+) {
+  const stub = ctx.env.USER_DO.get(ctx.env.USER_DO.idFromName(name));
+  const headers = { ...(init.headers as Record<string, string>), 'X-Request-ID': ctx.requestId };
+  return stub.fetch(`https://user-do${path}`, { ...init, headers });
+}
+
+/** The user's partner DO name. */
+const destinationOf = (ctx: ImportContext, userId: string) =>
+  `user:${ctx.key.org}:${scopePartnerSubject(ctx.key, userId)}`;
+
+/** Read-only: would the destination accept an import now? Null when yes, else the refusal. */
+async function destinationRefusal(
+  ctx: ImportContext,
+  userId: string
+): Promise<'destination_not_empty' | 'destination_busy' | null> {
+  const res = await userDoFetch(ctx, destinationOf(ctx, userId), {}, '/admin/user-data/importable');
+  if (res.status === 200) return null;
+  if (res.status !== 409) throw new Error(`destination preflight failed with ${res.status}`);
+  return ((await res.json()) as { reason: 'destination_not_empty' | 'destination_busy' }).reason;
+}
+
+/**
+ * One user, in this order: budget, destination preflight (read-only), source
+ * export and ownership checks, budget for its audio, audio copy, then the
+ * import write (which re-checks the destination inside its transaction).
+ * Nothing touches R2 until the destination is known to be importable.
+ */
 async function copyOneUser(ctx: ImportContext, userId: string): Promise<LegacyImportResult> {
-  const { key } = ctx;
-  const source = await userDoFetch(ctx, `user:${key.org}:${userId}`);
+  if (!ctx.budget.start(DO_OPERATIONS_PER_USER)) return { userId, status: 'deferred' };
+  const refused = await destinationRefusal(ctx, userId);
+  if (refused) return { userId, status: refused };
+  const source = await userDoFetch(ctx, `user:${ctx.key.org}:${userId}`);
   if (source.status === 409) return { userId, status: 'source_busy' };
   if (!source.ok) throw new Error(`source export failed with ${source.status}`);
   const exported = (await source.json()) as UserDataExport;
   if (exported.identity === null) return { userId, status: 'not_found' };
-  if (!ownedByLegacyClient(exported.identity, key.org, ctx.legacyClientId)) {
+  if (!ownedByLegacyClient(exported.identity, ctx.key.org, ctx.legacyClientId)) {
     return { userId, status: 'client_mismatch' };
   }
+  const audioKeys = referencedAudioKeys(exported.entries).length;
+  const audioOperations = audioKeys * R2_OPERATIONS_PER_AUDIO_OBJECT + (audioKeys > 0 ? 1 : 0);
+  if (!ctx.budget.take(audioOperations)) return { userId, status: 'deferred' };
+  return copyWithAudio(ctx, userId, exported.entries);
+}
+
+/** Copy the user's audio, then import; on any failure remove only what this run wrote. */
+async function copyWithAudio(
+  ctx: ImportContext,
+  userId: string,
+  entries: [string, unknown][]
+): Promise<LegacyImportResult> {
+  const { key, env, logger } = ctx;
   const target = { org: key.org, namespace: key.userNamespace, subject: userId };
-  const audio = await rehomeHistoryAudio(
-    ctx.env.AUDIO_BUCKET,
-    exported.entries,
-    target,
-    ctx.logger
-  );
+  const audio = await rehomeHistoryAudio(env.AUDIO_BUCKET, entries, target, logger);
+  if (!audio.ok) {
+    await removeRehomedAudio(env.AUDIO_BUCKET, audio.written, logger);
+    logger.warn('partner_key_legacy_import_audio_copy_failed_user', {
+      key_id: key.id,
+      user_id: userId,
+    });
+    return { userId, status: 'audio_copy_failed' };
+  }
   try {
     const result = await importInto(ctx, userId, audio.entries);
     if (result.ok) {
       return { userId, status: 'copied', entries: result.imported, audio: audio.counts };
     }
-    await removeRehomedAudio(ctx.env.AUDIO_BUCKET, audio.written, ctx.logger);
+    await removeRehomedAudio(env.AUDIO_BUCKET, audio.written, logger);
     return { userId, status: result.reason };
   } catch (error) {
-    await removeRehomedAudio(ctx.env.AUDIO_BUCKET, audio.written, ctx.logger);
+    await removeRehomedAudio(env.AUDIO_BUCKET, audio.written, logger);
     throw error;
   }
 }
@@ -186,15 +274,11 @@ async function importInto(
   userId: string,
   entries: [string, unknown][]
 ): Promise<UserDataImportResult> {
-  const dest = await userDoFetch(
-    ctx,
-    `user:${ctx.key.org}:${scopePartnerSubject(ctx.key, userId)}`,
-    {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ entries }),
-    }
-  );
+  const dest = await userDoFetch(ctx, destinationOf(ctx, userId), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ entries }),
+  });
   // Status first: only a 200 or a 409 carries an import result (a storage
   // error answers 500 with an error body, which is not one).
   if (dest.status !== 200 && dest.status !== 409) {
@@ -216,6 +300,8 @@ export async function importLegacyUsers(
     requestId: string;
     /** The key's status NOW (re-read before each batch). */
     currentStatus: () => Promise<PartnerKeyStatus>;
+    /** Override LEGACY_IMPORT_OPERATION_BUDGET (tests). */
+    operationBudget?: number;
   }
 ): Promise<LegacyImportResult[]> {
   const ctx = {
@@ -224,13 +310,15 @@ export async function importLegacyUsers(
     legacyClientId: input.legacyClientId,
     requestId: opts.requestId,
     logger: opts.logger,
+    budget: new OperationBudget(opts.operationBudget ?? LEGACY_IMPORT_OPERATION_BUDGET),
   };
   const results: LegacyImportResult[] = [];
   for (let i = 0; i < input.userIds.length; i += IMPORT_CONCURRENCY) {
     // A revoke (or the grace running out) during a long import stops it:
     // the users not yet copied are reported `key_revoked` / `key_expired`.
     // If the status cannot be read, stop too: `status_check_failed`.
-    const stopped = await stopReason(key, opts);
+    // The status read is a Durable Object call too: out of budget → deferred.
+    const stopped = ctx.budget.start(1) ? await stopReason(key, opts) : 'deferred';
     if (stopped) {
       results.push(...input.userIds.slice(i).map((userId) => ({ userId, status: stopped })));
       break;

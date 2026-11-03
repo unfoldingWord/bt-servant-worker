@@ -8,9 +8,16 @@
  * family and file, owner `partner:<ns>:<user_id>`) and rewrites the key in
  * the copied history. The source objects are never changed or deleted.
  *
- * A missing object, or one whose copy fails, keeps its history entry but
- * loses that audio key (logged; counted as `missing` / `failed`), so the
- * imported history never points outside the partner partition.
+ * Rules:
+ * - A target key that already exists (an earlier run wrote it) is reused,
+ *   never overwritten, and never listed in `written` — so a cleanup can only
+ *   ever delete objects THIS run created.
+ * - A source object that is truly missing (`get` → null) keeps its history
+ *   entry but loses that audio key (logged; counted as `missing`).
+ * - Any other failure (an R2 error, an unrecognised key) fails the whole
+ *   user (`ok: false`): the caller writes nothing to the destination and
+ *   removes `written`, and a re-run can retry.
+ * Copies are streamed (`object.body`), never buffered.
  */
 
 import { partnerAudioKeyFor } from '../audio/index.js';
@@ -22,45 +29,65 @@ const AUDIO_KEY_FIELDS = ['voice_audio_key', 'inbound_voice_audio_key'] as const
 const HISTORY_KEY = 'history';
 /** Objects copied at once. */
 const COPY_CONCURRENCY = 5;
+/** R2 operations one referenced object can take at most: head, get, put. */
+export const R2_OPERATIONS_PER_AUDIO_OBJECT = 3;
 
-export type AudioCopyCounts = { copied: number; failed: number; missing: number };
+export type AudioCopyCounts = { copied: number; existing: number; missing: number };
 
 export type AudioTarget = { org: string; namespace: string; subject: string };
 
-type Outcome = { key: string | null; result: keyof AudioCopyCounts };
+export type RehomeResult =
+  | { ok: true; entries: [string, unknown][]; counts: AudioCopyCounts; written: string[] }
+  | { ok: false; written: string[] };
+
+type Outcome =
+  { result: 'copied' | 'existing'; key: string } | { result: 'missing' | 'failed'; key: null };
+
+/** Every distinct audio key the exported history references (to budget before copying). */
+export function referencedAudioKeys(entries: [string, unknown][]): string[] {
+  const history = entries.find(([name]) => name === HISTORY_KEY)?.[1];
+  if (!Array.isArray(history)) return [];
+  const keys = new Set<string>();
+  for (const item of history) {
+    if (typeof item !== 'object' || item === null) continue;
+    for (const field of AUDIO_KEY_FIELDS) {
+      const value: unknown = Reflect.get(item, field);
+      if (typeof value === 'string' && value !== '') keys.add(value);
+    }
+  }
+  return [...keys];
+}
 
 /**
  * Copy the audio referenced by `entries`' history into the partner partition
- * and return the entries with the keys rewritten, plus the counts and the
- * new keys written (so a refused import can remove them again).
+ * and return the entries with the keys rewritten. On any non-missing failure
+ * returns `ok: false` with the keys this run wrote, for the caller to remove.
  */
 export async function rehomeHistoryAudio(
   bucket: R2Bucket,
   entries: [string, unknown][],
   target: AudioTarget,
   logger: RequestLogger
-): Promise<{ entries: [string, unknown][]; counts: AudioCopyCounts; written: string[] }> {
-  const history = entries.find(([name]) => name === HISTORY_KEY)?.[1];
-  const counts: AudioCopyCounts = { copied: 0, failed: 0, missing: 0 };
-  if (!Array.isArray(history)) return { entries, counts, written: [] };
-  const outcomes = await copyAll(bucket, referencedKeys(history), target, logger);
-  for (const outcome of outcomes.values()) {
-    if (outcome.result === 'copied') counts.copied += 1;
-    else if (outcome.result === 'missing') counts.missing += 1;
-    else counts.failed += 1;
-  }
-  const rewritten = history.map((item: unknown) => rewriteEntry(item, outcomes));
-  const written = [...outcomes.values()].flatMap((o) =>
-    o.result === 'copied' && o.key ? [o.key] : []
-  );
-  return {
-    entries: entries.map(([name, value]) => [name, name === HISTORY_KEY ? rewritten : value]),
-    counts,
-    written,
+): Promise<RehomeResult> {
+  const outcomes = await copyAll(bucket, referencedAudioKeys(entries), target, logger);
+  const all = [...outcomes.values()];
+  const written = all.flatMap((o) => (o.result === 'copied' ? [o.key] : []));
+  if (all.some((o) => o.result === 'failed')) return { ok: false, written };
+  const counts: AudioCopyCounts = {
+    copied: written.length,
+    existing: all.filter((o) => o.result === 'existing').length,
+    missing: all.filter((o) => o.result === 'missing').length,
   };
+  const rewritten = entries.map(([name, value]): [string, unknown] => [
+    name,
+    name === HISTORY_KEY && Array.isArray(value)
+      ? value.map((item: unknown) => rewriteEntry(item, outcomes))
+      : value,
+  ]);
+  return { ok: true, entries: rewritten, counts, written };
 }
 
-/** Remove objects written for an import that was then refused (best effort, logged). */
+/** Remove objects THIS run wrote, for an import that was then refused or failed (best effort, logged). */
 export async function removeRehomedAudio(
   bucket: R2Bucket,
   written: string[],
@@ -74,19 +101,6 @@ export async function removeRehomedAudio(
       count: written.length,
     });
   }
-}
-
-/** Every distinct audio key the history references. */
-function referencedKeys(history: unknown[]): string[] {
-  const keys = new Set<string>();
-  for (const item of history) {
-    if (typeof item !== 'object' || item === null) continue;
-    for (const field of AUDIO_KEY_FIELDS) {
-      const value: unknown = Reflect.get(item, field);
-      if (typeof value === 'string' && value !== '') keys.add(value);
-    }
-  }
-  return [...keys];
 }
 
 async function copyAll(
@@ -107,7 +121,7 @@ async function copyAll(
   return outcomes;
 }
 
-/** Copy one object; never throws (the outcome says what happened, and failures are logged). */
+/** Copy one object (streamed); never throws — the outcome says what happened, failures are logged. */
 async function copyOne(
   bucket: R2Bucket,
   key: string,
@@ -118,26 +132,26 @@ async function copyOne(
   const destination = partnerAudioKeyFor(key, target);
   if (destination === null) {
     logger.warn('partner_key_legacy_import_audio_unrecognized', fields);
-    return { key: null, result: 'failed' };
+    return { result: 'failed', key: null };
   }
   try {
+    if ((await bucket.head(destination)) !== null) return { result: 'existing', key: destination };
     const object = await bucket.get(key);
     if (object === null) {
       logger.warn('partner_key_legacy_import_audio_missing', fields);
-      return { key: null, result: 'missing' };
+      return { result: 'missing', key: null };
     }
-    const bytes = await object.arrayBuffer();
-    await bucket.put(destination, bytes, {
+    await bucket.put(destination, object.body, {
       ...(object.httpMetadata ? { httpMetadata: object.httpMetadata } : {}),
     });
-    return { key: destination, result: 'copied' };
+    return { result: 'copied', key: destination };
   } catch (error) {
     logger.error('partner_key_legacy_import_audio_copy_failed', error, fields);
-    return { key: null, result: 'failed' };
+    return { result: 'failed', key: null };
   }
 }
 
-/** One history entry with each audio key replaced by its copy, or dropped. */
+/** One history entry with each audio key replaced by its copy, or dropped (missing source). */
 function rewriteEntry(item: unknown, outcomes: Map<string, Outcome>): unknown {
   if (typeof item !== 'object' || item === null) return item;
   const copy: Record<string, unknown> = { ...(item as Record<string, unknown>) };

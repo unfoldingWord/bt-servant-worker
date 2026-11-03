@@ -131,8 +131,8 @@ export async function importUserData(
 ): Promise<UserDataImportResult> {
   const copied = entries.filter(([key]) => !NOT_COPIED.includes(key));
   return storage.transaction(async (txn): Promise<UserDataImportResult> => {
-    if (await turnInFlight(txn)) return { ok: false, reason: 'destination_busy' };
-    if (await hasCopiedData(txn)) return { ok: false, reason: 'destination_not_empty' };
+    const refusal = await importRefusal(txn);
+    if (refusal) return refusal;
     for (let i = 0; i < copied.length; i += PUT_BATCH) {
       await txn.put(Object.fromEntries(copied.slice(i, i + PUT_BATCH)));
     }
@@ -167,4 +167,24 @@ export function readImportEntries(body: unknown): [string, unknown][] | null {
   const isPair = (pair: unknown): pair is [string, unknown] =>
     Array.isArray(pair) && pair.length === 2 && typeof pair[0] === 'string' && pair[0] !== '';
   return entries.every(isPair) ? entries : null;
+}
+
+/** Why an import into this DO would be refused right now, or null (the import's own rules). */
+async function importRefusal(
+  storage: StorageReader
+): Promise<Extract<UserDataImportResult, { ok: false }> | null> {
+  if (await turnInFlight(storage)) return { ok: false, reason: 'destination_busy' };
+  if (await hasCopiedData(storage)) return { ok: false, reason: 'destination_not_empty' };
+  return null;
+}
+
+/**
+ * Read-only preflight for the legacy import: would `importUserData` accept a
+ * write now (idle and empty)? Lets the caller skip a user BEFORE copying
+ * any audio; the import itself re-checks inside its write transaction.
+ */
+export async function checkImportable(
+  storage: DurableObjectStorage
+): Promise<{ ok: true } | Extract<UserDataImportResult, { ok: false }>> {
+  return (await importRefusal(storage)) ?? { ok: true };
 }

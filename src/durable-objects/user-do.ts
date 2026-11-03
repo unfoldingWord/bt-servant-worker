@@ -87,7 +87,12 @@ import {
   ValidationError,
 } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
-import { exportUserData, importUserData, readImportEntries } from './user-data-transfer.js';
+import {
+  checkImportable,
+  exportUserData,
+  importUserData,
+  readImportEntries,
+} from './user-data-transfer.js';
 import {
   IDENTITY_KEY,
   LOCK_STALE_THRESHOLD_MS,
@@ -878,6 +883,7 @@ export class UserDO {
     this.app.get('/identity', () => this.handleGetIdentity());
     // Super-admin legacy import only (admin-portal#354); see user-data-transfer.ts.
     this.app.get('/admin/user-data', () => this.handleExportUserData());
+    this.app.get('/admin/user-data/importable', () => this.handleCheckImportable());
     this.app.put('/admin/user-data', (c) => this.handleImportUserData(c.req.raw));
   }
 
@@ -4024,6 +4030,19 @@ export class UserDO {
         return exported === 'busy'
           ? Response.json({ ok: false, reason: 'source_busy' }, { status: 409 })
           : Response.json(exported);
+      },
+      storageErrorResponse
+    );
+  }
+
+  /** Legacy import preflight: 200 when an import would be accepted now, else 409 + reason. */
+  private async handleCheckImportable(): Promise<Response> {
+    return withEndpointLogging(
+      this.getLogger(),
+      'check_importable',
+      async () => {
+        const result = await checkImportable(this.state.storage);
+        return Response.json(result, { status: result.ok ? 200 : 409 });
       },
       storageErrorResponse
     );

@@ -10,7 +10,10 @@ import { rehomeHistoryAudio } from '../../src/services/partner-keys/legacy-audio
 import { partnerAudioKeyFor } from '../../src/services/audio/r2-storage.js';
 import type { Env } from '../../src/config/types.js';
 import { isJsonSafe, readImportEntries } from '../../src/durable-objects/user-data-transfer.js';
-import { importLegacyUsers } from '../../src/services/partner-keys/legacy-import.js';
+import {
+  importLegacyUsers,
+  LEGACY_IMPORT_OPERATION_BUDGET,
+} from '../../src/services/partner-keys/legacy-import.js';
 import type { PartnerKeyRecord } from '../../src/types/partner-keys.js';
 import { createMockLogger } from '../helpers/mock-logger.js';
 
@@ -71,7 +74,7 @@ describe('importLegacyUsers reads the destination status before its body', () =>
     expect(await run(busy)).toEqual([{ userId: 'u1', status: 'destination_busy' }]);
     const ok = envWithDestination(() => Response.json({ ok: true, imported: 1 }));
     expect(await run(ok)).toEqual([
-      { userId: 'u1', status: 'copied', entries: 1, audio: { copied: 0, failed: 0, missing: 0 } },
+      { userId: 'u1', status: 'copied', entries: 1, audio: { copied: 0, existing: 0, missing: 0 } },
     ]);
   });
 });
@@ -197,48 +200,112 @@ describe('readImportEntries: the import body shape', () => {
   });
 });
 
-describe('rehomeHistoryAudio: failures and odd keys', () => {
-  const target = { org: 'bcs', namespace: 'pk_0123456789abcdef', subject: 'u1' };
-  const history = (key: string) =>
+const target = { org: 'bcs', namespace: 'pk_0123456789abcdef', subject: 'u1' };
+const history = (key: string) =>
+  [
     [
-      [
-        'history',
-        [{ user_message: 'm', assistant_response: 'r', timestamp: 1, voice_audio_key: key }],
-      ],
-    ] as [string, unknown][];
+      'history',
+      [{ user_message: 'm', assistant_response: 'r', timestamp: 1, voice_audio_key: key }],
+    ],
+  ] as [string, unknown][];
 
-  it('counts a failed copy, logs it, and drops the key while keeping the entry', async () => {
-    const bucket = {
-      get: async () => ({ arrayBuffer: async () => new ArrayBuffer(1), httpMetadata: {} }),
-      put: async () => {
-        throw new Error('R2 put failed');
-      },
-    } as unknown as R2Bucket;
+/** An in-memory bucket: `objects` holds what exists; `failPut` makes every put throw. */
+function fakeBucket(objects: Map<string, string>, failPut = false) {
+  return {
+    head: vi.fn(async (key: string) => (objects.has(key) ? { key } : null)),
+    get: vi.fn(async (key: string) =>
+      objects.has(key) ? { body: objects.get(key), httpMetadata: {} } : null
+    ),
+    put: vi.fn(async (key: string, body: string) => {
+      if (failPut) throw new Error('R2 put failed');
+      objects.set(key, body);
+    }),
+  };
+}
+const SOURCE_KEY = 'audio/bcs/u1/a.opus';
+const TARGET_KEY = 'audio/bcs/partner:pk_0123456789abcdef:u1/a.opus';
+
+describe('rehomeHistoryAudio: failures fail the user', () => {
+  it('a failed copy fails the user (ok: false), logged, nothing listed as written', async () => {
+    const bucket = fakeBucket(new Map([[SOURCE_KEY, 'x']]), true);
     const logger = createMockLogger();
-    const out = await rehomeHistoryAudio(bucket, history('audio/bcs/u1/a.opus'), target, logger);
-    expect(out.counts).toEqual({ copied: 0, failed: 1, missing: 0 });
-    expect(out.written).toEqual([]);
-    const [entry] = out.entries[0]?.[1] as Record<string, unknown>[];
-    expect(entry).toEqual({ user_message: 'm', assistant_response: 'r', timestamp: 1 });
+    const out = await rehomeHistoryAudio(
+      bucket as unknown as R2Bucket,
+      history(SOURCE_KEY),
+      target,
+      logger
+    );
+    expect(out).toEqual({ ok: false, written: [] });
     expect(logger.error).toHaveBeenCalledWith(
       'partner_key_legacy_import_audio_copy_failed',
       expect.any(Error),
-      { user_id: 'u1', source_key: 'audio/bcs/u1/a.opus' }
+      { user_id: 'u1', source_key: SOURCE_KEY }
     );
   });
 
-  it('treats a key outside the two audio families as failed, without touching R2', async () => {
-    const bucket = { get: vi.fn(), put: vi.fn() } as unknown as R2Bucket;
+  it('a key outside the two audio families fails the user without touching R2', async () => {
+    const bucket = fakeBucket(new Map());
     const out = await rehomeHistoryAudio(
-      bucket,
+      bucket as unknown as R2Bucket,
       history('ptxprint/x.pdf'),
       target,
       createMockLogger()
     );
-    expect(out.counts).toEqual({ copied: 0, failed: 1, missing: 0 });
-    expect(bucket.get).not.toHaveBeenCalled();
+    expect(out.ok).toBe(false);
+    expect(bucket.head).not.toHaveBeenCalled();
+  });
+});
+
+describe('rehomeHistoryAudio: streaming, reuse and missing sources', () => {
+  it('streams the copy (passes the object body to put)', async () => {
+    const bucket = fakeBucket(new Map([[SOURCE_KEY, 'stream-body']]));
+    const out = await rehomeHistoryAudio(
+      bucket as unknown as R2Bucket,
+      history(SOURCE_KEY),
+      target,
+      createMockLogger()
+    );
+    expect(out).toMatchObject({ ok: true, written: [TARGET_KEY] });
+    expect(bucket.put).toHaveBeenCalledWith(TARGET_KEY, 'stream-body', { httpMetadata: {} });
   });
 
+  it('reuses a target that already exists: no put, not listed as written', async () => {
+    const bucket = fakeBucket(
+      new Map([
+        [SOURCE_KEY, 'x'],
+        [TARGET_KEY, 'earlier run'],
+      ])
+    );
+    const out = await rehomeHistoryAudio(
+      bucket as unknown as R2Bucket,
+      history(SOURCE_KEY),
+      target,
+      createMockLogger()
+    );
+    expect(out).toMatchObject({
+      ok: true,
+      written: [],
+      counts: { copied: 0, existing: 1, missing: 0 },
+    });
+    expect(bucket.put).not.toHaveBeenCalled();
+  });
+
+  it('a missing source drops only its key and keeps the entry', async () => {
+    const bucket = fakeBucket(new Map());
+    const out = await rehomeHistoryAudio(
+      bucket as unknown as R2Bucket,
+      history(SOURCE_KEY),
+      target,
+      createMockLogger()
+    );
+    expect(out).toMatchObject({ ok: true, counts: { copied: 0, existing: 0, missing: 1 } });
+    if (!out.ok) return;
+    const [entry] = out.entries[0]?.[1] as Record<string, unknown>[];
+    expect(entry).toEqual({ user_message: 'm', assistant_response: 'r', timestamp: 1 });
+  });
+});
+
+describe('partnerAudioKeyFor', () => {
   it('maps keys to the partner partition exactly as the chat flow writes them', () => {
     expect(partnerAudioKeyFor('audio/old/u1/a.opus', target)).toBe(
       'audio/bcs/partner:pk_0123456789abcdef:u1/a.opus'
@@ -247,5 +314,63 @@ describe('rehomeHistoryAudio: failures and odd keys', () => {
       partnerAudioKeyFor('voice-submissions/bcs/u1/Ann/v.ogg', { ...target, subject: 'a b' })
     ).toBe('voice-submissions/bcs/partner:pk_0123456789abcdef:a-b/Ann/v.ogg');
     expect(partnerAudioKeyFor('audio/bcs/u1/x/a.opus', target)).toBeNull();
+  });
+});
+
+describe('importLegacyUsers operation budget', () => {
+  it('defers the users that would not fit, and every later one', async () => {
+    const env = envWithDestination(() => Response.json({ ok: true, imported: 1 }));
+    const userIds = ['u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7'];
+    // Batch 1: status check (1) + 3 per user leaves room for 3 users out of 10.
+    const results = await importLegacyUsers(
+      env,
+      KEY,
+      { legacyClientId: 'shema', userIds },
+      { logger: createMockLogger(), requestId: 'r', currentStatus: active, operationBudget: 10 }
+    );
+    expect(results.map((r) => r.status)).toEqual([
+      'copied',
+      'copied',
+      'copied',
+      'deferred',
+      'deferred',
+      'deferred',
+      'deferred',
+    ]);
+  });
+
+  it('the default budget is a named constant well under the Cloudflare subrequest limit', () => {
+    expect(LEGACY_IMPORT_OPERATION_BUDGET).toBe(800);
+  });
+});
+
+describe('importLegacyUsers preflights the destination before any audio', () => {
+  it('a destination that refuses is skipped without the source export or R2', async () => {
+    const calls: string[] = [];
+    const stub = {
+      fetch: async (url: string) => {
+        calls.push(new URL(url).pathname);
+        return Response.json({ ok: false, reason: 'destination_not_empty' }, { status: 409 });
+      },
+    };
+    const env = {
+      USER_DO: { idFromName: (n: string) => n, get: () => stub },
+      AUDIO_BUCKET: new Proxy(
+        {},
+        {
+          get: () => () => {
+            throw new Error('R2 touched');
+          },
+        }
+      ),
+    } as unknown as Env;
+    const results = await importLegacyUsers(
+      env,
+      KEY,
+      { legacyClientId: 'shema', userIds: ['u1'] },
+      { logger: createMockLogger(), requestId: 'r', currentStatus: active }
+    );
+    expect(results).toEqual([{ userId: 'u1', status: 'destination_not_empty' }]);
+    expect(calls).toEqual(['/admin/user-data/importable']);
   });
 });

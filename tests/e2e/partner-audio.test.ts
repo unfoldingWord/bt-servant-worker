@@ -199,7 +199,7 @@ describe('legacy import moves referenced audio into the partner partition', () =
     const { key, apiKey } = await createKey();
     expect(await importLeg1(key.id)).toMatchObject({
       status: 'copied',
-      audio: { copied: 2, failed: 0, missing: 1 },
+      audio: { copied: 2, existing: 0, missing: 1 },
     });
     const owner = `partner:${key.userNamespace}:leg1`;
     const [first, second, third] = await historyOf(`user:${ORG}:${owner}`);
@@ -219,5 +219,31 @@ describe('legacy import moves referenced audio into the partner partition', () =
     expect(await env.AUDIO_BUCKET.head(tts)).not.toBeNull();
     expect(await env.AUDIO_BUCKET.head(voice)).not.toBeNull();
     expect((await get(`/api/v1/audio/${tts}`, apiKey)).status).toBe(404);
+  });
+});
+
+describe('re-running the legacy import never deletes audio an earlier run wrote', () => {
+  it("the reviewer's case: import, re-run -> destination_not_empty, the first copies remain", async () => {
+    await seedLegacyUser();
+    const { key, apiKey } = await createKey();
+    expect(await importLeg1(key.id)).toMatchObject({ status: 'copied' });
+    const owner = `partner:${key.userNamespace}:leg1`;
+    const ttsCopy = `audio/${ORG}/${owner}/t1.opus`;
+    const voiceCopy = `voice-submissions/${ORG}/${owner}/leg1/v1.ogg`;
+
+    expect(await importLeg1(key.id)).toEqual({ userId: 'leg1', status: 'destination_not_empty' });
+    expect(await env.AUDIO_BUCKET.head(ttsCopy)).not.toBeNull();
+    expect(await env.AUDIO_BUCKET.head(voiceCopy)).not.toBeNull();
+    expect((await get(`/api/v1/audio/${ttsCopy}`, apiKey)).status).toBe(200);
+  });
+
+  it('the UserDO preflight answers 200 for an empty idle DO and 409 with the reason otherwise', async () => {
+    const empty = env.USER_DO.get(env.USER_DO.idFromName(`user:${ORG}:preflight-empty`));
+    expect((await empty.fetch('https://user-do/admin/user-data/importable')).status).toBe(200);
+    await seedLegacyUser();
+    const used = env.USER_DO.get(env.USER_DO.idFromName(`user:${ORG}:leg1`));
+    const res = await used.fetch('https://user-do/admin/user-data/importable');
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ ok: false, reason: 'destination_not_empty' });
   });
 });
