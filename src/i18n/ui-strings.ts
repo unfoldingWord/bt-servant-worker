@@ -39,8 +39,9 @@ const en = {
   /**
    * Shown when the orchestration loop exits because it hit
    * MAX_ORCHESTRATION_ITERATIONS. Streamed via `onProgress` AND persisted in
-   * history, so it is also what TTS reads aloud. Leading blank lines separate
-   * it from whatever partial text the last iteration produced.
+   * history, so on a voice turn it is also what TTS reads aloud. Leading blank
+   * lines separate it from the answer above it. On a text turn that answer is
+   * the no-tools recovery, not the unfinished round's narration (#421).
    */
   notice_max_iterations:
     "\n\n⚠️ I've reached my limit on how many steps I can take in a single turn while " +
@@ -49,6 +50,12 @@ const en = {
     '(e.g. "just submit the standard PDF" or "try once more with X"), and I\'ll pick ' +
     'up from here without re-doing the parts that already worked.',
   error_processing_failed: 'Processing failed',
+  /**
+   * Shown when a text turn ends with no user-facing text and a no-tools
+   * recovery call also produced none (#158). Not the max-iterations notice:
+   * that one is for a loop that ran out of steps with work still in progress.
+   */
+  notice_empty_answer: "Sorry, I couldn't finish an answer just now. Please try again.",
 } as const satisfies Record<string, UiStringValue>;
 
 /** Every worker-emitted UI string key. */
@@ -73,6 +80,8 @@ const pt = {
     'focar (por exemplo, "apenas envie o PDF padrão" ou "tente mais uma vez com X"), e ' +
     'eu retomo daqui sem refazer o que já funcionou.',
   error_processing_failed: 'Falha no processamento',
+  notice_empty_answer:
+    'Desculpe, não consegui concluir uma resposta agora. Tente de novo, por favor.',
 } as const satisfies Record<UiStringKey, UiStringValue>;
 
 /** Locale → table. Keys are ISO 639-1 primary subtags, lower-case. */
