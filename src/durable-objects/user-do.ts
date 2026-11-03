@@ -86,6 +86,7 @@ import {
   ValidationError,
 } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
+import { exportUserData, importUserData } from './user-data-transfer.js';
 import { countryFromPhoneUserId } from '../utils/phone-country.js';
 import { applyTemplateVariables } from '../utils/template.js';
 import { createTimingContext, timePhase, TimingContext } from '../utils/timing.js';
@@ -876,6 +877,9 @@ export class UserDO {
     this.app.get('/memory', () => this.handleGetMemory());
     this.app.delete('/memory', () => this.handleDeleteMemory());
     this.app.get('/identity', () => this.handleGetIdentity());
+    // Super-admin legacy import only (admin-portal#354); see user-data-transfer.ts.
+    this.app.get('/admin/user-data', () => this.handleExportUserData());
+    this.app.put('/admin/user-data', (c) => this.handleImportUserData(c.req.raw));
   }
 
   private getLogger(): RequestLogger {
@@ -3983,6 +3987,28 @@ export class UserDO {
       async () => {
         const identity = (await this.state.storage.get<StoredIdentity>(IDENTITY_KEY)) ?? null;
         return Response.json({ identity });
+      },
+      storageErrorResponse
+    );
+  }
+
+  private async handleExportUserData(): Promise<Response> {
+    return withEndpointLogging(
+      this.getLogger(),
+      'export_user_data',
+      async () => Response.json(await exportUserData(this.state.storage)),
+      storageErrorResponse
+    );
+  }
+
+  private async handleImportUserData(request: Request): Promise<Response> {
+    return withEndpointLogging(
+      this.getLogger(),
+      'import_user_data',
+      async () => {
+        const { entries } = (await request.json()) as { entries: [string, unknown][] };
+        const result = await importUserData(this.state.storage, entries);
+        return Response.json(result, { status: result.ok ? 200 : 409 });
       },
       storageErrorResponse
     );

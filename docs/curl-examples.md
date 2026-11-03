@@ -634,6 +634,37 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_
   -d '{"createdBy": "ops@unfoldingword.org", "graceSeconds": 86400}'
 ```
 
+### Import a Partner App's Existing Users (super-admin)
+
+For an app that used to call with the shared `ENGINE_API_KEY` and is moving to
+a partner key. Its users' conversations live under their raw `user_id`; with
+the partner key the same user is namespaced, so without this step they would
+start over. This copies the named users' data (history, preferences, memory,
+prompt overrides, selected mode and language, welcome flags) into the key's
+namespace, once.
+
+```bash
+curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_import-legacy-users" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"legacyClientId": "my-app", "userIds": ["user-1", "user-2"]}'
+```
+
+**Response (200):** `{"keyId": "...", "org": "...", "results": [{"userId": "user-1", "status": "copied", "entries": 6}, ...]}`
+
+- Only `ENGINE_API_KEY` can call it. The partner key itself never gets access
+  to raw user ids: conversations are keyed by org and user id only, so raw-id
+  access would let it reach other clients' users.
+- The source is the user's conversation in the **key's org**, and it is
+  copied only when its stored identity is a private chat whose `client_id`
+  equals `legacyClientId`. Otherwise the status is `client_mismatch`, or
+  `not_found` when there is no identity record. `destination_not_empty` means
+  the partner key has already been used for that user; nothing is
+  overwritten. `failed` is logged.
+- The source is not changed or deleted. Run the import at the switch: turns
+  the app still sends with the shared key afterwards are not copied.
+- `userIds`: 1-100 distinct ids, each valid as a partner `user_id`.
+
 ### Calling Chat With a Partner Key
 
 A partner key may call **only** `POST /api/v1/chat` and

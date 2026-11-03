@@ -139,6 +139,16 @@ function isPartnerGroupId(value: string): boolean {
   return CHAT_ID_PATTERN.test(value) && !value.includes(':');
 }
 
+/** A non-empty single-line string of at most MAX_PARTNER_ID_LENGTH code points. */
+export function isValidPartnerIdentifier(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    codePointLength(value) <= MAX_PARTNER_ID_LENGTH &&
+    !hasLineBreakOrControl(value)
+  );
+}
+
 /** An identifier field: absent/null, or a bounded single-line non-empty string. */
 function checkIdentifier(
   value: unknown,
@@ -146,12 +156,7 @@ function checkIdentifier(
   required: boolean
 ): PartnerPolicyResult | null {
   if (!isPresent(value) && !required) return null;
-  const valid =
-    typeof value === 'string' &&
-    value.length > 0 &&
-    codePointLength(value) <= MAX_PARTNER_ID_LENGTH &&
-    !hasLineBreakOrControl(value);
-  if (!valid) {
+  if (!isValidPartnerIdentifier(value)) {
     return reject(
       400,
       `partner_${field}`,

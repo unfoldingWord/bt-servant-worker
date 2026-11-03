@@ -236,6 +236,7 @@ All admin endpoints require Bearer token authentication with `ENGINE_API_KEY` (t
 | `/api/v1/admin/api-keys/:keyId`                                        | GET          | Get one partner key                                                                         |
 | `/api/v1/admin/api-keys/:keyId/_revoke`                                | POST         | Revoke a partner key (idempotent)                                                           |
 | `/api/v1/admin/api-keys/:keyId/_rotate`                                | POST         | Issue a replacement key; the old one keeps working for a grace window (default 7 days)      |
+| `/api/v1/admin/api-keys/:keyId/_import-legacy-users`                   | POST         | Copy an app's shared-key users into the key's namespace (super-admin)                       |
 
 The snapshot route is the only way into a DO whose `user:{org}:{user_id}` name is unknown (object ids from the Cloudflare REST listing are one-way), which is what makes the DO population enumerable after the fact. `identity` is `null` for DOs that predate identity persistence and have not chatted since.
 

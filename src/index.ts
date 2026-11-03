@@ -89,6 +89,7 @@ import {
 } from './services/partner-keys/key-material.js';
 import type { RotateOutcome } from './services/partner-keys/ledger.js';
 import { orgHasConfig } from './services/partner-keys/org-exists.js';
+import { importLegacyUsers, readLegacyImportBody } from './services/partner-keys/legacy-import.js';
 import {
   type PartnerKeyRecord,
   partnerKeyStatus,
@@ -1905,6 +1906,44 @@ app.post(`${PARTNER_KEYS_BASE}/:keyId/_rotate`, async (c) => {
   } catch (error) {
     logger.error('admin_action', error, ctx);
     return c.json({ error: 'Failed to rotate API key' }, 500);
+  }
+});
+
+/**
+ * Legacy user import (super-admin only; the admin guard refuses partner keys).
+ * Copies the named users' conversation data from `user:<org>:<id>` (the
+ * shared-key era) to this key's namespace. See legacy-import.ts for the
+ * guards. Always 200 with a per-user status once the body is valid.
+ */
+app.post(`${PARTNER_KEYS_BASE}/:keyId/_import-legacy-users`, async (c) => {
+  const keyId = c.req.param('keyId');
+  const logger = c.get('logger');
+  const ctx = { action: 'import_legacy_users', key_id: keyId };
+  const parsed = await readJsonBody(c.req.raw, logger, ctx);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const body = readLegacyImportBody(parsed.body);
+  if (!body.ok) return c.json({ error: body.error }, 400);
+  try {
+    const key = await keyStore(c).get(keyId);
+    if (!key) return c.json({ error: 'API key not found' }, 404);
+    const results = await importLegacyUsers(c.env, key, body.input, logger);
+    const counts = Object.fromEntries(
+      [...new Set(results.map((r) => r.status))].map((status) => [
+        status,
+        results.filter((r) => r.status === status).length,
+      ])
+    );
+    logger.log('admin_action', {
+      ...ctx,
+      org: key.org,
+      legacy_client_id: body.input.legacyClientId,
+      requested: body.input.userIds.length,
+      counts,
+    });
+    return c.json({ keyId: key.id, org: key.org, results });
+  } catch (error) {
+    logger.error('admin_action', error, ctx);
+    return c.json({ error: 'Failed to import legacy users' }, 500);
   }
 });
 

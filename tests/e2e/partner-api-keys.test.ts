@@ -735,3 +735,90 @@ describe('the PartnerKeyStoreDO serialises concurrent admin writes', () => {
     }
   });
 });
+
+/** Legacy-import helpers (admin-portal#354). */
+const ORG = 'org-354-legacy';
+const internalChat = (clientId: string, userId: string, message: string) =>
+  SELF.fetch(CHAT, {
+    method: 'POST',
+    headers: JSON_INTERNAL,
+    body: JSON.stringify(chatBody({ client_id: clientId, org: ORG, user_id: userId, message })),
+  });
+const historyOf = async (doName: string) => {
+  const stub = env.USER_DO.get(env.USER_DO.idFromName(doName));
+  const res = await stub.fetch('http://fake-host/history');
+  return (await res.json()) as { entries: { user_message: string }[]; total_count: number };
+};
+const importUsers = (keyId: string, body: unknown, headers = JSON_INTERNAL) =>
+  SELF.fetch(`${KEYS}/${keyId}/_import-legacy-users`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+
+describe('legacy user import (super-admin copy into a partner namespace)', () => {
+  it('copies only the named users of the legacy client, never overwrites, and leaves the source as is', async () => {
+    expect((await internalChat('shema', 'u1', 'shema history')).status).toBe(200);
+    expect((await internalChat('whatsapp', 'w1', 'someone else')).status).toBe(200);
+    const { key, apiKey } = await createKey(ORG);
+    const ns = key.userNamespace;
+
+    const res = await importUsers(key.id, {
+      legacyClientId: 'shema',
+      userIds: ['u1', 'w1', 'nobody'],
+    });
+    expect(res.status).toBe(200);
+    const { results } = (await res.json()) as { results: { userId: string; status: string }[] };
+    expect(results.map((r) => [r.userId, r.status])).toEqual([
+      ['u1', 'copied'],
+      ['w1', 'client_mismatch'],
+      ['nobody', 'not_found'],
+    ]);
+
+    // The identity record names its own DO, so it is not copied.
+    expect(await identityOf(`user:${ORG}:partner:${ns}:u1`)).toBeNull();
+    const copied = await historyOf(`user:${ORG}:partner:${ns}:u1`);
+    expect(copied.entries.map((e) => e.user_message)).toEqual(['shema history']);
+    expect((await historyOf(`user:${ORG}:partner:${ns}:w1`)).total_count).toBe(0);
+    expect((await historyOf(`user:${ORG}:u1`)).total_count).toBe(1); // source untouched
+
+    // The partner key now continues u1's conversation in its own namespace.
+    expect((await postChat(apiKey, chatBody({ user_id: 'u1', message: 'next' }))).status).toBe(200);
+    expect((await historyOf(`user:${ORG}:partner:${ns}:u1`)).total_count).toBe(2);
+
+    const again = await importUsers(key.id, { legacyClientId: 'shema', userIds: ['u1'] });
+    expect(((await again.json()) as { results: unknown[] }).results).toEqual([
+      { userId: 'u1', status: 'destination_not_empty' },
+    ]);
+  });
+});
+
+describe('legacy user import: access and validation', () => {
+  it('is super-admin only and validates its body', async () => {
+    const { key, apiKey } = await createKey(ORG);
+    const asPartner = await importUsers(
+      key.id,
+      { legacyClientId: 'shema', userIds: ['u1'] },
+      {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      }
+    );
+    expect(asPartner.status).toBe(403);
+    for (const body of [
+      { legacyClientId: 'shema', userIds: [] },
+      { legacyClientId: 'shema', userIds: ['a', 'a'] },
+      { legacyClientId: 'shema', userIds: ['a\nb'] },
+      { legacyClientId: '', userIds: ['a'] },
+      { legacyClientId: 'shema', userIds: Array.from({ length: 101 }, (_, i) => `u${i}`) },
+      { legacyClientId: 'shema', userIds: ['a'], org: 'other' },
+    ]) {
+      expect((await importUsers(key.id, body)).status).toBe(400);
+    }
+    const missing = await importUsers('pk_0000000000000000', {
+      legacyClientId: 'shema',
+      userIds: ['u1'],
+    });
+    expect(missing.status).toBe(404);
+  });
+});
