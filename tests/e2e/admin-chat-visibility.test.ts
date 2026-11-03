@@ -133,3 +133,26 @@ describe('ADMIN_KEY_REQUIRED value warning', () => {
     expect(logged[0]?.value).toBe('yes');
   });
 });
+
+describe('ADMIN_API_KEY equal to ENGINE_API_KEY', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('logs admin_key_equals_engine_key once per isolate, never the key', async () => {
+    const warnSpy = vi.spyOn(console, 'warn');
+    const cfg = { ADMIN_API_KEY: ` ${ENGINE}\n`, ADMIN_KEY_REQUIRED: 'true' };
+    for (let i = 0; i < 3; i++) {
+      const res = await run(
+        cfg,
+        new Request(ADMIN_CONFIG, { headers: { Authorization: `Bearer ${ENGINE}` } })
+      );
+      // The shared value classifies as the engine key, so enforcement refuses it.
+      expect(res.status).toBe(403);
+    }
+    const lines = warnSpy.mock.calls.map((args) => String(args[0]));
+    const logged = lines.filter((l) => l.startsWith('{"event":"admin_key_equals_engine_key"'));
+    expect(logged).toHaveLength(1);
+    expect(lines.join('\n')).not.toContain(ENGINE);
+  });
+});

@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest';
 import {
   adminKeyConfigured,
   adminKeyEnforced,
+  adminKeyEqualsEngineKey,
   adminKeyRequiredSetting,
   bearerToken,
   classifyToken,
@@ -115,6 +116,19 @@ describe('ADMIN_KEY_REQUIRED parsing', () => {
     const keys = { ENGINE_API_KEY: ENGINE, ADMIN_KEY_REQUIRED: 'yes' };
     expect(adminKeyEnforced(keys)).toBe(false);
     expect(hasSuperAdminAuthority(`Bearer ${ENGINE}`, keys)).toBe(true);
+  });
+});
+
+describe('adminKeyEqualsEngineKey', () => {
+  it('is true only when both are set and equal after trimming', () => {
+    expect(adminKeyEqualsEngineKey({ ENGINE_API_KEY: ENGINE, ADMIN_API_KEY: ENGINE })).toBe(true);
+    expect(
+      adminKeyEqualsEngineKey({ ENGINE_API_KEY: ` ${ENGINE}`, ADMIN_API_KEY: `${ENGINE}\n` })
+    ).toBe(true);
+    expect(adminKeyEqualsEngineKey(transition)).toBe(false);
+    expect(adminKeyEqualsEngineKey(unset)).toBe(false);
+    expect(adminKeyEqualsEngineKey({ ENGINE_API_KEY: '', ADMIN_API_KEY: '' })).toBe(false);
+    expect(adminKeyEqualsEngineKey({ ENGINE_API_KEY: '  ', ADMIN_API_KEY: '  ' })).toBe(false);
   });
 });
 

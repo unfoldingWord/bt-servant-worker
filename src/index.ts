@@ -51,6 +51,7 @@ import { stripControlChars } from './types/prompt-overrides.js';
 import {
   adminKeyConfigured,
   adminKeyEnforced,
+  adminKeyEqualsEngineKey,
   adminKeyRequiredSetting,
   bearerToken,
   classifyToken,
@@ -339,12 +340,7 @@ app.get('/api/v1/voice-submissions/*', async (c) => {
 });
 
 /** Auth context the chat routes hand to {@link handleChatRequest}. */
-type ChatAuth = {
-  keyClass: KeyClass | null;
-  superAdmin: boolean;
-  requestId: string;
-  logger: RequestLogger;
-};
+type ChatAuth = AppEnv['Variables'];
 
 function chatAuth(c: Context<AppEnv>): ChatAuth {
   return {
@@ -359,12 +355,14 @@ function chatAuth(c: Context<AppEnv>): ChatAuth {
 // visible in logs without repeating on every admin request.
 let warnedAdminKeyRequiredInvalid = false;
 let warnedAdminKeyRequiredWithoutKey = false;
+let warnedAdminKeyEqualsEngineKey = false;
 
 /**
- * Log, once per isolate, an ADMIN_KEY_REQUIRED value that is neither true nor
- * false (treated as "true": fails closed), or an enforcing value with no
- * ADMIN_API_KEY (not enforced, so nobody is locked out). The flag value is
- * config, not a secret, so it is logged as-is.
+ * Log, once per isolate each: an ADMIN_KEY_REQUIRED value that is neither true
+ * nor false (treated as "true": fails closed); an enforcing value with no
+ * ADMIN_API_KEY (not enforced, so nobody is locked out); and an ADMIN_API_KEY
+ * equal to ENGINE_API_KEY (treated as the engine key). The flag value is
+ * config, not a secret, so it is logged as-is; key values never are.
  */
 function warnOnAdminKeyConfig(env: Env, logger: RequestLogger): void {
   const setting = adminKeyRequiredSetting(env);
@@ -379,6 +377,12 @@ function warnOnAdminKeyConfig(env: Env, logger: RequestLogger): void {
     warnedAdminKeyRequiredWithoutKey = true;
     logger.warn('admin_key_required_without_admin_key', {
       detail: 'ADMIN_KEY_REQUIRED enforces but ADMIN_API_KEY is not set; not enforced',
+    });
+  }
+  if (!warnedAdminKeyEqualsEngineKey && adminKeyEqualsEngineKey(env)) {
+    warnedAdminKeyEqualsEngineKey = true;
+    logger.warn('admin_key_equals_engine_key', {
+      detail: 'ADMIN_API_KEY equals ENGINE_API_KEY; it is treated as the engine key',
     });
   }
 }
@@ -2370,7 +2374,7 @@ async function handleChatRequest(
   transport: ChatTransport,
   auth: ChatAuth
 ): Promise<Response> {
-  const { requestId, logger } = auth;
+  const { logger } = auth;
   const timing = createTimingContext();
 
   let body: ChatRequest;
@@ -2400,9 +2404,7 @@ async function handleChatRequest(
           env,
           transport,
           body,
-          logger,
           timing,
-          requestId,
           auth,
         });
       } catch (error) {
@@ -2465,9 +2467,8 @@ type ChatDispatchParams = {
   env: Env;
   transport: ChatTransport;
   body: ChatRequest;
-  logger: RequestLogger;
   timing: TimingContext;
-  requestId: string;
+  /** Key class, super-admin authority, request id and request logger (from `/api/*`). */
   auth: ChatAuth;
 };
 
@@ -2477,7 +2478,8 @@ type ChatDispatchParams = {
  * scope a callback boundary; the behavior is unchanged.
  */
 async function dispatchChatRequest(params: ChatDispatchParams): Promise<Response> {
-  const { request, env, transport, body, logger, timing, requestId, auth } = params;
+  const { request, env, transport, body, timing, auth } = params;
+  const { logger, requestId } = auth;
   const validationError = validateChatBody(body, transport);
   if (validationError) {
     logger.warn('chat_validation_failed', {

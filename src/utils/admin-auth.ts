@@ -16,8 +16,9 @@
  * admin key set, behaviour is exactly what it was before the split (the engine
  * key is super admin), so the flag can never lock every caller out of admin.
  *
- * Org-scoped admin keys (`ORG_ADMIN_KEYS` KV) are not handled here; the
- * `/api/v1/admin/orgs/:org/*` gate still checks them after this module.
+ * There are no per-org admin keys: values in the `ORG_ADMIN_KEYS` KV namespace
+ * are not accepted as bearer tokens, and the `/api/v1/admin/*` gate (driven by
+ * this module's result) is the only auth check on the admin routes.
  */
 import { constantTimeCompare } from './crypto.js';
 
@@ -53,6 +54,19 @@ export function configuredAdminKey(keys: AuthKeys): string | null {
 /** True when a dedicated admin key is configured (non-blank after trimming). */
 export function adminKeyConfigured(keys: AuthKeys): boolean {
   return configuredAdminKey(keys) !== null;
+}
+
+/**
+ * True when ADMIN_API_KEY is configured and, trimmed, equals the trimmed
+ * ENGINE_API_KEY. Such a value classifies as the engine key (see
+ * classifyToken), so the admin key would never carry its own authority; the
+ * caller logs it so the misconfiguration is visible.
+ */
+export function adminKeyEqualsEngineKey(keys: AuthKeys): boolean {
+  const adminKey = configuredAdminKey(keys);
+  const engineKey = typeof keys.ENGINE_API_KEY === 'string' ? keys.ENGINE_API_KEY.trim() : '';
+  if (adminKey === null || engineKey.length === 0) return false;
+  return constantTimeCompare(adminKey, engineKey);
 }
 
 /** Parsed `ADMIN_KEY_REQUIRED`. `invalid` is any non-blank value other than true/false. */
