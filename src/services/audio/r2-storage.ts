@@ -190,9 +190,22 @@ export function partnerAudioKeyFor(
     return ['audio', target.org, owner, parts[3]].join('/');
   }
   if (parts[0] === VOICE_SUBMISSION_PREFIX && parts.length === 5) {
-    return [VOICE_SUBMISSION_PREFIX, target.org, chatSegment(owner), parts[3], parts[4]].join('/');
+    const chat = partnerVoiceSubmissionOwner(target);
+    return [VOICE_SUBMISSION_PREFIX, target.org, chat, parts[3], parts[4]].join('/');
   }
   return null;
+}
+
+/**
+ * The owner segment of `target`'s voice-submission copies (partnerAudioKeyFor).
+ * It is slugged, so two distinct subjects (`Ann B`, `Ann-B`) can share it:
+ * their copies of the same recording land on the same key.
+ */
+export function partnerVoiceSubmissionOwner(target: {
+  namespace: string;
+  subject: string;
+}): string {
+  return chatSegment(`${partnerSubjectPrefix(target.namespace)}${target.subject}`);
 }
 
 /** True when a voice-submission key sits in some partner's partition. */

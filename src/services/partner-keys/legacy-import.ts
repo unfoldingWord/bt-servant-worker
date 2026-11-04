@@ -50,6 +50,7 @@ import {
   scopePartnerSubject,
 } from '../../types/partner-namespace.js';
 import { codePointLength } from '../../types/single-line.js';
+import { partnerVoiceSubmissionOwner } from '../audio/index.js';
 import { isValidPartnerIdentifier, isValidPartnerUserId } from './policy.js';
 import {
   AUDIO_RENEW_EVERY,
@@ -485,7 +486,7 @@ export async function importLegacyUsers(
     lease: new ImportLease(opts.renewLease ?? (async () => true), opts.logger, key.id),
   };
   const results: LegacyImportResult[] = [];
-  for (let i = 0; i < input.userIds.length; i += IMPORT_CONCURRENCY) {
+  for (let i = 0, size = 0; i < input.userIds.length; i += size) {
     // A revoke (or the grace running out) during a long import stops it:
     // the users not yet copied are reported `key_revoked` / `key_expired`.
     // If the status cannot be read, stop too: `status_check_failed`.
@@ -500,7 +501,8 @@ export async function importLegacyUsers(
       results.push(...input.userIds.slice(i).map((userId) => ({ userId, status: stopped })));
       break;
     }
-    const batch = input.userIds.slice(i, i + IMPORT_CONCURRENCY);
+    const batch = nextBatch(input.userIds, i, key.userNamespace);
+    size = batch.length;
     const settled = await Promise.allSettled(batch.map((userId) => copyOneUser(ctx, userId)));
     settled.forEach((outcome, j) => {
       const userId = batch.at(j) ?? '';
@@ -516,6 +518,27 @@ export async function importLegacyUsers(
     });
   }
   return results;
+}
+
+/**
+ * The users copied together, from `start`: up to IMPORT_CONCURRENCY, in input
+ * order, ending before the first user whose voice-submission copies would land
+ * under the same owner segment as one already in the batch (ids such as
+ * `Ann B` and `Ann-B` slug alike). Two such users in one batch could both copy
+ * a shared recording to the same key, and one's cleanup could then delete the
+ * copy the other just imported. In different batches the later one finds the
+ * copy `existing`, never lists it in `written`, and so never deletes it.
+ */
+function nextBatch(userIds: string[], start: number, namespace: string): string[] {
+  const owners = new Set<string>();
+  const batch: string[] = [];
+  for (const userId of userIds.slice(start, start + IMPORT_CONCURRENCY)) {
+    const owner = partnerVoiceSubmissionOwner({ namespace, subject: userId });
+    if (owners.has(owner)) break;
+    owners.add(owner);
+    batch.push(userId);
+  }
+  return batch;
 }
 
 /**
