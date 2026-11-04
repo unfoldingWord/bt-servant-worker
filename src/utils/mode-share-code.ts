@@ -24,6 +24,7 @@
  */
 import { classifyTriggers, type MatchTier } from '../services/classifier/index.js';
 import type { ChatMode, PromptMode } from '../types/prompt-overrides.js';
+import { resolveEffectiveMode } from '../types/mode-markdown.js';
 import { chatTriggerModeOptions } from '../types/prompt-overrides.js';
 import {
   compareOrgs,
@@ -148,9 +149,14 @@ type ActualMatch =
   | { kind: 'mode'; name: string; tier: MatchTier | undefined; whole: boolean; org: string };
 
 /**
- * Send the message `#<code>` through `classifyTriggers` (leading-token
- * extraction included) and report the mode it selected, the tier that
- * selected it, whether the token consumed the whole message, and its owner.
+ * Run the chat path's two steps for the message `#<code>` and report the mode
+ * chat would actually OPEN: `classifyTriggers` (leading-token extraction
+ * included) picks a mode name, then `resolveEffectiveMode` (what the DO's
+ * `resolveModeOverride` runs on that name, for a non-admin private chat)
+ * decides which stored mode, if any, takes effect. That second step can
+ * reject the pick (a draft or group-only element found first) or land on
+ * another mode (an earlier element listing the name as an alias), so the
+ * answer follows its result, not the classifier's.
  */
 function matchCode(code: string, pool: ChatMode[], homeOrg: string): ActualMatch {
   const options = chatTriggerModeOptions(pool, WHATSAPP_CHAT);
@@ -160,13 +166,20 @@ function matchCode(code: string, pool: ChatMode[], homeOrg: string): ActualMatch
   });
   if (classified.clearMode) return { kind: 'clear' };
   if (classified.modeName === undefined) return { kind: 'none' };
-  const owner = pool.find((m) => m.name === classified.modeName);
+  const effective = resolveEffectiveMode({ modes: pool }, classified.modeName, {
+    includeUnpublished: WHATSAPP_CHAT.isAdmin,
+    isGroupChat: WHATSAPP_CHAT.isGroupChat,
+  });
+  if (effective.effectiveModeName === undefined) return { kind: 'none' };
+  const owner = pool.find((m) => m.name === effective.effectiveModeName);
   if (owner === undefined) return { kind: 'none' };
   const whole = classified.strippedMessage === '' && classified.unmatchedTriggers.length === 0;
   // Only qualified (foreign) entries are stamped with `org` by the merge; a
   // bare name is always the home org's, whatever a stored record carries.
   const org = owner.name.includes('/') && owner.org !== undefined ? owner.org : homeOrg;
-  return { kind: 'mode', name: owner.name, tier: classified.modeMatchTier, whole, org };
+  // The classifier's tier only describes the opened mode when resolution kept its pick.
+  const tier = effective.resolvedViaAlias ? 'alias' : classified.modeMatchTier;
+  return { kind: 'mode', name: owner.name, tier, whole, org };
 }
 
 /** The message opened this org's own mode, by its canonical name, on the exact tier, consuming it all. */
@@ -367,8 +380,16 @@ function selectTarget(
   isHome: boolean
 ): { mode: PromptMode; wellShaped: boolean; targetModes: ChatMode[] } | undefined {
   const { modes, sourceIndexes } = sanitizeModeElements(elements);
-  const strictOk = (k: number): boolean =>
-    modeElementError(elements.at(sourceIndexes.at(k) ?? -1)) === null;
+  const strictOk = (k: number): boolean => modeElementError(sourceElement(k)) === null;
+  // sourceIndexes is parallel to modes; a miss is a bug, so fail loudly
+  // rather than judge some other row.
+  const sourceElement = (k: number): unknown => {
+    const index = sourceIndexes.at(k);
+    if (index === undefined || index >= elements.length) {
+      throw new Error(`share-code: no source element for sanitized mode ${k}`);
+    }
+    return elements.at(index);
+  };
   const served = (k: number): boolean => {
     const mode = modes.at(k);
     if (mode === undefined || mode.published !== true) return false;

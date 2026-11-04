@@ -9,7 +9,12 @@ import { env } from 'cloudflare:test';
 import { describe, expect, it, vi } from 'vitest';
 import type { PromptMode } from '../../src/types/prompt-overrides.js';
 import { chatTriggerModeOptions } from '../../src/types/prompt-overrides.js';
-import { MAX_FOREIGN_ORGS_PER_TURN } from '../../src/utils/cross-org-modes.js';
+import { resolveEffectiveMode } from '../../src/types/mode-markdown.js';
+import { classifyTriggers } from '../../src/services/classifier/index.js';
+import {
+  MAX_FOREIGN_ORGS_PER_TURN,
+  readAllPublishedModes,
+} from '../../src/utils/cross-org-modes.js';
 import type { RequestLogger } from '../../src/utils/logger.js';
 import {
   invalidOrgError,
@@ -746,23 +751,9 @@ describe('share-code logging — shared reader', () => {
 });
 
 describe('loadShareCodeTarget — target selection follows chat (round 7)', () => {
-  it('[draft x, published x] on a home org selects the published one chat serves', async () => {
-    const kv = fakeKv({
-      [`${HOME}:modes`]: { modes: [{ name: 'x', overrides: {} }, published('x')] },
-    });
-    expect(await resolve(kv, HOME, 'x')).toEqual({ code: 'x', resolves: true, resolved_org: HOME });
-  });
-
   it('[draft x, published x] on a foreign org selects the one the merge keeps', async () => {
     const kv = fakeKv({ 'pbt:modes': { modes: [{ name: 'x', overrides: {} }, published('x')] } });
     expect(await resolve(kv, 'pbt', 'x')).toMatchObject({ code: 'pbt/x', resolves: true });
-  });
-
-  it('[a with alias b, b]: asking for b selects the mode NAMED b, not the alias owner', async () => {
-    const kv = fakeKv({
-      [`${HOME}:modes`]: { modes: [published('a', { aliases: ['b'] }), published('b')] },
-    });
-    expect(await resolve(kv, HOME, 'b')).toEqual({ code: 'b', resolves: true, resolved_org: HOME });
   });
 
   it('an alias still selects its mode when no mode has that name', async () => {
@@ -794,6 +785,75 @@ describe('loadShareCodeTarget — wrong-shape target (round 7)', () => {
       spyLogger()
     );
     expect(loaded).toEqual({ kind: 'corrupt_record', key: 'pbt:modes' });
+  });
+});
+
+/**
+ * What chat opens for the message `#<code>` from `homeOrg`: the DO's own two
+ * steps (`classifyTriggers`, then `resolveEffectiveMode` for a non-admin
+ * private chat) over the chat path's read. Parity tests compare the endpoint
+ * with this, not with a hand-written expectation.
+ */
+async function chatOpens(kv: KVNamespace, homeOrg: string, code: string) {
+  const orgModes = await readAllPublishedModes(kv, homeOrg, spyLogger());
+  const classified = classifyTriggers(`#${code}`, {
+    availableModes: chatTriggerModeOptions(orgModes.modes, { isGroupChat: false, isAdmin: false }),
+    availableLanguages: [],
+  });
+  if (classified.modeName === undefined) return undefined;
+  return resolveEffectiveMode(orgModes, classified.modeName, {
+    includeUnpublished: false,
+    isGroupChat: false,
+  }).effectiveModeName;
+}
+
+describe('share-code parity with chat: the effective-mode step (bench round 1, Frank P2)', () => {
+  const cases: Array<[string, unknown[]]> = [
+    [
+      '[draft x, published x]: chat rejects the draft it finds first',
+      [{ name: 'x', overrides: {} }, published('x')],
+    ],
+    [
+      '[group-only x, published private x]: chat rejects the group-only one',
+      [published('x', { requires_group: true }), published('x')],
+    ],
+    [
+      '[published a aliasing x, published x]: chat opens a',
+      [published('a', { aliases: ['x'] }), published('x')],
+    ],
+  ];
+
+  it.each(cases)('%s, so the endpoint says resolves: false', async (_label, modes) => {
+    const kv = fakeKv({ [`${HOME}:modes`]: { modes } });
+    const opened = await chatOpens(kv, HOME, 'x');
+    const answer = await resolve(kv, HOME, 'x');
+    expect(opened === 'x').toBe(false);
+    expect(answer.resolves).toBe(opened === 'x');
+  });
+
+  it('[published a aliasing x, published x]: resolved_org names the org of the mode chat opens', async () => {
+    const kv = fakeKv({
+      [`${HOME}:modes`]: { modes: [published('a', { aliases: ['x'] }), published('x')] },
+    });
+    expect(await chatOpens(kv, HOME, 'x')).toBe('a');
+    expect(await resolve(kv, HOME, 'x')).toEqual({
+      code: 'x',
+      resolves: false,
+      reason: 'ambiguous',
+      resolved_org: HOME,
+    });
+  });
+
+  it('control: a lone published x opens x in chat and resolves on the endpoint', async () => {
+    const kv = fakeKv({ [`${HOME}:modes`]: { modes: [published('x')] } });
+    expect(await chatOpens(kv, HOME, 'x')).toBe('x');
+    expect((await resolve(kv, HOME, 'x')).resolves).toBe(true);
+  });
+
+  it('control: a foreign [draft x, published x] agrees too (the merge drops the draft)', async () => {
+    const kv = fakeKv({ 'pbt:modes': { modes: [{ name: 'x', overrides: {} }, published('x')] } });
+    expect(await chatOpens(kv, HOME, 'pbt/x')).toBe('pbt/x');
+    expect((await resolve(kv, 'pbt', 'x')).resolves).toBe(true);
   });
 });
 
