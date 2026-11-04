@@ -659,3 +659,35 @@ describe('classifyTriggers — qualified tokens get the cascade within the quali
     expect(result.unmatchedTriggers.map((t) => t.rawToken)).toEqual(['x/english']);
   });
 });
+
+describe('classifyTriggers — match provenance via modeMatchTier (admin-portal#345)', () => {
+  const ctx = {
+    availableModes: [
+      { name: 'mast-methodology', label: 'MAST', aliases: ['mast-old'] },
+      { name: 'spoken', label: 'Spoken' },
+    ],
+    availableLanguages: [],
+  };
+
+  it('reports the alias tier when an old slug matched', () => {
+    const result = classifyTriggers('#mast-old', ctx);
+    expect(result.modeName).toBe('mast-methodology');
+    expect(result.modeMatchTier).toBe('alias');
+  });
+
+  it('a clear token carries no tier', () => {
+    const result = classifyTriggers('#Default', ctx);
+    expect(result.clearMode).toBe(true);
+    expect('modeMatchTier' in result).toBe(false);
+  });
+});
+
+describe('classifyTriggers — modeMatchTier (admin-portal#345)', () => {
+  it('reports the tier of the matched #mode token, and omits it when no mode matched', () => {
+    const ctx = { availableModes: modes, availableLanguages: [] };
+    expect(classifyTriggers('#spoken hi', ctx).modeMatchTier).toBe('exact');
+    expect(classifyTriggers('#mast hi', ctx).modeMatchTier).toBe('prefix');
+    expect(classifyTriggers('#spokne hi', ctx).modeMatchTier).toBe('fuzzy');
+    expect('modeMatchTier' in classifyTriggers('#zzz-nothing hi', ctx)).toBe(false);
+  });
+});

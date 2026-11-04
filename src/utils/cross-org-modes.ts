@@ -20,7 +20,7 @@
  * - A published foreign ELEMENT is held to the same shape rules the admin PUT
  *   enforces (`validatePromptMode`); one that fails is logged and skipped,
  *   never merged, because the DO dereferences it downstream (see
- *   `foreignModeShapeError`).
+ *   `modeShapeError`).
  * - At most `MAX_FOREIGN_ORGS_PER_TURN` foreign keys are read per turn, taken
  *   in sorted key order BEFORE any key is read. An org whose key sorts beyond
  *   that window is INVISIBLE on the chat path — its published modes are never
@@ -30,7 +30,7 @@
  */
 import type { ChatMode, ChatOrgModes, OrgModes, PromptMode } from '../types/prompt-overrides.js';
 import { validatePromptMode } from '../types/prompt-overrides.js';
-import type { RequestLogger } from './logger.js';
+import { type RequestLogger, withLogContext } from './logger.js';
 import { MCP_GLOBAL_KEY } from './mcp-validation.js';
 
 /** Suffix of the per-org modes key in PROMPT_OVERRIDES: `${org}:modes`. */
@@ -83,12 +83,13 @@ export function orgSlug(org: string): string {
     .replace(/^-+|-+$/g, '');
 }
 
-function modesKey(org: string): string {
+/** The PROMPT_OVERRIDES key holding `org`'s modes. Exact, unnormalized: `' PBT'` and `'PBT'` are different keys. */
+export function modesKey(org: string): string {
   return `${org}${MODES_KEY_SUFFIX}`;
 }
 
 /** Structural check for a stored `{ modes: [...] }` record. */
-function isOrgModes(value: unknown): value is OrgModes {
+export function isOrgModes(value: unknown): value is OrgModes {
   return (
     value !== null &&
     typeof value === 'object' &&
@@ -97,7 +98,7 @@ function isOrgModes(value: unknown): value is OrgModes {
 }
 
 /** Why an enumerated org is not mergeable, or null when it is. */
-function orgSkipReason(org: string, slug: string): 'reserved' | 'empty_slug' | null {
+export function orgSkipReason(org: string, slug: string): 'reserved' | 'empty_slug' | null {
   if (org === MCP_GLOBAL_KEY) return 'reserved';
   if (slug === '') return 'empty_slug';
   return null;
@@ -111,8 +112,155 @@ type ClaimedNames = Map<string, string>;
  * the container, not its elements, and a manual KV write can leave a null or
  * primitive there. Such an element must be skipped, never dereferenced.
  */
-function isModeRecord(mode: unknown): mode is PromptMode {
+export function isModeRecord(mode: unknown): mode is PromptMode {
   return mode !== null && typeof mode === 'object';
+}
+
+/**
+ * The STRICT shape check: why an element fails what the admin PUT enforces
+ * (`modeShapeError`: `validatePromptMode` plus a string `name`), or null. The
+ * foreign merge drops elements that fail it. The home read does NOT use it
+ * (see `sanitizeModeElements`); the share-code endpoint uses it to explain
+ * why a FOREIGN mode never reaches chat.
+ */
+export function modeElementError(element: unknown): string | null {
+  if (!isModeRecord(element)) return 'mode_not_object';
+  return modeShapeError(element);
+}
+
+/** One home element the crash guard dropped or normalized. */
+export interface ModeElementIssue {
+  index: number;
+  name?: string;
+  /** `mode_not_object`, `name_not_string`, or `normalized:<fields>`. */
+  issue: string;
+  /** The element is not published (drafts are not logged, as in the foreign merge). */
+  draft: boolean;
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === 'string';
+}
+
+/**
+ * The fields of one well-named element that the DO would throw on, set to
+ * their absent form: `aliases` that is not an array of strings
+ * (`findModeBySlug` and the classifier call array/string methods on it),
+ * `overrides: null` (`getEffectiveOverrides` tests `!== undefined`, then
+ * `resolvePromptOverrides` indexes it), and a non-string `welcome_message`
+ * (`maybeBuildModeWelcome` calls `.trim()` on it). Returns the original
+ * object when nothing needed fixing.
+ */
+function normalizeModeElement(mode: ChatMode): { mode: ChatMode; fixed: string[] } {
+  // Hot path (every chat turn): a clean element is returned as-is, uncopied.
+  if (!needsNormalizing(mode)) return { mode, fixed: [] };
+  const { aliases, overrides, welcome_message: welcome, ...rest } = mode;
+  const out: ChatMode = { ...rest };
+  const fixed = [
+    ...keepAliases(out, aliases),
+    ...keepOverrides(out, overrides),
+    ...keepWelcome(out, welcome),
+  ];
+  return fixed.length === 0 ? { mode, fixed } : { mode: out, fixed };
+}
+
+/** Whether any field `normalizeModeElement` fixes is present in a harmful form. */
+function needsNormalizing(mode: ChatMode): boolean {
+  const {
+    aliases,
+    overrides,
+    welcome_message: welcome,
+  } = mode as {
+    aliases?: unknown;
+    overrides?: unknown;
+    welcome_message?: unknown;
+  };
+  if (aliases !== undefined && (!Array.isArray(aliases) || !aliases.every(isString))) return true;
+  if (overrides === null) return true;
+  return welcome !== undefined && welcome !== null && !isString(welcome);
+}
+
+/** Copy `aliases` onto `out` keeping only strings; a non-array is dropped. Returns the fixed field, if any. */
+function keepAliases(out: ChatMode, aliases: unknown): string[] {
+  if (aliases === undefined) return [];
+  if (!Array.isArray(aliases)) return ['aliases'];
+  const kept = (aliases as unknown[]).filter(isString);
+  out.aliases = kept;
+  return kept.length === aliases.length ? [] : ['aliases'];
+}
+
+/** Copy `overrides` onto `out` unless it is `null`. */
+function keepOverrides(out: ChatMode, overrides: ChatMode['overrides'] | null): string[] {
+  if (overrides === null) return ['overrides'];
+  if (overrides !== undefined) out.overrides = overrides;
+  return [];
+}
+
+/** Copy `welcome_message` onto `out` unless it is a non-string (null and absent are harmless). */
+function keepWelcome(out: ChatMode, welcome: unknown): string[] {
+  if (welcome === undefined || welcome === null) return [];
+  if (!isString(welcome)) return ['welcome_message'];
+  out.welcome_message = welcome;
+  return [];
+}
+
+/**
+ * The chat path's home crash guard. Only what would make the DO throw is
+ * touched, so a working legacy mode keeps working even if the stricter admin
+ * PUT would now reject it: an element that is not an object or has no string
+ * `name` is dropped, and the fields in `normalizeModeElement` are set to their
+ * absent form. A clean element is passed through as the same object. Shared
+ * by the chat home read and the share-code endpoint, so both see what chat
+ * serves.
+ */
+export function sanitizeModeElements(elements: readonly unknown[]): {
+  modes: ChatMode[];
+  /** For each entry of `modes`, the index of its source element. */
+  sourceIndexes: number[];
+  issues: ModeElementIssue[];
+} {
+  const modes: ChatMode[] = [];
+  const sourceIndexes: number[] = [];
+  const issues: ModeElementIssue[] = [];
+  elements.forEach((element, index) => {
+    if (!isModeRecord(element)) {
+      issues.push({ index, issue: 'mode_not_object', draft: false });
+      return;
+    }
+    const draft = element.published !== true;
+    if (typeof (element as { name?: unknown }).name !== 'string') {
+      issues.push({ index, issue: 'name_not_string', draft });
+      return;
+    }
+    const { mode, fixed } = normalizeModeElement(element as ChatMode);
+    modes.push(mode);
+    sourceIndexes.push(index);
+    if (fixed.length > 0) {
+      issues.push({ index, name: mode.name, issue: `normalized:${fixed.join(',')}`, draft });
+    }
+  });
+  return { modes, sourceIndexes, issues };
+}
+
+/** Home element issues already logged in this isolate, so a bad record warns once, not every turn. */
+const loggedHomeIssues = new Set<string>();
+const MAX_LOGGED_HOME_ISSUES = 1000;
+
+/** The issues not yet logged in this isolate (drafts exempt), marking them logged. */
+function freshHomeIssues(key: string, issues: ModeElementIssue[]): ModeElementIssue[] {
+  if (loggedHomeIssues.size > MAX_LOGGED_HOME_ISSUES) loggedHomeIssues.clear();
+  return issues.filter((issue) => {
+    if (issue.draft) return false;
+    const id = `${key}\u0000${issue.index}\u0000${issue.name ?? ''}\u0000${issue.issue}`;
+    if (loggedHomeIssues.has(id)) return false;
+    loggedHomeIssues.add(id);
+    return true;
+  });
+}
+
+/** The merge's org order (first wins on a collision): plain code-unit order of raw org names. */
+export function compareOrgs(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 /**
@@ -129,7 +277,7 @@ function isModeRecord(mode: unknown): mode is PromptMode {
  * `overrides` / string `document`), plus an explicit `name` check because
  * `validatePromptMode` only validates `name` when the key is present.
  */
-function foreignModeShapeError(mode: PromptMode): string | null {
+function modeShapeError(mode: PromptMode): string | null {
   if (typeof mode.name !== 'string') return 'Mode name must be a string';
   return validatePromptMode(mode);
 }
@@ -184,7 +332,7 @@ function qualifyForeignMode(
  * Append one foreign org's PUBLISHED, well-shaped modes to `modes`, qualified.
  * Drafts are dropped before the shape check (they never reach the chat path,
  * so a malformed draft is not worth a log line); a published element that
- * fails `foreignModeShapeError` is logged and skipped.
+ * fails `modeShapeError` is logged and skipped.
  */
 function mergeForeignOrg(
   entry: { org: string; slug: string; modes: PromptMode[] },
@@ -199,7 +347,7 @@ function mergeForeignOrg(
       continue;
     }
     if (mode.published !== true) continue;
-    const shapeError = foreignModeShapeError(mode);
+    const shapeError = modeShapeError(mode);
     if (shapeError !== null) {
       logger.warn('cross_org_modes_invalid_shape', {
         org,
@@ -215,6 +363,16 @@ function mergeForeignOrg(
 }
 
 /**
+ * The merged list plus which org claimed each qualified name/alias (first in
+ * sorted org order). The share-code endpoint (admin-portal#345) reads `claimed`
+ * to name a collision winner; the chat path only needs `modes`.
+ */
+export interface CrossOrgMergeDetail extends ChatOrgModes {
+  /** Qualified name or alias → raw org name that claimed it. */
+  claimed: ReadonlyMap<string, string>;
+}
+
+/**
  * Merge the home org's modes (verbatim, first) with every other org's
  * published modes (qualified, in sorted org-name order). Pure; never throws.
  */
@@ -223,11 +381,20 @@ export function mergeCrossOrgModes(
   foreign: ForeignOrgModes[],
   logger: RequestLogger
 ): ChatOrgModes {
+  return { modes: mergeCrossOrgModesDetailed(home, foreign, logger).modes };
+}
+
+/** `mergeCrossOrgModes` with its claim decisions exposed. Same code path. */
+export function mergeCrossOrgModesDetailed(
+  home: OrgModes,
+  foreign: ForeignOrgModes[],
+  logger: RequestLogger
+): CrossOrgMergeDetail {
   const modes: ChatMode[] = [...home.modes];
   // Home names are bare and MODE_NAME_PATTERN forbids `/`, so only qualified
   // names can ever collide with each other.
   const claimed: ClaimedNames = new Map();
-  const sorted = [...foreign].sort((a, b) => (a.org < b.org ? -1 : a.org > b.org ? 1 : 0));
+  const sorted = [...foreign].sort((a, b) => compareOrgs(a.org, b.org));
 
   for (const { org, modes: orgModes } of sorted) {
     const slug = orgSlug(org);
@@ -238,7 +405,7 @@ export function mergeCrossOrgModes(
     }
     mergeForeignOrg({ org, slug, modes: orgModes }, modes, claimed, logger);
   }
-  return { modes };
+  return { modes, claimed };
 }
 
 /**
@@ -264,6 +431,15 @@ function capForeignKeys(keys: string[], logger: RequestLogger): string[] {
   return sorted.slice(0, MAX_FOREIGN_ORGS_PER_TURN);
 }
 
+/** Outcome of enumerating the foreign `*:modes` keys. */
+interface ForeignKeyListing {
+  keys: string[];
+  /** The listing threw; `keys` is empty and the turn is home-only. */
+  failed: boolean;
+  /** MAX_MODES_KEY_PAGES ran out before the listing completed. */
+  truncated: boolean;
+}
+
 /**
  * Enumerate every `*:modes` key other than the home org's. Paged and bounded;
  * a listing failure is logged and yields the empty list (home-only turn).
@@ -271,8 +447,9 @@ function capForeignKeys(keys: string[], logger: RequestLogger): string[] {
 async function listForeignModesKeys(
   kv: KVNamespace,
   homeKey: string,
-  logger: RequestLogger
-): Promise<string[]> {
+  ctx: ReaderContext
+): Promise<ForeignKeyListing> {
+  const { logger } = ctx;
   const names: string[] = [];
   try {
     let cursor: string | undefined;
@@ -283,33 +460,74 @@ async function listForeignModesKeys(
       for (const { name } of result.keys) {
         if (name.endsWith(MODES_KEY_SUFFIX) && name !== homeKey) names.push(name);
       }
-      if (result.list_complete) return names;
+      if (result.list_complete) return { keys: names, failed: false, truncated: false };
       cursor = result.cursor;
     }
     logger.warn('cross_org_modes_list_truncated', {
       pages: MAX_MODES_KEY_PAGES,
       listed: names.length,
     });
-    return names;
+    return { keys: names, failed: false, truncated: true };
   } catch (error) {
-    logger.error('cross_org_modes_list_failed', error, { listed: names.length });
+    logReadFailure(ctx, 'cross_org_modes_list_failed', error, { listed: names.length });
     // Degrade to the home org only — the turn must never fail on this read.
-    return [];
+    return { keys: [], failed: true, truncated: false };
   }
 }
 
-/** Read one foreign `<org>:modes` key; any failure or bad shape is logged and yields null. */
+/** Reads one KV key as JSON. */
+type JsonGet = (key: string) => Promise<unknown>;
+
+/**
+ * A stored value that is not JSON. Unlike a KV transport error it is
+ * permanent: retrying returns the same bytes. Kept distinct so callers that
+ * must tell "retry" from "broken data" (the share-code endpoint) can.
+ */
+export class CorruptModesRecordError extends Error {
+  readonly key: string;
+  constructor(key: string, cause: unknown) {
+    super(`Stored value at ${key} is not valid JSON`, { cause });
+    this.name = 'CorruptModesRecordError';
+    this.key = key;
+  }
+}
+
+/**
+ * `kv.get(key, 'json')` with the two failure kinds separated. KV parses the
+ * stored text with JSON.parse, so a value that is not JSON surfaces as a
+ * SyntaxError; that is rethrown as CorruptModesRecordError. Every other error
+ * (transport, limits) propagates unchanged. A missing key yields null.
+ */
+export async function readModesJson(kv: KVNamespace, key: string): Promise<unknown> {
+  try {
+    return await kv.get(key, 'json');
+  } catch (error) {
+    if (error instanceof Error && error.name === 'SyntaxError') {
+      throw new CorruptModesRecordError(key, error);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Read one foreign `<org>:modes` key. A bad shape is logged and yields null; a
+ * failed get is logged and yields `'read_failed'`, so a caller that needs an
+ * authoritative answer can tell a transient failure from an absent record.
+ */
 async function readForeignModes(
-  kv: KVNamespace,
+  get: JsonGet,
   key: string,
-  logger: RequestLogger
-): Promise<ForeignOrgModes | null> {
+  ctx: ReaderContext
+): Promise<ForeignOrgModes | 'read_failed' | null> {
+  const { logger } = ctx;
   let value: unknown;
   try {
-    value = await kv.get(key, 'json');
+    value = await get(key);
   } catch (error) {
-    logger.error('cross_org_modes_read_failed', error, { key });
-    return null;
+    logReadFailure(ctx, 'cross_org_modes_read_failed', error, { key });
+    // Corrupt JSON is permanent bad data, skipped like any record that is not
+    // a modes shape; only a transport failure is reported as retryable.
+    return error instanceof CorruptModesRecordError ? null : 'read_failed';
   }
   if (value === null) {
     // Listed a moment ago but gone now, or the stored value is JSON null.
@@ -322,20 +540,17 @@ async function readForeignModes(
     logger.warn('cross_org_modes_invalid_shape', { key, reason: 'not_modes_record' });
     return null;
   }
-  return { org: key.slice(0, -MODES_KEY_SUFFIX.length), modes: value.modes };
+  return { org: orgFromModesKey(key), modes: value.modes };
 }
 
 /** Read the home org's modes; a failure or bad shape is logged and yields an empty list. */
-async function readHomeModes(
-  kv: KVNamespace,
-  homeKey: string,
-  logger: RequestLogger
-): Promise<OrgModes> {
+async function readHomeModes(get: JsonGet, homeKey: string, ctx: ReaderContext): Promise<OrgModes> {
+  const { logger } = ctx;
   let value: unknown;
   try {
-    value = await kv.get(homeKey, 'json');
+    value = await get(homeKey);
   } catch (error) {
-    logger.error('org_modes_kv_read_error', error, { key: homeKey });
+    logReadFailure(ctx, 'org_modes_kv_read_error', error, { key: homeKey });
     return { modes: [] };
   }
   if (value === null) return { modes: [] }; // no modes configured — the normal case for most orgs
@@ -343,30 +558,155 @@ async function readHomeModes(
     logger.warn('org_modes_invalid_shape', { key: homeKey });
     return { modes: [] };
   }
-  return value;
+  const { modes, issues } = sanitizeModeElements(value.modes);
+  // Admin share-code reads must not use up chat's once-per-isolate warning.
+  const fresh = ctx.shareCode
+    ? issues.filter((issue) => !issue.draft)
+    : freshHomeIssues(homeKey, issues);
+  if (fresh.length > 0) {
+    logger.warn('org_modes_invalid_elements', {
+      key: homeKey,
+      issue_count: fresh.length,
+      issues: fresh.slice(0, MAX_DROPPED_KEYS_LOGGED).map(({ draft: _draft, ...rest }) => rest),
+    });
+  }
+  return { modes };
+}
+
+/** Who is reading: the chat path, or the admin share-code endpoint (admin-portal#345). */
+interface ReaderContext {
+  logger: RequestLogger;
+  /**
+   * The share-code endpoint: events carry `source: 'share_code'`, read and
+   * list failures are warn (the route's `mode_share_code_unavailable` is the
+   * summary when they matter), and the home-element dedup set is left alone.
+   */
+  shareCode: boolean;
+}
+
+/** Log a KV failure: error on the chat path, warn (message only) for share-code reads. */
+function logReadFailure(
+  ctx: ReaderContext,
+  event: string,
+  error: unknown,
+  data: Record<string, unknown>
+): void {
+  if (ctx.shareCode) logShareCodeFailure(ctx.logger, event, error, data);
+  else ctx.logger.error(event, error, data);
+}
+
+/** The context every share-code (admin-portal#345) log line carries. */
+export const SHARE_CODE_LOG_CONTEXT = { source: 'share_code' } as const;
+
+/**
+ * The one way the share-code endpoint and the shared reader in share-code mode
+ * log a failure: at warn (admin traffic must not read as chat errors), tagged
+ * with SHARE_CODE_LOG_CONTEXT, and keeping the same error fields the request
+ * logger's `error()` records (`error`, `error_name`, `stack`).
+ */
+export function logShareCodeFailure(
+  logger: RequestLogger,
+  event: string,
+  error: unknown,
+  data: Record<string, unknown>
+): void {
+  const fields: Record<string, unknown> = {
+    ...data,
+    ...SHARE_CODE_LOG_CONTEXT,
+    error: error instanceof Error ? error.message : String(error),
+  };
+  if (error instanceof Error) {
+    fields.error_name = error.name;
+    if (error.stack !== undefined) fields.stack = error.stack;
+  }
+  logger.warn(event, fields);
+}
+
+/** Options for `readCrossOrgModeSources`; the chat path passes none. */
+export interface CrossOrgReadOptions {
+  /**
+   * Raw JSON values (as `kv.get(key, 'json')` returned them) the caller has
+   * already read; those keys are not read again, so a caller that inspected a
+   * record answers from that same snapshot.
+   */
+  prefetched?: ReadonlyMap<string, unknown>;
+  /** Set by the admin share-code endpoint; see `ReaderContext.shareCode`. */
+  source?: 'share_code';
+}
+
+/** Everything the chat path read, before merging, plus how the read went. */
+export interface CrossOrgModeSources {
+  home: OrgModes;
+  /** Foreign records that were read and had a modes shape. */
+  foreign: ForeignOrgModes[];
+  /** Foreign keys the listing returned (home key excluded). */
+  listedKeys: string[];
+  /** The subset of `listedKeys` inside the per-turn cap — the only foreign keys read. */
+  readKeys: string[];
+  /** Keys in `readKeys` whose get threw (the chat path treats them as absent). */
+  failedKeys: string[];
+  listFailed: boolean;
+  listTruncated: boolean;
+}
+
+/**
+ * The chat path's raw read: the home get and the key listing in parallel, then
+ * the capped foreign gets in parallel. Never throws. See CrossOrgReadOptions.
+ */
+export async function readCrossOrgModeSources(
+  kv: KVNamespace,
+  homeOrg: string,
+  logger: RequestLogger,
+  opts: CrossOrgReadOptions = {}
+): Promise<CrossOrgModeSources> {
+  const { prefetched } = opts;
+  const shareCode = opts.source === 'share_code';
+  const ctx: ReaderContext = {
+    logger: shareCode ? withLogContext(logger, SHARE_CODE_LOG_CONTEXT) : logger,
+    shareCode,
+  };
+  const get: JsonGet = async (key) =>
+    prefetched?.has(key) === true ? prefetched.get(key) : readModesJson(kv, key);
+  const homeKey = modesKey(homeOrg);
+  const [home, listing] = await Promise.all([
+    readHomeModes(get, homeKey, ctx),
+    listForeignModesKeys(kv, homeKey, ctx),
+  ]);
+  const readKeys = capForeignKeys(listing.keys, ctx.logger);
+  const results = await Promise.all(
+    readKeys.map(async (key) => ({ key, result: await readForeignModes(get, key, ctx) }))
+  );
+  const foreign: ForeignOrgModes[] = [];
+  const failedKeys: string[] = [];
+  for (const { key, result } of results) {
+    if (result === 'read_failed') failedKeys.push(key);
+    else if (result !== null) foreign.push(result);
+  }
+  return {
+    home,
+    foreign,
+    listedKeys: listing.keys,
+    readKeys,
+    failedKeys,
+    listFailed: listing.failed,
+    listTruncated: listing.truncated,
+  };
+}
+
+/** The raw org name a `<org>:modes` key belongs to. */
+export function orgFromModesKey(key: string): string {
+  return key.slice(0, -MODES_KEY_SUFFIX.length);
 }
 
 /**
  * The chat path's modes read: the home org's modes plus every other org's
- * published modes, merged by `mergeCrossOrgModes`. The home get and the key
- * listing run in parallel, then the foreign gets run in parallel. Never throws.
+ * published modes, merged by `mergeCrossOrgModes`. Never throws.
  */
 export async function readAllPublishedModes(
   kv: KVNamespace,
   homeOrg: string,
   logger: RequestLogger
 ): Promise<ChatOrgModes> {
-  const homeKey = modesKey(homeOrg);
-  const [home, foreignKeys] = await Promise.all([
-    readHomeModes(kv, homeKey, logger),
-    listForeignModesKeys(kv, homeKey, logger),
-  ]);
-  const foreign = await Promise.all(
-    capForeignKeys(foreignKeys, logger).map((key) => readForeignModes(kv, key, logger))
-  );
-  return mergeCrossOrgModes(
-    home,
-    foreign.filter((entry): entry is ForeignOrgModes => entry !== null),
-    logger
-  );
+  const sources = await readCrossOrgModeSources(kv, homeOrg, logger);
+  return mergeCrossOrgModes(sources.home, sources.foreign, logger);
 }

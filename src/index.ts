@@ -47,6 +47,12 @@ import {
 import { validateResourceLanguage } from './types/resources.js';
 import { synthesizeModeDocument } from './types/mode-markdown.js';
 import { readAllPublishedModes } from './utils/cross-org-modes.js';
+import {
+  invalidOrgError,
+  loadShareCodeTarget,
+  resolveModeShareCode,
+  ShareCodeUnavailableError,
+} from './utils/mode-share-code.js';
 import { stripControlChars } from './types/prompt-overrides.js';
 import {
   adminKeyConfigured,
@@ -982,6 +988,122 @@ app.get('/api/v1/admin/orgs/:org/modes/:modeName', async (c) => {
   } catch (error) {
     logger.error('admin_action', error, { action: 'get_mode', org });
     return c.json({ error: 'Failed to read mode from storage' }, 500);
+  }
+});
+
+/** A 400 body for share-code input; `field` names the offending query/path field when there is one. */
+interface ShareCodeInputError {
+  error: string;
+  message: string;
+  field?: 'org' | 'home_org';
+}
+
+/** Validated share-code input, or the 400 body that rejects it. */
+function shareCodeInput(
+  org: string,
+  homeOrg: string | undefined,
+  modeName: string
+): { ok: true; homeOrg: string } | { ok: false; body: ShareCodeInputError } {
+  const nameError = validateModeName(modeName);
+  if (nameError) return { ok: false, body: { error: 'invalid_mode_name', message: nameError } };
+  if (homeOrg === undefined || homeOrg === '') {
+    const message = 'home_org query parameter is required';
+    return { ok: false, body: { error: 'home_org_required', message, field: 'home_org' } };
+  }
+  // A key KV would reject is caller input, not a transient failure.
+  for (const [field, value] of [
+    ['org', org],
+    ['home_org', homeOrg],
+  ] as const) {
+    const message = invalidOrgError(value);
+    if (message !== null) return { ok: false, body: { error: 'invalid_org', message, field } };
+  }
+  return { ok: true, homeOrg };
+}
+
+/**
+ * Response for a share-code failure, logged exactly once: a retryable
+ * ShareCodeUnavailableError at warn with its detail (503), anything else at
+ * error (500).
+ */
+function shareCodeFailure(
+  error: unknown,
+  logger: RequestLogger,
+  ctx: { org: string; home_org: string }
+): { body: Record<string, unknown>; status: 500 | 503 } {
+  if (error instanceof ShareCodeUnavailableError) {
+    logger.warn('mode_share_code_unavailable', {
+      ...ctx,
+      detail: error.detail,
+      key: error.key,
+      cause: error.cause instanceof Error ? error.cause.message : undefined,
+    });
+    return {
+      status: 503,
+      body: {
+        error: 'modes_unavailable',
+        detail: error.detail,
+        message: 'Published modes could not be read consistently; retry',
+      },
+    };
+  }
+  logger.error('admin_action', error, { action: 'get_mode_share_code', ...ctx });
+  return { status: 500, body: { error: 'Failed to compute mode share code' } };
+}
+
+/**
+ * Authoritative WhatsApp chat code for a mode (admin-portal#345). Answers by
+ * running the chat path's own read, merge and classifier from `home_org`'s
+ * point of view (see src/utils/mode-share-code.ts). A missing org or mode is a
+ * 404 with `error: 'mode_not_found'`, so a caller can tell it from a 404 on a
+ * route an older worker does not have.
+ */
+app.get('/api/v1/admin/orgs/:org/modes/:modeName/share-code', async (c) => {
+  const org = c.req.param('org');
+  const modeName = c.req.param('modeName');
+  const logger = c.get('logger');
+
+  const input = shareCodeInput(org, c.req.query('home_org'), modeName);
+  if (!input.ok) return c.json(input.body, 400);
+  const { homeOrg } = input;
+
+  try {
+    const kv = c.env.PROMPT_OVERRIDES;
+    const loaded = await loadShareCodeTarget(kv, { org, homeOrg, modeName }, logger);
+    if (loaded.kind === 'mode_not_found') {
+      return c.json({ error: 'mode_not_found', message: `Mode '${modeName}' not found` }, 404);
+    }
+    if (loaded.kind === 'corrupt_record') {
+      // The only log line for this case (the loader does not log it).
+      logger.error('admin_action', new Error('corrupt_modes_record'), {
+        action: 'get_mode_share_code',
+        org,
+        home_org: homeOrg,
+        key: loaded.key,
+      });
+      return c.json(
+        {
+          error: 'corrupt_modes_record',
+          message: `Stored modes for '${org}' are not a valid modes record`,
+        },
+        500
+      );
+    }
+
+    const answer = await resolveModeShareCode(kv, loaded.target, logger);
+    logger.log('admin_action', {
+      action: 'get_mode_share_code',
+      org,
+      home_org: homeOrg,
+      mode_name: loaded.target.mode.name,
+      code: answer.code,
+      resolves: answer.resolves,
+      reason: answer.reason,
+    });
+    return c.json({ ...answer, home_has_modes: loaded.homeHasModes, worker_version: APP_VERSION });
+  } catch (error) {
+    const failure = shareCodeFailure(error, logger, { org, home_org: homeOrg });
+    return c.json(failure.body, failure.status);
   }
 });
 
