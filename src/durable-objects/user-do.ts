@@ -856,6 +856,9 @@ export class UserDO {
   /** Sliding window timestamps for enqueue rate limiting */
   private enqueueTimestamps: number[] = [];
 
+  /** Count of `releaseLock` calls; lets an in-flight `refreshLock` see a release (#481). */
+  private lockReleases = 0;
+
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
     this.env = env;
@@ -1955,6 +1958,8 @@ export class UserDO {
   }
 
   private async releaseLock(): Promise<void> {
+    // Bumped before the delete is issued, so a refresh already in flight sees it.
+    this.lockReleases += 1;
     await this.state.storage.delete(PROCESSING_LOCK_KEY);
   }
 
@@ -1964,10 +1969,17 @@ export class UserDO {
    * message takes the lock over, so two turns run at once. Only an existing
    * lock is refreshed: a released lock is never re-created. A crashed turn
    * stops refreshing, so its lock still goes stale as before.
+   *
+   * The refresh is fire-and-forget, so `releaseLock` can run while its `get`
+   * is in flight; the get then returns the pre-release timestamp. The release
+   * counter closes that window: the put is issued synchronously after the
+   * check, so a release either happened before it (skip) or is ordered after
+   * it (its delete wins).
    */
   private async refreshLock(): Promise<void> {
+    const releasesBefore = this.lockReleases;
     const lock = await this.state.storage.get<number>(PROCESSING_LOCK_KEY);
-    if (lock === undefined) return;
+    if (lock === undefined || this.lockReleases !== releasesBefore) return;
     await this.state.storage.put(PROCESSING_LOCK_KEY, Date.now());
   }
 

@@ -21,21 +21,22 @@ interface LockInternals {
   releaseLock(): Promise<void>;
 }
 
-function createDO(): { userDo: LockInternals; store: Map<string, unknown> } {
+function createDO() {
   const store = new Map<string, unknown>();
+  const storage = {
+    get: vi.fn(async (key: string): Promise<unknown> => store.get(key)),
+    put: vi.fn(async (key: string, value: unknown) => {
+      store.set(key, value);
+    }),
+    delete: vi.fn(async (key: string) => store.delete(key)),
+    setAlarm: vi.fn(async () => undefined),
+  };
   const state = {
-    storage: {
-      get: vi.fn(async (key: string) => store.get(key)),
-      put: vi.fn(async (key: string, value: unknown) => {
-        store.set(key, value);
-      }),
-      delete: vi.fn(async (key: string) => store.delete(key)),
-      setAlarm: vi.fn(async () => undefined),
-    },
+    storage,
     blockConcurrencyWhile: <T>(fn: () => Promise<T>) => fn(),
   } as unknown as DurableObjectState;
   const env = { DEFAULT_ORG: 'unfoldingWord' } as unknown as Env;
-  return { userDo: new UserDO(state, env) as unknown as LockInternals, store };
+  return { userDo: new UserDO(state, env) as unknown as LockInternals, store, storage };
 }
 
 afterEach(() => {
@@ -76,6 +77,27 @@ describe('processing lock refresh (#481)', () => {
     await userDo.releaseLock();
 
     await userDo.refreshLock();
+
+    expect(store.has(PROCESSING_LOCK_KEY)).toBe(false);
+    expect(await userDo.tryAcquireLock()).toBe(true);
+  });
+
+  it('a refresh in flight when the lock is released does not put it back', async () => {
+    const { userDo, store, storage } = createDO();
+    expect(await userDo.tryAcquireLock()).toBe(true);
+
+    // Hold the refresh's read open; it will return the pre-release timestamp,
+    // as a get issued before the delete does.
+    const staleValue = store.get(PROCESSING_LOCK_KEY);
+    let releaseRead: () => void = () => undefined;
+    storage.get.mockImplementationOnce(
+      () => new Promise((resolve) => (releaseRead = () => resolve(staleValue)))
+    );
+    const refreshing = userDo.refreshLock();
+
+    await userDo.releaseLock();
+    releaseRead();
+    await refreshing;
 
     expect(store.has(PROCESSING_LOCK_KEY)).toBe(false);
     expect(await userDo.tryAcquireLock()).toBe(true);
