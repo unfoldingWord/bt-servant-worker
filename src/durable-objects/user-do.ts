@@ -51,6 +51,7 @@ import { DEFAULT_ORG_CONFIG, OrgConfig } from '../types/org-config.js';
 import {
   DEFAULT_PROMPT_VALUES,
   isModeVisible,
+  chatTriggerModeOptions,
   ModeContext,
   mergePromptOverrides,
   PROMPT_OVERRIDE_SLOTS,
@@ -2317,9 +2318,10 @@ export class UserDO {
   ) {
     const isGroupChat = this.isGroupChatType(body);
     const classified = classifyTriggers(loaded.messageText, {
-      availableModes: loaded.orgModes.modes
-        .filter((m) => isModeVisible(m, { isGroupChat, isAdmin: loaded.isAdmin }))
-        .map((m) => ({ name: m.name, label: m.label, aliases: m.aliases })),
+      availableModes: chatTriggerModeOptions(loaded.orgModes.modes, {
+        isGroupChat,
+        isAdmin: loaded.isAdmin,
+      }),
       availableLanguages: loaded.orgLanguages.languages
         .filter((l) => loaded.isAdmin || l.published === true)
         .map((l) => ({ name: l.name, label: l.label })),
@@ -3353,9 +3355,9 @@ export class UserDO {
     if (reason === 'missing' || reason === 'unpublished' || reason === 'requires-group') {
       logger.warn('mode_not_found', {
         active_mode: requestedModeName,
-        available_modes: orgModes.modes
-          .filter((m) => isModeVisible(m, { isGroupChat, isAdmin }))
-          .map((m) => m.name),
+        available_modes: chatTriggerModeOptions(orgModes.modes, { isGroupChat, isAdmin }).map(
+          (m) => m.name
+        ),
         reason,
       });
     }
