@@ -2062,6 +2062,8 @@ app.post(`${PARTNER_KEYS_BASE}/:keyId/_import-legacy-users`, async (c) => {
       importLegacyUsers(c.env, key, body.input, {
         logger,
         requestId: c.get('requestId'),
+        // Renewed before each user and before any cleanup delete; false = lost.
+        renewLease: () => keyStore(c).renewImportLease(key.userNamespace, holder),
         // Re-read from the store before each batch; a key that is gone counts as revoked.
         currentStatus: async () => {
           const now = await keyStore(c).get(keyId);

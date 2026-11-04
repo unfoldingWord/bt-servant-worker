@@ -53,12 +53,25 @@ async function readOp(request: Request, logger: RequestLogger): Promise<PartnerK
  * every key in a rotation chain shares the namespace and so writes the same
  * audio partition. A second import into it while one runs could delete
  * audio the first one just wrote (each run's cleanup removes what it wrote,
- * and the other run may already be reusing it). The TTL only covers a run
- * that died without releasing; a live run releases in `finally`.
+ * and the other run may already be reusing it). A live run renews its lease
+ * before each user and before any cleanup delete, so it never outlives the
+ * TTL, and releases it in `finally`; the TTL only frees the lease of a run
+ * that died. While a holder has not released (and keeps renewing), no other
+ * holder can acquire it.
  */
 const IMPORT_LEASE_PREFIX = 'import-lease:';
 export const IMPORT_LEASE_TTL_MS = 10 * 60 * 1000;
 type ImportLease = { holder: string; expiresAt: number };
+type LeaseOp = Extract<
+  PartnerKeyStoreOp,
+  { op: 'acquireImportLease' | 'renewImportLease' | 'releaseImportLease' }
+>;
+const LEASE_OPS: ReadonlySet<string> = new Set([
+  'acquireImportLease',
+  'renewImportLease',
+  'releaseImportLease',
+]);
+const isLeaseOp = (op: PartnerKeyStoreOp): op is LeaseOp => LEASE_OPS.has(op.op);
 
 /** Request id used when the worker sent none (it always does); never random. */
 const NO_REQUEST_ID = 'partner-key-store:no-request-id';
@@ -189,6 +202,20 @@ export class PartnerKeyStoreDO {
     return { acquired: true };
   }
 
+  /**
+   * Extend `holder`'s lease by the TTL. Refused (`renewed: false`) when another
+   * holder owns it now, or when there is none (it expired and was retaken and
+   * released): the caller has lost it and must stop. An expired lease still
+   * held by `holder` (nobody took it) is renewed. Runs serialized.
+   */
+  private async renewImportLease(namespace: string, holder: string): Promise<{ renewed: boolean }> {
+    const key = `${IMPORT_LEASE_PREFIX}${namespace}`;
+    const lease = await this.state.storage.get<ImportLease>(key);
+    if (lease?.holder !== holder) return { renewed: false };
+    await this.state.storage.put(key, { holder, expiresAt: Date.now() + IMPORT_LEASE_TTL_MS });
+    return { renewed: true };
+  }
+
   /** Delete the lease only if `holder` still holds it (an expired one may have been retaken). */
   private async releaseImportLease(
     namespace: string,
@@ -201,12 +228,20 @@ export class PartnerKeyStoreDO {
     return { released: true };
   }
 
+  /** The import-lease operations (see IMPORT_LEASE_PREFIX). */
+  private runLeaseOp(op: LeaseOp): Promise<unknown> {
+    if (op.op === 'acquireImportLease') return this.acquireImportLease(op.namespace, op.holder);
+    if (op.op === 'renewImportLease') return this.renewImportLease(op.namespace, op.holder);
+    return this.releaseImportLease(op.namespace, op.holder);
+  }
+
   /** Dispatch one operation; undefined for an unknown op. */
   private async run(
     op: PartnerKeyStoreOp,
     logger: RequestLogger,
     requestId: string
   ): Promise<unknown> {
+    if (isLeaseOp(op)) return this.runLeaseOp(op);
     const ledger = this.ledger(logger, requestId);
     switch (op.op) {
       case 'create':
@@ -219,10 +254,6 @@ export class PartnerKeyStoreDO {
         return ledger.revoke(op.id, op.revokedBy);
       case 'rotate':
         return ledger.rotate(op.id, { createdBy: op.createdBy, graceSeconds: op.graceSeconds });
-      case 'acquireImportLease':
-        return this.acquireImportLease(op.namespace, op.holder);
-      case 'releaseImportLease':
-        return this.releaseImportLease(op.namespace, op.holder);
       default:
         return undefined;
     }

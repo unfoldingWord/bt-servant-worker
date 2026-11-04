@@ -18,7 +18,10 @@
 
 import { env, runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { PartnerKeyStoreDO } from '../../src/durable-objects/partner-key-store-do';
+import {
+  IMPORT_LEASE_TTL_MS,
+  type PartnerKeyStoreDO,
+} from '../../src/durable-objects/partner-key-store-do';
 import {
   AUTH_UPDATE_PENDING,
   PartnerKeyLedger,
@@ -720,5 +723,80 @@ describe('the failed-alarm re-arm runs inside the operation chain', () => {
       arm.mockRestore();
       list.mockRestore();
     }
+  });
+});
+
+/** One import-lease operation through the DO's fetch, as the worker's store client sends it. */
+async function leaseOp(
+  op: 'acquireImportLease' | 'renewImportLease' | 'releaseImportLease',
+  namespace: string,
+  holder: string
+): Promise<Record<string, boolean>> {
+  const res = await stub().fetch('https://partner-key-store/op', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Request-ID': REQUEST_ID },
+    body: JSON.stringify({ op, namespace, holder }),
+  });
+  expect(res.status).toBe(200);
+  return (await res.json()) as Record<string, boolean>;
+}
+
+const leaseKey = (namespace: string) => `import-lease:${namespace}`;
+
+/** Move a lease's expiry, as if time had passed (`expiresAt` relative to now). */
+async function setLeaseExpiry(namespace: string, expiresAt: number): Promise<void> {
+  await runInDurableObject(stub(), async (_i: PartnerKeyStoreDO, state) => {
+    const lease = await state.storage.get<{ holder: string }>(leaseKey(namespace));
+    if (!lease) throw new Error('no lease');
+    await state.storage.put(leaseKey(namespace), { ...lease, expiresAt });
+  });
+}
+
+async function leaseExpiry(namespace: string): Promise<number | undefined> {
+  return runInDurableObject(stub(), async (_i: PartnerKeyStoreDO, state) => {
+    const lease = await state.storage.get<{ expiresAt: number }>(leaseKey(namespace));
+    return lease?.expiresAt;
+  });
+}
+
+describe('import lease: a holder that keeps renewing is never displaced', () => {
+  it('the same holder renews past the 10-minute mark; a second holder stays refused', async () => {
+    const ns = 'ns-lease-renew';
+    expect(await leaseOp('acquireImportLease', ns, 'run-a')).toEqual({ acquired: true });
+    // Ten minutes on, the lease is about to run out (1 ms left)...
+    await setLeaseExpiry(ns, Date.now() + 1);
+    expect(await leaseOp('renewImportLease', ns, 'run-a')).toEqual({ renewed: true });
+    // ...and the renewal pushed it a full TTL ahead.
+    expect(await leaseExpiry(ns)).toBeGreaterThan(Date.now() + IMPORT_LEASE_TTL_MS - 60_000);
+    expect(await leaseOp('acquireImportLease', ns, 'run-b')).toEqual({ acquired: false });
+  });
+
+  it('a second holder is refused until the first releases', async () => {
+    const ns = 'ns-lease-release';
+    expect(await leaseOp('acquireImportLease', ns, 'run-a')).toEqual({ acquired: true });
+    expect(await leaseOp('acquireImportLease', ns, 'run-b')).toEqual({ acquired: false });
+    expect(await leaseOp('renewImportLease', ns, 'run-b')).toEqual({ renewed: false });
+    expect(await leaseOp('releaseImportLease', ns, 'run-b')).toEqual({ released: false });
+    expect(await leaseOp('acquireImportLease', ns, 'run-b')).toEqual({ acquired: false });
+    expect(await leaseOp('releaseImportLease', ns, 'run-a')).toEqual({ released: true });
+    expect(await leaseOp('acquireImportLease', ns, 'run-b')).toEqual({ acquired: true });
+  });
+
+  it('a holder whose lease ran out and was taken over cannot renew it: the lease is lost', async () => {
+    const ns = 'ns-lease-lost';
+    expect(await leaseOp('acquireImportLease', ns, 'run-a')).toEqual({ acquired: true });
+    await setLeaseExpiry(ns, Date.now() - 1); // run-a stopped renewing (it died)
+    expect(await leaseOp('acquireImportLease', ns, 'run-b')).toEqual({ acquired: true });
+    expect(await leaseOp('renewImportLease', ns, 'run-a')).toEqual({ renewed: false });
+    expect(await leaseOp('releaseImportLease', ns, 'run-a')).toEqual({ released: false });
+    expect(await leaseOp('renewImportLease', ns, 'run-b')).toEqual({ renewed: true });
+  });
+
+  it('an expired lease nobody took is still its holder’s to renew', async () => {
+    const ns = 'ns-lease-expired-own';
+    expect(await leaseOp('acquireImportLease', ns, 'run-a')).toEqual({ acquired: true });
+    await setLeaseExpiry(ns, Date.now() - 1);
+    expect(await leaseOp('renewImportLease', ns, 'run-a')).toEqual({ renewed: true });
+    expect(await leaseOp('acquireImportLease', ns, 'run-b')).toEqual({ acquired: false });
   });
 });

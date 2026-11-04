@@ -72,8 +72,13 @@ const IMPORT_CONCURRENCY = 5;
  * do not fit are reported `deferred`; re-running the import continues.
  */
 export const LEGACY_IMPORT_OPERATION_BUDGET = 800;
-/** Durable Object calls per user: destination preflight, source export, destination import. */
-const DO_OPERATIONS_PER_USER = 3;
+/**
+ * Durable Object calls per user: lease renewal, destination preflight, source
+ * export, destination import.
+ */
+const DO_OPERATIONS_PER_USER = 4;
+/** Operations a cleanup can take: the R2 delete and the lease renewal before it. */
+const CLEANUP_OPERATIONS = 2;
 const IMPORT_FIELDS: ReadonlySet<string> = new Set(['legacyClientId', 'userIds']);
 
 export type LegacyImportInput = { legacyClientId: string; userIds: string[] };
@@ -173,7 +178,45 @@ type ImportContext = {
   requestId: string;
   logger: RequestLogger;
   budget: OperationBudget;
+  lease: ImportLease;
 };
+
+/**
+ * The run's hold on its import lease (PartnerKeyStoreDO). `hold()` renews it
+ * (a DO call) and is called before each user and before any cleanup delete,
+ * so a live run never outlives the lease TTL. Once a renewal is refused (or
+ * fails), the lease counts as lost for good: the run copies and deletes
+ * nothing more, and every user not yet done is `deferred`.
+ */
+class ImportLease {
+  private lost = false;
+  constructor(
+    private readonly renew: () => Promise<boolean>,
+    private readonly logger: RequestLogger,
+    private readonly keyId: string
+  ) {}
+
+  get isLost(): boolean {
+    return this.lost;
+  }
+
+  async hold(): Promise<boolean> {
+    if (this.lost) return false;
+    let renewed = false;
+    try {
+      renewed = await this.renew();
+    } catch (error) {
+      this.logger.error('partner_key_legacy_import_lease_renew_failed', error, {
+        key_id: this.keyId,
+      });
+    }
+    if (!renewed && !this.lost) {
+      this.lost = true;
+      this.logger.warn('partner_key_legacy_import_lease_lost', { key_id: this.keyId });
+    }
+    return renewed;
+  }
+}
 
 /**
  * The operations left for this request (LEGACY_IMPORT_OPERATION_BUDGET).
@@ -225,6 +268,25 @@ async function destinationRefusal(
   return ((await res.json()) as { reason: 'destination_not_empty' | 'destination_busy' }).reason;
 }
 
+/** The source user's exported entries, or why it is not copied (busy, not found, someone else's). */
+async function exportOwnedSource(
+  ctx: ImportContext,
+  userId: string
+): Promise<
+  | { ok: true; entries: [string, unknown][] }
+  | { ok: false; status: 'source_busy' | 'not_found' | 'client_mismatch' }
+> {
+  const source = await userDoFetch(ctx, `user:${ctx.key.org}:${userId}`);
+  if (source.status === 409) return { ok: false, status: 'source_busy' };
+  if (!source.ok) throw new Error(`source export failed with ${source.status}`);
+  const exported = (await source.json()) as UserDataExport;
+  if (exported.identity === null) return { ok: false, status: 'not_found' };
+  if (!ownedByLegacyClient(exported.identity, ctx.key.org, ctx.legacyClientId)) {
+    return { ok: false, status: 'client_mismatch' };
+  }
+  return { ok: true, entries: exported.entries };
+}
+
 /**
  * One user, in this order: budget, destination preflight (read-only), source
  * export and ownership checks, budget for its audio, audio copy, then the
@@ -233,19 +295,17 @@ async function destinationRefusal(
  */
 async function copyOneUser(ctx: ImportContext, userId: string): Promise<LegacyImportResult> {
   if (!ctx.budget.start(DO_OPERATIONS_PER_USER)) return { userId, status: 'deferred' };
+  if (!(await ctx.lease.hold())) return { userId, status: 'deferred' };
   const refused = await destinationRefusal(ctx, userId);
   if (refused) return { userId, status: refused };
-  const source = await userDoFetch(ctx, `user:${ctx.key.org}:${userId}`);
-  if (source.status === 409) return { userId, status: 'source_busy' };
-  if (!source.ok) throw new Error(`source export failed with ${source.status}`);
-  const exported = (await source.json()) as UserDataExport;
-  if (exported.identity === null) return { userId, status: 'not_found' };
-  if (!ownedByLegacyClient(exported.identity, ctx.key.org, ctx.legacyClientId)) {
-    return { userId, status: 'client_mismatch' };
-  }
+  const exported = await exportOwnedSource(ctx, userId);
+  if (!exported.ok) return { userId, status: exported.status };
   const audioKeys = referencedAudioKeys(exported.entries).length;
-  const audioOperations = audioKeys * R2_OPERATIONS_PER_AUDIO_OBJECT + (audioKeys > 0 ? 1 : 0);
+  const audioOperations =
+    audioKeys * R2_OPERATIONS_PER_AUDIO_OBJECT + (audioKeys > 0 ? CLEANUP_OPERATIONS : 0);
   if (!ctx.budget.take(audioOperations)) return { userId, status: 'deferred' };
+  // Another user of this run may have found the lease lost meanwhile: copy nothing.
+  if (ctx.lease.isLost) return { userId, status: 'deferred' };
   return copyWithAudio(ctx, userId, exported.entries);
 }
 
@@ -259,7 +319,7 @@ async function copyWithAudio(
   const target = { org: key.org, namespace: key.userNamespace, subject: userId };
   const audio = await rehomeHistoryAudio(env.AUDIO_BUCKET, entries, target, logger);
   if (!audio.ok) {
-    await removeRehomedAudio(env.AUDIO_BUCKET, audio.written, logger);
+    await removeIfLeaseHeld(ctx, userId, audio.written);
     logger.warn('partner_key_legacy_import_audio_copy_failed_user', {
       key_id: key.id,
       user_id: userId,
@@ -271,7 +331,7 @@ async function copyWithAudio(
     case 'imported':
       return { userId, status: 'copied', entries: outcome.imported, audio: audio.counts };
     case 'refused':
-      await removeRehomedAudio(env.AUDIO_BUCKET, audio.written, logger);
+      await removeIfLeaseHeld(ctx, userId, audio.written);
       return { userId, status: outcome.status };
     case 'unknown':
       logger.error('partner_key_legacy_import_outcome_unknown', outcome.error, {
@@ -281,6 +341,28 @@ async function copyWithAudio(
       });
       return { userId, status: 'import_outcome_unknown', audio: audio.counts };
   }
+}
+
+/**
+ * Remove this run's copies, but only while the run still holds its lease:
+ * without it, another import may already be reusing them. Kept copies are
+ * harmless (a later run reuses them) and are logged.
+ */
+async function removeIfLeaseHeld(
+  ctx: ImportContext,
+  userId: string,
+  written: string[]
+): Promise<void> {
+  if (written.length === 0) return;
+  if (await ctx.lease.hold()) {
+    await removeRehomedAudio(ctx.env.AUDIO_BUCKET, written, ctx.logger);
+    return;
+  }
+  ctx.logger.warn('partner_key_legacy_import_audio_kept_lease_lost', {
+    key_id: ctx.key.id,
+    user_id: userId,
+    count: written.length,
+  });
 }
 
 /** What the destination write did, as far as the answer shows. */
@@ -354,6 +436,12 @@ export async function importLegacyUsers(
     requestId: string;
     /** The key's status NOW (re-read before each batch). */
     currentStatus: () => Promise<PartnerKeyStatus>;
+    /**
+     * Renew the run's import lease; false when another holder owns it now.
+     * Called before each user and before any cleanup delete. Default: always
+     * held (callers that run without a lease, such as unit tests).
+     */
+    renewLease?: () => Promise<boolean>;
     /** Override LEGACY_IMPORT_OPERATION_BUDGET (tests). */
     operationBudget?: number;
   }
@@ -365,6 +453,7 @@ export async function importLegacyUsers(
     requestId: opts.requestId,
     logger: opts.logger,
     budget: new OperationBudget(opts.operationBudget ?? LEGACY_IMPORT_OPERATION_BUDGET),
+    lease: new ImportLease(opts.renewLease ?? (async () => true), opts.logger, key.id),
   };
   const results: LegacyImportResult[] = [];
   for (let i = 0; i < input.userIds.length; i += IMPORT_CONCURRENCY) {
@@ -372,7 +461,12 @@ export async function importLegacyUsers(
     // the users not yet copied are reported `key_revoked` / `key_expired`.
     // If the status cannot be read, stop too: `status_check_failed`.
     // The status read is a Durable Object call too: out of budget → deferred.
-    const stopped = ctx.budget.start(1) ? await stopReason(key, opts) : 'deferred';
+    // A lost lease stops the run: nothing more is copied or deleted.
+    const stopped = ctx.lease.isLost
+      ? 'deferred'
+      : ctx.budget.start(1)
+        ? await stopReason(key, opts)
+        : 'deferred';
     if (stopped) {
       results.push(...input.userIds.slice(i).map((userId) => ({ userId, status: stopped })));
       break;

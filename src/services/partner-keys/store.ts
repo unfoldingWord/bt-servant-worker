@@ -56,6 +56,7 @@ export type PartnerKeyStoreOp =
   | { op: 'revoke'; id: string; revokedBy?: string }
   | { op: 'rotate'; id: string; createdBy?: string; graceSeconds: number }
   | { op: 'acquireImportLease'; namespace: string; holder: string }
+  | { op: 'renewImportLease'; namespace: string; holder: string }
   | { op: 'releaseImportLease'; namespace: string; holder: string };
 
 export type CreateOutcome = { record: PartnerKeyRecord; plaintext: string; warnings: string[] };
@@ -100,6 +101,9 @@ export function partnerKeyStore(ns: DurableObjectNamespace, requestId: string) {
      */
     acquireImportLease: async (namespace: string, holder: string) =>
       (await call<{ acquired: boolean }>({ op: 'acquireImportLease', namespace, holder })).acquired,
+    /** Extend the lease for `holder`; false when another holder owns it now. */
+    renewImportLease: async (namespace: string, holder: string) =>
+      (await call<{ renewed: boolean }>({ op: 'renewImportLease', namespace, holder })).renewed,
     /** Release the lease if `holder` still holds it. */
     releaseImportLease: async (namespace: string, holder: string) => {
       await call<{ released: boolean }>({ op: 'releaseImportLease', namespace, holder });

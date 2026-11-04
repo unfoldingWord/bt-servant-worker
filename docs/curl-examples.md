@@ -677,8 +677,11 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_
 - One import per key chain at a time: while an import into the same user
   namespace is running (the same key, or another key of its rotation
   chain), another gets `409` with `code: "import_in_progress"` and does
-  nothing.
-  (A run that died without finishing stops blocking after 10 minutes.)
+  nothing. A running import renews its lease before each user and before
+  any cleanup, so it keeps it however long it runs; a run that died stops
+  blocking after 10 minutes. If a run ever loses its lease, it copies and
+  deletes nothing more and reports the users not yet done as `deferred`
+  (re-run the import for them).
 - Per user, in this order: a read-only check that the destination is empty
   and idle (otherwise `destination_not_empty` / `destination_busy`, with
   nothing copied), the source export, the audio copy, then the write (which
