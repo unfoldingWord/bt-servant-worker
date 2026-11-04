@@ -751,9 +751,72 @@ describe('share-code logging — shared reader', () => {
 });
 
 describe('loadShareCodeTarget — target selection follows chat (round 7)', () => {
+  it('[draft x, published x] on a home org: chat resolves the draft first and opens nothing (collision)', async () => {
+    const kv = fakeKv({
+      [`${HOME}:modes`]: { modes: [{ name: 'x', overrides: {} }, published('x')] },
+    });
+    expect(await resolve(kv, HOME, 'x')).toEqual({
+      code: 'x',
+      resolves: false,
+      reason: 'collision',
+    });
+  });
+
+  it('[group-only x, published x] on a home org: chat resolves the group-only one first (collision)', async () => {
+    const kv = fakeKv({
+      [`${HOME}:modes`]: { modes: [published('x', { requires_group: true }), published('x')] },
+    });
+    expect(await resolve(kv, HOME, 'x')).toEqual({
+      code: 'x',
+      resolves: false,
+      reason: 'collision',
+    });
+  });
+
   it('[draft x, published x] on a foreign org selects the one the merge keeps', async () => {
     const kv = fakeKv({ 'pbt:modes': { modes: [{ name: 'x', overrides: {} }, published('x')] } });
     expect(await resolve(kv, 'pbt', 'x')).toMatchObject({ code: 'pbt/x', resolves: true });
+  });
+});
+
+describe('loadShareCodeTarget — alias shadowing and parity (bench round 1)', () => {
+  it('[a with alias b, b]: the target is the mode NAMED b, but chat opens a (collision naming home)', async () => {
+    const kv = fakeKv({
+      [`${HOME}:modes`]: { modes: [published('a', { aliases: ['b'] }), published('b')] },
+    });
+    const loaded = await loadShareCodeTarget(
+      kv,
+      { org: HOME, homeOrg: HOME, modeName: 'b' },
+      spyLogger()
+    );
+    expect(loaded.kind === 'ok' && loaded.target.mode.name).toBe('b');
+    expect(await resolve(kv, HOME, 'b')).toEqual({
+      code: 'b',
+      resolves: false,
+      reason: 'collision',
+      resolved_org: HOME,
+    });
+  });
+
+  it('parity: each verdict agrees with the DO pipeline (classifier, then resolveEffectiveMode)', async () => {
+    const records: PromptMode[][] = [
+      [{ name: 'x', overrides: {} }, published('x')],
+      [published('x', { requires_group: true }), published('x')],
+      [published('a', { aliases: ['x'] }), published('x')],
+      [published('x')],
+    ];
+    for (const modes of records) {
+      const kv = fakeKv({ [`${HOME}:modes`]: { modes } });
+      const chatOpens = resolveEffectiveMode(
+        { modes },
+        classifyTriggers('#x', {
+          availableModes: chatTriggerModeOptions(modes, { isGroupChat: false, isAdmin: false }),
+          availableLanguages: [],
+        }).modeName,
+        { includeUnpublished: false, isGroupChat: false }
+      ).effectiveModeName;
+      expect((await resolve(kv, HOME, 'x')).resolves).toBe(chatOpens === 'x');
+    }
   });
 
   it('an alias still selects its mode when no mode has that name', async () => {
@@ -807,7 +870,7 @@ async function chatOpens(kv: KVNamespace, homeOrg: string, code: string) {
   }).effectiveModeName;
 }
 
-describe('share-code parity with chat: the effective-mode step (bench round 1, Frank P2)', () => {
+describe('share-code parity with chat through the chat read path (bench round 1, Frank P2)', () => {
   const cases: Array<[string, unknown[]]> = [
     [
       '[draft x, published x]: chat rejects the draft it finds first',
@@ -839,7 +902,7 @@ describe('share-code parity with chat: the effective-mode step (bench round 1, F
     expect(await resolve(kv, HOME, 'x')).toEqual({
       code: 'x',
       resolves: false,
-      reason: 'ambiguous',
+      reason: 'collision',
       resolved_org: HOME,
     });
   });

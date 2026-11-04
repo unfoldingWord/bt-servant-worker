@@ -24,8 +24,8 @@
  */
 import { classifyTriggers, type MatchTier } from '../services/classifier/index.js';
 import type { ChatMode, PromptMode } from '../types/prompt-overrides.js';
-import { resolveEffectiveMode } from '../types/mode-markdown.js';
 import { chatTriggerModeOptions } from '../types/prompt-overrides.js';
+import { resolveEffectiveMode } from '../types/mode-markdown.js';
 import {
   compareOrgs,
   CorruptModesRecordError,
@@ -142,21 +142,32 @@ function staticReason(target: ShareCodeTarget, isHome: boolean): ShareCodeReason
   return null;
 }
 
-/** What the classifier actually selected for the message `#<code>`, with its provenance. */
+/**
+ * The mode chat actually opens for the message `#<code>`, with its provenance.
+ * `shadowedName` is set when the classifier selected a name that chat's
+ * downstream lookup (`resolveEffectiveMode`) then rejected or redirected.
+ */
 type ActualMatch =
   | { kind: 'clear' }
-  | { kind: 'none' }
-  | { kind: 'mode'; name: string; tier: MatchTier | undefined; whole: boolean; org: string };
+  | { kind: 'none'; shadowedName?: string }
+  | {
+      kind: 'mode';
+      name: string;
+      tier: MatchTier | undefined;
+      whole: boolean;
+      org: string;
+      shadowedName?: string;
+    };
 
 /**
- * Run the chat path's two steps for the message `#<code>` and report the mode
- * chat would actually OPEN: `classifyTriggers` (leading-token extraction
- * included) picks a mode name, then `resolveEffectiveMode` (what the DO's
- * `resolveModeOverride` runs on that name, for a non-admin private chat)
- * decides which stored mode, if any, takes effect. That second step can
- * reject the pick (a draft or group-only element found first) or land on
- * another mode (an earlier element listing the name as an alias), so the
- * answer follows its result, not the classifier's.
+ * Send the message `#<code>` through `classifyTriggers` (leading-token
+ * extraction included), then through the DO's own downstream step,
+ * `resolveEffectiveMode` over the same pool (the DO's `resolveModeOverride`).
+ * That lookup takes the FIRST element whose name or alias matches, so an
+ * earlier draft or group-only duplicate makes chat open nothing, and an
+ * earlier mode aliasing the name makes chat open that mode instead. Report
+ * the mode chat opens, the classifier tier, whether the token consumed the
+ * whole message, and the opened mode's owner.
  */
 function matchCode(code: string, pool: ChatMode[], homeOrg: string): ActualMatch {
   const options = chatTriggerModeOptions(pool, WHATSAPP_CHAT);
@@ -165,21 +176,22 @@ function matchCode(code: string, pool: ChatMode[], homeOrg: string): ActualMatch
     availableLanguages: [],
   });
   if (classified.clearMode) return { kind: 'clear' };
-  if (classified.modeName === undefined) return { kind: 'none' };
-  const effective = resolveEffectiveMode({ modes: pool }, classified.modeName, {
+  const selected = classified.modeName;
+  if (selected === undefined) return { kind: 'none' };
+  const effective = resolveEffectiveMode({ modes: pool }, selected, {
     includeUnpublished: WHATSAPP_CHAT.isAdmin,
     isGroupChat: WHATSAPP_CHAT.isGroupChat,
-  });
-  if (effective.effectiveModeName === undefined) return { kind: 'none' };
-  const owner = pool.find((m) => m.name === effective.effectiveModeName);
-  if (owner === undefined) return { kind: 'none' };
+  }).effectiveModeName;
+  const shadowedName = effective === selected ? undefined : selected;
+  const owner = effective === undefined ? undefined : pool.find((m) => m.name === effective);
+  if (owner === undefined) return { kind: 'none', shadowedName: selected };
   const whole = classified.strippedMessage === '' && classified.unmatchedTriggers.length === 0;
   // Only qualified (foreign) entries are stamped with `org` by the merge; a
   // bare name is always the home org's, whatever a stored record carries.
   const org = owner.name.includes('/') && owner.org !== undefined ? owner.org : homeOrg;
-  // The classifier's tier only describes the opened mode when resolution kept its pick.
-  const tier = effective.resolvedViaAlias ? 'alias' : classified.modeMatchTier;
-  return { kind: 'mode', name: owner.name, tier, whole, org };
+  const tier = classified.modeMatchTier;
+  const base = { kind: 'mode', name: owner.name, tier, whole, org } as const;
+  return shadowedName === undefined ? base : { ...base, shadowedName };
 }
 
 /** The message opened this org's own mode, by its canonical name, on the exact tier, consuming it all. */
@@ -208,7 +220,11 @@ function answerFromMatch(
   if (isOwnExactMatch(match, expected)) {
     return { code, resolves: true, resolved_org: expected.org };
   }
-  const fallback: ShareCodeReason = match.kind === 'mode' ? 'ambiguous' : 'not_found';
+  // The classifier picked this name, but an earlier element of the same pool
+  // claims it in chat's first-match lookup: a collision within the record.
+  const shadowed = match.shadowedName === expected.name;
+  const opened: ShareCodeReason = match.kind === 'mode' ? 'ambiguous' : 'not_found';
+  const fallback: ShareCodeReason = shadowed ? 'collision' : opened;
   const answer: ShareCodeAnswer = { code, resolves: false, reason: whyMissing ?? fallback };
   if (match.kind === 'mode') answer.resolved_org = match.org;
   return answer;

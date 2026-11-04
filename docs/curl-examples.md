@@ -609,7 +609,7 @@ curl -s "http://localhost:$PORT/api/v1/admin/orgs/PBT/modes/obt-coach/share-code
   `requires_group`; `reserved` (a home slug that is a clear token, like
   `default`; `pbt/default` is not one); `capped` (the org is past the
   per-turn foreign-org cap, so the chat path never reads it); `collision`
-  (another org with the same slug claimed the name first, or another mode in this org already uses this name as an alias); `ambiguous` (the
+  (another org with the same slug claimed the name first, or another mode in this org already uses this name as an alias, or an earlier element of this org with the same name or alias wins chat's first-match lookup, such as an earlier draft or group-only duplicate); `ambiguous` (the
   message opens a different mode); `not_found` (it opens nothing).
 - `resolved_org`: the raw org name of the mode `#<code>` actually opens, when
   it opens one. It comes only from the classifier's actual match, run on the
