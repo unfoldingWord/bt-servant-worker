@@ -9,6 +9,8 @@ import { env } from 'cloudflare:test';
 import { describe, expect, it, vi } from 'vitest';
 import type { PromptMode } from '../../src/types/prompt-overrides.js';
 import { chatTriggerModeOptions } from '../../src/types/prompt-overrides.js';
+import { resolveEffectiveMode } from '../../src/types/mode-markdown.js';
+import { classifyTriggers } from '../../src/services/classifier/index.js';
 import { MAX_FOREIGN_ORGS_PER_TURN } from '../../src/utils/cross-org-modes.js';
 import type { RequestLogger } from '../../src/utils/logger.js';
 import {
@@ -746,11 +748,26 @@ describe('share-code logging — shared reader', () => {
 });
 
 describe('loadShareCodeTarget — target selection follows chat (round 7)', () => {
-  it('[draft x, published x] on a home org selects the published one chat serves', async () => {
+  it('[draft x, published x] on a home org: chat resolves the draft first and opens nothing (collision)', async () => {
     const kv = fakeKv({
       [`${HOME}:modes`]: { modes: [{ name: 'x', overrides: {} }, published('x')] },
     });
-    expect(await resolve(kv, HOME, 'x')).toEqual({ code: 'x', resolves: true, resolved_org: HOME });
+    expect(await resolve(kv, HOME, 'x')).toEqual({
+      code: 'x',
+      resolves: false,
+      reason: 'collision',
+    });
+  });
+
+  it('[group-only x, published x] on a home org: chat resolves the group-only one first (collision)', async () => {
+    const kv = fakeKv({
+      [`${HOME}:modes`]: { modes: [published('x', { requires_group: true }), published('x')] },
+    });
+    expect(await resolve(kv, HOME, 'x')).toEqual({
+      code: 'x',
+      resolves: false,
+      reason: 'collision',
+    });
   });
 
   it('[draft x, published x] on a foreign org selects the one the merge keeps', async () => {
@@ -758,11 +775,43 @@ describe('loadShareCodeTarget — target selection follows chat (round 7)', () =
     expect(await resolve(kv, 'pbt', 'x')).toMatchObject({ code: 'pbt/x', resolves: true });
   });
 
-  it('[a with alias b, b]: asking for b selects the mode NAMED b, not the alias owner', async () => {
+  it('[a with alias b, b]: the target is the mode NAMED b, but chat opens a (collision naming home)', async () => {
     const kv = fakeKv({
       [`${HOME}:modes`]: { modes: [published('a', { aliases: ['b'] }), published('b')] },
     });
-    expect(await resolve(kv, HOME, 'b')).toEqual({ code: 'b', resolves: true, resolved_org: HOME });
+    const loaded = await loadShareCodeTarget(
+      kv,
+      { org: HOME, homeOrg: HOME, modeName: 'b' },
+      spyLogger()
+    );
+    expect(loaded.kind === 'ok' && loaded.target.mode.name).toBe('b');
+    expect(await resolve(kv, HOME, 'b')).toEqual({
+      code: 'b',
+      resolves: false,
+      reason: 'collision',
+      resolved_org: HOME,
+    });
+  });
+
+  it('parity: each verdict agrees with the DO pipeline (classifier, then resolveEffectiveMode)', async () => {
+    const records: PromptMode[][] = [
+      [{ name: 'x', overrides: {} }, published('x')],
+      [published('x', { requires_group: true }), published('x')],
+      [published('a', { aliases: ['x'] }), published('x')],
+      [published('x')],
+    ];
+    for (const modes of records) {
+      const kv = fakeKv({ [`${HOME}:modes`]: { modes } });
+      const chatOpens = resolveEffectiveMode(
+        { modes },
+        classifyTriggers('#x', {
+          availableModes: chatTriggerModeOptions(modes, { isGroupChat: false, isAdmin: false }),
+          availableLanguages: [],
+        }).modeName,
+        { includeUnpublished: false, isGroupChat: false }
+      ).effectiveModeName;
+      expect((await resolve(kv, HOME, 'x')).resolves).toBe(chatOpens === 'x');
+    }
   });
 
   it('an alias still selects its mode when no mode has that name', async () => {

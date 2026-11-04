@@ -594,7 +594,7 @@ curl -s "http://localhost:$PORT/api/v1/admin/orgs/PBT/modes/obt-coach/share-code
   "resolves": true,
   "resolved_org": "PBT",
   "home_has_modes": true,
-  "worker_version": "2.59.0"
+  "worker_version": "2.60.0"
 }
 ```
 
@@ -609,7 +609,7 @@ curl -s "http://localhost:$PORT/api/v1/admin/orgs/PBT/modes/obt-coach/share-code
   `requires_group`; `reserved` (a home slug that is a clear token, like
   `default`; `pbt/default` is not one); `capped` (the org is past the
   per-turn foreign-org cap, so the chat path never reads it); `collision`
-  (another org with the same slug claimed the name first, or another mode in this org already uses this name as an alias); `ambiguous` (the
+  (another org with the same slug claimed the name first, or another mode in this org already uses this name as an alias, or an earlier element of this org with the same name or alias wins chat's first-match lookup, such as an earlier draft or group-only duplicate); `ambiguous` (the
   message opens a different mode); `not_found` (it opens nothing).
 - `resolved_org`: the raw org name of the mode `#<code>` actually opens, when
   it opens one. It comes only from the classifier's actual match, run on the
@@ -652,7 +652,7 @@ enforced. With it enforced, `ENGINE_API_KEY` gets `403` with
 | 503    | `{"error":"modes_unavailable","detail":...}`            | retry. `list_failed`: the key listing failed. `listing_lag`: the listing does not show the record yet. `read_failed`: the target record could not be read, or this org's own match could have been pre-empted by an unreadable org with the same slug that sorts first. A corrupt foreign org is skipped, as on the chat path; a failed home read for a foreign mode is not a 503 |
 
 A 404 without `"error":"mode_not_found"` means the route itself is missing (a
-worker older than 2.59.0).
+worker older than 2.60.0).
 
 Cost per call: one get each of `<org>:modes` and `<home_org>:modes` (one get
 when they are the same org). A home mode needs nothing more, because a bare
