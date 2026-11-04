@@ -236,6 +236,13 @@ interface OrchestratorOptions {
    * `orchestrate()` builds its context, which is later than the true start.
    */
   turnStartedAt?: number | undefined;
+  /**
+   * Re-stamp the caller's per-user processing lock (#481). The DO treats a
+   * lock older than 90 s as dead, and a live turn can now run far longer than
+   * that, so the orchestrator calls this at each round start and, throttled,
+   * while a stream is flowing. Absent on paths that hold no lock.
+   */
+  refreshLock?: (() => Promise<void>) | undefined;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
 }
@@ -353,6 +360,8 @@ interface OrchestrationContext {
   turnId: string | undefined;
   /** Epoch ms the turn started; base for the streaming ceiling and recovery gate (#481). */
   turnStartedAt: number;
+  /** Throttled per-user lock refresh (#481); see {@link createLockRefresher}. */
+  lockRefresher: LockRefresher;
   /** Mutable per-run telemetry accumulator. See `TelemetryAccumulator`. */
   telemetry: TelemetryAccumulator;
   catalog: ToolCatalog;
@@ -934,6 +943,53 @@ function streamCeilingRemainingMs(ctx: OrchestrationContext): number {
 /** Whether a rescue-only model call may still start this turn (Seth, 2026-11-04). */
 function canAffordRecoveryCall(ctx: OrchestrationContext): boolean {
   return Date.now() - ctx.turnStartedAt < TURN_RECOVERY_GATE_MS;
+}
+
+/**
+ * Minimum gap between lock refreshes driven by stream chunks (#481). The DO's
+ * stale threshold is 90 s. A refresh is checked on every chunk, and the stall
+ * timer guarantees a chunk at least every 30 s, so a flowing stream re-stamps
+ * the lock at most ~45 s apart. A fixed chunk count would not bound that
+ * (3,557 chunks took 89 s in the #481 incident; a slow stream sends fewer).
+ */
+const LOCK_REFRESH_INTERVAL_MS = 15_000;
+
+/** Why the lock was refreshed, for the failure log. */
+type LockRefreshReason = 'round_start' | 'stream_chunk';
+
+interface LockRefresher {
+  /** Refresh now (round start). */
+  now: (reason: LockRefreshReason) => void;
+  /** Refresh only if the last one is older than {@link LOCK_REFRESH_INTERVAL_MS}. */
+  maybe: (reason: LockRefreshReason) => void;
+}
+
+/**
+ * Wrap the caller's lock refresh (#481). Fire-and-forget by design: the write
+ * must not hold up the stream, so the promise is handled here, and a failed
+ * refresh is logged (the lock then ages as it did before #481).
+ */
+function createLockRefresher(
+  refresh: (() => Promise<void>) | undefined,
+  logger: RequestLogger
+): LockRefresher {
+  let last = Date.now();
+  const run = (reason: LockRefreshReason): void => {
+    if (!refresh) return;
+    last = Date.now();
+    refresh().catch((error: unknown) => {
+      logger.warn('turn_lock_refresh_failed', {
+        reason,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  };
+  return {
+    now: run,
+    maybe: (reason) => {
+      if (Date.now() - last >= LOCK_REFRESH_INTERVAL_MS) run(reason);
+    },
+  };
 }
 
 /** POST a Messages-API body to a route's endpoint with that route's credential (#403). */
@@ -1564,6 +1620,7 @@ async function streamClaudeResponse(ctx: OrchestrationContext): Promise<Anthropi
       signal,
       touch,
       abortKind,
+      onChunk: () => ctx.lockRefresher.maybe('stream_chunk'),
     });
     recordServedModel(ctx, route, parsed);
     ctx.logger.log('claude_fetch_complete', {
@@ -1617,6 +1674,8 @@ interface StreamWatch {
   signal: AbortSignal;
   /** Re-arm the stall timer; called on every chunk. */
   touch: () => void;
+  /** Per-chunk hook: refreshes the per-user lock, throttled (#481). */
+  onChunk?: () => void;
   /** Which timer aborted the read, once one has. */
   abortKind: () => StreamAbortKind | null;
 }
@@ -1722,6 +1781,13 @@ function abortSSEStream(
   throw new ClaudeStreamAbortedError(kind, state.message, stats.bytes);
 }
 
+/** A chunk arrived: re-arm the stall timer and run the per-chunk hook (#481). */
+function noteChunk(watch: StreamWatch | undefined): void {
+  if (!watch) return;
+  watch.touch();
+  watch.onChunk?.();
+}
+
 /** Validate the post-loop SSE state and surface a final Message. */
 function finalizeSSEStream(
   state: SSEParseState,
@@ -1778,7 +1844,7 @@ async function parseSSEStream(
       });
     }
     if (read.result.done) break;
-    watch?.touch();
+    noteChunk(watch);
     stats.chunks += 1;
     stats.bytes += read.result.value.length;
     buffer += decoder.decode(read.result.value, { stream: true });
@@ -2169,6 +2235,7 @@ function processIteration(ctx: OrchestrationContext, iteration: number): Promise
   return withSpan('iteration', { iteration }, async () => {
     const iterStart = Date.now();
     ctx.logger.log('iteration_start', { iteration, message_count: ctx.messages.length });
+    ctx.lockRefresher.now('round_start');
     ctx.logger.log('claude_request', {
       ...(ctx.turnId ? { turn_id: ctx.turnId } : {}),
       iteration,
@@ -2522,6 +2589,7 @@ function createOrchestrationContext(
     mcpCallsMade: { count: 0 },
     turnId: options.turnId,
     turnStartedAt: options.turnStartedAt ?? Date.now(),
+    lockRefresher: createLockRefresher(options.refreshLock, logger),
     telemetry: createTelemetryAccumulator(),
     catalog,
     logger,

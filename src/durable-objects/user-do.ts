@@ -1957,6 +1957,19 @@ export class UserDO {
     await this.state.storage.delete(PROCESSING_LOCK_KEY);
   }
 
+  /**
+   * Re-stamp the processing lock while a turn is live (#481). Without it, a
+   * turn longer than `LOCK_STALE_THRESHOLD_MS` looks dead and the user's next
+   * message takes the lock over, so two turns run at once. Only an existing
+   * lock is refreshed: a released lock is never re-created. A crashed turn
+   * stops refreshing, so its lock still goes stale as before.
+   */
+  private async refreshLock(): Promise<void> {
+    const lock = await this.state.storage.get<number>(PROCESSING_LOCK_KEY);
+    if (lock === undefined) return;
+    await this.state.storage.put(PROCESSING_LOCK_KEY, Date.now());
+  }
+
   // ── Webhook callbacks ─────────────────────────────────────────────────────────
 
   private buildWebhookCallbacks(
@@ -2187,7 +2200,7 @@ export class UserDO {
     const audioContext = this.buildAudioContext();
     const attachmentsContext = createAttachmentsContext();
     // prettier-ignore
-    const orchOpts = { ...this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, triggerCtx.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, triggerCtx.activeModeName, audioContext, attachmentsContext, workerOrigin, logger, callbacks, this.maybeBuildGroupContext(body), triggerCtx.languageDocument, triggerCtx.unmatchedTriggers, loaded.inboundVoiceKey, { triggerOnly: triggerCtx.triggerOnly }), turnId, turnStartedAt: ctx.startTime };
+    const orchOpts = { ...this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, triggerCtx.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, triggerCtx.activeModeName, audioContext, attachmentsContext, workerOrigin, logger, callbacks, this.maybeBuildGroupContext(body), triggerCtx.languageDocument, triggerCtx.unmatchedTriggers, loaded.inboundVoiceKey, { triggerOnly: triggerCtx.triggerOnly }), turnId, turnStartedAt: ctx.startTime, refreshLock: () => this.refreshLock() };
 
     const { orchResult, audioKey } = await this.orchestrateWithAudio(
       ctx,

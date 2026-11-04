@@ -128,7 +128,12 @@ interface TurnResult {
 
 /** Run one streaming turn, advancing fake time until it settles. */
 async function runTurn(
-  opts: { locale?: string; turnStartedAt?: number; advanceMs: number } = { advanceMs: 0 }
+  opts: {
+    locale?: string;
+    turnStartedAt?: number;
+    advanceMs: number;
+    refreshLock?: () => Promise<void>;
+  } = { advanceMs: 0 }
 ): Promise<TurnResult> {
   const logger = createMockLogger();
   const { callbacks, progress } = createMockCallbacks();
@@ -140,6 +145,7 @@ async function runTurn(
     logger,
     callbacks,
     turnStartedAt: opts.turnStartedAt,
+    refreshLock: opts.refreshLock,
   });
   // Attach the rejection handler now so advancing time cannot surface it as unhandled.
   const settled = pending.then(
@@ -358,5 +364,50 @@ describe('max_tokens (#481 comment, Q4 seam)', () => {
     expect(turn.responses).toEqual(['A long answer that ran out', NOTICE_EN]);
     expect(turn.stopReason).toBe('max_tokens');
     expect(findLog(turn.logger, 'warn', 'answer_truncated')).toMatchObject({ cause: 'max_tokens' });
+  });
+});
+
+describe('per-user lock refresh during long turns (#481)', () => {
+  it('refreshes at round start and keeps refreshing well inside 90 s while a 120 s stream flows', async () => {
+    vi.useFakeTimers();
+    const start = Date.now();
+    const refreshedAt: number[] = [];
+    const refreshLock = vi.fn(async () => {
+      refreshedAt.push(Date.now() - start);
+    });
+    const deltas = Array.from({ length: 14 }, (_, i) => `p${i} `);
+    mockTimedSSE(
+      [MESSAGE_START, TEXT_START, ...deltas.map((d) => textDelta(d)), ...finish('end_turn')],
+      { gapMs: 7_000, close: true }
+    );
+
+    const turn = await runTurn({ advanceMs: 200_000, refreshLock });
+
+    expect(turn.responses).toEqual([deltas.join('')]);
+    expect(refreshedAt[0]).toBe(0); // round start
+    const lastChunkAt = 7_000 * (deltas.length + 4);
+    const gaps = [...refreshedAt, lastChunkAt].slice(1).map((t, i) => t - refreshedAt[i]!);
+    expect(Math.max(...gaps)).toBeLessThan(45_000);
+    // Throttled: not one write per chunk.
+    expect(refreshLock.mock.calls.length).toBeLessThan(deltas.length);
+  });
+
+  it('a failing refresh is logged and does not fail the turn', async () => {
+    vi.useFakeTimers();
+    const refreshLock = vi.fn(async () => {
+      throw new Error('storage unavailable');
+    });
+    mockTimedSSE([MESSAGE_START, TEXT_START, textDelta('ok'), ...finish('end_turn')], {
+      gapMs: 10,
+      close: true,
+    });
+
+    const turn = await runTurn({ advanceMs: 1_000, refreshLock });
+
+    expect(turn.responses).toEqual(['ok']);
+    expect(findLog(turn.logger, 'warn', 'turn_lock_refresh_failed')).toMatchObject({
+      reason: 'round_start',
+      error: 'storage unavailable',
+    });
   });
 });
