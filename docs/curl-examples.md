@@ -320,32 +320,13 @@ has no compare-and-swap: two admins writing at once (or a colo holding a stale
 copy of `__global__`) resolve last-write-wins, as with every other admin config
 route today.
 
-**Authentication.** Every `/api/*` request must carry `ENGINE_API_KEY` — the
-global middleware accepts nothing else, and the MCP write routes additionally
-refuse anything but the super admin key (403). The `ORG_ADMIN_KEYS` mechanism
-below is defined in code but not currently reachable; it is kept here as a
-reference for the org-scoped routes, not as a way to reach the global pool.
-
-### Setting Up Org-Specific Admin Keys
-
-To allow delegated administration for specific organizations, store admin keys in the `ORG_ADMIN_KEYS` KV namespace:
-
-```bash
-# Create the KV namespace (one-time setup)
-npx wrangler kv:namespace create ORG_ADMIN_KEYS
-
-# Add the namespace ID to wrangler.toml (replace placeholder-id-for-dev)
-
-# Set an org-specific admin key
-npx wrangler kv:key put --binding=ORG_ADMIN_KEYS "unfoldingWord" "your-org-specific-api-key"
-
-# List all org keys
-npx wrangler kv:key list --binding=ORG_ADMIN_KEYS
-```
-
-Clients would then use the org-specific key instead of the super admin key —
-but see **Authentication** above: today every `/api/*` request must carry
-`ENGINE_API_KEY`, so all examples below use `$API_KEY`.
+**Authentication.** Every `/api/*` request must carry `ENGINE_API_KEY` or
+`ADMIN_API_KEY` — the global middleware accepts nothing else. Admin routes need
+super-admin authority: `ADMIN_API_KEY`, or `ENGINE_API_KEY` while
+`ADMIN_KEY_REQUIRED` is unset, blank or `"false"` (README "Authentication"),
+and the MCP write routes refuse anything else (403). Values stored in the
+`ORG_ADMIN_KEYS` KV namespace are not accepted as bearer tokens. All examples
+below use `$API_KEY`; use the admin key for the admin routes.
 
 ### List MCP Servers
 
@@ -602,7 +583,7 @@ instead of re-deriving the code for QR codes and `wa.me` links.
 
 ```bash
 curl -s "http://localhost:$PORT/api/v1/admin/orgs/PBT/modes/obt-coach/share-code?home_org=unfoldingWord" \
-  -H "Authorization: Bearer $API_KEY"
+  -H "Authorization: Bearer $ADMIN_API_KEY"
 ```
 
 **Response (200):**
@@ -654,8 +635,10 @@ wins over a mode that only lists it as an alias, and among duplicates the
 one chat serves wins (home: the first published, non-`requires_group` one;
 another org: the first published one that passes the shape check).
 
-Only the super-admin key (`ENGINE_API_KEY`) reaches this route; org-scoped
-admin keys are refused by the `/api/*` gate.
+Like every `/api/v1/admin/*` route, this needs super-admin authority:
+`ADMIN_API_KEY`, or `ENGINE_API_KEY` only while `ADMIN_KEY_REQUIRED` is not
+enforced. With it enforced, `ENGINE_API_KEY` gets `403` with
+`code: "admin_key_required"`.
 
 **Errors:**
 

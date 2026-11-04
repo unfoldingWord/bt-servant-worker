@@ -109,7 +109,7 @@ import {
   DetectedLanguage,
   UNDETERMINED_LANGUAGE,
 } from '../services/language/index.js';
-import { isAdminClient, isValidLanguageCode, validateChatBody } from '../utils/chat-validation.js';
+import { isValidLanguageCode, validateChatBody } from '../utils/chat-validation.js';
 import { hasClientHistory, sanitizeClientHistory } from '../utils/history-validation.js';
 import { OrgLanguages, resolveEffectiveLanguage } from '../types/languages.js';
 import { InternalQueueEntry } from '../types/queue.js';
@@ -603,10 +603,6 @@ function buildChatTurnPayload(
     exit_reason: turn.orchestration.exitReason,
     stop_reason: turn.orchestration.finalStopReason,
     mcp_calls_made: turn.orchestration.mcpCallsMade,
-    // #421: how much non-final text was kept off the user-facing reply.
-    // Lengths only — the narration itself is not telemetry.
-    dropped_response_count: turn.orchestration.droppedResponseCount,
-    dropped_response_lengths: turn.orchestration.droppedResponseLengths,
     input_tokens: usage.input_tokens,
     output_tokens: usage.output_tokens,
     cache_creation_input_tokens: usage.cache_creation_input_tokens,
@@ -3360,7 +3356,11 @@ export class UserDO {
   }
 
   private async resolvePrompts(body: ChatRequest, logger: RequestLogger) {
-    const isAdmin = isAdminClient(body.client_id);
+    // Admin visibility comes only from the worker-set `_is_admin` (client_id
+    // AND an admin-capable key). Fails closed: a body without it, such as a
+    // queued entry written before the worker started setting the field, is
+    // treated as non-admin.
+    const isAdmin = body._is_admin === true;
     const orgOverrides = body._org_prompt_overrides ?? {};
     const orgModes = body._org_modes ?? { modes: [] };
     const userSelectedMode = await this.getSelectedMode();
@@ -3855,7 +3855,8 @@ export class UserDO {
     activeModeName: string | undefined,
     body: ChatRequest
   ): ModeContext {
-    const isAdmin = isAdminClient(body.client_id);
+    // Worker-set only; absent (e.g. an older queued entry) ⇒ non-admin.
+    const isAdmin = body._is_admin === true;
     const isGroupChat = this.isGroupChatType(body);
     return {
       availableModes: orgModes.modes.filter((m) => isModeVisible(m, { isGroupChat, isAdmin })),

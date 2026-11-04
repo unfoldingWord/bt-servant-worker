@@ -733,7 +733,7 @@ describe('per-mode welcome — admin re-preview (#311 FIX B/3)', () => {
   });
 
   const adminBody = (message: string): ChatRequest =>
-    buildChatBody({ message, _org_modes: ORG_MODES, client_id: 'admin-portal' });
+    buildChatBody({ message, _org_modes: ORG_MODES, client_id: 'admin-portal', _is_admin: true });
 
   it('emits on the mode CHANGE but not on a subsequent already-active #<same-mode> turn', async () => {
     // Entry into spoken (a change from no mode) ⇒ welcome.
@@ -1066,7 +1066,7 @@ describe('per-mode welcome — admin preview persists first_interaction:false (#
   });
 
   const adminBody = (message: string): ChatRequest =>
-    buildChatBody({ message, _org_modes: ORG_MODES, client_id: 'admin-portal' });
+    buildChatBody({ message, _org_modes: ORG_MODES, client_id: 'admin-portal', _is_admin: true });
 
   it('admin emit persists first_interaction:false (no flag) so the next #<mode> turn omits the model note', async () => {
     const capture = setupAnthropicFetchCapture();

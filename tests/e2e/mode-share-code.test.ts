@@ -4,11 +4,32 @@
  * tests/unit/mode-share-code.test.ts; here the route's contract: auth, 400s,
  * the distinguishable 404 body, and the 200 shape with worker_version.
  */
-import { env, SELF } from 'cloudflare:test';
+import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { afterEach, describe, expect, it } from 'vitest';
+import type { Env } from '../../src/config/types';
 import { APP_VERSION } from '../../src/generated/version.js';
+import worker from '../../src/index';
 
-const AUTH = { Authorization: 'Bearer test-api-key' };
+const ENGINE = 'test-api-key'; // vitest.config.ts binding
+const ADMIN = 'u345-admin-key';
+/** The production posture (#485): the admin key exists and is enforced. */
+const ENFORCED: Partial<Env> = { ADMIN_API_KEY: ADMIN, ADMIN_KEY_REQUIRED: 'true' };
+const bearer = (key: string) => ({ Authorization: `Bearer ${key}` });
+
+/** Call the worker's default export with an overridden env (the same app and middleware as SELF). */
+async function fetchWith(overrides: Partial<Env>, target: string, key?: string): Promise<Response> {
+  const ctx = createExecutionContext();
+  const handler = worker as unknown as {
+    fetch: (req: Request, env: Env, ctx: ExecutionContext) => Promise<Response>;
+  };
+  const init = key === undefined ? {} : { headers: bearer(key) };
+  const res = await handler.fetch(new Request(target, init), { ...env, ...overrides }, ctx);
+  await waitOnExecutionContext(ctx);
+  return res;
+}
+
+/** The share-code route as the portal BFF calls it: with ADMIN_API_KEY, the admin key enforced. */
+const adminFetch = (target: string) => fetchWith(ENFORCED, target, ADMIN);
 const HOME = 'u345-home';
 const PARTNER = 'U345 Partner';
 const SEEDED = [`${HOME}:modes`, `${PARTNER}:modes`];
@@ -39,13 +60,13 @@ afterEach(async () => {
 
 describe('GET …/modes/:modeName/share-code', () => {
   it('requires the admin bearer token', async () => {
-    const res = await SELF.fetch(url(HOME, 'u345-coach', HOME));
+    const res = await fetchWith(ENFORCED, url(HOME, 'u345-coach', HOME));
     expect(res.status).toBe(401);
   });
 
   it('a home mode returns its bare code, resolves, and the worker version', async () => {
     await seed();
-    const res = await SELF.fetch(url(HOME, 'u345-coach', HOME), { headers: AUTH });
+    const res = await adminFetch(url(HOME, 'u345-coach', HOME));
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({
       code: 'u345-coach',
@@ -58,7 +79,7 @@ describe('GET …/modes/:modeName/share-code', () => {
 
   it('a foreign mode returns the qualified code the chat path matches', async () => {
     await seed();
-    const res = await SELF.fetch(url(PARTNER, 'u345-coach', HOME), { headers: AUTH });
+    const res = await adminFetch(url(PARTNER, 'u345-coach', HOME));
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({
       code: 'u345-partner/u345-coach',
@@ -71,7 +92,7 @@ describe('GET …/modes/:modeName/share-code', () => {
 
   it('a foreign draft returns its would-be code with resolves=false', async () => {
     await seed();
-    const res = await SELF.fetch(url(PARTNER, 'u345-draft', HOME), { headers: AUTH });
+    const res = await adminFetch(url(PARTNER, 'u345-draft', HOME));
     expect(await res.json()).toEqual({
       code: 'u345-partner/u345-draft',
       resolves: false,
@@ -86,16 +107,15 @@ describe('GET …/modes/:modeName/share-code — errors', () => {
   it('an unknown mode or org is a 404 whose JSON body says mode_not_found', async () => {
     await seed();
     for (const target of [url(HOME, 'u345-nope', HOME), url('u345-no-org', 'x', HOME)]) {
-      const res = await SELF.fetch(target, { headers: AUTH });
+      const res = await adminFetch(target);
       expect(res.status).toBe(404);
       expect(await res.json()).toMatchObject({ error: 'mode_not_found' });
     }
   });
 
   it('a route this worker does not have is a 404 without that body', async () => {
-    const res = await SELF.fetch(
-      `https://worker/api/v1/admin/orgs/${HOME}/modes/u345-coach/share-codez`,
-      { headers: AUTH }
+    const res = await adminFetch(
+      `https://worker/api/v1/admin/orgs/${HOME}/modes/u345-coach/share-codez`
     );
     expect(res.status).toBe(404);
     const text = await res.text();
@@ -104,7 +124,7 @@ describe('GET …/modes/:modeName/share-code — errors', () => {
 
   it('a home_org with no modes record is an empty home: 200 with home_has_modes false', async () => {
     await seed();
-    const res = await SELF.fetch(url(PARTNER, 'u345-coach', 'u345-typo'), { headers: AUTH });
+    const res = await adminFetch(url(PARTNER, 'u345-coach', 'u345-typo'));
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({
       code: 'u345-partner/u345-coach',
@@ -122,19 +142,32 @@ describe('GET …/modes/:modeName/share-code — auth and home org', () => {
       { target: url(HOME, 'u345-coach', long), field: 'home_org' },
     ];
     for (const { target, field } of cases) {
-      const res = await SELF.fetch(target, { headers: AUTH });
+      const res = await adminFetch(target);
       expect(res.status).toBe(400);
       expect(await res.json()).toMatchObject({ error: 'invalid_org', field });
     }
+  });
+});
+
+describe('GET …/modes/:modeName/share-code — admin key gate (#479, #485)', () => {
+  it('ENGINE_API_KEY gets 403 admin_key_required when ADMIN_KEY_REQUIRED=true', async () => {
+    await seed();
+    const res = await fetchWith(ENFORCED, url(HOME, 'u345-coach', HOME), ENGINE);
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({ code: 'admin_key_required' });
+  });
+
+  it('ENGINE_API_KEY still works while the admin key is not enforced (transition)', async () => {
+    await seed();
+    const res = await fetchWith({ ADMIN_API_KEY: ADMIN }, url(HOME, 'u345-coach', HOME), ENGINE);
+    expect(res.status).toBe(200);
   });
 
   it('an org-scoped admin key cannot reach the route (super admin only)', async () => {
     await seed();
     await env.ORG_ADMIN_KEYS.put(PARTNER, 'u345-org-key');
     try {
-      const res = await SELF.fetch(url(PARTNER, 'u345-coach', HOME), {
-        headers: { Authorization: 'Bearer u345-org-key' },
-      });
+      const res = await fetchWith(ENFORCED, url(PARTNER, 'u345-coach', HOME), 'u345-org-key');
       expect(res.status).toBe(403);
     } finally {
       await env.ORG_ADMIN_KEYS.delete(PARTNER);
@@ -146,20 +179,20 @@ describe('GET …/modes/:modeName/share-code — auth and home org', () => {
       `${HOME}:modes`,
       JSON.stringify({ modes: [null, { name: 'u345-coach', published: true, overrides: {} }] })
     );
-    const res = await SELF.fetch(url(HOME, 'u345-coach', HOME), { headers: AUTH });
+    const res = await adminFetch(url(HOME, 'u345-coach', HOME));
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ code: 'u345-coach', resolves: true });
   });
 
   it('home_org is required', async () => {
     await seed();
-    const res = await SELF.fetch(url(HOME, 'u345-coach'), { headers: AUTH });
+    const res = await adminFetch(url(HOME, 'u345-coach'));
     expect(res.status).toBe(400);
     expect(await res.json()).toMatchObject({ error: 'home_org_required', field: 'home_org' });
   });
 
   it('an invalid mode name is a 400', async () => {
-    const res = await SELF.fetch(url(HOME, 'Bad_Name', HOME), { headers: AUTH });
+    const res = await adminFetch(url(HOME, 'Bad_Name', HOME));
     expect(res.status).toBe(400);
     expect(await res.json()).toMatchObject({ error: 'invalid_mode_name' });
   });

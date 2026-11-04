@@ -98,8 +98,6 @@ function turnContext(inputLanguage: DetectedLanguage | null) {
         billable_input_tokens: 270,
       },
       mcpCallsMade: 2,
-      droppedResponseCount: 1,
-      droppedResponseLengths: [18],
       mode: 'dbs-coach',
       modeSwitchedTo: null,
       toolCalls: [TOOL_CALL],
@@ -265,9 +263,7 @@ describe('buildChatTurnRecord — model fallback fields (#403)', () => {
       'claude-opus-4-6': expect.objectContaining({ input_tokens: 120, output_tokens: 340 }),
     });
   });
-});
 
-describe('buildChatTurnRecord — failed turns and dropped text', () => {
   it('a failed turn records no served model, no route, and the routes it tried', () => {
     const error = new RouteChainExhaustedError(['primary', 'anthropic-alt'], 'http_5xx', 529);
     const record = buildFailedChatTurnRecord(
@@ -282,18 +278,6 @@ describe('buildChatTurnRecord — failed turns and dropped text', () => {
       route: null,
       routes_attempted: ['primary', 'anthropic-alt'],
     });
-  });
-
-  it('records dropped non-final response items by count and length, never their text (#421)', () => {
-    const { payload } = buildChatTurnRecord(
-      body(),
-      'en',
-      DEFAULT_ORG,
-      turnContext({ code: 'en', confidence: 0.9 })
-    );
-    expect(payload.dropped_response_count).toBe(1);
-    expect(payload.dropped_response_lengths).toEqual([18]);
-    expect(JSON.stringify(payload)).not.toContain('Let me');
   });
 
   it('a failed turn that never reached the chain reports an empty routes_attempted', () => {
