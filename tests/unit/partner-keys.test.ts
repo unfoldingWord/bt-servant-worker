@@ -24,7 +24,11 @@ import {
   sanitizeSpeaker,
   speakerPrefix,
 } from '../../src/services/claude/system-prompt.js';
-import { MAX_CHAT_ID_LENGTH, validateChatBody } from '../../src/utils/chat-validation.js';
+import {
+  conversationAddressError,
+  MAX_CHAT_ID_LENGTH,
+  validateChatBody,
+} from '../../src/utils/chat-validation.js';
 import {
   generateVoiceSubmissionKey,
   isPartnerVoiceSubmissionKey,
@@ -735,5 +739,28 @@ describe('partnerOwnsAudioKey: the partner audio ownership rule', () => {
     expect(partnerOwnsAudioKey(own, 'bcs', NS)).toBe(true);
     const internal = generateVoiceSubmissionKey('bcs', `partner-${NS}-x`, 'y');
     expect(isPartnerVoiceSubmissionKey(internal)).toBe(false);
+  });
+});
+
+describe('conversationAddressError: address fields must be primitive strings', () => {
+  it('accepts strings, absent and null fields', () => {
+    expect(conversationAddressError({ user_id: 'a', org: 'o', chat_id: null })).toBeNull();
+    expect(conversationAddressError({})).toBeNull();
+  });
+
+  it.each(['user_id', 'chat_id', 'thread_id', 'org', 'org_id', 'chat_type', 'client_id'])(
+    'refuses a non-string %s (array, object, number, boolean)',
+    (field) => {
+      for (const value of [['partner:pk_1:u'], { a: 1 }, 7, true]) {
+        expect(conversationAddressError({ [field]: value })).toBe(`${field} must be a string`);
+      }
+    }
+  );
+
+  it('validateChatBody runs the same check', () => {
+    const body = { user_id: ['partner:pk_1:u'], client_id: 'web', message: 'x' };
+    expect(validateChatBody(body as unknown as ChatRequest, 'final')).toBe(
+      'user_id must be a string'
+    );
   });
 });

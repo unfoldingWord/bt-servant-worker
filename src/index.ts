@@ -85,6 +85,7 @@ import {
 import { orgDoNameError, resolveOrgFromBody } from './utils/org.js';
 import {
   chatIdProblem,
+  conversationAddressError,
   isAdminClient,
   MAX_CHAT_ID_LENGTH,
   reservedPartnerIdError,
@@ -136,12 +137,13 @@ export const UserDO = instrumentDO(UserDOClass, resolveTelemetryConfig);
 export { PartnerKeyStoreDO } from './durable-objects/partner-key-store-do.js';
 
 /**
- * Per-request values set by the `/api/*` auth middleware: the principal
- * (internal: ENGINE_API_KEY or ADMIN_API_KEY; partner: an active partner
- * key), the key class a deployment-wide token matched (never the key; null
- * for a partner key), whether the caller has super-admin authority under
- * the current config (never a partner key), and the request id + logger
- * every later middleware and route logs through.
+ * Per-request values set by the `/api/*` auth middleware: the key class the
+ * bearer token matched (never the key), whether that key carries super-admin
+ * authority under the current config, and the request id + logger every later
+ * middleware and route logs through.
+ * Partner API keys (admin-portal#354) add the principal: `internal` for
+ * ENGINE_API_KEY / ADMIN_API_KEY, `partner` for an active partner key, which
+ * has no key class (null) and is never super-admin.
  */
 type AppEnv = {
   Bindings: Env;
@@ -227,8 +229,9 @@ function rejectAuth(
   if (NOT_PERMITTED_REASONS.has(reason)) {
     return c.json({ error: 'This API key is not permitted to call this endpoint' }, status);
   }
-  // `code` is the stable, machine-readable reason (#479); the same body for
-  // every token that did not authenticate, so it reveals nothing.
+  // `code` is the stable, machine-readable reason; `error` text is unchanged.
+  // The same body for every token that did not authenticate (a partner-shaped
+  // one included), so it reveals nothing.
   return c.json({ error: 'Invalid API key', code: 'invalid_api_key' }, status);
 }
 
@@ -301,17 +304,17 @@ async function partnerPreflight(c: Context<AppEnv>, token: string): Promise<Resp
   return null;
 }
 
-// Auth middleware for all /api routes. It mints the request id + logger that
-// later middlewares and routes log through, then classifies the bearer token,
-// in this order:
+// Auth middleware for all /api routes. Accepts ENGINE_API_KEY or (when
+// configured) ADMIN_API_KEY, and is the one place the bearer token is
+// classified (through the guarded classifyToken: a blank token or an unset
+// secret never matches). The key class and the super-admin authority derived
+// from it are stored on the context (`keyClass`, `superAdmin`) for the admin
+// gate, the MCP pool fence and the chat admin check. It also mints the request
+// id + logger that later middlewares and routes log through.
 //
-// 1. A deployment-wide key (classifyToken: ENGINE_API_KEY, or ADMIN_API_KEY
-//    when configured; a blank token or an unset secret never matches) is the
-//    "internal" principal. Its key class and the super-admin authority derived
-//    from it (isSuperAdminClass: ADMIN_API_KEY always, ENGINE_API_KEY only
-//    while ADMIN_KEY_REQUIRED does not enforce) go on the context for the
-//    /api/v1/admin/* gate, the MCP pool fence and the chat admin check.
-// 2. Anything else is treated as a partner key (admin-portal#354): shape and
+// Partner API keys (admin-portal#354), checked only after classifyToken:
+// 1. A deployment-wide key is the "internal" principal (as above).
+// 2. Anything else is treated as a partner key: shape and
 //    keyed tag first (partnerPreflight, no I/O), then the KV lookup, and only
 //    for an authenticated key the route allowlist (isPartnerRouteAllowed:
 //    POST /api/v1/chat and /api/v1/chat/stream, plus GET/HEAD on
@@ -322,21 +325,39 @@ async function partnerPreflight(c: Context<AppEnv>, token: string): Promise<Resp
 // Every rejection is logged (auth_rejected + reason) and counted.
 app.use('/api/*', async (c, next) => {
   const requestId = crypto.randomUUID();
+  const logger = createRequestLogger(requestId);
   c.set('requestId', requestId);
-  c.set('logger', createRequestLogger(requestId));
+  c.set('logger', logger);
+
   const presented = bearerToken(c.req.header('Authorization'));
   if (presented === null) {
     return rejectAuth(c, 401, 'missing_bearer');
   }
 
   const keyClass = classifyToken(presented, c.env);
-  if (keyClass !== null) {
-    c.set('principal', { kind: 'internal' });
-    c.set('keyClass', keyClass);
-    c.set('superAdmin', isSuperAdminClass(keyClass, c.env));
-    return next();
+  if (keyClass === null) {
+    // Not a deployment-wide key: a partner key, or nothing (rejected there,
+    // with the same `Invalid API key` body and `invalid_api_key` code).
+    const refused = await authenticatePartnerRequest(c, presented);
+    return refused ?? next();
   }
 
+  c.set('principal', { kind: 'internal' });
+  c.set('keyClass', keyClass);
+  c.set('superAdmin', isSuperAdminClass(keyClass, c.env));
+  return next();
+});
+
+/**
+ * The partner-key path of the `/api/*` middleware, in order: shape and tag
+ * (partnerPreflight, no I/O), the KV lookup, then the route allowlist. Sets a
+ * partner principal (no key class, never super-admin) and returns null, or
+ * returns the logged, counted rejection.
+ */
+async function authenticatePartnerRequest(
+  c: Context<AppEnv>,
+  presented: string
+): Promise<Response | null> {
   const refused = await partnerPreflight(c, presented);
   if (refused) return refused;
   const auth = await authenticatePartner(c, presented);
@@ -347,8 +368,8 @@ app.use('/api/*', async (c, next) => {
   c.set('principal', { kind: 'partner', key: auth.key });
   c.set('keyClass', null);
   c.set('superAdmin', false);
-  return next();
-});
+  return null;
+}
 
 // Chat endpoints — explicit transport per route.
 //
@@ -2062,7 +2083,8 @@ app.post(`${PARTNER_KEYS_BASE}/:keyId/_import-legacy-users`, async (c) => {
       importLegacyUsers(c.env, key, body.input, {
         logger,
         requestId: c.get('requestId'),
-        // Renewed before each user and before any cleanup delete; false = lost.
+        // Renewed before each user, during a long audio copy, before the
+        // destination write and before any cleanup delete; false = lost.
         renewLease: () => keyStore(c).renewImportLease(key.userNamespace, holder),
         // Re-read from the store before each batch; a key that is gone counts as revoked.
         currentStatus: async () => {
@@ -2148,7 +2170,14 @@ function handleGroupRequest(c: Context<AppEnv>, doPath: string) {
   const chatId = c.req.param('chatId') ?? '';
   const chatIdError = validateChatIdParam(chatId, 'chatId');
   if (chatIdError) return Promise.resolve(Response.json({ error: chatIdError }, { status: 400 }));
-  return handleDORequest(c, { org, doKey: `group:${org}:${chatId}`, doPath });
+  return handleDORequest({
+    request: c.req.raw,
+    env: c.env,
+    logger: c.get('logger'),
+    org,
+    doKey: `group:${org}:${chatId}`,
+    doPath,
+  });
 }
 
 /** Handle a thread admin request with chatId + threadId validation. */
@@ -2161,7 +2190,14 @@ function handleThreadRequest(c: Context<AppEnv>, doPath: string) {
   const threadIdError = validateChatIdParam(threadId, 'threadId');
   if (threadIdError)
     return Promise.resolve(Response.json({ error: threadIdError }, { status: 400 }));
-  return handleDORequest(c, { org, doKey: `group:${org}:${chatId}:${threadId}`, doPath });
+  return handleDORequest({
+    request: c.req.raw,
+    env: c.env,
+    logger: c.get('logger'),
+    org,
+    doKey: `group:${org}:${chatId}:${threadId}`,
+    doPath,
+  });
 }
 
 // ── Group admin endpoints (routed to group DO) ─────────────────────────────────
@@ -2738,6 +2774,17 @@ function resolveDOId(env: Env, org: string, body: ChatRequest): DurableObjectId 
   return env.USER_DO.idFromName(`user:${org}:${body.user_id}`);
 }
 
+/** Headers for the DO chat request: the caller's, plus the request id and the worker origin. */
+function doChatHeaders(request: Request, requestId: string | undefined): Headers {
+  const headers = new Headers(request.headers);
+  if (requestId) {
+    headers.set('X-Request-ID', requestId);
+  }
+  // Pass the real worker origin so the DO can build public-facing audio URLs
+  headers.set('X-Worker-Origin', new URL(request.url).origin);
+  return headers;
+}
+
 /**
  * Build a DO request with org-level KV data injected into the body.
  */
@@ -2750,8 +2797,10 @@ async function buildDOChatRequest(
     transport: ChatTransport;
     logger: ReturnType<typeof createRequestLogger>;
     requestId?: string;
+    /** Who authenticated (#354): from the auth principal, never from the body. */
     caller: ChatCaller;
-    isAdmin: boolean; // admin visibility: client_id AND the authenticated key class
+    /** Admin visibility, decided here from client_id AND the authenticated key class. */
+    isAdmin: boolean;
   }
 ): Promise<{ stub: DurableObjectStub; doRequest: Request }> {
   const { body, org, transport, logger } = opts;
@@ -2765,18 +2814,16 @@ async function buildDOChatRequest(
   const doId = resolveDOId(env, org, body);
   const stub = env.USER_DO.get(doId);
 
-  // prettier-ignore
-  logger.log('do_routed', { do_id: doId.toString(), transport, mcp_server_count: mcpServers.length, org_config: orgConfig });
+  logger.log('do_routed', {
+    do_id: doId.toString(),
+    transport,
+    mcp_server_count: mcpServers.length,
+    org_config: orgConfig,
+  });
 
   const doUrl = new URL(request.url);
   doUrl.pathname = doChatPathForTransport(transport);
-
-  const headers = new Headers(request.headers);
-  if (opts.requestId) {
-    headers.set('X-Request-ID', opts.requestId);
-  }
-  // Pass the real worker origin so the DO can build public-facing audio URLs
-  headers.set('X-Worker-Origin', new URL(request.url).origin);
+  const headers = doChatHeaders(request, opts.requestId);
 
   const doRequest = new Request(doUrl.toString(), {
     method: 'POST',
@@ -2793,10 +2840,12 @@ async function buildDOChatRequest(
       // AFTER the spread, so a client-supplied `_edge_country` in the inbound
       // body is always overwritten and can never reach telemetry.
       _edge_country: (request.cf as { country?: string } | undefined)?.country,
-      // Who authenticated (#354), and admin visibility (client_id AND a
-      // super-admin key, #479). Both set AFTER the spread, so a client-supplied
-      // `_caller` / `_is_admin` is always overwritten; the DO reads only these.
+      // Who authenticated (#354). Also set AFTER the spread, so it always comes
+      // from the auth middleware's principal, never from the client body.
       _caller: opts.caller,
+      // Admin visibility, decided by the worker from client_id AND the key the
+      // request authenticated with. Set AFTER the spread so a client-supplied
+      // `_is_admin` is always overwritten; the DO reads only this field.
       _is_admin: opts.isAdmin,
     }),
   });
@@ -2832,14 +2881,19 @@ function scopeChatBodyForPrincipal(
 
 /**
  * Parse a chat body. Malformed JSON throws SyntaxError; valid JSON that is not
- * an object (`null`, arrays, scalars) throws ValidationError — for every
- * caller, before anything dereferences a field. Both map to 400.
+ * an object (`null`, arrays, scalars), or a conversation-address field that
+ * is not a string (conversationAddressError), throws ValidationError — for
+ * every caller, before anything dereferences a field. Both map to 400.
  */
 async function readChatBodyObject(request: Request): Promise<Record<string, unknown>> {
   const parsed: unknown = await request.clone().json();
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new ValidationError('Request body must be a JSON object');
   }
+  // Before any authorization check (partner policy, admin client check) or
+  // routing: every conversation-address field must be a primitive string.
+  const addressError = conversationAddressError(parsed);
+  if (addressError) throw new ValidationError(addressError);
   return parsed as Record<string, unknown>;
 }
 
@@ -2849,7 +2903,8 @@ async function handleChatRequest(
   transport: ChatTransport,
   auth: ChatAuth
 ): Promise<Response> {
-  const { principal, logger } = auth;
+  const { logger } = auth;
+  const { principal } = auth;
   const timing = createTimingContext();
 
   let parsed: Record<string, unknown>;
@@ -2941,6 +2996,32 @@ function checkAdminClientKey(
   return { rejection };
 }
 
+/**
+ * validateChatBody with the SERVER-derived caller (the auth principal's kind;
+ * a client-sent `_caller` is never consulted), as a logged, counted 400; or
+ * null when the body is valid.
+ */
+function rejectInvalidChatBody(
+  body: ChatRequest,
+  transport: ChatTransport,
+  caller: ChatCaller,
+  logger: RequestLogger
+): Response | null {
+  const validationError = validateChatBody(body, transport, {
+    callbackAvailable: caller !== 'partner',
+    caller,
+  });
+  if (!validationError) return null;
+  logger.warn('chat_validation_failed', {
+    transport,
+    error: validationError,
+    user_id: body.user_id,
+    client_id: body.client_id,
+  });
+  countMetric('requests_total', { transport, status: 'validation_failed', status_code: 400 });
+  return Response.json({ error: validationError }, { status: 400 });
+}
+
 /** Params for {@link dispatchChatRequest} — the chat flow inside the pseudonym scope. */
 type ChatDispatchParams = {
   request: Request;
@@ -2959,23 +3040,12 @@ type ChatDispatchParams = {
  */
 async function dispatchChatRequest(params: ChatDispatchParams): Promise<Response> {
   const { request, env, transport, body, timing, auth } = params;
-  const { logger, requestId, principal } = auth;
+  const { logger, requestId } = auth;
+  const { principal } = auth;
   const caller: ChatCaller = principal.kind;
   const keyId = principalKeyId(principal);
-  const validationError = validateChatBody(body, transport, {
-    callbackAvailable: caller !== 'partner',
-    caller,
-  });
-  if (validationError) {
-    logger.warn('chat_validation_failed', {
-      transport,
-      error: validationError,
-      user_id: body.user_id,
-      client_id: body.client_id,
-    });
-    countMetric('requests_total', { transport, status: 'validation_failed', status_code: 400 });
-    return Response.json({ error: validationError }, { status: 400 });
-  }
+  const invalid = rejectInvalidChatBody(body, transport, caller, logger);
+  if (invalid) return invalid;
 
   const adminCheck = checkAdminClientKey(env, body, transport, auth);
   if ('rejection' in adminCheck) {
@@ -2987,8 +3057,15 @@ async function dispatchChatRequest(params: ChatDispatchParams): Promise<Response
   logger.log('request_received', { user_id: body.user_id, client_id: body.client_id, key_id: keyId, org, transport, chat_type: body.chat_type ?? 'private', chat_id: body.chat_id, thread_id: body.thread_id });
 
   const { stub, doRequest } = await timePhase(timing, 'kv_and_routing', () =>
-    // prettier-ignore
-    buildDOChatRequest(request, env, { body, org, transport, logger, requestId, caller, isAdmin: adminCheck.isAdmin })
+    buildDOChatRequest(request, env, {
+      body,
+      org,
+      transport,
+      logger,
+      requestId,
+      caller,
+      isAdmin: adminCheck.isAdmin,
+    })
   );
   const response = await timePhase(timing, 'do_fetch', () => stub.fetch(doRequest));
 
@@ -3033,6 +3110,10 @@ function respondToChatRequestError(
 }
 
 interface DORequestParams {
+  request: Request;
+  env: Env;
+  /** The request logger from the `/api/*` middleware (same request id). */
+  logger: RequestLogger;
   org: string;
   doKey: string;
   doPath: string;
@@ -3044,14 +3125,8 @@ interface DORequestParams {
  *
  * Routes to the DO identified by doKey (e.g. "user:org:userId" or "group:org:chatId").
  */
-async function handleDORequest(c: Context<AppEnv>, params: DORequestParams): Promise<Response> {
-  const { org, doKey, doPath, userId } = params;
-  const request = c.req.raw;
-  const env = c.env;
-  // The request id from the /api/* middleware, so these lines correlate with
-  // its auth line; for a user route the logger is bound to the user id, so
-  // every line below carries it.
-  const logger = userId ? createRequestLogger(c.get('requestId'), userId) : c.get('logger');
+async function handleDORequest(params: DORequestParams): Promise<Response> {
+  const { request, env, logger, org, doKey, doPath, userId } = params;
   const start = Date.now();
 
   if (!org) {
@@ -3062,12 +3137,8 @@ async function handleDORequest(c: Context<AppEnv>, params: DORequestParams): Pro
     return Response.json({ error: orgError, code: 'invalid_org' }, { status: 400 });
   }
 
-  logger.log('do_request_received', {
-    do_key: doKey,
-    org,
-    path: doPath,
-    method: request.method,
-  });
+  // prettier-ignore
+  logger.log('do_request_received', { do_key: doKey, org, path: doPath, method: request.method, user_id: userId });
 
   const doId = env.USER_DO.idFromName(doKey);
   const stub = env.USER_DO.get(doId);
@@ -3086,6 +3157,7 @@ async function handleDORequest(c: Context<AppEnv>, params: DORequestParams): Pro
 
   const response = await stub.fetch(doRequest);
   logger.log('do_request_complete', {
+    user_id: userId,
     path: doPath,
     status: response.status,
     duration_ms: Date.now() - start,
@@ -3145,5 +3217,13 @@ async function handleUserRequest(
   if (!userId) {
     return Response.json({ error: 'user_id is required in path' }, { status: 400 });
   }
-  return handleDORequest(c, { org, doKey: `user:${org}:${userId}`, doPath, userId });
+  return handleDORequest({
+    request: c.req.raw,
+    env: c.env,
+    logger: c.get('logger'),
+    org,
+    doKey: `user:${org}:${userId}`,
+    doPath,
+    userId,
+  });
 }

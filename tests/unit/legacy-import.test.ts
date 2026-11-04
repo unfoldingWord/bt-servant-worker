@@ -7,7 +7,10 @@
  */
 
 import { describe, expect, it, vi } from 'vitest';
-import { rehomeHistoryAudio } from '../../src/services/partner-keys/legacy-audio.js';
+import {
+  AUDIO_RENEW_EVERY,
+  rehomeHistoryAudio,
+} from '../../src/services/partner-keys/legacy-audio.js';
 import { partnerAudioKeyFor } from '../../src/services/audio/r2-storage.js';
 import type { Env } from '../../src/config/types.js';
 import { readImportEntries, toJsonSafe } from '../../src/durable-objects/user-data-transfer.js';
@@ -133,11 +136,15 @@ async function importWithAudio(dest: () => Response, renewLease?: () => Promise<
     USER_DO: {
       idFromName: (name: string) => name,
       get: () => ({
-        fetch: async (_url: string, init?: RequestInit) =>
-          init?.method === 'PUT' ? dest() : Response.json(source),
+        fetch: async (_url: string, init?: RequestInit) => {
+          if (init?.method !== 'PUT') return Response.json(source);
+          puts += 1;
+          return dest();
+        },
       }),
     },
   } as unknown as Env;
+  let puts = 0;
   const logger = createMockLogger();
   const [result] = await importLegacyUsers(
     env,
@@ -146,7 +153,7 @@ async function importWithAudio(dest: () => Response, renewLease?: () => Promise<
     { logger, requestId: 'req-1', currentStatus: active, ...(renewLease ? { renewLease } : {}) }
   );
   const kept = objects.has(`audio/bcs/partner:${KEY.userNamespace}:u1/t.opus`);
-  return { result, kept, logger };
+  return { result, kept, logger, puts };
 }
 
 /** A renewLease that answers `answers` in order, then false; counts its calls. */
@@ -175,7 +182,8 @@ describe('importLegacyUsers: a lost import lease stops the run', () => {
         }),
       },
     } as unknown as Env;
-    const lease = scriptedLease([true, true, true, true, true, false]);
+    // Each user renews twice (before the user, before the write): 10 holds for batch 1.
+    const lease = scriptedLease(Array<boolean>(10).fill(true));
     const logger = createMockLogger();
     const userIds = ['u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7'];
     const results = await importLegacyUsers(
@@ -221,16 +229,59 @@ describe('importLegacyUsers: a failing lease renewal', () => {
   });
 });
 
+describe('importLegacyUsers: the lease covers the destination write', () => {
+  it('held before the copy, lost before the write: no PUT, the copy stays, deferred', async () => {
+    const lease = scriptedLease([true, false]);
+    const out = await importWithAudio(() => Response.json({ ok: true, imported: 1 }), lease.renew);
+    expect(out.result).toEqual({ userId: 'u1', status: 'deferred' });
+    expect(out.puts).toBe(0);
+    expect(out.kept).toBe(true);
+    expect(out.logger.warn).toHaveBeenCalledWith(
+      'partner_key_legacy_import_audio_kept_lease_lost',
+      { key_id: KEY.id, user_id: 'u1', count: 1 }
+    );
+  });
+});
+
+describe('rehomeHistoryAudio renews during a long copy', () => {
+  it(`asks keepGoing every ${AUDIO_RENEW_EVERY} objects and stops (keeping the copies) when it says no`, async () => {
+    const objects = new Map<string, unknown>();
+    const keys = Array.from({ length: 30 }, (_, i) => `audio/bcs/u1/t${i}.opus`);
+    for (const k of keys) objects.set(k, new Uint8Array([1]));
+    const bucket = {
+      head: async (key: string) => (objects.has(key) ? {} : null),
+      get: async (key: string) => (objects.has(key) ? { body: objects.get(key) } : null),
+      put: async (key: string, body: unknown) => void objects.set(key, body),
+    } as unknown as R2Bucket;
+    const history = keys.map((k) => ({ voice_audio_key: k }));
+    let asked = 0;
+    const out = await rehomeHistoryAudio(
+      bucket,
+      [['history', history]],
+      { org: 'bcs', namespace: 'pk_1', subject: 'u1' },
+      createMockLogger(),
+      async () => {
+        asked += 1;
+        return false;
+      }
+    );
+    expect(asked).toBe(1);
+    expect(out).toMatchObject({ ok: false, stopped: true });
+    expect(out.written).toHaveLength(AUDIO_RENEW_EVERY);
+    for (const key of out.written) expect(objects.has(key)).toBe(true);
+  });
+});
+
 describe('importLegacyUsers: cleanup only while the lease is held', () => {
   it('never deletes copies once the lease is lost: a refusal then keeps them (logged)', async () => {
-    const lease = scriptedLease([true, false]); // held for the user, lost before cleanup
+    const lease = scriptedLease([true, true, false]); // held for the user and the write, lost before cleanup
     const refused = await importWithAudio(
       () => Response.json({ ok: false, reason: 'destination_not_empty' }, { status: 409 }),
       lease.renew
     );
     expect(refused.result).toEqual({ userId: 'u1', status: 'destination_not_empty' });
     expect(refused.kept).toBe(true);
-    expect(lease.calls()).toBe(2);
+    expect(lease.calls()).toBe(3);
     expect(refused.logger.warn).toHaveBeenCalledWith(
       'partner_key_legacy_import_audio_kept_lease_lost',
       { key_id: KEY.id, user_id: 'u1', count: 1 }
@@ -238,13 +289,13 @@ describe('importLegacyUsers: cleanup only while the lease is held', () => {
   });
 
   it('with the lease held, a refusal still removes this run’s copies', async () => {
-    const lease = scriptedLease([true, true]);
+    const lease = scriptedLease([true, true, true]);
     const refused = await importWithAudio(
       () => Response.json({ ok: false, reason: 'destination_not_empty' }, { status: 409 }),
       lease.renew
     );
     expect(refused.kept).toBe(false);
-    expect(lease.calls()).toBe(2);
+    expect(lease.calls()).toBe(3);
   });
 });
 
@@ -442,7 +493,7 @@ describe('rehomeHistoryAudio: failures fail the user', () => {
       target,
       logger
     );
-    expect(out).toEqual({ ok: false, written: [] });
+    expect(out).toEqual({ ok: false, written: [], stopped: false });
     expect(logger.error).toHaveBeenCalledWith(
       'partner_key_legacy_import_audio_copy_failed',
       expect.any(Error),
@@ -528,13 +579,13 @@ describe('importLegacyUsers operation budget', () => {
   it('defers the users that would not fit, and every later one', async () => {
     const env = envWithDestination(() => Response.json({ ok: true, imported: 1 }));
     const userIds = ['u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7'];
-    // Batch 1: status check (1) + 4 per user (lease renewal, preflight,
-    // export, import) leaves room for 3 users out of 13.
+    // Batch 1: status check (1) + 5 per user (two lease renewals, preflight,
+    // export, import) leaves room for 3 users out of 16.
     const results = await importLegacyUsers(
       env,
       KEY,
       { legacyClientId: 'shema', userIds },
-      { logger: createMockLogger(), requestId: 'r', currentStatus: active, operationBudget: 13 }
+      { logger: createMockLogger(), requestId: 'r', currentStatus: active, operationBudget: 16 }
     );
     expect(results.map((r) => r.status)).toEqual([
       'copied',

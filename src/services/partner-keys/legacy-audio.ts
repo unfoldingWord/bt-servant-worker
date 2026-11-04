@@ -34,6 +34,12 @@ const AUDIO_KEY_FIELDS = ['voice_audio_key', 'inbound_voice_audio_key'] as const
 const COPY_CONCURRENCY = 5;
 /** R2 operations one referenced object can take at most: head, get, put. */
 export const R2_OPERATIONS_PER_AUDIO_OBJECT = 3;
+/**
+ * During a long copy, `keepGoing` (the import lease renewal) is called before
+ * every batch that starts at a multiple of this many objects, so a long copy
+ * never outlives the lease.
+ */
+export const AUDIO_RENEW_EVERY = 25;
 
 export type AudioCopyCounts = { copied: number; existing: number; missing: number };
 
@@ -41,7 +47,8 @@ export type AudioTarget = { org: string; namespace: string; subject: string };
 
 export type RehomeResult =
   | { ok: true; entries: [string, unknown][]; counts: AudioCopyCounts; written: string[] }
-  | { ok: false; written: string[] };
+  /** `stopped`: `keepGoing` said no (lease lost); otherwise a copy failed. */
+  | { ok: false; written: string[]; stopped: boolean };
 
 type Outcome =
   { result: 'copied' | 'existing'; key: string } | { result: 'missing' | 'failed'; key: null };
@@ -86,12 +93,15 @@ export async function rehomeHistoryAudio(
   bucket: R2Bucket,
   entries: [string, unknown][],
   target: AudioTarget,
-  logger: RequestLogger
+  logger: RequestLogger,
+  keepGoing: () => Promise<boolean> = async () => true
 ): Promise<RehomeResult> {
-  const outcomes = await copyAll(bucket, referencedAudioKeys(entries), target, logger);
+  const keys = referencedAudioKeys(entries);
+  const { outcomes, stopped } = await copyAll(bucket, keys, { target, logger, keepGoing });
   const all = [...outcomes.values()];
   const written = all.flatMap((o) => (o.result === 'copied' ? [o.key] : []));
-  if (all.some((o) => o.result === 'failed')) return { ok: false, written };
+  if (stopped) return { ok: false, written, stopped: true };
+  if (all.some((o) => o.result === 'failed')) return { ok: false, written, stopped: false };
   const counts: AudioCopyCounts = {
     copied: written.length,
     existing: all.filter((o) => o.result === 'existing').length,
@@ -125,11 +135,14 @@ export async function removeRehomedAudio(
 async function copyAll(
   bucket: R2Bucket,
   keys: string[],
-  target: AudioTarget,
-  logger: RequestLogger
-): Promise<Map<string, Outcome>> {
+  opts: { target: AudioTarget; logger: RequestLogger; keepGoing: () => Promise<boolean> }
+): Promise<{ outcomes: Map<string, Outcome>; stopped: boolean }> {
+  const { target, logger, keepGoing } = opts;
   const outcomes = new Map<string, Outcome>();
   for (let i = 0; i < keys.length; i += COPY_CONCURRENCY) {
+    if (i > 0 && i % AUDIO_RENEW_EVERY === 0 && !(await keepGoing())) {
+      return { outcomes, stopped: true };
+    }
     const batch = keys.slice(i, i + COPY_CONCURRENCY);
     const results = await Promise.all(batch.map((key) => copyOne(bucket, key, target, logger)));
     batch.forEach((key, j) => {
@@ -137,7 +150,7 @@ async function copyAll(
       if (outcome) outcomes.set(key, outcome);
     });
   }
-  return outcomes;
+  return { outcomes, stopped: false };
 }
 
 /** Copy one object (streamed); never throws — the outcome says what happened, failures are logged. */

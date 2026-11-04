@@ -290,7 +290,46 @@ function validateClientOwnedFields(body: ChatRequest, isGroup: boolean): string 
   return null;
 }
 
+/**
+ * Body fields that address a conversation: they pick the Durable Object
+ * (`user:<org>:<user_id>`, `group:<org>:<chat_id>[:<thread_id>]`, chosen by
+ * chat_type) or build an id the worker trusts (client_id, the partner
+ * namespace). Each must be a primitive string when present (null counts as
+ * absent).
+ */
+export const CONVERSATION_ADDRESS_FIELDS: readonly string[] = [
+  'user_id',
+  'chat_id',
+  'thread_id',
+  'org',
+  'org_id',
+  'chat_type',
+  'client_id',
+];
+
+/**
+ * THE runtime type check for conversation-address fields, run on every chat
+ * body before any authorization check or routing (readChatBodyObject in the
+ * worker) and again by validateChatBody. Every check after it compares
+ * strings, but DO names are built by string interpolation, which would turn
+ * an array such as `["partner:<ns>:alice"]` into the very string the
+ * reserved-id checks refuse. So anything that is not a string (array,
+ * object, number, boolean) is a 400 here, for every caller. Returns the 400
+ * message, or null.
+ */
+export function conversationAddressError(body: object): string | null {
+  for (const field of CONVERSATION_ADDRESS_FIELDS) {
+    const value: unknown = Reflect.get(body, field);
+    if (value !== undefined && value !== null && typeof value !== 'string') {
+      return `${field} must be a string`;
+    }
+  }
+  return null;
+}
+
 function validateCoreFields(body: ChatRequest): string | null {
+  const addressError = conversationAddressError(body);
+  if (addressError) return addressError;
   if (!body.user_id) return 'user_id is required';
   if (!body.client_id) return 'client_id is required';
   // is_admin is not a public field — admin origin is derived server-side (the

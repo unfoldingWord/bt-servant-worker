@@ -54,9 +54,10 @@ async function readOp(request: Request, logger: RequestLogger): Promise<PartnerK
  * audio partition. A second import into it while one runs could delete
  * audio the first one just wrote (each run's cleanup removes what it wrote,
  * and the other run may already be reusing it). A live run renews its lease
- * before each user and before any cleanup delete, so it never outlives the
- * TTL, and releases it in `finally`; the TTL only frees the lease of a run
- * that died. While a holder has not released (and keeps renewing), no other
+ * before each user, every AUDIO_RENEW_EVERY objects of a long audio copy,
+ * before the destination write and before any cleanup delete, so it never
+ * outlives the TTL, and releases it in `finally`; the TTL only frees the
+ * lease of a run that died. While a holder has not released (and keeps renewing), no other
  * holder can acquire it.
  */
 const IMPORT_LEASE_PREFIX = 'import-lease:';

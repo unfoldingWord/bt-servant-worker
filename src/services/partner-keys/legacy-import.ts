@@ -52,6 +52,7 @@ import {
 import { codePointLength } from '../../types/single-line.js';
 import { isValidPartnerIdentifier, isValidPartnerUserId } from './policy.js';
 import {
+  AUDIO_RENEW_EVERY,
   type AudioCopyCounts,
   R2_OPERATIONS_PER_AUDIO_OBJECT,
   referencedAudioKeys,
@@ -73,10 +74,11 @@ const IMPORT_CONCURRENCY = 5;
  */
 export const LEGACY_IMPORT_OPERATION_BUDGET = 800;
 /**
- * Durable Object calls per user: lease renewal, destination preflight, source
- * export, destination import.
+ * Durable Object calls per user: lease renewal before the user and again
+ * before the destination write, destination preflight, source export,
+ * destination import.
  */
-const DO_OPERATIONS_PER_USER = 4;
+const DO_OPERATIONS_PER_USER = 5;
 /** Operations a cleanup can take: the R2 delete and the lease renewal before it. */
 const CLEANUP_OPERATIONS = 2;
 const IMPORT_FIELDS: ReadonlySet<string> = new Set(['legacyClientId', 'userIds']);
@@ -183,10 +185,12 @@ type ImportContext = {
 
 /**
  * The run's hold on its import lease (PartnerKeyStoreDO). `hold()` renews it
- * (a DO call) and is called before each user and before any cleanup delete,
- * so a live run never outlives the lease TTL. Once a renewal is refused (or
- * fails), the lease counts as lost for good: the run copies and deletes
- * nothing more, and every user not yet done is `deferred`.
+ * (a DO call) and is called before each user, every AUDIO_RENEW_EVERY
+ * objects of a long audio copy, before the destination write and before any
+ * cleanup delete, so a live run never outlives the lease TTL. Once a renewal
+ * is refused (or fails), the lease counts as lost for good: the run copies,
+ * writes and deletes nothing more (copies already made are kept), and every
+ * user not yet done is `deferred`.
  */
 class ImportLease {
   private lost = false;
@@ -302,7 +306,9 @@ async function copyOneUser(ctx: ImportContext, userId: string): Promise<LegacyIm
   if (!exported.ok) return { userId, status: exported.status };
   const audioKeys = referencedAudioKeys(exported.entries).length;
   const audioOperations =
-    audioKeys * R2_OPERATIONS_PER_AUDIO_OBJECT + (audioKeys > 0 ? CLEANUP_OPERATIONS : 0);
+    audioKeys * R2_OPERATIONS_PER_AUDIO_OBJECT +
+    Math.floor(audioKeys / AUDIO_RENEW_EVERY) + // lease renewals during a long copy
+    (audioKeys > 0 ? CLEANUP_OPERATIONS : 0);
   if (!ctx.budget.take(audioOperations)) return { userId, status: 'deferred' };
   // Another user of this run may have found the lease lost meanwhile: copy nothing.
   if (ctx.lease.isLost) return { userId, status: 'deferred' };
@@ -317,7 +323,11 @@ async function copyWithAudio(
 ): Promise<LegacyImportResult> {
   const { key, env, logger } = ctx;
   const target = { org: key.org, namespace: key.userNamespace, subject: userId };
-  const audio = await rehomeHistoryAudio(env.AUDIO_BUCKET, entries, target, logger);
+  // A long copy renews the lease as it goes; a lost lease stops it.
+  const audio = await rehomeHistoryAudio(env.AUDIO_BUCKET, entries, target, logger, () =>
+    ctx.lease.hold()
+  );
+  if (!audio.ok && audio.stopped) return keepCopiesAndDefer(ctx, userId, audio.written);
   if (!audio.ok) {
     await removeIfLeaseHeld(ctx, userId, audio.written);
     logger.warn('partner_key_legacy_import_audio_copy_failed_user', {
@@ -326,6 +336,10 @@ async function copyWithAudio(
     });
     return { userId, status: 'audio_copy_failed' };
   }
+  // The lease must cover the destination write too: without it another run
+  // may be importing this user and reusing these copies, so write nothing
+  // and delete nothing.
+  if (!(await ctx.lease.hold())) return keepCopiesAndDefer(ctx, userId, audio.written);
   const outcome = await importInto(ctx, userId, audio.entries);
   switch (outcome.kind) {
     case 'imported':
@@ -341,6 +355,20 @@ async function copyWithAudio(
       });
       return { userId, status: 'import_outcome_unknown', audio: audio.counts };
   }
+}
+
+/** The lease was lost mid-user: report `deferred`, keep this run's copies (logged), write nothing. */
+function keepCopiesAndDefer(
+  ctx: ImportContext,
+  userId: string,
+  written: string[]
+): LegacyImportResult {
+  ctx.logger.warn('partner_key_legacy_import_audio_kept_lease_lost', {
+    key_id: ctx.key.id,
+    user_id: userId,
+    count: written.length,
+  });
+  return { userId, status: 'deferred' };
 }
 
 /**
@@ -438,7 +466,8 @@ export async function importLegacyUsers(
     currentStatus: () => Promise<PartnerKeyStatus>;
     /**
      * Renew the run's import lease; false when another holder owns it now.
-     * Called before each user and before any cleanup delete. Default: always
+     * Called before each user, during a long audio copy, before the
+     * destination write and before any cleanup delete. Default: always
      * held (callers that run without a lease, such as unit tests).
      */
     renewLease?: () => Promise<boolean>;

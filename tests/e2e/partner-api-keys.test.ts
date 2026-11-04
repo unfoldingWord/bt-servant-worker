@@ -790,6 +790,63 @@ describe('internal callers cannot name partner users or groups', () => {
   });
 });
 
+/** Stored history length of a DO (0 when it has none). */
+async function historyLength(doName: string): Promise<number> {
+  const stub = env.USER_DO.get(env.USER_DO.idFromName(doName));
+  return runInDurableObject(
+    stub,
+    async (_i, state) => ((await state.storage.get<unknown[]>('history')) ?? []).length
+  );
+}
+
+describe('conversation-address fields must be strings (array coercion)', () => {
+  const ORG_A = 'org-354-arrays';
+
+  it("rejects the reviewer's three array variants with 400 on every chat route, before the partner DO", async () => {
+    const { key, apiKey } = await createKey(ORG_A);
+    const ns = key.userNamespace;
+    expect((await postChat(apiKey, chatBody())).status).toBe(200); // partner alice has history
+    const target = `user:${ORG_A}:partner:${ns}:alice`;
+    const before = await historyLength(target);
+    expect(before).toBeGreaterThan(0);
+    const calls = capture.calls.length;
+
+    const variants = [
+      chatBody({ client_id: 'web', org: ORG_A, user_id: [`partner:${ns}:alice`] }),
+      chatBody({
+        client_id: 'telegram',
+        org: ORG_A,
+        chat_type: 'group',
+        chat_id: [`partner:${ns}:alice`],
+      }),
+      chatBody({ client_id: 'web', org: [`${ORG_A}:partner`], user_id: `${ns}:alice` }),
+    ];
+    const routes = [CHAT, `${CHAT}/stream`, `${CHAT}/callback`];
+    for (const body of variants) {
+      for (const url of routes) {
+        const res = await apiFetch(url, {
+          method: 'POST',
+          headers: JSON_INTERNAL,
+          body: JSON.stringify(body),
+        });
+        expect(res.status, url).toBe(400);
+        expect(((await res.json()) as { error: string }).error).toMatch(/ must be a string$/);
+      }
+    }
+    expect(capture.calls).toHaveLength(calls);
+    expect(await historyLength(target)).toBe(before);
+    expect(await identityOf(`group:${ORG_A}:partner:${ns}:alice`)).toBeNull();
+  });
+
+  it('a partner key gets the same 400 for a non-string address field', async () => {
+    const { apiKey } = await createKey(ORG_A);
+    for (const extra of [{ user_id: ['alice'] }, { chat_type: 'group', chat_id: { id: 'g' } }]) {
+      const res = await postChat(apiKey, chatBody(extra));
+      expect(res.status).toBe(400);
+    }
+  });
+});
+
 describe('responses that carry a plaintext key are not cacheable', () => {
   it('create and rotate send Cache-Control: no-store; rotate reports warnings', async () => {
     const created = await apiFetch(KEYS, {
