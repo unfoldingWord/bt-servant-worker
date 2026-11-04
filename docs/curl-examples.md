@@ -912,6 +912,99 @@ mode + language selection") before involving a real Telegram group.
 
 ---
 
+## Admin: Mode Share Code (admin-portal#345)
+
+The authoritative WhatsApp chat code for a mode, as seen from the org a
+WhatsApp request carries (`home_org`, the gateway's `ENGINE_ORG`). The worker
+answers by running its own chat path: the same cross-org read (per-turn org
+cap included), the same first-wins collision handling, and the real `#`-token
+classifier (exact, then prefix, then fuzzy) over `#<code>`. The portal uses it
+instead of re-deriving the code for QR codes and `wa.me` links.
+
+`home_org` is compared to `:org` by exact key, like the chat path: `PBT` and
+`pbt` are different orgs.
+
+```bash
+curl -s "http://localhost:$PORT/api/v1/admin/orgs/PBT/modes/obt-coach/share-code?home_org=unfoldingWord" \
+  -H "Authorization: Bearer $ADMIN_API_KEY"
+```
+
+**Response (200):**
+
+```json
+{
+  "code": "pbt/obt-coach",
+  "resolves": true,
+  "resolved_org": "PBT",
+  "home_has_modes": true,
+  "worker_version": "2.60.0"
+}
+```
+
+- `code`: the token without `#`. A bare slug for a home mode, `<orgslug>/<slug>`
+  for another org's. `null` only when the org name slugs to nothing.
+- `resolves`: `true` only when sending `#<code>` from `home_org` selects exactly
+  this org's mode.
+- `reason` (only when `resolves` is false), checked in this order:
+  `org_skipped`; `invalid_mode` (another org's mode fails the shape check the
+  admin PUT enforces, so the cross-org merge drops it; never reported for a
+  home mode, which chat serves as long as it has a string name); `draft`;
+  `requires_group`; `reserved` (a home slug that is a clear token, like
+  `default`; `pbt/default` is not one); `capped` (the org is past the
+  per-turn foreign-org cap, so the chat path never reads it); `collision`
+  (another org with the same slug claimed the name first, or another mode in this org already uses this name as an alias, or an earlier element of this org with the same name or alias wins chat's first-match lookup, such as an earlier draft or group-only duplicate); `ambiguous` (the
+  message opens a different mode); `not_found` (it opens nothing).
+- `resolved_org`: the raw org name of the mode `#<code>` actually opens, when
+  it opens one. It comes only from the classifier's actual match, run on the
+  whole message `#<code>`: on `collision` it is the winning org when the
+  winner's mode is visible in a private chat, and absent when it is hidden
+  (for example `requires_group`).
+- `resolved_org_uncertain`: `true` only on a `resolves: false` answer when
+  another org's modes could not be read. The `resolves` verdict and the
+  `reason` stand (a failed read can only add competitors, never this org's
+  own match), but which look-alike the code opens is unknown, so
+  `resolved_org` is omitted; `ambiguous` vs `not_found` is equally uncertain.
+- `home_has_modes`: whether `<home_org>:modes` exists as a modes record.
+  `false` is legal (the chat path treats it as an empty home org) but usually
+  means a mistyped gateway org, so the portal can warn. Absent when the home
+  record could not be read or is not valid JSON, for a foreign mode; the answer is then computed
+  with an empty home, as the chat path would, because a home record never
+  affects a `<orgslug>/<slug>` token.
+
+Draft and `requires_group` modes still return the would-be `code`.
+
+`:modeName` is resolved the way chat resolves it: a mode whose name matches
+wins over a mode that only lists it as an alias, and among duplicates the
+one chat serves wins (home: the first published, non-`requires_group` one;
+another org: the first published one that passes the shape check).
+
+Like every `/api/v1/admin/*` route, this needs super-admin authority:
+`ADMIN_API_KEY`, or `ENGINE_API_KEY` only while `ADMIN_KEY_REQUIRED` is not
+enforced. With it enforced, `ENGINE_API_KEY` gets `403` with
+`code: "admin_key_required"`.
+
+**Errors:**
+
+| Status | Body                                                    | When                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ------ | ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 400    | `{"error":"home_org_required","field":"home_org",...}`  | `home_org` is missing or empty                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| 400    | `{"error":"invalid_mode_name",...}`                     | `:modeName` fails the slug pattern                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| 400    | `{"error":"invalid_org","field":"org"\|"home_org",...}` | that field's `<org>:modes` key would exceed the 512-byte KV key limit                                                                                                                                                                                                                                                                                                                                                                                                         |
+| 404    | `{"error":"mode_not_found",...}`                        | no such org or mode                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| 500    | `{"error":"corrupt_modes_record",...}`                  | `<org>:modes` is not valid JSON, or is JSON but not a `{ "modes": [...] }` record (permanent; fix the record)                                                                                                                                                                                                                                                                                                                                                                 |
+| 503    | `{"error":"modes_unavailable","detail":...}`            | retry. `list_failed`: the key listing failed. `listing_lag`: a complete listing does not show the record yet. `read_failed`: the target record could not be read, or an unreadable org with the same slug that sorts first could change who owns the name (it could claim it, or drop an earlier claimant's mode). A corrupt foreign org is skipped, as on the chat path; a failed home read for a foreign mode is not a 503; other failed reads set `resolved_org_uncertain` |
+
+A 404 without `"error":"mode_not_found"` means the route itself is missing (a
+worker older than 2.60.0).
+
+Cost per call: one get each of `<org>:modes` and `<home_org>:modes` (one get
+when they are the same org). A home mode needs nothing more, because a bare
+`#token` only ever matches home modes. A foreign mode adds the chat path's key
+listing and up to 50 foreign gets, reusing the two records already read. The
+route answers one mode per call; it is admin-only and low traffic.
+
+---
+
 ## Testing All E2E Scenarios
 
 ```bash

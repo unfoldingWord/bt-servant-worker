@@ -108,6 +108,24 @@ export function createRequestLogger(requestId: string, userId?: string) {
 
 export type RequestLogger = ReturnType<typeof createRequestLogger>;
 
+/**
+ * The same logger with `context` merged into every event's data. Lets a
+ * caller reuse a shared reader (whose events also serve as chat-health
+ * signals) while tagging its own traffic, e.g. `{ source: 'share_code' }`,
+ * without changing the events the chat path emits.
+ */
+export function withLogContext(
+  logger: RequestLogger,
+  context: Record<string, unknown>
+): RequestLogger {
+  return {
+    log: (event, data = {}) => logger.log(event, { ...data, ...context }),
+    info: (event, data = {}) => logger.info(event, { ...data, ...context }),
+    warn: (event, data = {}) => logger.warn(event, { ...data, ...context }),
+    error: (event, err, data = {}) => logger.error(event, err, { ...data, ...context }),
+  };
+}
+
 // ── Argument redaction utilities for safe logging ───────────────────────────
 // Used by MCP discovery, orchestrator, and code execution to log tool inputs
 // without exposing sensitive values on the happy path.

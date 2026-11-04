@@ -46,6 +46,8 @@ export interface UnmatchedTrigger {
 export interface ClassifierResult {
   /** Resolved mode name (slug), or undefined if no #mode token matched */
   modeName: string | undefined;
+  /** The cascade tier that resolved `modeName`; present exactly when `modeName` is. */
+  modeMatchTier?: MatchTier;
   /** Resolved language name (slug), or undefined if no @language token matched */
   languageName: string | undefined;
   /** User message with all leading trigger tokens stripped (matched or not) */
@@ -191,29 +193,40 @@ function boundedLevenshtein(a: string, b: string, maxDistance: number): number {
 
 const LEVENSHTEIN_MAX = 2;
 
+/** Which tier of the cascade produced a match (`alias` is the exact tier hitting an alias). */
+export type MatchTier = 'exact' | 'alias' | 'prefix' | 'fuzzy';
+
+/** A resolved token: the option's canonical `name` and the tier that matched it. */
+interface TokenMatch {
+  name: string;
+  tier: MatchTier;
+}
+
 /**
  * Tier 1: case-insensitive exact match. Matches the canonical `name` or any
  * alias (issue #284), always returning the canonical `name`. Canonical names
  * are checked first so a name can never be shadowed by another mode's alias.
  */
-function tryExactMatch(lower: string, options: AvailableOption[]): string | null {
+function tryExactMatch(lower: string, options: AvailableOption[]): TokenMatch | null {
   for (const opt of options) {
-    if (opt.name.toLowerCase() === lower) return opt.name;
+    if (opt.name.toLowerCase() === lower) return { name: opt.name, tier: 'exact' };
   }
   for (const opt of options) {
-    if (opt.aliases?.some((alias) => alias.toLowerCase() === lower) === true) return opt.name;
+    if (opt.aliases?.some((alias) => alias.toLowerCase() === lower) === true) {
+      return { name: opt.name, tier: 'alias' };
+    }
   }
   return null;
 }
 
 /** Tier 2: unique prefix winner. */
-function tryPrefixMatch(lower: string, options: AvailableOption[]): string | null {
+function tryPrefixMatch(lower: string, options: AvailableOption[]): TokenMatch | null {
   const hits = options.filter((opt) => opt.name.toLowerCase().startsWith(lower));
-  return hits.length === 1 ? (hits[0] as AvailableOption).name : null;
+  return hits.length === 1 ? { name: (hits[0] as AvailableOption).name, tier: 'prefix' } : null;
 }
 
 /** Tier 3: Levenshtein ≤ LEVENSHTEIN_MAX with a strict unique winner. */
-function tryFuzzyMatch(lower: string, options: AvailableOption[]): string | null {
+function tryFuzzyMatch(lower: string, options: AvailableOption[]): TokenMatch | null {
   let best: { name: string; distance: number } | null = null;
   let tied = false;
   for (const opt of options) {
@@ -226,7 +239,7 @@ function tryFuzzyMatch(lower: string, options: AvailableOption[]): string | null
       tied = true;
     }
   }
-  return best !== null && !tied ? best.name : null;
+  return best !== null && !tied ? { name: best.name, tier: 'fuzzy' } : null;
 }
 
 /**
@@ -239,7 +252,7 @@ function tryFuzzyMatch(lower: string, options: AvailableOption[]): string | null
  * `pbt/obt-coach`, while `#pbt/obt-c` gets the same cascade within the
  * qualified set. Bare tokens only ever see the request org's own modes.
  */
-function matchToken(raw: string, options: AvailableOption[]): string | null {
+function matchToken(raw: string, options: AvailableOption[]): TokenMatch | null {
   const qualified = raw.includes('/');
   const pool = options.filter((opt) => opt.name.includes('/') === qualified);
   if (pool.length === 0) return null;
@@ -268,7 +281,7 @@ function matchToken(raw: string, options: AvailableOption[]): string | null {
  */
 type TokenOutcome =
   | { kind: 'clear'; sigil: '#' | '@' }
-  | { kind: 'matched'; sigil: '#' | '@'; name: string }
+  | { kind: 'matched'; sigil: '#' | '@'; name: string; tier: MatchTier }
   | { kind: 'unmatched'; trigger: UnmatchedTrigger; tokenText: string };
 
 /** Classify a single leading token. Pure: no shared state. */
@@ -278,9 +291,9 @@ function classifyToken(token: ParsedToken, ctx: ClassifierContext): TokenOutcome
   if (CLEAR_TOKENS.has(token.raw.toLowerCase())) {
     return { kind: 'clear', sigil: token.sigil };
   }
-  const matched = matchToken(token.raw, options);
-  if (matched !== null) {
-    return { kind: 'matched', sigil: token.sigil, name: matched };
+  const match = matchToken(token.raw, options);
+  if (match !== null) {
+    return { kind: 'matched', sigil: token.sigil, name: match.name, tier: match.tier };
   }
   const triggerKind: TriggerKind = isMode ? 'mode' : 'language';
   return {
@@ -305,6 +318,7 @@ export function classifyTriggers(messageText: string, ctx: ClassifierContext): C
   }
 
   let modeName: string | undefined;
+  let modeMatchTier: MatchTier | undefined;
   let languageName: string | undefined;
   let clearMode = false;
   let clearLanguage = false;
@@ -317,8 +331,12 @@ export function classifyTriggers(messageText: string, ctx: ClassifierContext): C
       if (outcome.sigil === '#') clearMode = true;
       else clearLanguage = true;
     } else if (outcome.kind === 'matched') {
-      if (outcome.sigil === '#') modeName = outcome.name;
-      else languageName = outcome.name;
+      if (outcome.sigil === '#') {
+        modeName = outcome.name;
+        modeMatchTier = outcome.tier;
+      } else {
+        languageName = outcome.name;
+      }
     } else {
       unmatchedTriggers.push(outcome.trigger);
       unmatchedTokenTexts.push(outcome.tokenText);
@@ -337,5 +355,6 @@ export function classifyTriggers(messageText: string, ctx: ClassifierContext): C
     unmatchedTriggers,
     clearMode,
     clearLanguage,
+    ...(modeMatchTier === undefined ? {} : { modeMatchTier }),
   };
 }
