@@ -2,8 +2,10 @@
  * System prompt builder for Claude orchestration
  */
 
-import { ChatHistoryEntry } from '../../types/engine.js';
+import { ChatCaller, ChatHistoryEntry } from '../../types/engine.js';
+import { isPartnerCaller } from '../../utils/chat-validation.js';
 import { PromptSlot } from '../../types/prompt-overrides.js';
+import { toSingleLine } from '../../types/single-line.js';
 import { UnmatchedTrigger } from '../classifier/index.js';
 import { generateToolCatalog, ToolCatalog } from '../mcp/index.js';
 
@@ -52,6 +54,13 @@ interface SystemPromptOptions {
   clientId?: string | undefined;
   groupContext?: GroupChatContext | undefined;
   isVoiceMessage?: boolean | undefined;
+  /**
+   * Who authenticated the request (`_caller`, the single source of truth;
+   * absent = internal). For a partner API key (admin-portal#354) the Client
+   * Platform section says only "a partner app"; the server-set client_id is
+   * never interpolated.
+   */
+  caller?: ChatCaller | undefined;
   /** Per-turn language document to inject into the system prompt */
   languageDocument?: string | undefined;
   /** Set when the user's whole message was routing triggers. */
@@ -73,9 +82,37 @@ interface SystemPromptOptions {
 /** Max length for speaker names (prevents prompt bloat). */
 const MAX_SPEAKER_LENGTH = 64;
 
-/** Sanitize a speaker name: strip brackets, trim, and limit length. */
-export function sanitizeSpeaker(name: string): string {
-  return name.replace(/[[\]]/g, '').trim().slice(0, MAX_SPEAKER_LENGTH) || 'Unknown';
+/**
+ * Sanitize a speaker name for the prompt, for EVERY caller (Telegram and
+ * WhatsApp group names as much as partner apps): square brackets removed (the
+ * history prefix is `[name]:`), controls and line breaks of every kind
+ * (C0, C1, U+2028/U+2029) and whitespace runs flattened to one space, trimmed,
+ * and capped at 64 code points. A name can therefore never start a new prompt
+ * line or a heading. Empty → "Unknown". Not a string (a number, an object —
+ * anything a client sent) → undefined: there is no name to render, and the
+ * caller renders none. This is the ONE type check for speakers; partner keys
+ * additionally get a 400 for a non-string speaker at the boundary.
+ */
+export function sanitizeSpeaker(name: unknown): string | undefined {
+  if (typeof name !== 'string') return undefined;
+  return toSingleLine(name, MAX_SPEAKER_LENGTH, '[]') || 'Unknown';
+}
+
+/**
+ * A partner's speaker as the UserDO stores and logs it: the same flattening
+ * as sanitizeSpeaker (so at most 64 code points), but nothing to show (blank,
+ * or not a string) → undefined, so no name is stored at all. Internal
+ * callers' speaker is stored as sent (the prompt sanitizes it either way).
+ */
+export function normalizeSpeaker(name: unknown): string | undefined {
+  if (typeof name !== 'string') return undefined;
+  return toSingleLine(name, MAX_SPEAKER_LENGTH, '[]') || undefined;
+}
+
+/** `[Name]: ` for a message from a group speaker, or '' when there is none to show. */
+export function speakerPrefix(speaker: unknown): string {
+  const name = speaker ? sanitizeSpeaker(speaker) : undefined;
+  return name === undefined ? '' : `[${name}]: `;
 }
 
 /**
@@ -201,10 +238,17 @@ const RESOURCE_AVAILABILITY_RULES =
   '- NEVER offer a substitute version that no tool returned. If you could not check, say so instead of guessing.';
 
 /** Build the client platform + client_instructions section. */
-function buildClientSection(clientId: string | undefined, clientInstructions: string): string {
+function buildClientSection(
+  clientId: string | undefined,
+  clientInstructions: string,
+  partnerCaller: boolean
+): string {
   const parts: string[] = [];
   if (clientId) {
-    parts.push(`## Client Platform\nThe user is communicating via: ${clientId}`);
+    // Partner requests: the model is told only that it is a partner app,
+    // decided from `_caller` (never from a client_id prefix).
+    const platform = partnerCaller ? 'a partner app' : clientId;
+    parts.push(`## Client Platform\nThe user is communicating via: ${platform}`);
   }
   parts.push(clientInstructions);
   return parts.join('\n\n');
@@ -217,8 +261,10 @@ function buildGroupSection(groupContext: GroupChatContext | undefined): string |
     '## Group Chat Context',
     'You are in a group conversation. Messages come from different participants.',
   ];
-  if (groupContext.currentSpeaker) {
-    const safe = sanitizeSpeaker(groupContext.currentSpeaker);
+  const safe = groupContext.currentSpeaker
+    ? sanitizeSpeaker(groupContext.currentSpeaker)
+    : undefined;
+  if (safe !== undefined) {
     lines.push(`The current speaker is: ${safe}.`);
     lines.push('Address the current speaker by name when responding.');
   }
@@ -434,7 +480,8 @@ export function buildSystemPromptBlocks(
   resolvedPromptValues: Required<Record<PromptSlot, string>>,
   options?: SystemPromptOptions
 ): SystemPromptBlocks {
-  const { memoryTOC, memoryEnabled, clientId, groupContext, isVoiceMessage } = options ?? {};
+  const { memoryTOC, memoryEnabled, clientId, groupContext, isVoiceMessage, caller } =
+    options ?? {};
 
   // ── Cacheable: derived only from org/mode config and the MCP catalog ──
   const stableSections: string[] = [
@@ -451,7 +498,7 @@ export function buildSystemPromptBlocks(
   // recovering those tokens needs actual prompt reordering and is deliberately
   // out of scope here (see docs/plans/prompt-caching.md).
   const sections: string[] = [
-    buildClientSection(clientId, resolvedPromptValues.client_instructions),
+    buildClientSection(clientId, resolvedPromptValues.client_instructions, isPartnerCaller(caller)),
   ];
 
   const groupSection = buildGroupSection(groupContext);
@@ -548,9 +595,7 @@ export function historyToMessages(
   const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
 
   for (const entry of truncated) {
-    const userContent = entry.speaker
-      ? `[${sanitizeSpeaker(entry.speaker)}]: ${entry.user_message}`
-      : entry.user_message;
+    const userContent = `${speakerPrefix(entry.speaker)}${entry.user_message}`;
     messages.push({ role: 'user', content: userContent });
     messages.push({ role: 'assistant', content: entry.assistant_response });
   }

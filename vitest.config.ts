@@ -52,8 +52,16 @@ export default defineConfig({
           ANTHROPIC_API_KEY: anthropicKey,
           // #311: wa.me share number for first-contact welcome tests.
           WHATSAPP_NUMBER: '15558196461',
+          // admin-portal#354: HMAC key for the partner API key tag.
+          PARTNER_KEY_TAG_SECRET: 'test-partner-key-tag-secret',
         },
-        kvNamespaces: ['ORG_ADMIN_KEYS', 'MCP_SERVERS', 'ORG_CONFIG', 'PROMPT_OVERRIDES'],
+        kvNamespaces: [
+          'ORG_ADMIN_KEYS',
+          'MCP_SERVERS',
+          'ORG_CONFIG',
+          'PROMPT_OVERRIDES',
+          'API_KEYS',
+        ],
         r2Buckets: ['AUDIO_BUCKET', 'PTXPRINT_BUCKET'],
       },
       // Disable isolated storage to avoid issues with multi-request DO tests

@@ -34,17 +34,17 @@ describe('validateChatBody — shared rules', () => {
     expect(validateChatBody(body as ChatRequest, 'final')).toBe('client_id is required');
   });
 
-  it('rejects is_admin in the body (admin origin is derived from client_id)', () => {
+  it('rejects is_admin in the body (admin origin is derived server-side)', () => {
     const body = { ...baseBody, is_admin: true } as unknown as ChatRequest;
     expect(validateChatBody(body, 'final')).toBe(
-      'is_admin is not a valid field; admin origin is derived from client_id'
+      'is_admin is not a valid field; admin origin is derived server-side from the authenticated caller and client_id'
     );
   });
 
   it('rejects is_admin: false the same way (any presence of the field)', () => {
     const body = { ...baseBody, is_admin: false } as unknown as ChatRequest;
     expect(validateChatBody(body, 'final')).toBe(
-      'is_admin is not a valid field; admin origin is derived from client_id'
+      'is_admin is not a valid field; admin origin is derived server-side from the authenticated caller and client_id'
     );
   });
 });

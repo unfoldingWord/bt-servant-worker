@@ -12,7 +12,7 @@ import { UserDO as UserDOClass } from './durable-objects/index.js';
 import { discoverAllTools, listOrgResources } from './services/mcp/index.js';
 import { readDoSnapshot } from './services/admin/do-snapshot.js';
 import { MCPServerWrite } from './types/mcp.js';
-import { ChatRequest, ChatTransport, ChatType } from './types/engine.js';
+import { ChatCaller, ChatRequest, ChatTransport, ChatType } from './types/engine.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig, validateOrgConfig } from './types/org-config.js';
 import {
   checkModeSlugUniqueness,
@@ -65,7 +65,7 @@ import {
   type KeyClass,
 } from './utils/admin-auth.js';
 import { ValidationError } from './utils/errors.js';
-import { getAudio, VOICE_SUBMISSION_PREFIX } from './services/audio/index.js';
+import { getAudio, partnerOwnsAudioKey, VOICE_SUBMISSION_PREFIX } from './services/audio/index.js';
 import { createRequestLogger, type RequestLogger } from './utils/logger.js';
 import { createTimingContext, timePhase, type TimingContext } from './utils/timing.js';
 import {
@@ -88,8 +88,40 @@ import {
   toPublicServerConfigs,
   upsertServer,
 } from './utils/mcp-servers.js';
-import { resolveOrgFromBody } from './utils/org.js';
-import { isAdminClient, validateChatBody } from './utils/chat-validation.js';
+import { orgDoNameError, resolveOrgFromBody } from './utils/org.js';
+import {
+  chatIdProblem,
+  conversationAddressError,
+  isAdminClient,
+  MAX_CHAT_ID_LENGTH,
+  reservedPartnerIdError,
+  validateChatBody,
+} from './utils/chat-validation.js';
+import {
+  applyPartnerChatPolicy,
+  isPartnerRouteAllowed,
+  principalKeyId,
+  type Principal,
+} from './services/partner-keys/policy.js';
+import { isReservedPartnerId } from './types/partner-namespace.js';
+import { lookupPartnerKeyByToken, partnerKeyStore } from './services/partner-keys/store.js';
+import {
+  hasValidPartnerKeyTag,
+  looksLikePartnerKey,
+  partnerKeyPrefix,
+} from './services/partner-keys/key-material.js';
+import type { RotateOutcome } from './services/partner-keys/ledger.js';
+import { orgHasConfig } from './services/partner-keys/org-exists.js';
+import { importLegacyUsers, readLegacyImportBody } from './services/partner-keys/legacy-import.js';
+import {
+  type PartnerKeyRecord,
+  partnerKeyStatus,
+  readRevokeBody,
+  readRotateBody,
+  toPublicPartnerKey,
+  validatePartnerKeyCreate,
+  validatePartnerKeyOrg,
+} from './types/partner-keys.js';
 import { instrument, instrumentDO } from '@microlabs/otel-cf-workers';
 import {
   resolveTelemetryConfig,
@@ -115,10 +147,14 @@ export { PartnerKeyStoreDO } from './durable-objects/partner-key-store-do.js';
  * bearer token matched (never the key), whether that key carries super-admin
  * authority under the current config, and the request id + logger every later
  * middleware and route logs through.
+ * Partner API keys (admin-portal#354) add the principal: `internal` for
+ * ENGINE_API_KEY / ADMIN_API_KEY, `partner` for an active partner key, which
+ * has no key class (null) and is never super-admin.
  */
 type AppEnv = {
   Bindings: Env;
   Variables: {
+    principal: Principal;
     keyClass: KeyClass | null;
     superAdmin: boolean;
     requestId: string;
@@ -172,6 +208,108 @@ app.get('/health', (c) => c.json({ status: 'healthy', version: APP_VERSION }));
 // Bucket: PTXPRINT_BUCKET (defined in wrangler.toml).
 app.get('/public/ptxprint/*', async (c) => servePublicPtxprintObject(c.req.path, c.env));
 
+/**
+ * Rejections of a VALID partner key that is used outside its scope: the key
+ * is real, so "Invalid API key" would be misleading.
+ */
+const NOT_PERMITTED_REASONS: ReadonlySet<string> = new Set(['partner_route_forbidden']);
+
+/** Observable auth rejection: one log line + one counter, never the token value. */
+function rejectAuth(
+  c: Context<AppEnv>,
+  status: 401 | 403,
+  reason: string,
+  extra: Record<string, unknown> = {}
+) {
+  c.get('logger').warn('auth_rejected', {
+    reason,
+    status,
+    path: c.req.path,
+    method: c.req.method,
+    ...extra,
+  });
+  countMetric('auth_rejections_total', { reason, status_code: status });
+  if (status === 401) {
+    return c.json({ error: 'Authorization header with Bearer token required' }, status);
+  }
+  if (NOT_PERMITTED_REASONS.has(reason)) {
+    return c.json({ error: 'This API key is not permitted to call this endpoint' }, status);
+  }
+  // `code` is the stable, machine-readable reason; `error` text is unchanged.
+  // The same body for every token that did not authenticate (a partner-shaped
+  // one included), so it reveals nothing.
+  return c.json({ error: 'Invalid API key', code: 'invalid_api_key' }, status);
+}
+
+/**
+ * Resolve a partner-shaped bearer token to an active partner key, or an auth
+ * rejection. Unknown, revoked and expired keys get the SAME 403 body (a caller
+ * learns nothing about which keys exist); only the log reason differs.
+ */
+async function authenticatePartner(
+  c: Context<AppEnv>,
+  token: string
+): Promise<{ ok: true; key: PartnerKeyRecord } | { ok: false; response: Response }> {
+  let key: PartnerKeyRecord | null;
+  try {
+    key = await lookupPartnerKeyByToken(c.env.API_KEYS, token);
+  } catch (error) {
+    c.get('logger').error('partner_key_lookup_failed', error, {
+      path: c.req.path,
+      method: c.req.method,
+    });
+    countMetric('auth_rejections_total', { reason: 'partner_lookup_error', status_code: 503 });
+    return {
+      ok: false,
+      response: c.json({ error: 'Authentication temporarily unavailable' }, 503),
+    };
+  }
+  if (!key) return { ok: false, response: rejectAuth(c, 403, 'unknown_partner_key') };
+  const status = partnerKeyStatus(key, Date.now());
+  if (status !== 'active') {
+    // revoked_partner_key | expired_partner_key (past its rotation grace)
+    const reason = `${status}_partner_key`;
+    return { ok: false, response: rejectAuth(c, 403, reason, { key_id: key.id }) };
+  }
+  return { ok: true, key };
+}
+
+/**
+ * Everything checked about a non-internal token BEFORE any KV read, so a junk
+ * token or a guessed one costs no I/O: the shape, then the keyed tag (an HMAC
+ * only PARTNER_KEY_TAG_SECRET can produce; see key-material.ts). The display
+ * prefix (`bts_<8 hex>`) is not secret and is logged for attribution.
+ * Returns the rejection, or null to go on to the lookup. The route allowlist
+ * is checked only AFTER the key is authenticated, so a forged or unknown
+ * look-alike always gets "Invalid API key", never the "not permitted" answer
+ * that would tell it the token's shape passed.
+ */
+/** Whether this isolate has already logged the missing PARTNER_KEY_TAG_SECRET. */
+let tagSecretMissingLogged = false;
+
+async function partnerPreflight(c: Context<AppEnv>, token: string): Promise<Response | null> {
+  if (!looksLikePartnerKey(token)) return rejectAuth(c, 403, 'invalid_token');
+  const keyPrefix = { key_prefix: partnerKeyPrefix(token) };
+  const secret = c.env.PARTNER_KEY_TAG_SECRET;
+  if (!secret) {
+    // Misconfiguration: no partner key can be verified, so none is valid.
+    // Logged as an error once per isolate (not once per request); each
+    // request is still an ordinary, counted auth rejection.
+    if (!tagSecretMissingLogged) {
+      tagSecretMissingLogged = true;
+      c.get('logger').error(
+        'partner_key_tag_secret_missing',
+        new Error('PARTNER_KEY_TAG_SECRET unset')
+      );
+    }
+    return rejectAuth(c, 403, 'partner_tag_secret_missing', keyPrefix);
+  }
+  if (!(await hasValidPartnerKeyTag(token, secret))) {
+    return rejectAuth(c, 403, 'invalid_partner_key_tag', keyPrefix);
+  }
+  return null;
+}
+
 // Auth middleware for all /api routes. Accepts ENGINE_API_KEY or (when
 // configured) ADMIN_API_KEY, and is the one place the bearer token is
 // classified (through the guarded classifyToken: a blank token or an unset
@@ -179,6 +317,18 @@ app.get('/public/ptxprint/*', async (c) => servePublicPtxprintObject(c.req.path,
 // from it are stored on the context (`keyClass`, `superAdmin`) for the admin
 // gate, the MCP pool fence and the chat admin check. It also mints the request
 // id + logger that later middlewares and routes log through.
+//
+// Partner API keys (admin-portal#354), checked only after classifyToken:
+// 1. A deployment-wide key is the "internal" principal (as above).
+// 2. Anything else is treated as a partner key: shape and
+//    keyed tag first (partnerPreflight, no I/O), then the KV lookup, and only
+//    for an authenticated key the route allowlist (isPartnerRouteAllowed:
+//    POST /api/v1/chat and /api/v1/chat/stream, plus GET/HEAD on
+//    /api/v1/audio/* and /api/v1/voice-submissions/*, which serve a partner
+//    only its own audio). A partner key has no key class and is never
+//    super-admin.
+//
+// Every rejection is logged (auth_rejected + reason) and counted.
 app.use('/api/*', async (c, next) => {
   const requestId = crypto.randomUUID();
   const logger = createRequestLogger(requestId);
@@ -187,34 +337,45 @@ app.use('/api/*', async (c, next) => {
 
   const presented = bearerToken(c.req.header('Authorization'));
   if (presented === null) {
-    // Observable rejection: never silently drop a 401. Token value is never logged.
-    logger.warn('auth_rejected', {
-      reason: 'missing_bearer',
-      status: 401,
-      path: c.req.path,
-      method: c.req.method,
-    });
-    countMetric('auth_rejections_total', { reason: 'missing_bearer', status_code: 401 });
-    return c.json({ error: 'Authorization header with Bearer token required' }, 401);
+    return rejectAuth(c, 401, 'missing_bearer');
   }
 
   const keyClass = classifyToken(presented, c.env);
   if (keyClass === null) {
-    logger.warn('auth_rejected', {
-      reason: 'invalid_token',
-      status: 403,
-      path: c.req.path,
-      method: c.req.method,
-    });
-    countMetric('auth_rejections_total', { reason: 'invalid_token', status_code: 403 });
-    // `code` is the stable, machine-readable reason; `error` text is unchanged.
-    return c.json({ error: 'Invalid API key', code: 'invalid_api_key' }, 403);
+    // Not a deployment-wide key: a partner key, or nothing (rejected there,
+    // with the same `Invalid API key` body and `invalid_api_key` code).
+    const refused = await authenticatePartnerRequest(c, presented);
+    return refused ?? next();
   }
 
+  c.set('principal', { kind: 'internal' });
   c.set('keyClass', keyClass);
   c.set('superAdmin', isSuperAdminClass(keyClass, c.env));
   return next();
 });
+
+/**
+ * The partner-key path of the `/api/*` middleware, in order: shape and tag
+ * (partnerPreflight, no I/O), the KV lookup, then the route allowlist. Sets a
+ * partner principal (no key class, never super-admin) and returns null, or
+ * returns the logged, counted rejection.
+ */
+async function authenticatePartnerRequest(
+  c: Context<AppEnv>,
+  presented: string
+): Promise<Response | null> {
+  const refused = await partnerPreflight(c, presented);
+  if (refused) return refused;
+  const auth = await authenticatePartner(c, presented);
+  if (!auth.ok) return auth.response;
+  if (!isPartnerRouteAllowed(c.req.method, c.req.path)) {
+    return rejectAuth(c, 403, 'partner_route_forbidden', { key_id: auth.key.id });
+  }
+  c.set('principal', { kind: 'partner', key: auth.key });
+  c.set('keyClass', null);
+  c.set('superAdmin', false);
+  return null;
+}
 
 // Chat endpoints — explicit transport per route.
 //
@@ -241,6 +402,18 @@ app.post('/api/v1/chat/callback', async (c) => {
   return handleChatRequest(c.req.raw, c.env, 'callback', chatAuth(c));
 });
 
+// The non-admin user routes never address a partner's DO: an id in the
+// reserved `partner:` form is a 400 here, the same rule validateChatBody
+// applies to chat bodies. Super-admin /api/v1/admin/* routes may still
+// address partner DOs (that is how support manages them).
+// Since worker #479 (with ADMIN_KEY_REQUIRED="true", as in production and
+// staging) ENGINE_API_KEY is no longer super-admin, so this check is what
+// keeps it, like every other non-admin caller, out of a partner's user DO.
+app.use('/api/v1/orgs/:org/users/:userId/*', async (c, next) => {
+  if (!isReservedPartnerId(c.req.param('userId'))) return next();
+  return c.json({ error: reservedPartnerIdError('userId') }, 400);
+});
+
 // User endpoints with org scope (new paths)
 app.get('/api/v1/orgs/:org/users/:userId/preferences', async (c) => {
   const org = c.req.param('org');
@@ -260,6 +433,24 @@ app.get('/api/v1/orgs/:org/users/:userId/history', async (c) => {
   return handleUserRequest(c, org, userId, '/history');
 });
 
+/**
+ * Who may download an audio object (admin-portal#354). Internal callers: any,
+ * as before. A partner key: only audio in its own partition — its own users'
+ * and groups' TTS replies and voice submissions in its org
+ * (partnerOwnsAudioKey). Anything else answers exactly like a missing object
+ * (404), so a partner learns nothing about other audio; the refusal is logged.
+ */
+function principalMayReadAudio(
+  principal: Principal | undefined,
+  key: string,
+  logger: RequestLogger
+): boolean {
+  if (principal?.kind !== 'partner') return true;
+  if (partnerOwnsAudioKey(key, principal.key.org, principal.key.userNamespace)) return true;
+  logger.warn('partner_audio_refused', { key_id: principal.key.id });
+  return false;
+}
+
 // Audio serving endpoint — serves TTS audio from R2
 app.get('/api/v1/audio/*', async (c) => {
   const start = Date.now();
@@ -269,6 +460,9 @@ app.get('/api/v1/audio/*', async (c) => {
   }
 
   const logger = c.get('logger');
+  if (!principalMayReadAudio(c.get('principal'), audioKey, logger)) {
+    return c.json({ error: 'Audio not found' }, 404);
+  }
   try {
     const object = await getAudio(c.env.AUDIO_BUCKET, audioKey, logger);
     if (!object) {
@@ -315,6 +509,9 @@ app.get('/api/v1/voice-submissions/*', async (c) => {
   }
 
   const logger = c.get('logger');
+  if (!principalMayReadAudio(c.get('principal'), key, logger)) {
+    return c.json({ error: 'Voice submission not found' }, 404);
+  }
   try {
     const object = await getAudio(c.env.AUDIO_BUCKET, key, logger);
     if (!object) {
@@ -351,6 +548,7 @@ type ChatAuth = AppEnv['Variables'];
 
 function chatAuth(c: Context<AppEnv>): ChatAuth {
   return {
+    principal: c.get('principal'),
     keyClass: c.get('keyClass'),
     superAdmin: c.get('superAdmin'),
     requestId: c.get('requestId'),
@@ -1310,10 +1508,14 @@ app.post('/api/v1/admin/orgs/:org/modes/:modeName/_retire', async (c) => {
 async function readJsonBody(
   req: Request,
   logger: RequestLogger,
-  logContext: Record<string, unknown>
+  logContext: Record<string, unknown>,
+  options: { allowEmpty?: boolean } = {}
 ): Promise<{ ok: true; body: unknown } | { ok: false; error: string }> {
   try {
-    return { ok: true, body: await req.json() };
+    if (!options.allowEmpty) return { ok: true, body: await req.json() };
+    // allowEmpty: an absent body is `undefined`; a present one must be JSON.
+    const text = await req.text();
+    return { ok: true, body: text.trim() === '' ? undefined : JSON.parse(text) };
   } catch (error) {
     logger.warn('admin_action', {
       ...logContext,
@@ -1804,6 +2006,283 @@ app.get('/api/v1/admin/do/:hexId/snapshot', async (c) => {
     return c.json({ error: 'Failed to snapshot Durable Object' }, 500);
   }
 });
+
+// ── Partner API keys (admin-portal#354) ──────────────────────────────────────
+//
+// Super-admin only (the one /api/v1/admin/* guard, isSuperAdmin, above).
+// Org-agnostic paths, like the DO snapshot route, because a super admin lists
+// across orgs; `?org=` filters. Responses go through toPublicPartnerKey, which
+// never carries the hash; the plaintext appears only in the create and rotate
+// responses, as `apiKey`, and cannot be fetched again.
+
+const PARTNER_KEYS_BASE = '/api/v1/admin/api-keys';
+
+/** On every response that carries a plaintext key: no cache may keep a copy. */
+const NO_STORE_HEADERS = { 'Cache-Control': 'no-store' } as const;
+
+function unknownOrgMessage(org: string): string {
+  return `Org '${org}' has no configuration in this worker (check the spelling). Pass "allow_new_org": true to create a key for an org that is not configured yet.`;
+}
+
+/** The PartnerKeyStoreDO client for this request (shares its request id). */
+const keyStore = (c: Context<AppEnv>) =>
+  partnerKeyStore(c.env.PARTNER_KEY_STORE, c.get('requestId'));
+
+app.post(PARTNER_KEYS_BASE, async (c) => {
+  const logger = c.get('logger');
+  const parsed = await readJsonBody(c.req.raw, logger, { action: 'create_api_key' });
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const validated = validatePartnerKeyCreate(parsed.body);
+  if (!validated.ok) return c.json({ error: validated.error }, 400);
+
+  try {
+    const { org } = validated.input;
+    if (!validated.allowNewOrg && !(await orgHasConfig(c.env, org))) {
+      logger.warn('admin_action', { action: 'create_api_key', org, rejected: 'unknown_org' });
+      return c.json({ error: unknownOrgMessage(org), code: 'unknown_org' }, 400);
+    }
+    const { record, plaintext, warnings } = await keyStore(c).create(validated.input);
+    logger.log('admin_action', {
+      action: 'create_api_key',
+      key_id: record.id,
+      org: record.org,
+      app: record.app,
+      created_by: record.createdBy,
+      warnings,
+    });
+    return c.json(
+      { key: toPublicPartnerKey(record), warnings, apiKey: plaintext },
+      201,
+      NO_STORE_HEADERS
+    );
+  } catch (error) {
+    logger.error('admin_action', error, { action: 'create_api_key', org: validated.input.org });
+    return c.json({ error: 'Failed to create API key' }, 500);
+  }
+});
+
+app.get(PARTNER_KEYS_BASE, async (c) => {
+  const logger = c.get('logger');
+  const org = c.req.query('org');
+  if (org !== undefined) {
+    const orgError = validatePartnerKeyOrg(org);
+    if (orgError) return c.json({ error: orgError }, 400);
+  }
+  try {
+    const { records } = await keyStore(c).list(org);
+    logger.log('admin_action', {
+      action: 'list_api_keys',
+      org: org ?? null,
+      count: records.length,
+    });
+    // The DO list is always complete (no paging).
+    return c.json({ org: org ?? null, keys: records.map((r) => toPublicPartnerKey(r)) });
+  } catch (error) {
+    logger.error('admin_action', error, { action: 'list_api_keys', org: org ?? null });
+    return c.json({ error: 'Failed to list API keys' }, 500);
+  }
+});
+
+app.get(`${PARTNER_KEYS_BASE}/:keyId`, async (c) => {
+  const keyId = c.req.param('keyId');
+  const logger = c.get('logger');
+  try {
+    const record = await keyStore(c).get(keyId);
+    if (!record) return c.json({ error: 'API key not found' }, 404);
+    logger.log('admin_action', { action: 'get_api_key', key_id: keyId });
+    return c.json({ key: toPublicPartnerKey(record) });
+  } catch (error) {
+    logger.error('admin_action', error, { action: 'get_api_key', key_id: keyId });
+    return c.json({ error: 'Failed to read API key' }, 500);
+  }
+});
+
+app.post(`${PARTNER_KEYS_BASE}/:keyId/_revoke`, async (c) => {
+  const keyId = c.req.param('keyId');
+  const logger = c.get('logger');
+  const ctx = { action: 'revoke_api_key', key_id: keyId };
+  const parsed = await readJsonBody(c.req.raw, logger, ctx, { allowEmpty: true });
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const actor = readRevokeBody(parsed.body);
+  if (!actor.ok) return c.json({ error: actor.error }, 400);
+
+  try {
+    const result = await keyStore(c).revoke(keyId, actor.revokedBy);
+    if (!result) return c.json({ error: 'API key not found' }, 404);
+    logger.log('admin_action', {
+      ...ctx,
+      org: result.record.org,
+      already_revoked: result.alreadyRevoked,
+      revoked_ids: result.revokedIds,
+      revoked_by: actor.revokedBy ?? null,
+      warnings: result.warnings,
+    });
+    return c.json({
+      key: toPublicPartnerKey(result.record),
+      alreadyRevoked: result.alreadyRevoked,
+      revokedIds: result.revokedIds,
+      warnings: result.warnings,
+    });
+  } catch (error) {
+    logger.error('admin_action', error, ctx);
+    return c.json({ error: 'Failed to revoke API key' }, 500);
+  }
+});
+
+app.post(`${PARTNER_KEYS_BASE}/:keyId/_rotate`, async (c) => {
+  const keyId = c.req.param('keyId');
+  const logger = c.get('logger');
+  const ctx = { action: 'rotate_api_key', key_id: keyId };
+  const parsed = await readJsonBody(c.req.raw, logger, ctx, { allowEmpty: true });
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const body = readRotateBody(parsed.body);
+  if (!body.ok) return c.json({ error: body.error }, 400);
+
+  try {
+    const { ok: _ok, ...opts } = body;
+    const result = await keyStore(c).rotate(keyId, opts);
+    if (result.status !== 'ok') return rotateRefusal(c, result);
+    logger.log('admin_action', {
+      ...ctx,
+      org: result.record.org,
+      new_key_id: result.record.id,
+      grace_seconds: body.graceSeconds,
+      old_expires_at: result.previous.expiresAt ?? null,
+      revoked_ids: result.revokedIds,
+      warnings: result.warnings,
+    });
+    return c.json(
+      {
+        key: toPublicPartnerKey(result.record),
+        previous: toPublicPartnerKey(result.previous),
+        revokedIds: result.revokedIds,
+        warnings: result.warnings,
+        apiKey: result.plaintext,
+      },
+      200,
+      NO_STORE_HEADERS
+    );
+  } catch (error) {
+    logger.error('admin_action', error, ctx);
+    return c.json({ error: 'Failed to rotate API key' }, 500);
+  }
+});
+
+/**
+ * Legacy user import (super-admin only; the admin guard refuses partner keys).
+ * Copies the named users' conversation data from `user:<org>:<id>` (the
+ * shared-key era) to this key's namespace. See legacy-import.ts for the
+ * guards. Always 200 with a per-user status once the body is valid.
+ */
+app.post(`${PARTNER_KEYS_BASE}/:keyId/_import-legacy-users`, async (c) => {
+  const keyId = c.req.param('keyId');
+  const logger = c.get('logger');
+  const ctx = { action: 'import_legacy_users', key_id: keyId };
+  const parsed = await readJsonBody(c.req.raw, logger, ctx);
+  if (!parsed.ok) return c.json({ error: parsed.error }, 400);
+  const body = readLegacyImportBody(parsed.body);
+  if (!body.ok) return c.json({ error: body.error }, 400);
+  try {
+    const key = await keyStore(c).get(keyId);
+    if (!key) return c.json({ error: 'API key not found' }, 404);
+    const status = partnerKeyStatus(key, Date.now());
+    if (status !== 'active') {
+      logger.warn('admin_action', { ...ctx, rejected: `key_${status}` });
+      return c.json(
+        { error: `This API key is ${status}; import into an active key`, code: `key_${status}` },
+        409
+      );
+    }
+    // One import per user namespace at a time (a rotation chain shares one):
+    // a concurrent run could delete audio this one wrote (or is reusing).
+    // Released in finally; the TTL covers a crash.
+    const holder = crypto.randomUUID();
+    if (!(await keyStore(c).acquireImportLease(key.userNamespace, holder))) {
+      logger.warn('admin_action', { ...ctx, rejected: 'import_in_progress' });
+      return c.json({ error: IMPORT_IN_PROGRESS_ERROR, code: 'import_in_progress' }, 409);
+    }
+    const results = await withImportLease(c, key.userNamespace, holder, () =>
+      importLegacyUsers(c.env, key, body.input, {
+        logger,
+        requestId: c.get('requestId'),
+        // Renewed before each user, during a long audio copy, before the
+        // destination write and before any cleanup delete; false = lost.
+        renewLease: () => keyStore(c).renewImportLease(key.userNamespace, holder),
+        // Re-read from the store before each batch; a key that is gone counts as revoked.
+        currentStatus: async () => {
+          const now = await keyStore(c).get(keyId);
+          return now ? partnerKeyStatus(now, Date.now()) : 'revoked';
+        },
+      })
+    );
+    logger.log('admin_action', {
+      ...ctx,
+      org: key.org,
+      legacy_client_id: body.input.legacyClientId,
+      requested: body.input.userIds.length,
+      counts: countByStatus(results),
+    });
+    return c.json({ keyId: key.id, org: key.org, results });
+  } catch (error) {
+    logger.error('admin_action', error, ctx);
+    return c.json({ error: 'Failed to import legacy users' }, 500);
+  }
+});
+
+const IMPORT_IN_PROGRESS_ERROR =
+  'An import for this API key is already running; retry when it finishes';
+
+/** How many users ended in each status, for the summary log line. */
+function countByStatus(results: { status: string }[]): Record<string, number> {
+  return Object.fromEntries(
+    results.reduce((m, r) => m.set(r.status, (m.get(r.status) ?? 0) + 1), new Map<string, number>())
+  );
+}
+
+/** Run `task`, then release the import lease (a failed release is logged; the TTL frees it). */
+async function withImportLease<T>(
+  c: Context<AppEnv>,
+  namespace: string,
+  holder: string,
+  task: () => Promise<T>
+): Promise<T> {
+  try {
+    return await task();
+  } finally {
+    try {
+      await keyStore(c).releaseImportLease(namespace, holder);
+    } catch (error) {
+      c.get('logger').error('partner_key_legacy_import_lease_release_failed', error, {
+        user_namespace: namespace,
+      });
+    }
+  }
+}
+
+/** HTTP response for a rotation that did not happen. */
+function rotateRefusal(c: Context<AppEnv>, result: Exclude<RotateOutcome, { status: 'ok' }>) {
+  switch (result.status) {
+    case 'not_found':
+      return c.json({ error: 'API key not found' }, 404);
+    case 'revoked':
+      return c.json(
+        { error: 'A revoked or expired API key cannot be rotated; create a new key' },
+        409
+      );
+    case 'already_rotated':
+      // Also the recovery path for a rotate response lost in transit: the new
+      // key's plaintext is never stored, so the way back is to rotate the
+      // successor (with a grace, which leaves this key working meanwhile).
+      return c.json(
+        {
+          error: `This key was already rotated to ${result.rotatedTo}. If the response with that key's apiKey was lost, rotate ${result.rotatedTo} (keep a grace period: graceSeconds 0 would also revoke this key)`,
+          code: 'already_rotated',
+          rotatedTo: result.rotatedTo,
+        },
+        409
+      );
+  }
+}
 
 // ── Group/thread admin helpers ──────────────────────────────────────────────────
 
@@ -2385,17 +2864,12 @@ function doChatPathForTransport(transport: ChatTransport): string {
   }
 }
 
-/** Max length for chat_id and thread_id path parameters. */
-const MAX_CHAT_ID_LENGTH = 256;
-/** Pattern: alphanumeric, hyphens, underscores, dots, colons (Telegram IDs are typically numeric). */
-const CHAT_ID_PATTERN = /^[\w.:-]+$/;
-
 /** Validate a chat_id or thread_id path parameter. Returns an error string or null. */
 function validateChatIdParam(value: string, paramName: string): string | null {
-  if (!value) return `${paramName} is required`;
-  if (value.length > MAX_CHAT_ID_LENGTH)
-    return `${paramName} must be <= ${MAX_CHAT_ID_LENGTH} characters`;
-  if (!CHAT_ID_PATTERN.test(value)) return `${paramName} contains invalid characters`;
+  const problem = chatIdProblem(value);
+  if (problem === 'missing') return `${paramName} is required`;
+  if (problem === 'too_long') return `${paramName} must be <= ${MAX_CHAT_ID_LENGTH} characters`;
+  if (problem === 'invalid_characters') return `${paramName} contains invalid characters`;
   return null;
 }
 
@@ -2422,6 +2896,17 @@ function resolveDOId(env: Env, org: string, body: ChatRequest): DurableObjectId 
   return env.USER_DO.idFromName(`user:${org}:${body.user_id}`);
 }
 
+/** Headers for the DO chat request: the caller's, plus the request id and the worker origin. */
+function doChatHeaders(request: Request, requestId: string | undefined): Headers {
+  const headers = new Headers(request.headers);
+  if (requestId) {
+    headers.set('X-Request-ID', requestId);
+  }
+  // Pass the real worker origin so the DO can build public-facing audio URLs
+  headers.set('X-Worker-Origin', new URL(request.url).origin);
+  return headers;
+}
+
 /**
  * Build a DO request with org-level KV data injected into the body.
  */
@@ -2434,6 +2919,8 @@ async function buildDOChatRequest(
     transport: ChatTransport;
     logger: ReturnType<typeof createRequestLogger>;
     requestId?: string;
+    /** Who authenticated (#354): from the auth principal, never from the body. */
+    caller: ChatCaller;
     /** Admin visibility, decided here from client_id AND the authenticated key class. */
     isAdmin: boolean;
   }
@@ -2458,13 +2945,7 @@ async function buildDOChatRequest(
 
   const doUrl = new URL(request.url);
   doUrl.pathname = doChatPathForTransport(transport);
-
-  const headers = new Headers(request.headers);
-  if (opts.requestId) {
-    headers.set('X-Request-ID', opts.requestId);
-  }
-  // Pass the real worker origin so the DO can build public-facing audio URLs
-  headers.set('X-Worker-Origin', new URL(request.url).origin);
+  const headers = doChatHeaders(request, opts.requestId);
 
   const doRequest = new Request(doUrl.toString(), {
     method: 'POST',
@@ -2481,6 +2962,9 @@ async function buildDOChatRequest(
       // AFTER the spread, so a client-supplied `_edge_country` in the inbound
       // body is always overwritten and can never reach telemetry.
       _edge_country: (request.cf as { country?: string } | undefined)?.country,
+      // Who authenticated (#354). Also set AFTER the spread, so it always comes
+      // from the auth middleware's principal, never from the client body.
+      _caller: opts.caller,
       // Admin visibility, decided by the worker from client_id AND the key the
       // request authenticated with. Set AFTER the spread so a client-supplied
       // `_is_admin` is always overwritten; the DO reads only this field.
@@ -2491,6 +2975,50 @@ async function buildDOChatRequest(
   return { stub, doRequest };
 }
 
+/**
+ * Apply the partner-key rules (org forcing, refusals, user namespacing) to a
+ * parsed chat body. Internal callers pass through untouched. Returns the body
+ * to dispatch, or the rejection response (already logged and counted).
+ */
+function scopeChatBodyForPrincipal(
+  body: Record<string, unknown>,
+  principal: Principal,
+  transport: ChatTransport,
+  logger: RequestLogger
+): { ok: true; body: ChatRequest } | { ok: false; response: Response } {
+  // Internal callers: a non-string `speaker` is not refused; sanitizeSpeaker
+  // renders nothing for it (see system-prompt.ts).
+  if (principal.kind !== 'partner') return { ok: true, body: body as unknown as ChatRequest };
+  const result = applyPartnerChatPolicy(body, principal.key);
+  if (result.ok) return result;
+  const { status, reason, error } = result.rejection;
+  logger.warn('partner_request_rejected', { key_id: principal.key.id, reason, transport, status });
+  countMetric('requests_total', {
+    transport,
+    status: 'partner_policy_rejected',
+    status_code: status,
+  });
+  return { ok: false, response: Response.json({ error }, { status }) };
+}
+
+/**
+ * Parse a chat body. Malformed JSON throws SyntaxError; valid JSON that is not
+ * an object (`null`, arrays, scalars), or a conversation-address field that
+ * is not a string (conversationAddressError), throws ValidationError — for
+ * every caller, before anything dereferences a field. Both map to 400.
+ */
+async function readChatBodyObject(request: Request): Promise<Record<string, unknown>> {
+  const parsed: unknown = await request.clone().json();
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new ValidationError('Request body must be a JSON object');
+  }
+  // Before any authorization check (partner policy, admin client check) or
+  // routing: every conversation-address field must be a primitive string.
+  const addressError = conversationAddressError(parsed);
+  if (addressError) throw new ValidationError(addressError);
+  return parsed as Record<string, unknown>;
+}
+
 async function handleChatRequest(
   request: Request,
   env: Env,
@@ -2498,15 +3026,21 @@ async function handleChatRequest(
   auth: ChatAuth
 ): Promise<Response> {
   const { logger } = auth;
+  const { principal } = auth;
   const timing = createTimingContext();
 
-  let body: ChatRequest;
+  let parsed: Record<string, unknown>;
   try {
-    body = (await request.clone().json()) as ChatRequest;
+    parsed = await readChatBodyObject(request);
   } catch (error) {
     // A malformed body has no identifiers to hash, so there is no scope to be inside.
     return respondToChatRequestError(error, transport, timing, logger);
   }
+  // Partner bodies are rewritten (org forced, user_id namespaced) BEFORE the
+  // pseudonym scope so telemetry hashes the namespaced id, not the raw one.
+  const scoped = scopeChatBodyForPrincipal(parsed, principal, transport, logger);
+  if (!scoped.ok) return scoped.response;
+  const { body } = scoped;
 
   // Establish the OTLP user pseudonym for this request's ENTIRE async call tree before
   // anything logs, so every record and span it produces can carry `user_hash` without
@@ -2584,6 +3118,32 @@ function checkAdminClientKey(
   return { rejection };
 }
 
+/**
+ * validateChatBody with the SERVER-derived caller (the auth principal's kind;
+ * a client-sent `_caller` is never consulted), as a logged, counted 400; or
+ * null when the body is valid.
+ */
+function rejectInvalidChatBody(
+  body: ChatRequest,
+  transport: ChatTransport,
+  caller: ChatCaller,
+  logger: RequestLogger
+): Response | null {
+  const validationError = validateChatBody(body, transport, {
+    callbackAvailable: caller !== 'partner',
+    caller,
+  });
+  if (!validationError) return null;
+  logger.warn('chat_validation_failed', {
+    transport,
+    error: validationError,
+    user_id: body.user_id,
+    client_id: body.client_id,
+  });
+  countMetric('requests_total', { transport, status: 'validation_failed', status_code: 400 });
+  return Response.json({ error: validationError }, { status: 400 });
+}
+
 /** Params for {@link dispatchChatRequest} — the chat flow inside the pseudonym scope. */
 type ChatDispatchParams = {
   request: Request;
@@ -2603,17 +3163,11 @@ type ChatDispatchParams = {
 async function dispatchChatRequest(params: ChatDispatchParams): Promise<Response> {
   const { request, env, transport, body, timing, auth } = params;
   const { logger, requestId } = auth;
-  const validationError = validateChatBody(body, transport);
-  if (validationError) {
-    logger.warn('chat_validation_failed', {
-      transport,
-      error: validationError,
-      user_id: body.user_id,
-      client_id: body.client_id,
-    });
-    countMetric('requests_total', { transport, status: 'validation_failed', status_code: 400 });
-    return Response.json({ error: validationError }, { status: 400 });
-  }
+  const { principal } = auth;
+  const caller: ChatCaller = principal.kind;
+  const keyId = principalKeyId(principal);
+  const invalid = rejectInvalidChatBody(body, transport, caller, logger);
+  if (invalid) return invalid;
 
   const adminCheck = checkAdminClientKey(env, body, transport, auth);
   if ('rejection' in adminCheck) {
@@ -2622,7 +3176,7 @@ async function dispatchChatRequest(params: ChatDispatchParams): Promise<Response
 
   const org = resolveOrgFromBody(body, env.DEFAULT_ORG);
   // prettier-ignore
-  logger.log('request_received', { user_id: body.user_id, client_id: body.client_id, org, transport, chat_type: body.chat_type ?? 'private', chat_id: body.chat_id, thread_id: body.thread_id });
+  logger.log('request_received', { user_id: body.user_id, client_id: body.client_id, key_id: keyId, org, transport, chat_type: body.chat_type ?? 'private', chat_id: body.chat_id, thread_id: body.thread_id });
 
   const { stub, doRequest } = await timePhase(timing, 'kv_and_routing', () =>
     buildDOChatRequest(request, env, {
@@ -2631,6 +3185,7 @@ async function dispatchChatRequest(params: ChatDispatchParams): Promise<Response
       transport,
       logger,
       requestId,
+      caller,
       isAdmin: adminCheck.isAdmin,
     })
   );
@@ -2698,6 +3253,10 @@ async function handleDORequest(params: DORequestParams): Promise<Response> {
 
   if (!org) {
     return Response.json({ error: 'org is required in path' }, { status: 400 });
+  }
+  const orgError = orgDoNameError(org);
+  if (orgError) {
+    return Response.json({ error: orgError, code: 'invalid_org' }, { status: 400 });
   }
 
   // prettier-ignore

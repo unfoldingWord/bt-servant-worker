@@ -479,6 +479,349 @@ curl -X DELETE "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-serve
 
 ---
 
+## Admin: Partner API Keys
+
+Named, revocable keys for partner apps (admin-portal#354). Our own clients
+(web client, WhatsApp gateway, admin portal) keep using their deployment-wide
+keys unchanged. These admin endpoints, like every `/api/v1/admin/*` route,
+need super-admin authority: `ADMIN_API_KEY` (or `ENGINE_API_KEY` only while
+`ADMIN_KEY_REQUIRED` is not `"true"`; production and staging set it to
+`"true"`). A partner key never has it. The examples use `$API_KEY`; use the
+admin key.
+
+- The plaintext key (`apiKey`, shape `bts_<8 hex>_<43 base64url>_<11 base64url tag>`)
+  is returned **once**, by create and rotate. It cannot be fetched again; only
+  its SHA-256 is stored.
+- **One writer.** Every admin operation goes to one Durable Object,
+  `PartnerKeyStoreDO` (binding `PARTNER_KEY_STORE`), which runs them one at a
+  time against its own transactional storage, the source of truth. Two admins
+  acting on the same key at the same moment are simply applied in order.
+- **Auth reads KV.** After each change the DO writes the key's record to
+  `API_KEYS` KV at `key:<sha256>` (one write per changed key), and the chat
+  auth reads only that. If the KV write fails, the change still stands, the
+  response carries `"warnings": ["auth_update_pending"]`, and the DO retries
+  the write from an alarm (every 30s) until it succeeds.
+- **Tag.** The last 11 characters are an HMAC tag made with the
+  `PARTNER_KEY_TAG_SECRET` secret. Auth checks it before any KV read, so a
+  random or guessed token never costs a lookup. Without that secret partner
+  keys can be neither issued nor used (every partner token gets `403 Invalid
+API key`, and the misconfiguration is logged once per isolate), and
+  changing it invalidates every issued key.
+- List and get return the record (`id`, `prefix`, `name`, `app`, `org`,
+  `createdBy`, `createdAt`, `scopes`, `userNamespace`, `status`, and when set
+  `revokedAt`, `revokedBy`, `rotatedFrom`, `rotatedTo`, `expiresAt`,
+  `termsVersion`, `termsAcceptedAt`, `limits`). Never the plaintext, never
+  the hash. `expiresAt` is set on a key rotated away with a non-zero grace:
+  the end of that grace, after which its `status` reads `expired`. `limits` is reserved for
+  future per-key limits; no request can set it today, so it is absent.
+- Create and rotate responses (the only ones carrying `apiKey`) are sent with
+  `Cache-Control: no-store`.
+- **Propagation.** KV is eventually consistent, and Cloudflare caches every
+  KV read at the edge for 60s by default — misses ("negative lookups")
+  included. So a revocation can take **about a minute** to take effect
+  everywhere, and **a brand-new key may take up to ~60s to work everywhere**
+  (a location that looked the key up just before it existed keeps answering
+  `403` until its cached miss expires). To replace a key without a gap,
+  prefer rotation with a grace period over create-then-revoke.
+- List and get read the Durable Object, so they are always current and the
+  list is always complete. Revoked keys are kept for audit.
+
+### Create a Key
+
+```bash
+curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "org": "bcs",
+    "name": "BCS production",
+    "app": "BCS Translator App",
+    "createdBy": "ops@unfoldingword.org",
+    "termsVersion": "2026-11",
+    "termsAcceptedAt": "2026-11-02T15:00:00Z"
+  }'
+```
+
+**Response (201):** `{"key": {...record, "status": "active"}, "warnings": [], "apiKey": "bts_1a2b3c4d_..."}`
+
+`org`, `name`, `app` and `createdBy` are required; `termsVersion` and
+`termsAcceptedAt` are optional; `termsAcceptedAt` must be an ISO-8601
+date-time with a time zone (`2026-11-02T15:00:00Z` or `...+02:00`). Size caps are UTF-8 bytes of the JSON-encoded
+value: `name` and `app` 100, `createdBy` (and `revokedBy`) 120,
+`termsVersion` 32. Labels must be a single line: a control character or line
+break of any kind is a `400`, not silently removed. Any other field (for example `scopes` or
+`limits`) is a `400`: every key has `scopes: ["chat"]`, and limits are not
+settable yet.
+
+**Unknown org.** The worker has no org registry, so an org counts as known
+when it has any stored configuration (an `ORG_CONFIG` key `<org>`, or a
+`PROMPT_OVERRIDES` key `<org>` / `<org>:*` such as `<org>:modes`), or is the
+default org. Otherwise create returns `400 {"code": "unknown_org"}`, which
+catches typos that would silently serve the defaults. For an org that will be
+configured later, send `"allow_new_org": true`.
+
+### List Keys (all orgs, or one)
+
+```bash
+curl "http://localhost:$PORT/api/v1/admin/api-keys" -H "Authorization: Bearer $API_KEY"
+curl "http://localhost:$PORT/api/v1/admin/api-keys?org=bcs" -H "Authorization: Bearer $API_KEY"
+```
+
+**Response (200):** `{"org": "bcs" | null, "keys": [...records]}`
+
+### Get One Key
+
+```bash
+curl "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+### Revoke a Key
+
+Immediate, and **revoke kills the whole chain**: any predecessor of this key
+that is still working in its rotation grace window is revoked too, so revoking
+the current key really cuts the partner off. The response lists every key this
+call revoked in `revokedIds` (this key first, then its predecessors).
+Idempotent: revoking a revoked key returns it unchanged with
+`"alreadyRevoked": true` and `revokedIds: []` (its chain was already killed
+when it was revoked). The body is optional.
+
+```bash
+curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_revoke" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"revokedBy": "ops@unfoldingword.org"}'
+```
+
+### Rotate a Key
+
+Issues a new key with the same name, app, org, terms and `userNamespace` (so
+the partner's users keep their history), then retires the old one. Returns
+`{"key": {...new}, "previous": {...old}, "revokedIds": [...], "warnings": [], "apiKey": "bts_..."}`.
+
+**Grace window.** By default the old key keeps working for 7 days
+(`previous.expiresAt`), so the partner can ship the new key without an
+outage; after that it gets `403` (reason `expired_partner_key`) and shows
+`status: "expired"`. Set `graceSeconds` (integer, 0 to 2592000 = 30 days; `null` is a `400`) to
+change it; `"graceSeconds": 0` revokes the old key at once ("rotate and kill
+now"), together with any older keys still in their own grace window, and the
+response lists them in `revokedIds`. An explicit `_revoke` is always immediate, also during a grace window.
+
+A revoked or expired key, or one already rotated, cannot be rotated (`409`);
+create a new key or rotate the replacement instead. Two rotations of the same
+key sent together are applied in order: the first succeeds and the second
+gets `409` (already rotated). The new key, the retired old key and any chain
+revocations are written in one atomic step. `warnings` is `[]`, or
+`["auth_update_pending"]` when the KV write for auth is still being retried
+(see above). The body is optional:
+`{"createdBy": "...", "graceSeconds": 86400}`.
+
+**A lost response.** The plaintext is never stored, so a create or rotate
+response that does not arrive cannot be fetched again. Recover like this:
+
+- **Lost rotate response:** `GET` the old key; its `rotatedTo` is the new key
+  id (a repeated rotate of the old key also answers `409` with
+  `"code": "already_rotated"` and `"rotatedTo"`). Rotate that new key id to
+  get a fresh `apiKey`. Keep a grace period: the old key keeps working through
+  its own grace window meanwhile. `"graceSeconds": 0` removes this safety net,
+  because it revokes the old key at once, so a lost grace-0 response leaves
+  the partner with no working key until the new key is rotated.
+- **Lost create response:** nobody has the key. Find it in the list, revoke it
+  (or rotate it) and use the new `apiKey`.
+
+```bash
+curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_rotate" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"createdBy": "ops@unfoldingword.org", "graceSeconds": 86400}'
+```
+
+### Import a Partner App's Existing Users (super-admin)
+
+For an app that used to call with the shared `ENGINE_API_KEY` and is moving to
+a partner key. Its users' conversations live under their raw `user_id`; with
+the partner key the same user is namespaced, so without this step they would
+start over. This copies the named users' data (history, preferences, memory,
+prompt overrides, selected mode and language, welcome flags) into the key's
+namespace, once.
+
+```bash
+curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_import-legacy-users" \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"legacyClientId": "my-app", "userIds": ["user-1", "user-2"]}'
+```
+
+**Response (200):** `{"keyId": "...", "org": "...", "results": [{"userId": "user-1", "status": "copied", "entries": 6}, ...]}`
+
+- Only a super-admin key (`ADMIN_API_KEY`) can call it. The partner key itself never gets access
+  to raw user ids: conversations are keyed by org and user id only, so raw-id
+  access would let it reach other clients' users.
+- The source is the user's conversation in the **key's org**, and it is
+  copied only when its stored identity is a private chat whose `client_id`
+  equals `legacyClientId`. Otherwise the status is `client_mismatch`, or
+  `not_found` when there is no identity record. `destination_not_empty` means
+  the partner key has already been used for that user; nothing is
+  overwritten. `destination_busy` means a turn is running or queued for that
+  user under the partner key, and `source_busy` the same for the shared-key
+  user (the export, and the check and write, are each one storage
+  transaction inside that user's DO, refused while a turn holds its lock or
+  anything is queued; the import never takes the lock itself); retry later. `failed` is logged.
+- The key must be active: a revoked or expired key gets `409`
+  (`key_revoked` / `key_expired`). The status is checked again before each
+  batch of 5 users: if the key is revoked (or its grace runs out) during the
+  import, the import stops and the users not yet copied are reported
+  `key_revoked` / `key_expired` (or `status_check_failed`, logged, if the
+  status cannot be read). The response is still `200` with every user's
+  status.
+- One import per key chain at a time: while an import into the same user
+  namespace is running (the same key, or another key of its rotation
+  chain), another gets `409` with `code: "import_in_progress"` and does
+  nothing. A running import renews its lease before each user and before
+  any cleanup, so it keeps it however long it runs; a run that died stops
+  blocking after 10 minutes. If a run ever loses its lease, it copies and
+  deletes nothing more and reports the users not yet done as `deferred`
+  (re-run the import for them).
+- Per user, in this order: a read-only check that the destination is empty
+  and idle (otherwise `destination_not_empty` / `destination_busy`, with
+  nothing copied), the source export, the audio copy, then the write (which
+  checks the destination again).
+- Audio the copied history references (`voice_audio_key` TTS replies,
+  `inbound_voice_audio_key` voice messages, and each audio entry of
+  `attachments[]`) is copied in R2, streamed, into the partner's partition
+  (`audio/<org>/partner:<ns>:<user_id>/...`,
+  `voice-submissions/<org>/partner:<ns>:<user_id>/...`), and the keys in the
+  copied history are rewritten (for an attachment, its `r2_key` and `url`),
+  so the partner key can download it. Source
+  objects are not changed. A copy that already exists (from an earlier run)
+  is reused, never overwritten. Each copied user's result carries
+  `audio: { copied, existing, missing }`.
+  - A source object that no longer exists keeps its history entry without
+    the audio key, or without that attachment (logged, `missing`).
+  - Any other copy failure fails the user: `audio_copy_failed`, nothing
+    written to the destination, and only the objects this run created are
+    removed. Re-run to retry.
+  - Copies are removed only when the destination definitely did not take
+    the write (a `destination_not_empty` / `destination_busy` refusal, or a
+    body refused before any write). If the write's outcome is unknown (the
+    request failed, or the answer was not a readable result), the user is
+    `import_outcome_unknown` (logged) and the copies are kept: re-running
+    reports `destination_not_empty` if the write landed, or imports again
+    reusing those copies if it did not.
+- One request does at most 800 R2 and Durable Object operations (a margin
+  under Cloudflare's per-request subrequest limit). Users that would not fit,
+  and every user after them, are reported `deferred`; re-run the import with
+  those ids to continue.
+- Every copied value must survive a JSON round-trip (all UserDO data is JSON
+  today). An object member that is `undefined` is dropped (it carries
+  nothing either way). Anything else that would not survive (a `Date`,
+  `Map`, `Set`, binary data, `NaN` or `Infinity`, a function) makes that
+  user `failed` (logged with the storage key), and nothing is written.
+- The source is not changed or deleted. Each user is copied once, as it is
+  at that moment: a turn the app sends with the shared key after that user's
+  export is NOT copied. Cut-over runbook, in this order:
+  1. Stop the app's shared-key traffic (pause the app, or put it in
+     maintenance).
+  2. Run the import, and re-run it for any user reported `source_busy` /
+     `destination_busy` until each is `copied` (or a status you accept).
+  3. Switch the app to the partner key and resume traffic.
+- `userIds`: 1-100 distinct ids, each valid as a partner `user_id`.
+- Only shared-key users can be imported: a `legacyClientId` starting with
+  `partner:`, or a `userId` containing `partner:`, is a `400`, so one
+  partner's users can never be copied into another partner's namespace.
+
+### Calling Chat With a Partner Key
+
+A partner key may call **only** `POST /api/v1/chat`,
+`POST /api/v1/chat/stream`, and `GET` on the two audio download routes
+(`/api/v1/audio/...` and `/api/v1/voice-submissions/...`, for its own audio
+only; see below). Every other `/api/*` route answers `403`
+(`This API key is not permitted to call this endpoint`). That answer is given
+only once the key is authenticated (tag checked, key found and active); a
+forged or unknown look-alike gets `403 Invalid API key` on every route. On
+those two routes:
+
+- `org` / `org_id` may be omitted or `null` (the key's org applies) or equal
+  the key's org; any other value is a `400`.
+- `client_id` is **set by the server** to `partner:<userNamespace>`; whatever
+  the body sends is discarded. A partner can therefore not pose as
+  `whatsapp`, `web` or `admin-portal`, and none of its text reaches the
+  prompt (which says only "a partner app").
+- `user_id`, `chat_id` and `thread_id` must be single-line strings of at most
+  256 characters (`400` otherwise; `null` counts as absent for the optional
+  two). Single-line excludes all control characters (C0 and C1), the
+  Unicode line/paragraph separators and invisible format characters. Leading
+  or trailing whitespace is refused, not trimmed. `chat_id` and `thread_id`
+  may use only letters, digits, `_`, `.` and `-` (no `:`: the group
+  conversation name joins them with `:`). `user_id` may not contain `/`, `?`,
+  `#`, `%` or `\`, so every partner user stays addressable in the
+  `/users/:userId` routes. `chat_id` is stored with the
+  key's prefix, so it may be at most 228 characters (256 minus the prefix);
+  `thread_id` up to 256.
+- `speaker` may be at most 256 characters (longer is `400`,
+  `partner_speaker`). A partner's speaker is then normalized before it is
+  stored, logged or reaches the prompt: brackets removed, line breaks and
+  controls flattened to one space, capped at 64 characters. (Internal
+  clients' speakers are stored as sent; the prompt sanitizes every speaker.)
+- `progress_callback_url` (and the other callback fields) are refused (`400`,
+  the existing `/chat` and `/chat/stream` validation, worded for partners as
+  "progress callbacks are not available with partner API keys").
+- Audio works as for internal clients (decided 2026-11-02): voice messages
+  in (`message_type: "audio"`, `audio_base64`, `audio_format`, with the same
+  size and format limits) and spoken replies out (`voice_format`, the audio
+  tools and the audio prompt guidance). Reply audio comes back as
+  `voice_audio_url` (`/api/v1/audio/...`); archived voice messages and
+  attached recordings as `/api/v1/voice-submissions/...` URLs. Fetch them
+  with the same partner key.
+- **Audio ownership.** A partner's audio lives in its own partition: TTS
+  replies at `audio/<org>/partner:<ns>:<user_id>/<file>` and voice
+  submissions at `voice-submissions/<org>/partner:<ns>:<chat>/<speaker>/<file>`
+  (the chat segment is the user for a private chat, the group for a group).
+  A partner key downloads only keys with exactly that shape, in its key's org
+  and its own namespace; any other key (another partner's, an internal
+  user's, another org's) answers `404`, exactly like a missing object. In a
+  partner chat, `attach_audio` / `read_r2_object` reach only that partner's
+  own recordings, and internal chats can never attach a partner's recording.
+  There is no listing route.
+- Inside the worker `user_id` becomes
+  `partner:<userNamespace>:<user_id>` (and `chat_id` likewise), so a partner's
+  users can never reach another app's or a WhatsApp user's conversation.
+  That form is reserved: an internal (`ENGINE_API_KEY` / `ADMIN_API_KEY`)
+  caller sending a `user_id`, or a
+  `chat_id` (joined with `thread_id` as `<chat_id>:<thread_id>`, as in the
+  group's name), that starts with `partner:` gets a `400`; so does a
+  `partner:`-form `:userId` on the non-admin user routes
+  (`/api/v1/orgs/:org/users/:userId/preferences` and `/history`). The
+  super-admin `/api/v1/admin/...` routes may still address partner users.
+- For every caller, an `org` containing `:` is a `400` wherever it names a
+  conversation: chat bodies (`org` / `org_id`) and every `/orgs/:org/users/...`
+  and `/orgs/:org/groups/...` route, admin or not (`invalid_org`).
+  Conversation names join their parts with `:`, so such an org could rebuild
+  another org's or a partner's name.
+
+```bash
+export PARTNER_KEY="bts_..."   # from the create response
+curl -X POST "http://localhost:$PORT/api/v1/chat" \
+  -H "Authorization: Bearer $PARTNER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "client_id": "bcs-app",
+    "user_id": "user-42",
+    "message": "What is Genesis 1:1?",
+    "message_type": "text"
+  }'
+```
+
+An unknown, revoked or expired key, or a token whose tag does not verify, gets
+`403 {"error": "Invalid API key"}` (logged as `auth_rejected` with reason
+`unknown_partner_key`, `revoked_partner_key`, `expired_partner_key` or
+`invalid_partner_key_tag`).
+Every chat request logs `key_id` on `request_received` (`"internal"` for
+`ENGINE_API_KEY`), which is how usage and "last used" per key are read from
+telemetry.
+
+---
+
 ## Admin: Mode Management — `spoken-mode` (STAGING ONLY)
 
 > ⚠️ **STAGING ONLY.** The procedure below pushes the assembled

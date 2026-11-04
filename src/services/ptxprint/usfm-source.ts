@@ -21,6 +21,7 @@
  * markers `\zaln-s`/`\w` in en_ult/en_ust); tracked as v1.1 follow-up.
  */
 
+import { sha256Hex } from '../../utils/crypto.js';
 import { RequestLogger } from '../../utils/logger.js';
 import { BOOK_INDEX } from './presets.js';
 import { PayloadSource } from './types.js';
@@ -113,11 +114,6 @@ export function buildUsfmR2Key(translation: string, sha256: string, filename: st
 export function buildUsfmPublicUrl(baseUrl: string, key: string): string {
   const base = baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
   return `${base}/public/ptxprint/${key}`;
-}
-
-async function sha256Hex(bytes: Uint8Array): Promise<string> {
-  const buf = await crypto.subtle.digest('SHA-256', bytes);
-  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 async function fetchUsfmBytes(url: string, logger: RequestLogger): Promise<Uint8Array> {

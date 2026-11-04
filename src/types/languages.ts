@@ -197,7 +197,7 @@ export function validateDefaultLanguageUpdate(
  * resolved document when applicable, otherwise `undefined`. `reason`
  * distinguishes missing vs unpublished for log correlation.
  *
- * Admin-origin requests (the worker-set `_is_admin`: `isAdminClient(client_id)` plus an admin-capable key)
+ * Admin-origin requests (the worker-set `_is_admin`: `isAdminClient(client_id)` plus an admin-capable key; never a partner API key)
  * pass `options.includeUnpublished = true` so authors can test draft languages
  * from the portal's test chat pane. For those requests a matched draft
  * returns `reason: 'ok'` — end-user requests keep the default filter.

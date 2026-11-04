@@ -32,3 +32,59 @@ export function constantTimeCompare(a: string, b: string): boolean {
 
   return result === 0;
 }
+
+/** Lowercase hex encoding of a byte array. */
+export function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** SHA-256 digest, lowercase hex. Strings are hashed as their UTF-8 bytes. */
+export async function sha256Hex(data: string | Uint8Array): Promise<string> {
+  const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return bytesToHex(new Uint8Array(digest));
+}
+
+/** Standard base64 encoding of a byte array (btoa over a binary string). */
+export function bytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+/** URL-safe base64 without padding (RFC 4648 §5). */
+export function bytesToBase64Url(bytes: Uint8Array): string {
+  return bytesToBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/**
+ * Imported HMAC keys, per isolate, keyed on the secret. The secrets are a
+ * handful of wrangler secrets (partner key tag, telemetry salt), so the map
+ * stays tiny; it is cleared if it ever grows past the bound. Only resolved
+ * CryptoKeys are cached (never a pending promise), so no request awaits a
+ * promise created by another request. Two concurrent first uses may both
+ * import; that is harmless.
+ */
+const hmacKeys = new Map<string, CryptoKey>();
+const MAX_CACHED_HMAC_KEYS = 8;
+
+async function hmacKey(secret: string): Promise<CryptoKey> {
+  const cached = hmacKeys.get(secret);
+  if (cached) return cached;
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  if (hmacKeys.size >= MAX_CACHED_HMAC_KEYS) hmacKeys.clear();
+  hmacKeys.set(secret, key);
+  return key;
+}
+
+/** HMAC-SHA-256 of `data` (UTF-8) under `secret` (UTF-8), as raw bytes. */
+export async function hmacSha256(secret: string, data: string): Promise<Uint8Array> {
+  const key = await hmacKey(secret);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data)));
+}

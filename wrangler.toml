@@ -71,6 +71,11 @@ id = "d7149c3d69f34cff87146557163f0a6c"
 binding = "PROMPT_OVERRIDES"
 id = "c1828624ab434f079776bddd171882d9"
 
+# Partner API keys (admin-portal#354). SHA-256-keyed records, never plaintext.
+[[kv_namespaces]]
+binding = "API_KEYS"
+id = "db5c2236e33d41f3a95e550de2011da1"
+
 # Workers AI
 [ai]
 binding = "AI"
@@ -94,8 +99,7 @@ bucket_name = "bt-servant-ptxprint"
 name = "USER_DO"
 class_name = "UserDO"
 
-# Placeholder binding for the partner API key store (admin-portal#354, PR #475).
-# The class is an empty stub until #475 lands; see src/durable-objects/partner-key-store-do.ts.
+# Single writer for partner API key administration (admin-portal#354).
 [[durable_objects.bindings]]
 name = "PARTNER_KEY_STORE"
 class_name = "PartnerKeyStoreDO"
@@ -113,8 +117,9 @@ tag = "v3"
 renamed_classes = [{from = "UserSession", to = "UserDO"}]
 deleted_classes = ["UserQueue"]
 
-# v4 is already applied on the staging script (by PR #475's branch deploy on
-# 2026-11-03). Declaring it here lets main deploy to staging again.
+# v4 (PartnerKeyStoreDO) is applied on staging and production: #483 declared
+# it with a stub class, which #475 replaced with the real implementation.
+# Replacing a class body needs no new migration tag.
 [[migrations]]
 tag = "v4"
 new_sqlite_classes = ["PartnerKeyStoreDO"]
@@ -162,6 +167,11 @@ id = "f0783f5b724b427d94245ecbf810a267"
 [[env.staging.kv_namespaces]]
 binding = "PROMPT_OVERRIDES"
 id = "1416f321fbda450095214111d38d211a"
+
+# Partner API keys (admin-portal#354).
+[[env.staging.kv_namespaces]]
+binding = "API_KEYS"
+id = "dca367a5e27445a79223f9c599d2394f"
 
 [env.staging.ai]
 binding = "AI"
