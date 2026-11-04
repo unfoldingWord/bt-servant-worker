@@ -249,6 +249,72 @@ describe('ledger: revoke', () => {
   });
 });
 
+describe('the chain walk has no depth cap (a long chain is revoked whole)', () => {
+  /** Create a key and rotate it `rotations` times with grace; every key stays active. */
+  async function longChain(rotations: number) {
+    const first = await withLedger((l) => l.create(INPUT));
+    let latestId = first.record.id;
+    for (let i = 0; i < rotations; i++) {
+      const next = await withLedger((l) => l.rotate(latestId, { graceSeconds: 3600 }));
+      if (next.status !== 'ok') throw new Error(next.status);
+      latestId = next.record.id;
+    }
+    return { first, latestId };
+  }
+
+  it('revoking the latest of 60 rotations revokes all 61 keys, the first included', async () => {
+    const { first, latestId } = await longChain(60);
+    const result = await withLedger((l) => l.revoke(latestId));
+    expect(result?.revokedIds).toHaveLength(61);
+    expect(result?.revokedIds.at(-1)).toBe(first.record.id);
+    expect(partnerKeyStatus((await projected(first.plaintext))!, Date.now())).toBe('revoked');
+  });
+
+  it('a grace-0 rotation of the latest of 60 rotations revokes all 61 keys', async () => {
+    const { first, latestId } = await longChain(60);
+    const result = await withLedger((l) => l.rotate(latestId, { graceSeconds: 0 }));
+    if (result.status !== 'ok') throw new Error(result.status);
+    expect(result.revokedIds).toHaveLength(61);
+    expect(result.revokedIds.at(-1)).toBe(first.record.id);
+    expect(partnerKeyStatus((await projected(first.plaintext))!, Date.now())).toBe('revoked');
+  });
+
+  it('a cycle in damaged data ends the walk and is logged', async () => {
+    const { first, latestId } = await longChain(1);
+    // Damage: point the first key back at the latest, closing a loop.
+    await withLedger(async (l, storage) => {
+      const entry = await l.get(first.record.id);
+      if (!entry) throw new Error('missing');
+      await storage.put(`rec:${first.record.id}`, {
+        ...entry,
+        record: { ...entry.record, rotatedFrom: latestId },
+      });
+      const latest = await l.get(latestId);
+      if (!latest) throw new Error('missing');
+      await storage.put(`rec:${latestId}`, {
+        ...latest,
+        record: { ...latest.record, rotatedTo: first.record.id },
+      });
+    });
+    const logger = createMockLogger();
+    const result = await runInDurableObject(stub(), async (_i, state) =>
+      new PartnerKeyLedger({
+        storage: state.storage,
+        kv: kv.asKV(),
+        tagSecret: SECRET,
+        logger,
+        requestId: REQUEST_ID,
+      }).revoke(latestId)
+    );
+    expect(result?.revokedIds).toEqual([latestId, first.record.id]);
+    expect(logger.error).toHaveBeenCalledWith(
+      'partner_key_chain_cycle',
+      expect.any(Error),
+      expect.objectContaining({ key_id: latestId, revisited_id: latestId })
+    );
+  });
+});
+
 describe('KV projection failure is retried by the DO alarm', () => {
   it('commits, warns auth_update_pending, marks the key owed, and the alarm writes KV', async () => {
     const created = await withLedger((l) => l.create(INPUT), failingKv);

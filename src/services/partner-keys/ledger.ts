@@ -57,8 +57,6 @@ const ORG_PREFIX = 'org:';
 const PENDING_PREFIX = 'proj:';
 /** Delay before the alarm retries KV projections that failed. */
 export const PROJECTION_RETRY_MS = 30_000;
-/** Bound on a rotation-chain walk (guards against a cycle in damaged data). */
-const MAX_CHAIN_DEPTH = 50;
 /**
  * Bound on each KV operation. The DO runs one operation at a time (its
  * `serialize` chain), so a KV call that never settles would hold every later
@@ -477,17 +475,30 @@ export class PartnerKeyLedger {
 
   /**
    * Walk `key`'s predecessors along `rotatedFrom`, nearest first (a link
-   * counts only if the predecessor's `rotatedTo` names its successor; at most
-   * MAX_CHAIN_DEPTH links). `visit` decides per predecessor: 'take' it,
-   * 'skip' it and keep walking, or 'stop'.
+   * counts only if the predecessor's `rotatedTo` names its successor).
+   * `visit` decides per predecessor: 'take' it, 'skip' it and keep walking,
+   * or 'stop'. The walk is complete — no depth cap, because revocation must
+   * reach every predecessor still in grace however long the chain is. Only a
+   * cycle (damaged data: a valid chain cannot revisit a key) ends it early,
+   * and that is logged.
    */
   private async walkPredecessors(
     key: PartnerKeyRecord,
     visit: (entry: LedgerEntry) => 'take' | 'skip' | 'stop'
   ): Promise<LedgerEntry[]> {
     const taken: LedgerEntry[] = [];
+    const seen = new Set<string>([key.id]);
     let successor = key;
-    for (let depth = 0; depth < MAX_CHAIN_DEPTH && successor.rotatedFrom; depth++) {
+    while (successor.rotatedFrom) {
+      if (seen.has(successor.rotatedFrom)) {
+        this.logger.error('partner_key_chain_cycle', new Error('rotation chain revisits a key'), {
+          key_id: key.id,
+          revisited_id: successor.rotatedFrom,
+          request_id: this.requestId,
+        });
+        break;
+      }
+      seen.add(successor.rotatedFrom);
       const entry = await this.get(successor.rotatedFrom);
       if (!entry || entry.record.rotatedTo !== successor.id) break;
       const verdict = visit(entry);
