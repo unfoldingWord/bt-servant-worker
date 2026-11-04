@@ -160,6 +160,22 @@ describe('ENGINE_API_KEY is not super-admin under the production auth configurat
   });
 });
 
+describe('admin routes added on main stay behind the admin gate', () => {
+  it('the mode share-code route (#477) refuses ENGINE_API_KEY and a partner key', async () => {
+    const { apiKey } = await createKey('org-354-share-code');
+    const url = 'https://worker/api/v1/admin/orgs/org-354-share-code/modes/m1/share-code';
+    const engine = await apiFetch(url, { headers: INTERNAL });
+    expect(engine.status).toBe(403);
+    expect(await engine.json()).toMatchObject({ code: 'admin_key_required' });
+    const partner = await apiFetch(url, { headers: partnerHeaders(apiKey) });
+    expect(partner.status).toBe(403);
+    expect(await partner.json()).toEqual({
+      error: 'This API key is not permitted to call this endpoint',
+    });
+    expect((await apiFetch(url, { headers: ADMIN })).status).not.toBe(403);
+  });
+});
+
 describe('internal callers on chat', () => {
   it('an internal non-string speaker in a group chat is not refused and is not rendered', async () => {
     const res = await apiFetch(CHAT, {
