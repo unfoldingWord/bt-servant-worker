@@ -22,6 +22,7 @@ import {
   OrchestrationResult,
   TriggerOnlyContext,
   DEFAULT_MODEL,
+  normalizeSpeaker,
 } from '../services/claude/index.js';
 import { formatTOCForPrompt, JsonMemoryStore } from '../services/memory/index.js';
 import { buildToolCatalog, discoverAllTools } from '../services/mcp/index.js';
@@ -87,6 +88,21 @@ import {
   ValidationError,
 } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
+import {
+  checkImportable,
+  exportUserData,
+  importUserData,
+  readImportEntries,
+} from './user-data-transfer.js';
+import {
+  HISTORY_KEY,
+  IDENTITY_KEY,
+  LOCK_STALE_THRESHOLD_MS,
+  PROCESSING_LOCK_KEY,
+  QUEUE_INFLIGHT_KEY,
+  QUEUE_KEY,
+  QUEUE_PROCESSING_KEY,
+} from './user-do-storage-keys.js';
 import { countryFromPhoneUserId } from '../utils/phone-country.js';
 import { applyTemplateVariables } from '../utils/template.js';
 import { createTimingContext, timePhase, TimingContext } from '../utils/timing.js';
@@ -109,7 +125,11 @@ import {
   DetectedLanguage,
   UNDETERMINED_LANGUAGE,
 } from '../services/language/index.js';
-import { isValidLanguageCode, validateChatBody } from '../utils/chat-validation.js';
+import {
+  isPartnerCaller,
+  isValidLanguageCode,
+  validateChatBody,
+} from '../utils/chat-validation.js';
 import { hasClientHistory, sanitizeClientHistory } from '../utils/history-validation.js';
 import { OrgLanguages, resolveEffectiveLanguage } from '../types/languages.js';
 import { InternalQueueEntry } from '../types/queue.js';
@@ -117,8 +137,6 @@ import { statusUpdate, uiString } from '../i18n/ui-strings.js';
 import { createStatusEmitter, StatusEmitter } from '../i18n/status-emitter.js';
 
 // ── Storage keys ───────────────────────────────────────────────────────────────
-const HISTORY_KEY = 'history';
-const IDENTITY_KEY = 'identity';
 const PREFERENCES_KEY = 'preferences';
 const PROMPT_OVERRIDES_KEY = 'prompt_overrides';
 const SELECTED_MODE_KEY = 'selected_mode';
@@ -147,18 +165,6 @@ const MODE_WELCOME_PENDING_PREFIX = 'mode_welcome_pending:';
  * (one prefix `list`, limit 1) whenever pending bits are deleted.
  */
 const MODE_WELCOME_PENDING_ANY_KEY = 'mode_welcome_pending_any';
-const PROCESSING_LOCK_KEY = '_processing_lock';
-const QUEUE_KEY = 'queue';
-const QUEUE_PROCESSING_KEY = 'queue_processing';
-/**
- * Reservation for the entry currently being processed off the queue. The
- * queue is one storage value with a byte budget (`MAX_QUEUE_BYTES`); a
- * dequeued entry leaves that value but may come BACK via `reEnqueue` on a
- * transient failure, so its bytes stay counted against the budget until the
- * turn ends. Expires like the processing lock (`LOCK_STALE_THRESHOLD_MS`) so
- * an eviction mid-turn can never shrink the budget for good.
- */
-const QUEUE_INFLIGHT_KEY = 'queue_inflight';
 
 /** What `QUEUE_INFLIGHT_KEY` stores: the entry's serialized size and when it was dequeued. */
 interface QueueInFlightReservation {
@@ -167,7 +173,6 @@ interface QueueInFlightReservation {
 }
 
 // ── Constants ──────────────────────────────────────────────────────────────────
-const LOCK_STALE_THRESHOLD_MS = 90_000; // 90 seconds
 const DEFAULT_MAX_QUEUE_DEPTH = 50;
 /**
  * Byte budget for the serialized callback/SSE queue. The queue is persisted as
@@ -872,6 +877,10 @@ export class UserDO {
     this.app.get('/memory', () => this.handleGetMemory());
     this.app.delete('/memory', () => this.handleDeleteMemory());
     this.app.get('/identity', () => this.handleGetIdentity());
+    // Super-admin legacy import only (admin-portal#354); see user-data-transfer.ts.
+    this.app.get('/admin/user-data', () => this.handleExportUserData());
+    this.app.get('/admin/user-data/importable', () => this.handleCheckImportable());
+    this.app.put('/admin/user-data', (c) => this.handleImportUserData(c.req.raw));
   }
 
   private getLogger(): RequestLogger {
@@ -1038,6 +1047,16 @@ export class UserDO {
       return { error: Response.json({ error: validationError }, { status: 400 }) };
     }
 
+    // Partner callers only: one normalized speaker (flattened, at most 64 code
+    // points, absent when blank) for everything downstream — history, logs,
+    // the queue and the prompt. Internal callers' speaker is stored and logged
+    // exactly as sent, as before #354; the prompt still renders it through
+    // sanitizeSpeaker.
+    if (isPartnerCaller(body._caller)) {
+      const speaker = normalizeSpeaker(body.speaker);
+      if (speaker === undefined) delete body.speaker;
+      else body.speaker = speaker;
+    }
     return { body };
   }
 
@@ -3297,7 +3316,10 @@ export class UserDO {
     const org = body.org ?? body.org_id ?? this.env.DEFAULT_ORG;
     const isGroup = this.isGroupChatType(body);
     const chatScope = isGroup && body.chat_id ? body.chat_id : body.user_id;
-    const speakerScope = body.speaker?.trim() ? body.speaker : body.user_id;
+    // A path segment: only a real, non-blank name (a non-string speaker from a
+    // client falls back to the user id instead of throwing).
+    const speakerScope =
+      typeof body.speaker === 'string' && body.speaker.trim() ? body.speaker : body.user_id;
     const key = generateVoiceSubmissionKey(org, chatScope, speakerScope);
     const mimeType = audioFormatToMime(audioFormat);
     try {
@@ -3769,6 +3791,7 @@ export class UserDO {
       modeContext: this.buildModeContext(orgModes, activeModeName, body),
       audioContext,
       attachmentsContext,
+      caller: body._caller,
       workerOrigin,
       clientId: body.client_id,
       groupContext,
@@ -3981,6 +4004,75 @@ export class UserDO {
       async () => {
         const identity = (await this.state.storage.get<StoredIdentity>(IDENTITY_KEY)) ?? null;
         return Response.json({ identity });
+      },
+      storageErrorResponse
+    );
+  }
+
+  /*
+   * Legacy import (admin-portal#354): export from the source DO, import into
+   * the destination DO. Neither takes the turn lock. Both handlers do ONLY
+   * storage operations (no outbound fetch, no timers), each inside one
+   * `storage.transaction`, so the DO's input gate delivers no other event
+   * — no new request, no alarm, no resumed turn — until it returns: the
+   * busy check, the emptiness check and the write see one consistent state.
+   * Taking the lock instead would be worse: releasing it does not drain the
+   * queue (only a fetch-handler turn can reach Anthropic; alarm() cannot),
+   * and processQueueEntry overwrites it anyway. So a DO with a turn in
+   * flight (a live lock) or anything queued (`queue_processing`) is refused
+   * — `source_busy` / `destination_busy`, retry later — and an idle one is
+   * read or written without being touched otherwise.
+   */
+  private async handleExportUserData(): Promise<Response> {
+    return withEndpointLogging(
+      this.getLogger(),
+      'export_user_data',
+      async () => {
+        const exported = await exportUserData(this.state.storage);
+        return exported === 'busy'
+          ? Response.json({ ok: false, reason: 'source_busy' }, { status: 409 })
+          : Response.json(exported);
+      },
+      storageErrorResponse
+    );
+  }
+
+  /** Legacy import preflight: 200 when an import would be accepted now, else 409 + reason. */
+  private async handleCheckImportable(): Promise<Response> {
+    return withEndpointLogging(
+      this.getLogger(),
+      'check_importable',
+      async () => {
+        const result = await checkImportable(this.state.storage);
+        return Response.json(result, { status: result.ok ? 200 : 409 });
+      },
+      storageErrorResponse
+    );
+  }
+
+  private async handleImportUserData(request: Request): Promise<Response> {
+    return withEndpointLogging(
+      this.getLogger(),
+      'import_user_data',
+      async () => {
+        let parsed: unknown;
+        try {
+          parsed = await request.json();
+        } catch (error) {
+          this.getLogger().warn('import_user_data_invalid_json', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          parsed = undefined;
+        }
+        const entries = readImportEntries(parsed);
+        if (!entries) {
+          return Response.json(
+            { error: 'Body must be { "entries": [[key, value], ...] } with string keys' },
+            { status: 400 }
+          );
+        }
+        const result = await importUserData(this.state.storage, entries);
+        return Response.json(result, { status: result.ok ? 200 : 409 });
       },
       storageErrorResponse
     );

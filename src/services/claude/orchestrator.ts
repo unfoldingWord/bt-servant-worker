@@ -10,8 +10,16 @@
 
 import Anthropic from '@anthropic-ai/sdk';
 import { Env } from '../../config/types.js';
-import { AudioContext, VOICE_SUBMISSION_PREFIX, voiceSubmissionKeyToUrl } from '../audio/index.js';
-import { ChatHistoryEntry, StreamCallbacks } from '../../types/engine.js';
+import {
+  AudioContext,
+  isPartnerVoiceSubmissionKey,
+  partnerOwnsAudioKey,
+  VOICE_SUBMISSION_PREFIX,
+  voiceSubmissionKeyToUrl,
+} from '../audio/index.js';
+import { ChatCaller, ChatHistoryEntry, StreamCallbacks } from '../../types/engine.js';
+import { isPartnerCaller } from '../../utils/chat-validation.js';
+import { namespaceOfClientId } from '../../types/partner-namespace.js';
 import { uiString } from '../../i18n/ui-strings.js';
 import { createStatusEmitter, StatusEmitter } from '../../i18n/status-emitter.js';
 import { DEFAULT_ORG_CONFIG, OrgConfig } from '../../types/org-config.js';
@@ -62,7 +70,7 @@ import {
   buildSystemPromptBlocks,
   GroupChatContext,
   historyToMessages,
-  sanitizeSpeaker,
+  speakerPrefix,
   TriggerOnlyContext,
   VOICE_WRITING_RULES,
 } from './system-prompt.js';
@@ -195,6 +203,13 @@ interface OrchestratorOptions {
    * memory tools together, so the model is never told memory exists.
    */
   memoryEnabled?: boolean | undefined;
+  /**
+   * Who authenticated the request (the DO passes `body._caller`; absent =
+   * internal). For a partner API key (admin-portal#354) the prompt names only
+   * "a partner app", and `read_r2_object` / `attach_audio` reach only that
+   * partner's own voice submissions (partnerNamespace below).
+   */
+  caller?: ChatCaller | undefined;
   modeContext?: ModeContext | undefined;
   audioContext?: AudioContext | undefined;
   attachmentsContext?: AttachmentsContext | undefined;
@@ -362,6 +377,12 @@ interface OrchestrationContext {
   modeContext: ModeContext | undefined;
   audioContext: AudioContext | undefined;
   attachmentsContext: AttachmentsContext | undefined;
+  /**
+   * The partner's user namespace for a partner-key request (from its
+   * server-set client_id `partner:<ns>`), else undefined. Scopes
+   * `read_r2_object` / `attach_audio` to that partner's own recordings.
+   */
+  partnerNamespace: string | undefined;
   workerOrigin: string;
   /** The org scope for this request. Used by `read_r2_object` / `attach_audio` to
    *  enforce that requested R2 keys belong to this org. */
@@ -2097,9 +2118,7 @@ function buildSeedMessages(
     ...historyToMessages(options.history, llmMax),
     {
       role: 'user',
-      content: options.groupContext?.currentSpeaker
-        ? `[${sanitizeSpeaker(options.groupContext.currentSpeaker)}]: ${userMessage}`
-        : userMessage,
+      content: `${speakerPrefix(options.groupContext?.currentSpeaker)}${userMessage}`,
     },
   ];
 }
@@ -2189,7 +2208,7 @@ function createOrchestrationContext(
   const llmMax = orgConfig?.max_history_llm ?? DEFAULT_ORG_CONFIG.max_history_llm;
 
   // prettier-ignore
-  const systemBlocks = buildSystemPromptBlocks(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, memoryEnabled: hasMemoryForTurn(options), clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument, triggerOnly: options.triggerOnly, unmatchedTriggers: options.unmatchedTriggers, addressedToBot: options.addressedToBot, inboundVoiceKey: options.inboundVoiceKey });
+  const systemBlocks = buildSystemPromptBlocks(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, memoryEnabled: hasMemoryForTurn(options), caller: options.caller, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument, triggerOnly: options.triggerOnly, unmatchedTriggers: options.unmatchedTriggers, addressedToBot: options.addressedToBot, inboundVoiceKey: options.inboundVoiceKey });
 
   return {
     client: new Anthropic({ apiKey: env.ANTHROPIC_API_KEY }),
@@ -2217,6 +2236,7 @@ function createOrchestrationContext(
     modeContext: options.modeContext,
     audioContext: options.audioContext,
     attachmentsContext: options.attachmentsContext,
+    partnerNamespace: partnerNamespaceOf(options),
     workerOrigin: options.workerOrigin ?? '',
     org: options.org ?? options.env.DEFAULT_ORG,
     env: options.env,
@@ -2674,6 +2694,38 @@ async function handleUpdateMemory(input: unknown, ctx: OrchestrationContext): Pr
 }
 
 /**
+ * Partner scoping for the audio tools (admin-portal#354). A partner chat may
+ * reach only its own partner's recordings (partnerOwnsAudioKey); a non-partner
+ * chat may never reach any partner's. Logged and answered like any other
+ * out-of-scope key, without saying whether the object exists.
+ */
+function checkPartnerVoiceScope(
+  toolName: string,
+  r2Key: string,
+  ctx: OrchestrationContext
+): { error: string } | null {
+  const allowed =
+    ctx.partnerNamespace === undefined
+      ? !isPartnerVoiceSubmissionKey(r2Key)
+      : partnerOwnsAudioKey(r2Key, ctx.org, ctx.partnerNamespace);
+  if (allowed) return null;
+  ctx.logger.warn('r2_key_out_of_scope', {
+    tool: toolName,
+    r2_key: r2Key,
+    org: ctx.org,
+    reason: ctx.partnerNamespace === undefined ? 'partner-partition' : 'not-this-partner',
+  });
+  return { error: 'r2_key is out of scope for this request.' };
+}
+
+/** The partner namespace of a partner-key turn (client_id `partner:<ns>`), else undefined. */
+function partnerNamespaceOf(options: OrchestratorOptions): string | undefined {
+  if (!isPartnerCaller(options.caller)) return undefined;
+  // A partner turn without a well-formed partner client_id owns nothing ('').
+  return namespaceOfClientId(options.clientId) ?? '';
+}
+
+/**
  * Verify that an R2 key passed to `read_r2_object` / `attach_audio` belongs
  * to the current org's voice-submissions namespace. Returns `null` when the
  * key is in scope; otherwise returns an error envelope (logged at WARN per
@@ -2687,6 +2739,8 @@ function checkVoiceSubmissionScope(
   r2Key: string,
   ctx: OrchestrationContext
 ): { error: string } | null {
+  const partnerError = checkPartnerVoiceScope(toolName, r2Key, ctx);
+  if (partnerError) return partnerError;
   const expectedPrefix = `${VOICE_SUBMISSION_PREFIX}/${ctx.org}/`;
   if (!r2Key.startsWith(expectedPrefix)) {
     ctx.logger.warn('r2_key_out_of_scope', {

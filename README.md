@@ -165,6 +165,7 @@ All `/api/*` routes require a Bearer token in the `Authorization` header.
 - **`ENGINE_API_KEY`** — the chat/user key: chat, user preferences and history, audio and voice-submission routes. It also has super-admin access while `ADMIN_KEY_REQUIRED` is not `"true"` (see below).
 - **`ADMIN_API_KEY`** (optional secret) — the dedicated admin key. Passes the `/api/*` check on its own and always has super-admin access to every admin route (all orgs, the global MCP pool, DO snapshots), so an admin client needs only this key.
 - **`ORG_ADMIN_KEYS` KV namespace** — still bound, but values stored there are **not** accepted as bearer tokens: `/api/*` accepts only the two keys above, and no route reads this namespace for auth.
+- **Partner API keys** (admin-portal#354) — named, revocable `bts_…` keys issued per partner app through `/api/v1/admin/api-keys` (super-admin only, like every admin route). Administered by one Durable Object (`PartnerKeyStoreDO`, the single writer and source of truth), which projects each key's record to the `API_KEYS` KV namespace under the SHA-256 of the key for auth. Keys carry an HMAC tag (`PARTNER_KEY_TAG_SECRET`), so a random token is rejected without a KV read. A partner key can call **only** `POST /api/v1/chat` and `POST /api/v1/chat/stream` (always for its own org, with its end users' ids namespaced per partner; voice in and spoken replies work as for internal clients), plus `GET`/`HEAD` on `/api/v1/audio/*` and `/api/v1/voice-submissions/*` limited to its own users' and groups' audio (anything else answers 404). A new or revoked key can take up to ~60s to take effect everywhere (KV edge caching), so replace keys by rotation with a grace period. See [docs/curl-examples.md](docs/curl-examples.md#admin-partner-api-keys).
 - **Webhook callbacks** — authenticated via `X-Engine-Token` header containing the `ENGINE_API_KEY`
 
 ```
@@ -247,6 +248,12 @@ All admin endpoints (everything under `/api/v1/admin/*`) require a key with supe
 | `/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/history`     | GET/DEL      | Thread chat history                                                                         |
 | `/api/v1/admin/orgs/:org/groups/:chatId/threads/:threadId/memory`      | GET/DEL      | Thread shared memory                                                                        |
 | `/api/v1/admin/do/:hexId/snapshot`                                     | GET          | Open a DO by its 64-hex object id; returns its stored identity and history (`?limit=`, 100) |
+| `/api/v1/admin/api-keys`                                               | POST         | Create a partner API key; the plaintext `apiKey` is returned only here (#354)               |
+| `/api/v1/admin/api-keys`                                               | GET          | List partner keys, all orgs or `?org=`; never the plaintext or hash                         |
+| `/api/v1/admin/api-keys/:keyId`                                        | GET          | Get one partner key                                                                         |
+| `/api/v1/admin/api-keys/:keyId/_revoke`                                | POST         | Revoke a partner key (idempotent)                                                           |
+| `/api/v1/admin/api-keys/:keyId/_rotate`                                | POST         | Issue a replacement key; the old one keeps working for a grace window (default 7 days)      |
+| `/api/v1/admin/api-keys/:keyId/_import-legacy-users`                   | POST         | Copy an app's shared-key users into the key's namespace (super-admin)                       |
 
 The snapshot route is the only way into a DO whose `user:{org}:{user_id}` name is unknown (object ids from the Cloudflare REST listing are one-way), which is what makes the DO population enumerable after the fact. `identity` is `null` for DOs that predate identity persistence and have not chatted since.
 
@@ -635,6 +642,7 @@ Access control (who can reset a group, who counts as "addressed") is the **gatew
 | `OPENAI_API_KEY`              | API key for OpenAI (TTS)                                                                                                                         |
 | `ENGINE_API_KEY`              | Bearer token for API auth + webhook `X-Engine-Token`; super-admin access only while `ADMIN_KEY_REQUIRED` is not `"true"`                         |
 | `ADMIN_API_KEY`               | Dedicated admin key: passes `/api/*` auth and has super-admin access to `/api/v1/admin/*`. Unset ⇒ `ENGINE_API_KEY` stays super admin (optional) |
+| `PARTNER_KEY_TAG_SECRET`      | HMAC key for the tag on partner API keys (#354). Unset ⇒ partner keys can't be issued or used; changing it invalidates every issued key          |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP base URL of the collector. Telemetry is a no-op unless this AND the token are set (optional)                                           |
 | `OTEL_COLLECTOR_TOKEN`        | Bearer token the collector expects (optional)                                                                                                    |
 | `TELEMETRY_USER_ID_SALT`      | HMAC key for the OTLP-path `user_hash` pseudonym; unset ⇒ no pseudonym egresses (optional)                                                       |
@@ -693,16 +701,18 @@ Primary traffic never touches OpenRouter; it is a failover path only. OpenRouter
 
 ### Cloudflare Bindings
 
-| Binding            | Type           | Purpose                                                                   |
-| ------------------ | -------------- | ------------------------------------------------------------------------- |
-| `AI`               | Workers AI     | STT (Whisper)                                                             |
-| `USER_DO`          | Durable Object | Per-conversation chat, history, memory, queue (private, group, or thread) |
-| `AUDIO_BUCKET`     | R2 Bucket      | TTS audio + archived voice submissions                                    |
-| `PTXPRINT_BUCKET`  | R2 Bucket      | USFM sources, generated PDFs, fonts (served at `/public/ptxprint/*`)      |
-| `ORG_ADMIN_KEYS`   | KV Namespace   | Bound but not used for auth (not accepted as Bearer tokens)               |
-| `MCP_SERVERS`      | KV Namespace   | MCP server configurations — one global pool under key `__global__` (#278) |
-| `ORG_CONFIG`       | KV Namespace   | Org-level configuration (history limits, etc.)                            |
-| `PROMPT_OVERRIDES` | KV Namespace   | Org-level prompt overrides, modes, languages, scaffold, default language  |
+| Binding             | Type           | Purpose                                                                   |
+| ------------------- | -------------- | ------------------------------------------------------------------------- |
+| `AI`                | Workers AI     | STT (Whisper)                                                             |
+| `USER_DO`           | Durable Object | Per-conversation chat, history, memory, queue (private, group, or thread) |
+| `PARTNER_KEY_STORE` | Durable Object | Partner API key administration, single writer (admin-portal#354)          |
+| `AUDIO_BUCKET`      | R2 Bucket      | TTS audio + archived voice submissions                                    |
+| `PTXPRINT_BUCKET`   | R2 Bucket      | USFM sources, generated PDFs, fonts (served at `/public/ptxprint/*`)      |
+| `ORG_ADMIN_KEYS`    | KV Namespace   | Bound but not used for auth (not accepted as Bearer tokens)               |
+| `MCP_SERVERS`       | KV Namespace   | MCP server configurations — one global pool under key `__global__` (#278) |
+| `ORG_CONFIG`        | KV Namespace   | Org-level configuration (history limits, etc.)                            |
+| `PROMPT_OVERRIDES`  | KV Namespace   | Org-level prompt overrides, modes, languages, scaffold, default language  |
+| `API_KEYS`          | KV Namespace   | Partner API key auth projection, keyed by SHA-256 of the key (#354)       |
 
 The worker also declares **tail consumers** (`bt-servant-tail` for death detection and `bt-servant-telemetry-production` for log fanout; staging uses `bt-servant-tail-staging` and `bt-servant-telemetry-dev`), enables the `nodejs_compat` compatibility flag (AsyncLocalStorage for trace-context propagation), and raises the CPU limit to 300,000 ms for long ptxprint flows.
 

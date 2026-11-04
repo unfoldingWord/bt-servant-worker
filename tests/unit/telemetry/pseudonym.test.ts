@@ -32,10 +32,14 @@ async function readPseudonym(): Promise<string | undefined> {
   return getUserPseudonym();
 }
 
-/** Make crypto.subtle.importKey reject, forcing withUserPseudonym's catch branch. */
+/**
+ * Make crypto.subtle.sign reject, forcing withUserPseudonym's catch branch.
+ * (`sign`, not `importKey`: the imported HMAC key is cached per isolate, so
+ * importKey is not called again once a salt has been used.)
+ */
 function breakHashing() {
   return vi
-    .spyOn(globalThis.crypto.subtle, 'importKey')
+    .spyOn(globalThis.crypto.subtle, 'sign')
     .mockRejectedValue(new Error('subtle unavailable') as never);
 }
 
