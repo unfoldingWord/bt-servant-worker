@@ -259,13 +259,18 @@ function whyForeignMissing(
 }
 
 /**
- * Apply failed foreign reads to an answer. A failed read can only ADD
- * competitors; it can never add this org's own exact match. So `resolves` is
- * firm both ways, and on a miss only the look-alike is in doubt:
- * `resolved_org` is dropped and `resolved_org_uncertain` set. The one
- * exception is an own exact match that a failed org could have pre-empted:
- * same slug and processed first by the merge (`compareOrgs`), which throws
- * a retryable 503.
+ * Apply failed foreign reads to an answer, modelling how claims depend on
+ * each other. Qualified names only compete within one slug, and the merge is
+ * first-wins in `compareOrgs` order, where a name collision drops the loser's
+ * WHOLE mode, aliases included. So an unreadable org with the target's slug
+ * that sorts before the target can change who owns `<slug>/<name>` in either
+ * direction: it could claim the name itself, or claim a name of an earlier
+ * claimant's mode and so drop that mode's alias claim, which frees the
+ * target. Any such failure makes the answer retryable (503), positive or
+ * negative. `capped` stays firm: it comes from the listing, before any claim.
+ * Other failures cannot touch `<slug>/*` claims; they leave the verdict firm
+ * and only make the look-alike unknown, so `resolved_org` is dropped and
+ * `resolved_org_uncertain` set.
  */
 function applyFailedReads(
   answer: ShareCodeAnswer,
@@ -273,15 +278,16 @@ function applyFailedReads(
   sources: CrossOrgModeSources
 ): ShareCodeAnswer {
   if (sources.failedKeys.length === 0) return answer;
-  if (!answer.resolves) {
-    const { resolved_org: _unknown, ...firm } = answer;
-    return { ...firm, resolved_org_uncertain: true };
+  const claimRelevant = sources.failedKeys.find((key) => {
+    const failed = orgFromModesKey(key);
+    return orgSlug(failed) === target.slug && compareOrgs(failed, target.org) < 0;
+  });
+  if (claimRelevant !== undefined && answer.reason !== 'capped') {
+    throw new ShareCodeUnavailableError('read_failed', { key: claimRelevant });
   }
-  const preempted = sources.failedKeys
-    .map(orgFromModesKey)
-    .some((failed) => orgSlug(failed) === target.slug && compareOrgs(failed, target.org) < 0);
-  if (preempted) throw new ShareCodeUnavailableError('read_failed', { key: sources.failedKeys[0] });
-  return answer;
+  if (answer.resolves) return answer;
+  const { resolved_org: _unknown, ...firm } = answer;
+  return { ...firm, resolved_org_uncertain: true };
 }
 
 async function resolveForeign(

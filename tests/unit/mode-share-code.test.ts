@@ -920,6 +920,40 @@ describe('share-code parity with chat through the chat read path (bench round 1,
   });
 });
 
+describe('failed reads and claim dependencies (bench round 3, Frank P2)', () => {
+  // 'PBT' < 'Pbt' < 'pbt' in merge order; all three slug to `pbt`.
+  const records = {
+    'PBT:modes': { modes: [published('y')] },
+    'Pbt:modes': { modes: [published('y', { aliases: ['x'] })] },
+    'pbt:modes': { modes: [published('x')] },
+  };
+
+  it('all reads succeed: PBT claims pbt/y, which drops Pbt (alias x too), so pbt/x resolves', async () => {
+    const kv = fakeKv(records);
+    expect(await chatOpens(kv, HOME, 'pbt/x')).toBe('pbt/x');
+    expect(await resolve(kv, 'pbt', 'x')).toEqual({
+      code: 'pbt/x',
+      resolves: true,
+      resolved_org: 'pbt',
+    });
+  });
+
+  it('the PBT read fails: Pbt would claim pbt/x, but that is not a firm collision; 503 read_failed', async () => {
+    const kv = fakeKv(records, { failGet: ['PBT:modes'] });
+    expect(await unavailableDetail(resolve(kv, 'pbt', 'x'))).toBe('read_failed');
+  });
+
+  it('the 503 names the failed key that could change the claim, not just the first failed key', async () => {
+    const kv = fakeKv(
+      { ...records, 'AAA:modes': { modes: [published('z')] } },
+      { failGet: ['AAA:modes', 'PBT:modes'] }
+    );
+    const error = await resolve(kv, 'pbt', 'x').catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ShareCodeUnavailableError);
+    expect((error as ShareCodeUnavailableError).key).toBe('PBT:modes');
+  });
+});
+
 describe('chatTriggerModeOptions', () => {
   it('drops drafts and group-only modes for a non-admin private chat, keeps aliases', () => {
     const options = chatTriggerModeOptions(
