@@ -831,14 +831,16 @@ export function resolveStatusLocale(
 }
 
 /**
- * User-facing text for a failed turn. An upstream `Error.message` passes
- * through unchanged (it is diagnostic — `ClaudeAPIError`, `MCPError` — and
- * translating exceptions is out of scope); only the generic fallback for a
- * non-Error throw is localized (#405). Pure: callers resolve `locale` before
- * their `try`, so no storage read ever happens inside a catch block.
+ * User-facing text for a failed turn: always the localized
+ * `error_processing_failed` (#481). An internal `Error.message` (for example
+ * a stream abort's `upstream-abort` reason, as logged in #481) is never put on
+ * the error event or callback, on any transport. The cause is diagnostic and
+ * goes to the logs, which every caller writes before sending this. Pure: callers resolve
+ * `locale` before their `try`, so no storage read ever happens inside a catch
+ * block.
  */
-export function processingFailureDetail(error: unknown, locale: string): string {
-  return error instanceof Error ? error.message : uiString(locale, 'error_processing_failed');
+export function processingFailureDetail(locale: string): string {
+  return uiString(locale, 'error_processing_failed');
 }
 
 export class UserDO {
@@ -1286,7 +1288,7 @@ export class UserDO {
     return createErrorResponse(
       uiString(locale, 'error_processing_failed'),
       'INTERNAL_ERROR',
-      processingFailureDetail(error, locale),
+      processingFailureDetail(locale),
       500
     );
   }
@@ -1310,7 +1312,7 @@ export class UserDO {
       } catch (error) {
         this.logFailedChatTurn(body, error, logger);
         logger.error('immediate_callback_error', error, { message_id: messageId });
-        await callbacks?.onError?.(processingFailureDetail(error, locale));
+        await callbacks?.onError?.(processingFailureDetail(locale));
       } finally {
         await this.releaseLock();
         await this.drainQueue(logger);
@@ -1372,7 +1374,7 @@ export class UserDO {
       } catch (error) {
         this.logFailedChatTurn(body, error, logger);
         logger.error('immediate_sse_error', error, { message_id: messageId });
-        await sendEvent({ type: 'error', error: processingFailureDetail(error, locale) });
+        await sendEvent({ type: 'error', error: processingFailureDetail(locale) });
       } finally {
         clearInterval(keepaliveInterval);
         await this.closeSSEWriter(writer, 'processImmediateSSE', messageId, logger);
@@ -1548,7 +1550,7 @@ export class UserDO {
       const response = await this.processChat(body, workerOrigin, logger, timing, callbacks);
       await callbacks?.onComplete?.(response);
     } catch (error) {
-      await callbacks?.onError?.(processingFailureDetail(error, locale));
+      await callbacks?.onError?.(processingFailureDetail(locale));
       throw error;
     }
   }
@@ -1658,7 +1660,7 @@ export class UserDO {
       // Send error to SSE client BEFORE closing the writer — if we let this propagate
       // to processQueueEntry's handleProcessingError, the writer is already closed.
       logger.error('sse_entry_processing_error', error, { message_id: entry.message_id });
-      await sendEvent({ type: 'error', error: processingFailureDetail(error, locale) });
+      await sendEvent({ type: 'error', error: processingFailureDetail(locale) });
       throw error; // Re-throw for retry logic in processQueueEntry
     } finally {
       clearInterval(keepaliveInterval);
@@ -1855,9 +1857,12 @@ export class UserDO {
     this.logFailedChatTurn(entry.body, error, logger);
     const writer = this.queuedWriters.get(entry.message_id);
     if (writer) {
+      // The raw `errorMessage` is for retry classification and logs only (#481).
+      // Pure locale (request hint, else English): no storage read on a failure path.
+      const locale = resolveStatusLocale(entry.body, DEFAULT_PREFERENCES);
       try {
         const encoder = new TextEncoder();
-        const event: SSEEvent = { type: 'error', error: errorMessage };
+        const event: SSEEvent = { type: 'error', error: processingFailureDetail(locale) };
         await writer.write(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
         await writer.close();
       } catch (writeErr) {
@@ -2182,7 +2187,7 @@ export class UserDO {
     const audioContext = this.buildAudioContext();
     const attachmentsContext = createAttachmentsContext();
     // prettier-ignore
-    const orchOpts = { ...this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, triggerCtx.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, triggerCtx.activeModeName, audioContext, attachmentsContext, workerOrigin, logger, callbacks, this.maybeBuildGroupContext(body), triggerCtx.languageDocument, triggerCtx.unmatchedTriggers, loaded.inboundVoiceKey, { triggerOnly: triggerCtx.triggerOnly }), turnId };
+    const orchOpts = { ...this.buildOrchOpts(body, loaded.catalog, loaded.history, effectivePreferences, triggerCtx.resolved, loaded.memoryStore, loaded.formattedTOC, loaded.orgModes, triggerCtx.activeModeName, audioContext, attachmentsContext, workerOrigin, logger, callbacks, this.maybeBuildGroupContext(body), triggerCtx.languageDocument, triggerCtx.unmatchedTriggers, loaded.inboundVoiceKey, { triggerOnly: triggerCtx.triggerOnly }), turnId, turnStartedAt: ctx.startTime };
 
     const { orchResult, audioKey } = await this.orchestrateWithAudio(
       ctx,

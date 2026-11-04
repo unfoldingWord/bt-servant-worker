@@ -413,6 +413,8 @@ const BOUNDED_LABEL_VALUES: Record<string, ReadonlySet<string>> = {
     'PermissionDeniedError',
     'UnprocessableEntityError',
     'ConflictError',
+    // Streaming body cut off by the stall timer or turn ceiling (#481)
+    'ClaudeStreamAbortedError',
   ]),
 };
 

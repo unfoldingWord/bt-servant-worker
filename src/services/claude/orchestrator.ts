@@ -230,6 +230,12 @@ interface OrchestratorOptions {
   org?: string | undefined;
   /** Per-turn id minted by the caller; stamped on every log this run emits. */
   turnId?: string | undefined;
+  /**
+   * Epoch ms when the caller started this turn (#481). The streaming ceiling
+   * and the recovery-call gate are measured from it. Defaults to the moment
+   * `orchestrate()` builds its context, which is later than the true start.
+   */
+  turnStartedAt?: number | undefined;
   logger: RequestLogger;
   callbacks?: StreamCallbacks | undefined;
 }
@@ -345,6 +351,8 @@ interface OrchestrationContext {
    * generations on it would silently merge two users' turns.
    */
   turnId: string | undefined;
+  /** Epoch ms the turn started; base for the streaming ceiling and recovery gate (#481). */
+  turnStartedAt: number;
   /** Mutable per-run telemetry accumulator. See `TelemetryAccumulator`. */
   telemetry: TelemetryAccumulator;
   catalog: ToolCatalog;
@@ -701,14 +709,46 @@ function fingerprint(text: string): string {
  * not strictly a nesting problem. Raw globalThis.fetch works in all contexts.
  */
 /**
- * Hard ceiling on a single Anthropic Messages API request. Cloudflare Workers'
- * subrequest fetch has its own time budget but does not surface a useful error
- * when the upstream stalls; we add an explicit AbortSignal so an unresponsive
- * Anthropic stream surfaces as a clear `claude_fetch_aborted` error instead of
- * a silent orchestration death (which is what staging exhibited on
- * 2026-04-30 — the loop simply stopped emitting events after iteration 4).
+ * Hard ceiling on a single NON-STREAMING Anthropic Messages API request.
+ * Cloudflare Workers' subrequest fetch has its own time budget but does not
+ * surface a useful error when the upstream stalls; we add an explicit
+ * AbortSignal so an unresponsive call surfaces as a clear `claude_fetch_aborted`
+ * error instead of a silent orchestration death (which is what staging
+ * exhibited on 2026-04-30 — the loop simply stopped emitting events after
+ * iteration 4).
+ *
+ * Streaming calls no longer use it (#481): a total cap cannot tell a stalled
+ * stream from a live one still writing a long answer, and in prod every firing
+ * in a 7-day window was a live stream. Streaming uses the stall timer and the
+ * turn ceiling below instead.
  */
 const CLAUDE_REQUEST_TIMEOUT_MS = 90_000;
+
+/**
+ * Streaming stall timer (#481). Armed when the first body chunk arrives and
+ * re-armed on every chunk after it, so it fires only when the stream has gone
+ * quiet for this long. Anthropic `ping` events count as chunks: a stream that
+ * is still pinging is alive. This still catches the 2026-04-30 silent stall.
+ */
+const CLAUDE_STREAM_STALL_TIMEOUT_MS = 30_000;
+
+/**
+ * Backstop for streaming calls (#481), measured from the turn start rather than
+ * per call. With the total cap gone, a stream that trickles a byte every 29 s
+ * would otherwise never end. 270 s leaves headroom under the web client's 300 s
+ * hard cutoff (bt-servant-web-client `use-chat-runtime.ts`, `HARD_MAX_MS`) for
+ * the `complete` event and history write. An answer cut here is delivered with
+ * the truncation notice, like a stall.
+ */
+const TURN_STREAM_CEILING_MS = 270_000;
+
+/**
+ * An extra model call that only exists to rescue a turn (a recovery call, or a
+ * continuation after `max_tokens`) may start only while the turn is younger
+ * than this (Seth, 2026-11-04). #481 records whether one would have fitted;
+ * the #478 redo and a `max_tokens` continuation (if adopted) gate on it.
+ */
+const TURN_RECOVERY_GATE_MS = 240_000;
 
 /**
  * Retry/backoff policy for transient Anthropic API failures (issue #248).
@@ -805,46 +845,95 @@ function isOurTimeoutAbort(error: unknown): boolean {
 const CLAUDE_FIRST_BYTE_TIMEOUT_MS = 20_000;
 
 /**
- * One controller, two timers. Both fire an identical `AbortError` out of `fetch`,
- * so the two are told apart by STATE, not by the error: `firstByteFired` is set by
- * the first-byte timer before it aborts, and `firstByteReceived()` clears that
- * timer once the stream has yielded its first chunk — not when `fetch` resolves,
+ * Which timer aborted an attempt (#481). Bounded enum, safe as a metric label:
+ * `first_byte` (#403, pre-body), `stall` (no chunk for the stall window) or
+ * `deadline` (the 90 s non-streaming cap, or the streaming turn ceiling).
+ */
+export type StreamAbortKind = 'first_byte' | 'stall' | 'deadline';
+
+/**
+ * One controller, up to three timers. All fire an identical `AbortError` out of
+ * `fetch`, so they are told apart by STATE, not by the error: each timer records
+ * its kind before it aborts. `firstByteReceived()` clears the first-byte timer
+ * once the stream has yielded its first chunk — not when `fetch` resolves,
  * because headers alone prove nothing: a `200` whose body never starts is the
- * slowest outage of all (Codex review on #464).
+ * slowest outage of all (Codex review on #464) — and arms the stall timer.
  */
 interface AttemptGuard {
   signal: AbortSignal;
-  /** Clears both timers. Caller MUST invoke once the body has been read. */
+  /** Clears every timer. Caller MUST invoke once the body has been read. */
   cleanup: () => void;
   /** Call once the first body chunk has arrived: the first-byte deadline no longer applies. */
   firstByteReceived: () => void;
   /** True once the first-byte timer aborted the attempt. */
   firstByteFired: () => boolean;
+  /** A body chunk arrived: re-arm the stall timer (no-op without one, or after cleanup). */
+  touch: () => void;
+  /** The timer that aborted this attempt, or null while none has. */
+  abortKind: () => StreamAbortKind | null;
 }
 
-function buildAttemptGuard(bodyTimeoutMs: number, firstByteTimeoutMs?: number): AttemptGuard {
+interface GuardTimeouts {
+  /** Whole-attempt cap: 90 s non-streaming; time left before the turn ceiling when streaming. */
+  bodyMs: number;
+  /** Streaming only: deadline for the first body chunk. */
+  firstByteMs?: number;
+  /** Streaming only: maximum silence between chunks once the body has started. */
+  stallMs?: number;
+}
+
+function buildAttemptGuard(timeouts: GuardTimeouts): AttemptGuard {
   const controller = new AbortController();
-  let firstByte = false;
-  const bodyTimer = setTimeout(() => controller.abort(), bodyTimeoutMs);
+  let fired: StreamAbortKind | null = null;
+  let closed = false;
+  const abortAs = (kind: StreamAbortKind) => (): void => {
+    if (controller.signal.aborted) return;
+    fired = kind;
+    controller.abort();
+  };
+  const bodyTimer = setTimeout(abortAs('deadline'), timeouts.bodyMs);
   const firstByteTimer =
-    firstByteTimeoutMs === undefined
+    timeouts.firstByteMs === undefined
       ? undefined
-      : setTimeout(() => {
-          firstByte = true;
-          controller.abort();
-        }, firstByteTimeoutMs);
+      : setTimeout(abortAs('first_byte'), timeouts.firstByteMs);
+  let stallTimer: ReturnType<typeof setTimeout> | undefined;
+  const clearStall = (): void => {
+    if (stallTimer !== undefined) clearTimeout(stallTimer);
+  };
+  const armStall = (): void => {
+    if (closed || timeouts.stallMs === undefined) return;
+    clearStall();
+    stallTimer = setTimeout(abortAs('stall'), timeouts.stallMs);
+  };
   const clearFirstByte = (): void => {
     if (firstByteTimer !== undefined) clearTimeout(firstByteTimer);
   };
   return {
     signal: controller.signal,
     cleanup: () => {
+      closed = true;
       clearTimeout(bodyTimer);
       clearFirstByte();
+      clearStall();
     },
-    firstByteReceived: clearFirstByte,
-    firstByteFired: () => firstByte,
+    firstByteReceived: () => {
+      clearFirstByte();
+      armStall();
+    },
+    firstByteFired: () => fired === 'first_byte',
+    touch: armStall,
+    abortKind: () => fired,
   };
+}
+
+/** Milliseconds left before the streaming turn ceiling (#481); never negative. */
+function streamCeilingRemainingMs(ctx: OrchestrationContext): number {
+  return Math.max(0, ctx.turnStartedAt + TURN_STREAM_CEILING_MS - Date.now());
+}
+
+/** Whether a rescue-only model call may still start this turn (Seth, 2026-11-04). */
+function canAffordRecoveryCall(ctx: OrchestrationContext): boolean {
+  return Date.now() - ctx.turnStartedAt < TURN_RECOVERY_GATE_MS;
 }
 
 /** POST a Messages-API body to a route's endpoint with that route's credential (#403). */
@@ -898,7 +987,11 @@ function logFetchCommencement(
     streaming,
     body_size_bytes: body.length,
     message_count: ctx.messages.length,
-    timeout_ms: CLAUDE_REQUEST_TIMEOUT_MS,
+    // Streaming has no per-call total cap (#481): it is bounded by the stall
+    // timer and by whatever is left of the turn ceiling.
+    timeout_ms: streaming ? streamCeilingRemainingMs(ctx) : CLAUDE_REQUEST_TIMEOUT_MS,
+    ...(streaming ? { stall_timeout_ms: CLAUDE_STREAM_STALL_TIMEOUT_MS } : {}),
+    turn_elapsed_ms: Date.now() - ctx.turnStartedAt,
   });
 }
 
@@ -911,7 +1004,8 @@ function logFetchAborted(
   if ((error as Error)?.name !== 'AbortError') return;
   ctx.logger.error('claude_fetch_aborted', error, {
     streaming,
-    timeout_ms: CLAUDE_REQUEST_TIMEOUT_MS,
+    // Streaming: the turn ceiling fired before the first byte (#481).
+    timeout_ms: streaming ? TURN_STREAM_CEILING_MS : CLAUDE_REQUEST_TIMEOUT_MS,
     duration_ms: Date.now() - fetchStart,
   });
 }
@@ -922,10 +1016,14 @@ export interface AnthropicFetchResult {
   response: Response;
   /** Abort signal of the successful attempt; governs the body read until {@link cleanup}. */
   signal: AbortSignal;
-  /** Clears the successful attempt's hang-guard timer. Caller must invoke after reading. */
+  /** Clears the successful attempt's hang-guard timers. Caller must invoke after reading. */
   cleanup: () => void;
   /** Start timestamp of the successful attempt, for `claude_fetch_complete` duration. */
   fetchStart: number;
+  /** Re-arms the stall timer; the SSE reader calls it on every chunk (#481). */
+  touch: () => void;
+  /** Which timer aborted the body read, if any (#481). */
+  abortKind: () => StreamAbortKind | null;
 }
 
 /**
@@ -965,8 +1063,13 @@ async function attemptRouteFetch(
   attempt: number
 ): Promise<AnthropicAttemptOutcome> {
   const guard = buildAttemptGuard(
-    CLAUDE_REQUEST_TIMEOUT_MS,
-    streaming ? CLAUDE_FIRST_BYTE_TIMEOUT_MS : undefined
+    streaming
+      ? {
+          bodyMs: streamCeilingRemainingMs(ctx),
+          firstByteMs: CLAUDE_FIRST_BYTE_TIMEOUT_MS,
+          stallMs: CLAUDE_STREAM_STALL_TIMEOUT_MS,
+        }
+      : { bodyMs: CLAUDE_REQUEST_TIMEOUT_MS }
   );
   const { signal, cleanup } = guard;
   const fetchStart = Date.now();
@@ -991,7 +1094,8 @@ async function attemptRouteFetch(
     if (!response)
       return { ok: false, response: headersOnly, emptyResponse: true, cleanup, fetchStart };
     guard.firstByteReceived();
-    return { ok: true, result: { response, signal, cleanup, fetchStart } };
+    const { touch, abortKind } = guard;
+    return { ok: true, result: { response, signal, cleanup, fetchStart, touch, abortKind } };
   } catch (networkError) {
     return {
       ok: false,
@@ -1451,12 +1555,16 @@ async function callClaude(ctx: OrchestrationContext): Promise<Anthropic.Message>
 
 async function streamClaudeResponse(ctx: OrchestrationContext): Promise<Anthropic.Message> {
   const {
-    result: { response, signal, cleanup, fetchStart },
+    result: { response, signal, cleanup, fetchStart, touch, abortKind },
     route,
   } = await fetchWithRouteFallback(ctx, true);
   try {
     if (!response.body) await throwAnthropicHttpError(ctx, response, true, fetchStart);
-    const parsed = await parseSSEStream(response.body!, ctx.logger, ctx.callbacks, signal);
+    const parsed = await parseSSEStream(response.body!, ctx.logger, ctx.callbacks, {
+      signal,
+      touch,
+      abortKind,
+    });
     recordServedModel(ctx, route, parsed);
     ctx.logger.log('claude_fetch_complete', {
       route: route.id,
@@ -1504,61 +1612,128 @@ function applySSELines(
   }
 }
 
-function attachSSEAbortListener(
-  signal: AbortSignal | undefined,
-  reader: ReadableStreamDefaultReader<Uint8Array>,
-  logger: RequestLogger,
-  ref: { chunks: number; bytes: number; start: number; state: SSEParseState }
-): (() => void) | undefined {
-  if (!signal) return undefined;
-  const onAbort = () => {
-    logger.warn('sse_stream_aborted', {
-      elapsed_ms: Date.now() - ref.start,
-      chunks: ref.chunks,
-      bytes: ref.bytes,
-      event_counts: { ...ref.state.eventCounts },
-    });
-    reader.cancel('upstream-abort').catch(() => {
-      // The abort itself is already logged above (sse_stream_aborted). reader.cancel()
-      // rejecting — e.g. the stream is already closed — is idempotent and harmless,
-      // so there is nothing further to record here.
-    });
-  };
-  signal.addEventListener('abort', onAbort);
-  return () => signal.removeEventListener('abort', onAbort);
+/** What the SSE reader needs from the attempt guard (#481). */
+interface StreamWatch {
+  signal: AbortSignal;
+  /** Re-arm the stall timer; called on every chunk. */
+  touch: () => void;
+  /** Which timer aborted the read, once one has. */
+  abortKind: () => StreamAbortKind | null;
+}
+
+/** Counters for one SSE body read, for the stream logs. */
+interface SSEReadStats {
+  chunks: number;
+  bytes: number;
+  start: number;
 }
 
 /**
- * Validate the post-loop SSE state and surface a final Message.
- *
- * CRITICAL: must check abort BEFORE the !state.message guard. The abort
- * listener cancels the reader, which makes reader.read() resolve with
- * done=true — so the loop exits "cleanly" even though we never saw
- * message_stop. Without this check, a 90s timeout that fires AFTER
- * message_start arrived would silently return the partial message
- * (truncated text or a half-built tool call) as a successful response,
- * defeating the entire reason this timeout exists.
+ * A streaming call that a guard timer cut off after the body had started
+ * (#481). `partial` is whatever message had been assembled by then (undefined
+ * when `message_start` never arrived). The message keeps the word "timeout":
+ * the queued path's `isTransientError` matched the old message on it, and that
+ * retry behaviour is unchanged here.
  */
+export class ClaudeStreamAbortedError extends Error {
+  readonly abortKind: StreamAbortKind;
+  readonly partial: Anthropic.Message | undefined;
+  readonly bytesReceived: number;
+
+  constructor(abortKind: StreamAbortKind, partial: Anthropic.Message | undefined, bytes: number) {
+    super(`Claude stream aborted (${abortKind} timeout) before completing`);
+    this.name = 'ClaudeStreamAbortedError';
+    this.abortKind = abortKind;
+    this.partial = partial;
+    this.bytesReceived = bytes;
+  }
+}
+
+/** Result of one guarded read: a chunk, or the guard aborted the stream. */
+type GuardedRead =
+  | { aborted: false; result: ReadableStreamReadResult<Uint8Array> }
+  | { aborted: true; readError: string | undefined };
+
+/** Resolves (never rejects) once `signal` aborts, so it can be raced against every read. */
+function abortedSignal(signal: AbortSignal): Promise<GuardedRead> {
+  const aborted: GuardedRead = { aborted: true, readError: undefined };
+  return new Promise((resolve) => {
+    if (signal.aborted) resolve(aborted);
+    else signal.addEventListener('abort', () => resolve(aborted), { once: true });
+  });
+}
+
+/**
+ * Read one chunk, raced against the guard. The race is what makes the abort
+ * detectable whatever the runtime does with the body when the fetch signal
+ * aborts: the pending read may resolve `done`, reject with an `AbortError`, or
+ * reject with the cancel reason (prod logged the turn's failure as
+ * `upstream-abort`, the cancel reason, #481). A rejection that is NOT ours is
+ * rethrown unchanged.
+ */
+async function guardedRead(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  watch: StreamWatch | undefined,
+  aborted: Promise<GuardedRead> | undefined
+): Promise<GuardedRead> {
+  if (!watch || !aborted) return { aborted: false, result: await reader.read() };
+  try {
+    const read = reader.read().then((result): GuardedRead => ({ aborted: false, result }));
+    return await Promise.race([read, aborted]);
+  } catch (error) {
+    if (!watch.signal.aborted) throw error;
+    // Ours: the error is the runtime tearing the body down after the abort. It
+    // is carried into the `sse_stream_aborted` log by the caller.
+    return { aborted: true, readError: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * The guard cut the stream off: log it, release the upstream connection, and
+ * throw a {@link ClaudeStreamAbortedError} carrying whatever was assembled.
+ * Whether that partial is good enough to deliver is the iteration's call.
+ */
+function abortSSEStream(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  state: SSEParseState,
+  stats: SSEReadStats,
+  logger: RequestLogger,
+  detail: { watch: StreamWatch; readError: string | undefined }
+): never {
+  // Only the attempt guard aborts this signal, so a kind is always recorded;
+  // `deadline` is the defensive fallback.
+  const kind = detail.watch.abortKind() ?? 'deadline';
+  logger.warn('sse_stream_aborted', {
+    stream_abort_kind: kind,
+    elapsed_ms: Date.now() - stats.start,
+    chunks: stats.chunks,
+    bytes: stats.bytes,
+    event_counts: { ...state.eventCounts },
+    had_message: !!state.message,
+    ...(detail.readError ? { read_error: detail.readError } : {}),
+  });
+  reader.cancel(`stream-${kind}`).catch((error: unknown) => {
+    // Expected when the runtime already tore the body down; still made visible.
+    logger.warn('sse_stream_cancel_failed', {
+      stream_abort_kind: kind,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  });
+  throw new ClaudeStreamAbortedError(kind, state.message, stats.bytes);
+}
+
+/** Validate the post-loop SSE state and surface a final Message. */
 function finalizeSSEStream(
   state: SSEParseState,
-  ref: { chunks: number; bytes: number; start: number },
-  logger: RequestLogger,
-  signal: AbortSignal | undefined
+  stats: SSEReadStats,
+  logger: RequestLogger
 ): Anthropic.Message {
   const base = {
-    elapsed_ms: Date.now() - ref.start,
-    chunks: ref.chunks,
-    bytes: ref.bytes,
+    elapsed_ms: Date.now() - stats.start,
+    chunks: stats.chunks,
+    bytes: stats.bytes,
     event_counts: { ...state.eventCounts },
   };
-  if (signal?.aborted) {
-    logger.error('sse_stream_aborted_with_partial', null, {
-      ...base,
-      had_partial_message: !!state.message,
-      partial_stop_reason: state.message?.stop_reason ?? null,
-    });
-    throw new Error('Claude stream aborted (timeout) before completing');
-  }
   if (!state.message) {
     logger.error('sse_stream_no_message', null, base);
     throw new Error('Claude stream ended before producing a message');
@@ -1571,37 +1746,50 @@ function finalizeSSEStream(
   return state.message;
 }
 
-/** Parse an SSE stream from the Anthropic Messages API into a final Message. */
+/**
+ * Parse an SSE stream from the Anthropic Messages API into a final Message.
+ *
+ * CRITICAL: an aborted stream must never come back as a normal Message. The
+ * abort is checked on every read AND once more after the loop, because a
+ * cancelled body can make `read()` resolve `done` as if the stream had ended
+ * cleanly; returning the partial message then would hand a half-built tool
+ * call to the tool loop as if it were complete.
+ */
 async function parseSSEStream(
   body: ReadableStream<Uint8Array>,
   logger: RequestLogger,
   callbacks?: StreamCallbacks,
-  signal?: AbortSignal
+  watch?: StreamWatch
 ): Promise<Anthropic.Message> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   const state: SSEParseState = { message: undefined, eventCounts: {} };
-  const ref = { chunks: 0, bytes: 0, start: Date.now(), state };
+  const stats: SSEReadStats = { chunks: 0, bytes: 0, start: Date.now() };
+  const aborted = watch ? abortedSignal(watch.signal) : undefined;
   let buffer = '';
 
   logger.log('sse_stream_start', {});
-  const detachAbort = attachSSEAbortListener(signal, reader, logger, ref);
-
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      ref.chunks += 1;
-      ref.bytes += value.length;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-      applySSELines(state, lines, logger, callbacks);
+  for (;;) {
+    const read = await guardedRead(reader, watch, aborted);
+    if (read.aborted) {
+      return abortSSEStream(reader, state, stats, logger, {
+        watch: watch!,
+        readError: read.readError,
+      });
     }
-    return finalizeSSEStream(state, ref, logger, signal);
-  } finally {
-    detachAbort?.();
+    if (read.result.done) break;
+    watch?.touch();
+    stats.chunks += 1;
+    stats.bytes += read.result.value.length;
+    buffer += decoder.decode(read.result.value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() ?? '';
+    applySSELines(state, lines, logger, callbacks);
   }
+  if (watch?.signal.aborted) {
+    return abortSSEStream(reader, state, stats, logger, { watch, readError: undefined });
+  }
+  return finalizeSSEStream(state, stats, logger);
 }
 
 function applyContentDelta(
@@ -1685,11 +1873,72 @@ function notifyCallback(logger: RequestLogger, fn: () => unknown): void {
   }
 }
 
+/** One model call's outcome for the iteration: a full message, or a partial final answer. */
+interface IterationCall {
+  response: Anthropic.Message;
+  /** Set when the stream was cut off and `response` is the partial answer received (#481). */
+  streamAbort: StreamAbortKind | null;
+}
+
+/** Block types a delivered partial may contain: answer text and the model's own reasoning. */
+const PARTIAL_DELIVERABLE_BLOCKS = new Set(['text', 'thinking', 'redacted_thinking']);
+
+/**
+ * The partial message from a cut-off stream, if it can stand as the answer
+ * (#481): `message_start` arrived, the round has non-whitespace text, and it
+ * has no tool call. A round with a tool call is narration whose call never
+ * finished, so its text is not an answer and the turn still fails.
+ */
+function deliverablePartial(error: unknown): Anthropic.Message | null {
+  if (!(error instanceof ClaudeStreamAbortedError) || !error.partial) return null;
+  const { content } = error.partial;
+  if (!content.every((block) => PARTIAL_DELIVERABLE_BLOCKS.has(block.type))) return null;
+  const hasText = content.some((block) => block.type === 'text' && block.text.trim() !== '');
+  return hasText ? error.partial : null;
+}
+
+/** Meter a cut-off stream by kind and by whether its partial answer reached the user. */
+function recordStreamAbort(
+  ctx: OrchestrationContext,
+  error: ClaudeStreamAbortedError,
+  outcome: 'partial_delivered' | 'failed'
+): void {
+  countMetric('claude_stream_abort_total', {
+    reason: error.abortKind,
+    status: outcome,
+    route: currentRoute(ctx).id,
+  });
+}
+
+/** Deliver a cut-off final answer as the iteration's response (#481). */
+function acceptPartialResponse(
+  ctx: OrchestrationContext,
+  error: ClaudeStreamAbortedError,
+  partial: Anthropic.Message,
+  call: { iteration: number; callStart: number }
+): IterationCall {
+  const route = currentRoute(ctx);
+  recordServedModel(ctx, route, partial);
+  recordMetric('claude_fetch_duration_ms', Date.now() - call.callStart, {
+    status: 'partial',
+    route: route.id,
+  });
+  countMetric('claude_fetch_total', { status: 'partial', route: route.id });
+  recordStreamAbort(ctx, error, 'partial_delivered');
+  ctx.logger.warn('iteration_stream_partial_delivered', {
+    iteration: call.iteration,
+    stream_abort_kind: error.abortKind,
+    bytes_received: error.bytesReceived,
+    turn_elapsed_ms: Date.now() - ctx.turnStartedAt,
+  });
+  return { response: partial, streamAbort: error.abortKind };
+}
+
 async function callClaudeForIteration(
   ctx: OrchestrationContext,
   iteration: number,
   iterStart: number
-): Promise<Anthropic.Message> {
+): Promise<IterationCall> {
   const callStart = Date.now();
   try {
     const response = await callClaude(ctx);
@@ -1697,8 +1946,14 @@ async function callClaudeForIteration(
     const route = currentRoute(ctx).id;
     recordMetric('claude_fetch_duration_ms', Date.now() - callStart, { status: 'success', route });
     countMetric('claude_fetch_total', { status: 'success', route });
-    return response;
+    return { response, streamAbort: null };
   } catch (error) {
+    const partial = deliverablePartial(error);
+    if (partial) {
+      const aborted = error as ClaudeStreamAbortedError;
+      return acceptPartialResponse(ctx, aborted, partial, { iteration, callStart });
+    }
+    if (error instanceof ClaudeStreamAbortedError) recordStreamAbort(ctx, error, 'failed');
     const route = currentRoute(ctx).id;
     recordMetric('claude_fetch_duration_ms', Date.now() - callStart, { status: 'error', route });
     countMetric('claude_fetch_total', {
@@ -1710,6 +1965,9 @@ async function callClaudeForIteration(
       iteration,
       message_count: ctx.messages.length,
       elapsed_ms: Date.now() - iterStart,
+      ...(error instanceof ClaudeStreamAbortedError
+        ? { stream_abort_kind: error.abortKind, bytes_received: error.bytesReceived }
+        : {}),
     });
     throw error;
   }
@@ -1847,6 +2105,66 @@ function sanitizeAssistantContent(
   return cleaned;
 }
 
+/** Why an answer was cut short: a guard timer on the stream (#481), or the token cap. */
+type TruncationCause = StreamAbortKind | 'max_tokens';
+
+/**
+ * Close a final answer that was cut short (#481): keep the text, then append
+ * the localized truncation notice, streamed now and kept in `responses` (so it
+ * is in history and the next turn knows the answer was incomplete), the same
+ * way `notice_max_iterations` is.
+ *
+ * Q4 seam (open with Ian): if a `max_tokens` stop should get a continuation
+ * call, it goes here, before the notice, and only when
+ * `canAffordRecoveryCall(ctx)`. The notice stays the fallback for a
+ * continuation that is unaffordable or is itself cut. Until then,
+ * `recovery_affordable` records how often such a call would have fitted.
+ */
+function finishTruncatedAnswer(ctx: OrchestrationContext, cause: TruncationCause): void {
+  ctx.logger.warn('answer_truncated', {
+    ...(ctx.turnId ? { turn_id: ctx.turnId } : {}),
+    cause,
+    turn_elapsed_ms: Date.now() - ctx.turnStartedAt,
+    recovery_affordable: canAffordRecoveryCall(ctx),
+  });
+  countMetric('answer_truncated_total', { reason: cause });
+  // A partial message has no stop_reason; give the turn record a value that
+  // tells a cut-off stream apart from a clean stop.
+  if (cause !== 'max_tokens') ctx.telemetry.finalStopReason = 'stream_aborted';
+  const notice = uiString(ctx.locale, 'notice_answer_truncated');
+  notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress(notice));
+  ctx.responses.push(notice);
+}
+
+/** Why the final round ended, for `iteration_end`. */
+function finalRoundReason(
+  stopReason: Anthropic.Message['stop_reason'],
+  streamAbort: StreamAbortKind | null
+): string {
+  if (streamAbort) return 'stream_aborted';
+  return stopReason === 'end_turn' ? 'end_turn' : 'no_tool_calls';
+}
+
+/** The round that ends the turn: add the truncation notice when the answer was cut short. */
+function endFinalRound(
+  ctx: OrchestrationContext,
+  round: {
+    iteration: number;
+    iterStart: number;
+    stopReason: Anthropic.Message['stop_reason'];
+    streamAbort: StreamAbortKind | null;
+  }
+): void {
+  const cause: TruncationCause | null =
+    round.streamAbort ?? (round.stopReason === 'max_tokens' ? 'max_tokens' : null);
+  if (cause) finishTruncatedAnswer(ctx, cause);
+  ctx.logger.log('iteration_end', {
+    iteration: round.iteration,
+    reason: finalRoundReason(round.stopReason, round.streamAbort),
+    total_duration_ms: Date.now() - round.iterStart,
+  });
+}
+
 function processIteration(ctx: OrchestrationContext, iteration: number): Promise<boolean> {
   return withSpan('iteration', { iteration }, async () => {
     const iterStart = Date.now();
@@ -1875,7 +2193,7 @@ function processIteration(ctx: OrchestrationContext, iteration: number): Promise
       ctx.emitStatus?.('status_preparing');
     }
 
-    const response = await callClaudeForIteration(ctx, iteration, iterStart);
+    const { response, streamAbort } = await callClaudeForIteration(ctx, iteration, iterStart);
     response.content = sanitizeAssistantContent(response.content, ctx.logger);
     const toolCalls = extractToolCalls(response.content);
     reportClaudeResponse(ctx, { iteration, response, toolCalls, iterStart });
@@ -1883,12 +2201,9 @@ function processIteration(ctx: OrchestrationContext, iteration: number): Promise
     ctx.lastIterationStartIndex = ctx.responses.length;
     ctx.responses.push(...extractTextResponses(response.content));
 
+    // A delivered partial never has a tool call, so it always ends the turn here.
     if (response.stop_reason === 'end_turn' || toolCalls.length === 0) {
-      ctx.logger.log('iteration_end', {
-        iteration,
-        reason: response.stop_reason === 'end_turn' ? 'end_turn' : 'no_tool_calls',
-        total_duration_ms: Date.now() - iterStart,
-      });
+      endFinalRound(ctx, { iteration, iterStart, stopReason: response.stop_reason, streamAbort });
       return true;
     }
 
@@ -2206,6 +2521,7 @@ function createOrchestrationContext(
     ...executionLimits(config),
     mcpCallsMade: { count: 0 },
     turnId: options.turnId,
+    turnStartedAt: options.turnStartedAt ?? Date.now(),
     telemetry: createTelemetryAccumulator(),
     catalog,
     logger,

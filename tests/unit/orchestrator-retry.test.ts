@@ -34,7 +34,8 @@ function createMockLogger(): RequestLogger {
 }
 
 function makeCtx(logger: RequestLogger): RetryCtx {
-  return { logger } as unknown as RetryCtx;
+  // `turnStartedAt` sets the streaming turn ceiling (#481); a fresh turn has all of it.
+  return { logger, messages: [], turnStartedAt: Date.now() } as unknown as RetryCtx;
 }
 
 /** `primary` (2 outage attempts) and `anthropic-alt` (1 outage attempt). */

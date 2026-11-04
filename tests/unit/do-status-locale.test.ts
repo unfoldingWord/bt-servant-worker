@@ -7,8 +7,8 @@
  *   - transcribing audio       → status_transcribing
  *   - TTS generating           → status_tts_generating
  *   - TTS 15s keepalive        → status_tts_still_generating
- *   - 'Processing failed'      → error_processing_failed (fallback only;
- *                                an upstream Error.message passes through)
+ *   - 'Processing failed'      → error_processing_failed (every failure;
+ *                                no internal Error.message is forwarded, #481)
  *
  * The DO runs against a Map-backed fake DurableObjectState whose storage
  * holds `preferences.response_language = 'pt'` and can gate individual reads.
@@ -455,7 +455,9 @@ describe('UserDO queued transports release resources when the locale read throws
     const events = await eventsPending;
 
     expect(events.map((e) => e.type)).toEqual(['status', 'error']);
-    expect(events[1]).toEqual({ type: 'error', error: 'locale read exploded' });
+    // The locale read is what failed, so the frame falls back to English (#481:
+    // the internal message is never forwarded).
+    expect(events[1]).toEqual({ type: 'error', error: UI_STRINGS.en.error_processing_failed });
     expect(processChat).not.toHaveBeenCalled();
     expect(logger.error).toHaveBeenCalledWith(
       'sse_entry_processing_error',
@@ -485,7 +487,7 @@ describe('UserDO queued transports release resources when the locale read throws
 
     await expect(userDo.processCallbackEntry(entry, logger)).rejects.toBe(readFailure);
 
-    expect(onError).toHaveBeenCalledWith('locale read exploded');
+    expect(onError).toHaveBeenCalledWith(UI_STRINGS.en.error_processing_failed);
     expect(processChat).not.toHaveBeenCalled();
   });
 });
@@ -628,19 +630,13 @@ describe('UserDO TTS keepalive failure (#405 review L3)', () => {
   });
 });
 
-describe('processingFailureDetail (#405)', () => {
-  it('localizes the generic fallback when the thrown value is not an Error', () => {
-    expect(processingFailureDetail('boom', 'pt')).toBe(UI_STRINGS.pt.error_processing_failed);
-  });
-
-  it('passes an upstream Error.message through unchanged (diagnostic, not translated)', () => {
-    expect(processingFailureDetail(new Error('Anthropic API returned 529: overloaded'), 'pt')).toBe(
-      'Anthropic API returned 529: overloaded'
-    );
+describe('processingFailureDetail (#405, #481)', () => {
+  it('is the localized error_processing_failed string', () => {
+    expect(processingFailureDetail('pt')).toBe(UI_STRINGS.pt.error_processing_failed);
   });
 
   it('uses English for an unsupported locale', () => {
-    expect(processingFailureDetail('boom', 'sw')).toBe(UI_STRINGS.en.error_processing_failed);
+    expect(processingFailureDetail('sw')).toBe(UI_STRINGS.en.error_processing_failed);
   });
 });
 
