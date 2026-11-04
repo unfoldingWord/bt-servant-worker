@@ -189,16 +189,6 @@ const VOICE_RESPONSE_GUIDANCE =
   '\n\n' +
   VOICE_PLANNING_RULES;
 
-/**
- * Text-mode planning line (#421). Voice already has "Do NOT narrate your
- * actions" inside {@link VOICE_WRITING_RULES}. This only cuts wasted tokens;
- * the emission path still drops anything written between tool rounds.
- */
-const TEXT_TURN_RULES =
-  '## Answer once\n\n' +
-  'Do not write text between tool rounds. Do the lookups, then answer once. ' +
-  'Never say you were answering from memory.';
-
 // Non-overridable rendering contract. Downstream clients (web, WhatsApp) parse
 // Claude's output for media URLs and render them natively — this rule set is
 // the wire format between the worker and those clients. Do not move this into
@@ -229,12 +219,22 @@ const MEDIA_FORMATTING_RULES =
 // server-agnostic on purpose: which servers and versions exist is the pool's
 // business, not this string's. Injected in voice mode too — a spoken answer
 // can name an unavailable version just as easily as a written one.
+//
+// The cross-server check is deliberately conditioned on the user naming a
+// version. The unconditioned wording that shipped in #446 ("If one server does
+// not have a requested version, check the other scripture servers") was read by
+// the model as "fetch every passage from both servers": on prod, 2026-11-03,
+// the share of ordinary turns fetching the same passage from two servers went
+// from 12% to 25% at the deploy and median turn time roughly doubled. The
+// explicit one-server default below closes that reading without weakening the
+// never-invent guarantee that admin-portal#342 needed.
 const RESOURCE_AVAILABILITY_RULES =
   '## Never invent resource availability\n\n' +
   'Only name a Bible version or other resource as available if a tool returned it during this turn. ' +
   'Knowing that a version exists is not evidence that you have it.\n' +
   '- When the user asks which versions are available, call the version-listing tool of each scripture server in the tool catalog and answer from those results.\n' +
-  '- If one server does not have a requested version, check the other scripture servers before telling the user it is unavailable.\n' +
+  '- When the user asks for a passage in a named version and the server you tried does not have that version, check the other scripture servers before telling the user it is unavailable.\n' +
+  '- For an ordinary passage request with no version named, fetch it from one server. Do not fetch the same passage from a second server to compare or confirm; the first result is the answer.\n' +
   '- NEVER offer a substitute version that no tool returned. If you could not check, say so instead of guessing.';
 
 /** Build the client platform + client_instructions section. */
@@ -518,7 +518,6 @@ export function buildSystemPromptBlocks(
   sections.push(...buildConditionalSections(preferences, history));
   sections.push(RESOURCE_AVAILABILITY_RULES);
   if (!isVoiceMessage) {
-    sections.push(TEXT_TURN_RULES);
     sections.push(MEDIA_FORMATTING_RULES);
   }
   sections.push(resolvedPromptValues.closing);

@@ -885,17 +885,11 @@ describe('describeLeftoverLegacyKeys', () => {
 });
 
 describe('poolWriteAuthError', () => {
-  it('accepts exactly the engine key', () => {
-    expect(poolWriteAuthError('Bearer engine-key', 'engine-key')).toBeNull();
+  it('accepts a request with super-admin authority', () => {
+    expect(poolWriteAuthError(true)).toBeNull();
   });
 
-  it.each([
-    ['org-scoped key', 'Bearer org-key'],
-    ['prefix of the engine key', 'Bearer engine'],
-    ['missing Bearer prefix', 'engine-key'],
-    ['empty token', 'Bearer '],
-    ['no header', undefined],
-  ])('rejects %s', (_label, header) => {
-    expect(poolWriteAuthError(header, 'engine-key')).toContain('super admin');
+  it('rejects a request without it', () => {
+    expect(poolWriteAuthError(false)).toContain('super admin');
   });
 });

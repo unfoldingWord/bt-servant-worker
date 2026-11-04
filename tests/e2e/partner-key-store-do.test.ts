@@ -249,19 +249,19 @@ describe('ledger: revoke', () => {
   });
 });
 
-describe('the chain walk has no depth cap (a long chain is revoked whole)', () => {
-  /** Create a key and rotate it `rotations` times with grace; every key stays active. */
-  async function longChain(rotations: number) {
-    const first = await withLedger((l) => l.create(INPUT));
-    let latestId = first.record.id;
-    for (let i = 0; i < rotations; i++) {
-      const next = await withLedger((l) => l.rotate(latestId, { graceSeconds: 3600 }));
-      if (next.status !== 'ok') throw new Error(next.status);
-      latestId = next.record.id;
-    }
-    return { first, latestId };
+/** Create a key and rotate it `rotations` times with grace; every key stays active. */
+async function longChain(rotations: number) {
+  const first = await withLedger((l) => l.create(INPUT));
+  let latestId = first.record.id;
+  for (let i = 0; i < rotations; i++) {
+    const next = await withLedger((l) => l.rotate(latestId, { graceSeconds: 3600 }));
+    if (next.status !== 'ok') throw new Error(next.status);
+    latestId = next.record.id;
   }
+  return { first, latestId };
+}
 
+describe('the chain walk has no depth cap (a long chain is revoked whole)', () => {
   it('revoking the latest of 60 rotations revokes all 61 keys, the first included', async () => {
     const { first, latestId } = await longChain(60);
     const result = await withLedger((l) => l.revoke(latestId));
@@ -278,7 +278,9 @@ describe('the chain walk has no depth cap (a long chain is revoked whole)', () =
     expect(result.revokedIds.at(-1)).toBe(first.record.id);
     expect(partnerKeyStatus((await projected(first.plaintext))!, Date.now())).toBe('revoked');
   });
+});
 
+describe('the chain walk survives damaged data', () => {
   it('a cycle in damaged data ends the walk and is logged', async () => {
     const { first, latestId } = await longChain(1);
     // Damage: point the first key back at the latest, closing a loop.

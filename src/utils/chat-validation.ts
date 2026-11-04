@@ -33,31 +33,21 @@ export function isValidLanguageCode(code: string): boolean {
  * client_id values that identify admin-origin callers.
  *
  * These client_ids are hardcoded in the corresponding caller's server-side
- * source (e.g. bt-servant-admin-portal/worker/baruch.ts sets
- * `client_id: "admin-portal"` on every chat relay). client_id is still
- * self-asserted body data: since partner API keys (admin-portal#354) the
- * callers that reach the chat routes are no longer only internal services
- * holding ENGINE_API_KEY. So the admin bit must never be derived from
- * client_id alone — use {@link callerIsAdmin}, which also requires the
- * request to come from an internal caller. For partner requests the client_id
- * is not the partner's at all: the worker replaces it with a server-set
- * `partner:<userNamespace>` (see {@link partnerClientId}), so it can never
- * name an admin client in the first place.
+ * source (e.g. bt-servant-admin-portal/worker/chat.ts sets
+ * `client_id: "admin-portal"` on every chat relay). client_id alone is not
+ * trusted: the worker grants admin visibility only when the request also
+ * authenticated with a super-admin key (src/utils/admin-auth.ts), and passes
+ * the result to the DO as the server-set `_is_admin` body field. A partner
+ * API key (admin-portal#354) is never super-admin, and for partner requests
+ * the client_id is not the partner's at all: the worker replaces it with a
+ * server-set `partner:<userNamespace>` (see {@link partnerClientId}), so it
+ * can never name an admin client in the first place.
  */
 const ADMIN_CLIENT_IDS: ReadonlySet<string> = new Set(['admin-portal']);
 
-/** True when `clientId` names an admin-capable client. Not sufficient on its own; see callerIsAdmin. */
+/** True when `clientId` names an admin-capable client. Not sufficient on its own: the worker also requires a super-admin key (`_is_admin`). */
 export function isAdminClient(clientId: string | undefined): boolean {
   return clientId !== undefined && ADMIN_CLIENT_IDS.has(clientId);
-}
-
-/**
- * The admin bit for a chat request: an admin client_id AND an internal caller.
- * A partner-authenticated body (`_caller: 'partner'`, stamped by the worker
- * after the client spread) is never admin, whatever client_id it carries.
- */
-export function callerIsAdmin(body: Pick<ChatRequest, '_caller' | 'client_id'>): boolean {
-  return !isPartnerCaller(body._caller) && isAdminClient(body.client_id);
 }
 
 /**
@@ -303,10 +293,10 @@ function validateClientOwnedFields(body: ChatRequest, isGroup: boolean): string 
 function validateCoreFields(body: ChatRequest): string | null {
   if (!body.user_id) return 'user_id is required';
   if (!body.client_id) return 'client_id is required';
-  // is_admin is not a public field — admin origin is derived server-side by
-  // callerIsAdmin(): an internal caller (`_caller`, set from the auth
-  // principal) AND an admin client_id. Reject the field so older callers that
-  // try to self-assert get a clear error rather than silent false-negatives.
+  // is_admin is not a public field — admin origin is derived server-side (the
+  // worker-set `_is_admin`: an admin client_id AND a super-admin key; never a
+  // partner key). Reject the field so older callers that try to self-assert
+  // get a clear error rather than silent false-negatives.
   if ((body as unknown as Record<string, unknown>).is_admin !== undefined) {
     return 'is_admin is not a valid field; admin origin is derived server-side from the authenticated caller and client_id';
   }

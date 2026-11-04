@@ -19,8 +19,9 @@
  * Skipped on Windows (SQLite/workerd incompatibility). Runs in CI on Linux.
  */
 
-import { env, runInDurableObject, SELF } from 'cloudflare:test';
+import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ADMIN, apiFetch, ENGINE, JSON_ADMIN, JSON_ENGINE } from '../helpers/production-auth.js';
 import type { StoredIdentity } from '../../src/types/engine';
 import type { PublicPartnerKey } from '../../src/types/partner-keys';
 import { sha256Hex } from '../../src/utils/crypto';
@@ -35,8 +36,10 @@ import {
 // The Anthropic call is intercepted at globalThis.fetch; see anthropic-capture.ts.
 vi.mock('@anthropic-ai/sdk', () => ({ default: vi.fn() }));
 
-const INTERNAL = { Authorization: 'Bearer test-api-key' };
-const JSON_INTERNAL = { ...INTERNAL, 'Content-Type': 'application/json' };
+// Chat and user routes: ENGINE_API_KEY. Admin routes: ADMIN_API_KEY (the
+// production auth configuration; see tests/helpers/production-auth.ts).
+const INTERNAL = ENGINE;
+const JSON_INTERNAL = JSON_ENGINE;
 const KEYS = 'https://worker/api/v1/admin/api-keys';
 /** Matches PARTNER_KEY_TAG_SECRET in vitest.config.ts. */
 const TAG_SECRET = 'test-partner-key-tag-secret';
@@ -50,9 +53,9 @@ const partnerHeaders = (apiKey: string) => ({
 });
 
 async function createKey(org: string, extra: Record<string, unknown> = {}): Promise<CreateBody> {
-  const res = await SELF.fetch(KEYS, {
+  const res = await apiFetch(KEYS, {
     method: 'POST',
-    headers: JSON_INTERNAL,
+    headers: JSON_ADMIN,
     body: JSON.stringify({
       org,
       name: 'Test key',
@@ -76,7 +79,7 @@ const chatBody = (extra: Record<string, unknown> = {}) => ({
 });
 
 const postChat = (apiKey: string, body: unknown, url = CHAT) =>
-  SELF.fetch(url, { method: 'POST', headers: partnerHeaders(apiKey), body: JSON.stringify(body) });
+  apiFetch(url, { method: 'POST', headers: partnerHeaders(apiKey), body: JSON.stringify(body) });
 
 const storeStub = () =>
   env.PARTNER_KEY_STORE.get(env.PARTNER_KEY_STORE.idFromName(PARTNER_KEY_STORE_NAME));
@@ -116,9 +119,9 @@ afterEach(async () => {
   await clearNamespace();
 });
 
-describe('ENGINE_API_KEY is unchanged', () => {
-  it('still reaches chat validation and admin routes', async () => {
-    const chat = await SELF.fetch(CHAT, {
+describe('the deployment-wide keys are unchanged (production auth: ADMIN_KEY_REQUIRED=true)', () => {
+  it('ENGINE_API_KEY still reaches chat validation; ADMIN_API_KEY the partner key admin routes', async () => {
+    const chat = await apiFetch(CHAT, {
       method: 'POST',
       headers: JSON_INTERNAL,
       body: JSON.stringify({ client_id: 'web', message: 'x', message_type: 'text' }),
@@ -126,12 +129,40 @@ describe('ENGINE_API_KEY is unchanged', () => {
     expect(chat.status).toBe(400);
     expect(await chat.json()).toEqual({ error: 'user_id is required' });
 
-    const list = await SELF.fetch(KEYS, { headers: INTERNAL });
+    const list = await apiFetch(KEYS, { headers: ADMIN });
     expect(list.status).toBe(200);
   });
+});
 
+describe('ENGINE_API_KEY is not super-admin under the production auth configuration', () => {
+  it('ENGINE_API_KEY is refused on every partner key admin route and the legacy import', async () => {
+    const { key } = await createKey('org-354-engine-refused');
+    const routes: [string, string, unknown?][] = [
+      ['GET', KEYS],
+      ['POST', KEYS, { org: 'unfoldingWord', name: 'n', app: 'a', createdBy: 'x@example.org' }],
+      ['GET', `${KEYS}/${key.id}`],
+      ['POST', `${KEYS}/${key.id}/_revoke`],
+      ['POST', `${KEYS}/${key.id}/_rotate`, { graceSeconds: 60 }],
+      ['POST', `${KEYS}/${key.id}/_import-legacy-users`, { legacyClientId: 'c', userIds: ['u'] }],
+    ];
+    for (const [method, url, body] of routes) {
+      const res = await apiFetch(url, {
+        method,
+        headers: JSON_ENGINE,
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      });
+      expect(res.status, `${method} ${url}`).toBe(403);
+      expect(await res.json()).toMatchObject({ code: 'admin_key_required' });
+    }
+    // Nothing happened: the key is still active and unrotated.
+    const after = await apiFetch(`${KEYS}/${key.id}`, { headers: ADMIN });
+    expect(await after.json()).toMatchObject({ key: { status: 'active' } });
+  });
+});
+
+describe('internal callers on chat', () => {
   it('an internal non-string speaker in a group chat is not refused and is not rendered', async () => {
-    const res = await SELF.fetch(CHAT, {
+    const res = await apiFetch(CHAT, {
       method: 'POST',
       headers: JSON_INTERNAL,
       body: JSON.stringify(
@@ -149,10 +180,10 @@ describe('ENGINE_API_KEY is unchanged', () => {
     expect(JSON.stringify(capture.calls[0]?.body.messages)).not.toContain('[42]');
   });
 
-  it('lets an internal caller use any org and admin-portal client_id', async () => {
-    const res = await SELF.fetch(CHAT, {
+  it('lets an internal caller use any org, and the admin key an admin-portal client_id', async () => {
+    const res = await apiFetch(CHAT, {
       method: 'POST',
-      headers: JSON_INTERNAL,
+      headers: JSON_ADMIN,
       body: JSON.stringify(
         chatBody({ client_id: 'admin-portal', org: 'internal-354', user_id: 'bob' })
       ),
@@ -177,14 +208,14 @@ describe('admin CRUD: create and list', () => {
       userNamespace: key.id,
     });
 
-    const list = await SELF.fetch(`${KEYS}?org=org-354-crud`, { headers: INTERNAL });
+    const list = await apiFetch(`${KEYS}?org=org-354-crud`, { headers: ADMIN });
     const listText = await list.text();
     expect(listText).not.toContain(apiKey);
     expect(listText).not.toContain(await sha256Hex(apiKey));
     const listed = JSON.parse(listText) as { keys: PublicPartnerKey[] };
     expect(idsOf(listed.keys)).toEqual([key.id]);
 
-    const get = await SELF.fetch(`${KEYS}/${key.id}`, { headers: INTERNAL });
+    const get = await apiFetch(`${KEYS}/${key.id}`, { headers: ADMIN });
     const getText = await get.text();
     expect(get.status).toBe(200);
     expect(getText).not.toContain(apiKey);
@@ -195,12 +226,12 @@ describe('admin CRUD: create and list', () => {
   it('lists all orgs or filters by org', async () => {
     const a = await createKey('org-354-list-a');
     const b = await createKey('org-354-list-b');
-    const all = (await (await SELF.fetch(KEYS, { headers: INTERNAL })).json()) as {
+    const all = (await (await apiFetch(KEYS, { headers: ADMIN })).json()) as {
       keys: PublicPartnerKey[];
     };
     expect(idsOf(all.keys).sort()).toEqual([a.key.id, b.key.id].sort());
     const onlyB = (await (
-      await SELF.fetch(`${KEYS}?org=org-354-list-b`, { headers: INTERNAL })
+      await apiFetch(`${KEYS}?org=org-354-list-b`, { headers: ADMIN })
     ).json()) as { keys: PublicPartnerKey[] };
     expect(idsOf(onlyB.keys)).toEqual([b.key.id]);
   });
@@ -227,17 +258,17 @@ describe('admin CRUD: storage and validation', () => {
   });
 
   it('validates create bodies and unknown ids', async () => {
-    const bad = await SELF.fetch(KEYS, {
+    const bad = await apiFetch(KEYS, {
       method: 'POST',
-      headers: JSON_INTERNAL,
+      headers: JSON_ADMIN,
       body: JSON.stringify({ org: 'x', name: 'n', app: 'a', createdBy: 'c', scopes: ['admin'] }),
     });
     expect(bad.status).toBe(400);
-    const missing = await SELF.fetch(`${KEYS}/pk_0000000000000000`, { headers: INTERNAL });
+    const missing = await apiFetch(`${KEYS}/pk_0000000000000000`, { headers: ADMIN });
     expect(missing.status).toBe(404);
-    const revokeMissing = await SELF.fetch(`${KEYS}/pk_0000000000000000/_revoke`, {
+    const revokeMissing = await apiFetch(`${KEYS}/pk_0000000000000000/_revoke`, {
       method: 'POST',
-      headers: INTERNAL,
+      headers: ADMIN,
     });
     expect(revokeMissing.status).toBe(404);
   });
@@ -248,9 +279,9 @@ describe('admin CRUD: revoke', () => {
     const { key, apiKey } = await createKey('org-354-revoke');
     expect((await postChat(apiKey, chatBody())).status).toBe(200);
 
-    const revoke = await SELF.fetch(`${KEYS}/${key.id}/_revoke`, {
+    const revoke = await apiFetch(`${KEYS}/${key.id}/_revoke`, {
       method: 'POST',
-      headers: JSON_INTERNAL,
+      headers: JSON_ADMIN,
       body: JSON.stringify({ revokedBy: 'ops@example.org' }),
     });
     expect(revoke.status).toBe(200);
@@ -261,22 +292,22 @@ describe('admin CRUD: revoke', () => {
 
     const denied = await postChat(apiKey, chatBody());
     expect(denied.status).toBe(403);
-    expect(await denied.json()).toEqual({ error: 'Invalid API key' });
+    expect(await denied.json()).toEqual({ error: 'Invalid API key', code: 'invalid_api_key' });
     const rejected = findLog(capture.warnLogs, 'auth_rejected');
     expect(rejected?.payload).toMatchObject({ reason: 'revoked_partner_key', key_id: key.id });
 
-    const again = await SELF.fetch(`${KEYS}/${key.id}/_revoke`, {
+    const again = await apiFetch(`${KEYS}/${key.id}/_revoke`, {
       method: 'POST',
-      headers: INTERNAL,
+      headers: ADMIN,
     });
     expect(await again.json()).toMatchObject({ alreadyRevoked: true });
   });
 });
 
 const rotateKey = (keyId: string, body?: unknown) =>
-  SELF.fetch(`${KEYS}/${keyId}/_rotate`, {
+  apiFetch(`${KEYS}/${keyId}/_rotate`, {
     method: 'POST',
-    headers: JSON_INTERNAL,
+    headers: JSON_ADMIN,
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
 
@@ -344,9 +375,9 @@ describe('admin CRUD: rotate with grace', () => {
 
 describe('admin CRUD: org check on create', () => {
   const post = (org: string, extra: Record<string, unknown> = {}) =>
-    SELF.fetch(KEYS, {
+    apiFetch(KEYS, {
       method: 'POST',
-      headers: JSON_INTERNAL,
+      headers: JSON_ADMIN,
       body: JSON.stringify({ org, name: 'n', app: 'a', createdBy: 'c@d.org', ...extra }),
     });
 
@@ -455,7 +486,7 @@ describe('partner key outside chat', () => {
     const forged = `bts_00000000_${'A'.repeat(43)}_${'A'.repeat(11)}`;
     const res = await postChat(forged, chatBody());
     expect(res.status).toBe(403);
-    expect(await res.json()).toEqual({ error: 'Invalid API key' });
+    expect(await res.json()).toEqual({ error: 'Invalid API key', code: 'invalid_api_key' });
     expect(findLog(capture.warnLogs, 'auth_rejected')?.payload).toMatchObject({
       reason: 'invalid_partner_key_tag',
       key_prefix: 'bts_00000000',
@@ -473,7 +504,7 @@ describe('partner key outside chat', () => {
     ['GET', `/api/v1/admin/do/${'a'.repeat(64)}/snapshot`],
   ])('is blocked from %s %s', async (method, path) => {
     const { apiKey } = await createKey('org-354-deny');
-    const res = await SELF.fetch(`https://worker${path}`, {
+    const res = await apiFetch(`https://worker${path}`, {
       method,
       headers: partnerHeaders(apiKey),
       ...(method === 'POST' ? { body: JSON.stringify(chatBody()) } : {}),
@@ -543,7 +574,7 @@ describe('partner keys get the audio tools (audio decided 2026-11-02)', () => {
     const partnerKey =
       'voice-submissions/internal-354-attach/partner:pk_0123456789abcdef:u/s/x.ogg';
     modelCallsToolOnce('attach_audio', { r2_key: partnerKey });
-    const res = await SELF.fetch(CHAT, {
+    const res = await apiFetch(CHAT, {
       method: 'POST',
       headers: JSON_INTERNAL,
       body: JSON.stringify(chatBody({ org: 'internal-354-attach', user_id: 'dave' })),
@@ -562,7 +593,7 @@ describe('chat bodies that are valid JSON but not objects', () => {
     async (raw) => {
       const { apiKey } = await createKey('org-354-null-body');
       for (const headers of [JSON_INTERNAL, partnerHeaders(apiKey)]) {
-        const res = await SELF.fetch(CHAT, { method: 'POST', headers, body: raw });
+        const res = await apiFetch(CHAT, { method: 'POST', headers, body: raw });
         expect(res.status).toBe(400);
         expect(await res.json()).toEqual({ error: 'Request body must be a JSON object' });
       }
@@ -571,8 +602,12 @@ describe('chat bodies that are valid JSON but not objects', () => {
   );
 });
 
-describe('admin bypass requires an internal caller (DO level)', () => {
-  /** POST straight to a DO, as the worker would, with one unpublished (draft) mode. */
+describe('admin visibility comes only from the worker-set _is_admin (DO level)', () => {
+  /**
+   * POST straight to a DO, as the worker would, with one unpublished (draft)
+   * mode. The worker sets `_is_admin` only for an admin client_id with a
+   * super-admin key, which a partner key never is (worker #479).
+   */
   async function chatWithDraftMode(caller: 'partner' | 'internal'): Promise<string[]> {
     const stub = env.USER_DO.get(env.USER_DO.idFromName(`user:org-354-admin:${caller}`));
     const res = await stub.fetch('http://fake-host/chat/final', {
@@ -581,6 +616,7 @@ describe('admin bypass requires an internal caller (DO level)', () => {
       body: JSON.stringify({
         ...chatBody({ client_id: 'admin-portal', org: 'org-354-admin', user_id: caller }),
         _caller: caller,
+        _is_admin: caller === 'internal',
         _org_modes: { modes: [{ name: 'draft-mode', published: false }] },
       }),
     });
@@ -592,7 +628,7 @@ describe('admin bypass requires an internal caller (DO level)', () => {
     expect(await chatWithDraftMode('partner')).not.toContain('list_modes');
   });
 
-  it('an internal admin-portal body still does', async () => {
+  it('an internal admin-portal body the worker marked _is_admin does', async () => {
     expect(await chatWithDraftMode('internal')).toContain('list_modes');
   });
 });
@@ -603,9 +639,9 @@ describe('revoke kills the rotation chain (e2e)', () => {
     const rotated = (await (await rotateKey(key.id)).json()) as RotateBody;
     expect((await postChat(apiKey, chatBody())).status).toBe(200);
 
-    const revoke = await SELF.fetch(`${KEYS}/${rotated.key.id}/_revoke`, {
+    const revoke = await apiFetch(`${KEYS}/${rotated.key.id}/_revoke`, {
       method: 'POST',
-      headers: INTERNAL,
+      headers: ADMIN,
     });
     expect(await revoke.json()).toMatchObject({ revokedIds: [rotated.key.id, key.id] });
     expect((await postChat(apiKey, chatBody())).status).toBe(403);
@@ -663,7 +699,7 @@ describe('speaker length', () => {
 
   it('stores a long internal speaker exactly as sent (no change for internal clients)', async () => {
     const speaker = `Ann [team]\n${'n'.repeat(400)}`;
-    const internal = await SELF.fetch(CHAT, {
+    const internal = await apiFetch(CHAT, {
       method: 'POST',
       headers: JSON_INTERNAL,
       body: JSON.stringify(
@@ -689,9 +725,9 @@ describe('speaker length', () => {
 describe('the route allowlist is checked only after the key is authenticated', () => {
   it('a forged look-alike on an admin route gets Invalid API key, never "not permitted"', async () => {
     const token = `bts_0000abcd_${'A'.repeat(43)}_${'A'.repeat(11)}`; // forged tag
-    const res = await SELF.fetch(KEYS, { headers: { Authorization: `Bearer ${token}` } });
+    const res = await apiFetch(KEYS, { headers: { Authorization: `Bearer ${token}` } });
     expect(res.status).toBe(403);
-    expect(await res.json()).toEqual({ error: 'Invalid API key' });
+    expect(await res.json()).toEqual({ error: 'Invalid API key', code: 'invalid_api_key' });
     expect(findLog(capture.warnLogs, 'auth_rejected')?.payload).toMatchObject({
       reason: 'invalid_partner_key_tag',
       key_prefix: 'bts_0000abcd',
@@ -700,7 +736,7 @@ describe('the route allowlist is checked only after the key is authenticated', (
 
   it('a real partner key on an admin route is refused as not permitted, logged by key id', async () => {
     const { apiKey, key } = await createKey('org-354-route');
-    const res = await SELF.fetch(KEYS, { headers: { Authorization: `Bearer ${apiKey}` } });
+    const res = await apiFetch(KEYS, { headers: { Authorization: `Bearer ${apiKey}` } });
     expect(res.status).toBe(403);
     expect(await res.json()).toEqual({
       error: 'This API key is not permitted to call this endpoint',
@@ -735,7 +771,7 @@ describe('internal callers cannot name partner users or groups', () => {
       }),
     ];
     for (const body of bodies) {
-      const res = await SELF.fetch(CHAT, {
+      const res = await apiFetch(CHAT, {
         method: 'POST',
         headers: JSON_INTERNAL,
         body: JSON.stringify(body),
@@ -756,9 +792,9 @@ describe('internal callers cannot name partner users or groups', () => {
 
 describe('responses that carry a plaintext key are not cacheable', () => {
   it('create and rotate send Cache-Control: no-store; rotate reports warnings', async () => {
-    const created = await SELF.fetch(KEYS, {
+    const created = await apiFetch(KEYS, {
       method: 'POST',
-      headers: JSON_INTERNAL,
+      headers: JSON_ADMIN,
       body: JSON.stringify({
         org: 'org-354-nostore',
         name: 'n',
@@ -780,7 +816,7 @@ describe('responses that carry a plaintext key are not cacheable', () => {
   it('the list response is just org and keys (no paging fields)', async () => {
     await createKey('org-354-listshape');
     const list = (await (
-      await SELF.fetch(`${KEYS}?org=org-354-listshape`, { headers: INTERNAL })
+      await apiFetch(`${KEYS}?org=org-354-listshape`, { headers: ADMIN })
     ).json()) as Record<string, unknown>;
     expect(Object.keys(list).sort()).toEqual(['keys', 'org']);
   });
@@ -788,14 +824,14 @@ describe('responses that carry a plaintext key are not cacheable', () => {
 
 describe('the PartnerKeyStoreDO serialises concurrent admin writes', () => {
   const post = (path: string, body: unknown) =>
-    SELF.fetch(`${KEYS}/${path}`, {
+    apiFetch(`${KEYS}/${path}`, {
       method: 'POST',
-      headers: JSON_INTERNAL,
+      headers: JSON_ADMIN,
       body: JSON.stringify(body),
     });
   const listOrg = async (org: string) =>
     (
-      (await (await SELF.fetch(`${KEYS}?org=${org}`, { headers: INTERNAL })).json()) as {
+      (await (await apiFetch(`${KEYS}?org=${org}`, { headers: ADMIN })).json()) as {
         keys: PublicPartnerKey[];
       }
     ).keys;
@@ -838,7 +874,7 @@ describe('the PartnerKeyStoreDO serialises concurrent admin writes', () => {
 /** Legacy-import helpers (admin-portal#354). */
 const ORG = 'org-354-legacy';
 const internalChat = (clientId: string, userId: string, message: string) =>
-  SELF.fetch(CHAT, {
+  apiFetch(CHAT, {
     method: 'POST',
     headers: JSON_INTERNAL,
     body: JSON.stringify(chatBody({ client_id: clientId, org: ORG, user_id: userId, message })),
@@ -848,8 +884,8 @@ const historyOf = async (doName: string) => {
   const res = await stub.fetch('http://fake-host/history');
   return (await res.json()) as { entries: { user_message: string }[]; total_count: number };
 };
-const importUsers = (keyId: string, body: unknown, headers = JSON_INTERNAL) =>
-  SELF.fetch(`${KEYS}/${keyId}/_import-legacy-users`, {
+const importUsers = (keyId: string, body: unknown, headers: HeadersInit = JSON_ADMIN) =>
+  apiFetch(`${KEYS}/${keyId}/_import-legacy-users`, {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
@@ -962,7 +998,7 @@ describe('legacy user import: concurrency, key status and what is copied', () =>
 
   it('refuses a revoked key with 409', async () => {
     const { key } = await createKey(ORG);
-    await SELF.fetch(`${KEYS}/${key.id}/_revoke`, { method: 'POST', headers: INTERNAL });
+    await apiFetch(`${KEYS}/${key.id}/_revoke`, { method: 'POST', headers: ADMIN });
     const res = await importUsers(key.id, { legacyClientId: 'shema', userIds: ['u1'] });
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ code: 'key_revoked' });
@@ -1088,9 +1124,9 @@ describe('non-admin user routes refuse reserved partner ids; admin routes do not
   it('GET/PUT preferences and GET history answer 400 for a partner-form userId', async () => {
     const reserved = 'partner:pk_0123456789abcdef:u1';
     const calls = [
-      SELF.fetch(userPath(reserved, '/history'), { headers: INTERNAL }),
-      SELF.fetch(userPath(reserved, '/preferences'), { headers: INTERNAL }),
-      SELF.fetch(userPath(reserved, '/preferences'), {
+      apiFetch(userPath(reserved, '/history'), { headers: INTERNAL }),
+      apiFetch(userPath(reserved, '/preferences'), { headers: INTERNAL }),
+      apiFetch(userPath(reserved, '/preferences'), {
         method: 'PUT',
         headers: JSON_INTERNAL,
         body: JSON.stringify({ response_language: 'en' }),
@@ -1100,14 +1136,14 @@ describe('non-admin user routes refuse reserved partner ids; admin routes do not
       expect(res.status).toBe(400);
       expect(((await res.json()) as { error: string }).error).toContain("'partner:'");
     }
-    const normal = await SELF.fetch(userPath('ann', '/history'), { headers: INTERNAL });
+    const normal = await apiFetch(userPath('ann', '/history'), { headers: INTERNAL });
     expect(normal.status).toBe(200);
   });
 
   it('logs every DO-route line with the user id, under one request id', async () => {
     const lines: string[] = [];
     vi.spyOn(console, 'log').mockImplementation((line: unknown) => lines.push(String(line)));
-    const res = await SELF.fetch(userPath('ann', '/history'), { headers: INTERNAL });
+    const res = await apiFetch(userPath('ann', '/history'), { headers: INTERNAL });
     expect(res.status).toBe(200);
     const events = lines
       .map((line) => JSON.parse(line) as Record<string, unknown>)
@@ -1120,7 +1156,7 @@ describe('non-admin user routes refuse reserved partner ids; admin routes do not
   it('the super-admin admin routes still address a partner user (support)', async () => {
     const reserved = 'partner:pk_0123456789abcdef:u1';
     const url = `https://worker/api/v1/admin/orgs/${ORG_R}/users/${encodeURIComponent(reserved)}/memory`;
-    const res = await SELF.fetch(url, { headers: INTERNAL });
+    const res = await apiFetch(url, { headers: ADMIN });
     expect(res.status).toBe(200);
   });
 });
@@ -1153,7 +1189,7 @@ describe("org containing ':' is refused on every route that names a conversation
   const user = encodeURIComponent('pk_abc:u1');
 
   it("chat: the reviewer's input is a 400 before any model call", async () => {
-    const res = await SELF.fetch(CHAT, {
+    const res = await apiFetch(CHAT, {
       method: 'POST',
       headers: JSON_INTERNAL,
       body: JSON.stringify(
@@ -1175,7 +1211,7 @@ describe("org containing ':' is refused on every route that names a conversation
       `${W}/admin/orgs/${org}/groups/g1/threads/t1/history`,
     ];
     for (const url of urls) {
-      const res = await SELF.fetch(url, { headers: INTERNAL });
+      const res = await apiFetch(url, { headers: url.includes('/admin/') ? ADMIN : INTERNAL });
       expect(res.status, url).toBe(400);
       expect(await res.json()).toMatchObject({ code: 'invalid_org' });
     }

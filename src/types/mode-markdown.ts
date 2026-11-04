@@ -177,8 +177,7 @@ export function validateModeDocument(value: unknown): string | null {
  * "active." `modeOverrides` is the mode's overrides when applicable, otherwise
  * empty. `reason` distinguishes missing vs unpublished for log correlation.
  *
- * Admin-origin requests (identified server-side via `callerIsAdmin`: an
- * internal caller AND an admin client_id — a partner API key never is)
+ * Admin-origin requests (the worker-set `_is_admin`: `isAdminClient(client_id)` plus an admin-capable key; never a partner API key)
  * pass `options.includeUnpublished = true` so authors can test drafts from the
  * portal's test chat pane. For those requests a matched draft returns
  * `reason: 'ok'` — end-user requests keep the default filter.

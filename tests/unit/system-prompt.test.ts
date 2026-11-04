@@ -420,6 +420,20 @@ describe('buildSystemPrompt - resource availability rules (non-overridable, #342
     expect(prompt).toContain('NEVER offer a substitute version that no tool returned');
   });
 
+  // The cross-server check must be conditioned on the user naming a version.
+  // The unconditioned wording shipped in #446 made the model fetch the same
+  // passage from a second server on ~25% of ordinary turns (prod, 2026-11-03),
+  // doubling median turn time.
+  it('scopes the cross-server check to a named version and keeps ordinary passages on one server', () => {
+    const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
+    const start = prompt.indexOf(HEADING);
+    const rule = prompt.slice(start, prompt.indexOf('\n\n## ', start + HEADING.length));
+    expect(rule).toContain('asks for a passage in a named version');
+    expect(rule).toContain('fetch it from one server');
+    expect(rule).toContain('Do not fetch the same passage from a second server');
+    expect(rule).not.toContain('If one server does not have a requested version, check');
+  });
+
   it('survives when every overridable slot is replaced', () => {
     const custom = {
       identity: 'X_IDENTITY',
@@ -656,26 +670,5 @@ describe('buildSystemPrompt - trigger-only section (#360)', () => {
 
   it('tells the model not to call tools for a trigger-only turn', () => {
     expect(promptWith({ triggerOnly: { language: 'Hindi' } })).toContain('Do not call any tools');
-  });
-});
-
-describe('buildSystemPrompt - text turns do not narrate between tools (#421)', () => {
-  it('tells a text turn to look up silently and answer once', () => {
-    const prompt = buildSystemPrompt(createEmptyCatalog(), defaultPrefs, [], DEFAULT_PROMPT_VALUES);
-    expect(prompt).toContain('Do not write text between tool rounds');
-    expect(prompt).toContain('then answer once');
-    expect(prompt).toContain('Never say you were answering from memory');
-  });
-
-  it('leaves the voice prompt without that text-turn line', () => {
-    const prompt = buildSystemPrompt(
-      createEmptyCatalog(),
-      defaultPrefs,
-      [],
-      DEFAULT_PROMPT_VALUES,
-      { isVoiceMessage: true }
-    );
-    expect(prompt).not.toContain('Do not write text between tool rounds');
-    expect(prompt).toContain('Do NOT narrate your actions');
   });
 });

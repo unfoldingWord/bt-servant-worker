@@ -320,32 +320,13 @@ has no compare-and-swap: two admins writing at once (or a colo holding a stale
 copy of `__global__`) resolve last-write-wins, as with every other admin config
 route today.
 
-**Authentication.** Every `/api/*` request must carry `ENGINE_API_KEY` — the
-global middleware accepts nothing else, and the MCP write routes additionally
-refuse anything but the super admin key (403). The `ORG_ADMIN_KEYS` mechanism
-below is defined in code but not currently reachable; it is kept here as a
-reference for the org-scoped routes, not as a way to reach the global pool.
-
-### Setting Up Org-Specific Admin Keys
-
-To allow delegated administration for specific organizations, store admin keys in the `ORG_ADMIN_KEYS` KV namespace:
-
-```bash
-# Create the KV namespace (one-time setup)
-npx wrangler kv:namespace create ORG_ADMIN_KEYS
-
-# Add the namespace ID to wrangler.toml (replace placeholder-id-for-dev)
-
-# Set an org-specific admin key
-npx wrangler kv:key put --binding=ORG_ADMIN_KEYS "unfoldingWord" "your-org-specific-api-key"
-
-# List all org keys
-npx wrangler kv:key list --binding=ORG_ADMIN_KEYS
-```
-
-Clients would then use the org-specific key instead of the super admin key —
-but see **Authentication** above: today every `/api/*` request must carry
-`ENGINE_API_KEY`, so all examples below use `$API_KEY`.
+**Authentication.** Every `/api/*` request must carry `ENGINE_API_KEY` or
+`ADMIN_API_KEY` — the global middleware accepts nothing else. Admin routes need
+super-admin authority: `ADMIN_API_KEY`, or `ENGINE_API_KEY` while
+`ADMIN_KEY_REQUIRED` is unset, blank or `"false"` (README "Authentication"),
+and the MCP write routes refuse anything else (403). Values stored in the
+`ORG_ADMIN_KEYS` KV namespace are not accepted as bearer tokens. All examples
+below use `$API_KEY`; use the admin key for the admin routes.
 
 ### List MCP Servers
 
@@ -501,8 +482,12 @@ curl -X DELETE "http://localhost:$PORT/api/v1/admin/orgs/unfoldingWord/mcp-serve
 ## Admin: Partner API Keys
 
 Named, revocable keys for partner apps (admin-portal#354). Our own clients
-(web client, WhatsApp gateway, admin portal) keep using `ENGINE_API_KEY`
-unchanged. These admin endpoints accept **only** `ENGINE_API_KEY`.
+(web client, WhatsApp gateway, admin portal) keep using their deployment-wide
+keys unchanged. These admin endpoints, like every `/api/v1/admin/*` route,
+need super-admin authority: `ADMIN_API_KEY` (or `ENGINE_API_KEY` only while
+`ADMIN_KEY_REQUIRED` is not `"true"`; production and staging set it to
+`"true"`). A partner key never has it. The examples use `$API_KEY`; use the
+admin key.
 
 - The plaintext key (`apiKey`, shape `bts_<8 hex>_<43 base64url>_<11 base64url tag>`)
   is returned **once**, by create and rotate. It cannot be fetched again; only
@@ -669,7 +654,7 @@ curl -X POST "http://localhost:$PORT/api/v1/admin/api-keys/pk_0123456789abcdef/_
 
 **Response (200):** `{"keyId": "...", "org": "...", "results": [{"userId": "user-1", "status": "copied", "entries": 6}, ...]}`
 
-- Only `ENGINE_API_KEY` can call it. The partner key itself never gets access
+- Only a super-admin key (`ADMIN_API_KEY`) can call it. The partner key itself never gets access
   to raw user ids: conversations are keyed by org and user id only, so raw-id
   access would let it reach other clients' users.
 - The source is the user's conversation in the **key's org**, and it is
@@ -798,7 +783,8 @@ those two routes:
 - Inside the worker `user_id` becomes
   `partner:<userNamespace>:<user_id>` (and `chat_id` likewise), so a partner's
   users can never reach another app's or a WhatsApp user's conversation.
-  That form is reserved: an `ENGINE_API_KEY` caller sending a `user_id`, or a
+  That form is reserved: an internal (`ENGINE_API_KEY` / `ADMIN_API_KEY`)
+  caller sending a `user_id`, or a
   `chat_id` (joined with `thread_id` as `<chat_id>:<thread_id>`, as in the
   group's name), that starts with `partner:` gets a `400`; so does a
   `partner:`-form `:userId` on the non-admin user routes

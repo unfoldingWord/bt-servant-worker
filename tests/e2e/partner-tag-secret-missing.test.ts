@@ -38,7 +38,7 @@ describe('PARTNER_KEY_TAG_SECRET unset', () => {
     for (let i = 0; i < 3; i++) {
       const res = await call({ Authorization: `Bearer ${TOKEN}` });
       expect(res.status).toBe(403);
-      expect(await res.json()).toEqual({ error: 'Invalid API key' });
+      expect(await res.json()).toEqual({ error: 'Invalid API key', code: 'invalid_api_key' });
     }
     const logged = errors.filter((line) => line.includes('partner_key_tag_secret_missing'));
     expect(logged).toHaveLength(1);

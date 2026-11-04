@@ -9,8 +9,9 @@
  * real (miniflare) AUDIO_BUCKET.
  */
 
-import { env, runInDurableObject, SELF } from 'cloudflare:test';
+import { env, runInDurableObject } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { apiFetch, JSON_ADMIN, JSON_ENGINE } from '../helpers/production-auth.js';
 import type { PublicPartnerKey } from '../../src/types/partner-keys';
 import { setupAnthropicFetchCapture } from '../helpers/anthropic-capture.js';
 import { PARTNER_KEY_STORE_NAME } from '../../src/services/partner-keys/store';
@@ -29,8 +30,9 @@ vi.mock('../../src/services/audio/openai-tts.js', () => ({
   })),
 }));
 
-const INTERNAL = { Authorization: 'Bearer test-api-key' };
-const JSON_INTERNAL = { ...INTERNAL, 'Content-Type': 'application/json' };
+// Chat and user routes: ENGINE_API_KEY. Admin routes: ADMIN_API_KEY (the
+// production auth configuration; see tests/helpers/production-auth.ts).
+const JSON_INTERNAL = JSON_ENGINE;
 const KEYS = 'https://worker/api/v1/admin/api-keys';
 const CHAT = 'https://worker/api/v1/chat';
 const ORG = 'org-354-audio-out';
@@ -39,9 +41,9 @@ const W = 'https://worker';
 type CreateBody = { key: PublicPartnerKey; apiKey: string };
 
 async function createKey(): Promise<CreateBody> {
-  const res = await SELF.fetch(KEYS, {
+  const res = await apiFetch(KEYS, {
     method: 'POST',
-    headers: JSON_INTERNAL,
+    headers: JSON_ADMIN,
     body: JSON.stringify({
       org: ORG,
       name: 'Audio key',
@@ -55,7 +57,7 @@ async function createKey(): Promise<CreateBody> {
 }
 
 const bearer = (token: string) => ({ Authorization: `Bearer ${token}` });
-const get = (path: string, token: string) => SELF.fetch(`${W}${path}`, { headers: bearer(token) });
+const get = (path: string, token: string) => apiFetch(`${W}${path}`, { headers: bearer(token) });
 
 async function putAudio(key: string): Promise<void> {
   await env.AUDIO_BUCKET.put(key, new Uint8Array([9, 9]), {
@@ -76,7 +78,7 @@ afterEach(() => vi.restoreAllMocks());
 describe('partner voice in and audio out', () => {
   it('a voice message is accepted, archived in the partner partition and answered with audio the key can download', async () => {
     const { key, apiKey } = await createKey();
-    const res = await SELF.fetch(CHAT, {
+    const res = await apiFetch(CHAT, {
       method: 'POST',
       headers: { ...bearer(apiKey), 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -137,7 +139,7 @@ describe('partner audio downloads are limited to the partner partition', () => {
     const voiceA = `voice-submissions/${ORG}/partner:${a.key.userNamespace}:c1/u1/head.ogg`;
     for (const k of [ownA, ofB, voiceA]) await putAudio(k);
     const head = (path: string) =>
-      SELF.fetch(`${W}${path}`, { method: 'HEAD', headers: bearer(a.apiKey) });
+      apiFetch(`${W}${path}`, { method: 'HEAD', headers: bearer(a.apiKey) });
 
     expect((await head(`/api/v1/audio/${ownA}`)).status).toBe(200);
     expect((await head(`/api/v1/voice-submissions/${voiceA}`)).status).toBe(200);
@@ -162,7 +164,7 @@ describe('partner audio downloads are limited to the partner partition', () => {
 
 /** A shared-key user `leg1` whose history references a TTS reply, a voice message and a missing object. */
 async function seedLegacyUser(): Promise<{ tts: string; voice: string }> {
-  const chat = await SELF.fetch(CHAT, {
+  const chat = await apiFetch(CHAT, {
     method: 'POST',
     headers: JSON_INTERNAL,
     body: JSON.stringify({
@@ -195,9 +197,9 @@ async function seedLegacyUser(): Promise<{ tts: string; voice: string }> {
 }
 
 async function importLeg1(keyId: string): Promise<Record<string, unknown> | undefined> {
-  const res = await SELF.fetch(`${KEYS}/${keyId}/_import-legacy-users`, {
+  const res = await apiFetch(`${KEYS}/${keyId}/_import-legacy-users`, {
     method: 'POST',
-    headers: JSON_INTERNAL,
+    headers: JSON_ADMIN,
     body: JSON.stringify({ legacyClientId: 'shema', userIds: ['leg1'] }),
   });
   return ((await res.json()) as { results: Record<string, unknown>[] }).results[0];
@@ -331,9 +333,9 @@ async function plantLease(namespace: string, expiresAt: number): Promise<void> {
 }
 
 const importStatus = async (keyId: string) =>
-  SELF.fetch(`${KEYS}/${keyId}/_import-legacy-users`, {
+  apiFetch(`${KEYS}/${keyId}/_import-legacy-users`, {
     method: 'POST',
-    headers: JSON_INTERNAL,
+    headers: JSON_ADMIN,
     body: JSON.stringify({ legacyClientId: 'shema', userIds: ['leg1'] }),
   });
 
@@ -373,9 +375,9 @@ describe('the import lease covers a whole rotation chain', () => {
   it('a rotation chain shares the lease: an import on A while B (its successor) holds it gets 409', async () => {
     await seedLegacyUser();
     const a = await createKey();
-    const rotated = await SELF.fetch(`${KEYS}/${a.key.id}/_rotate`, {
+    const rotated = await apiFetch(`${KEYS}/${a.key.id}/_rotate`, {
       method: 'POST',
-      headers: JSON_INTERNAL,
+      headers: JSON_ADMIN,
       body: JSON.stringify({ graceSeconds: 3600 }),
     });
     expect(rotated.status).toBe(200);
