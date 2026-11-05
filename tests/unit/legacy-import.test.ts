@@ -299,31 +299,36 @@ describe('importLegacyUsers: cleanup only while the lease is held', () => {
   });
 });
 
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+/** Map-backed R2 double where every call yields, so users copied together interleave their head/put. */
+function yieldingBucket(objects: Map<string, unknown>) {
+  return {
+    head: async (key: string) => {
+      await tick();
+      return objects.has(key) ? {} : null;
+    },
+    get: async (key: string) => {
+      await tick();
+      return objects.has(key) ? { body: objects.get(key) } : null;
+    },
+    put: async (key: string, body: unknown) => {
+      await tick();
+      objects.set(key, body);
+    },
+    delete: async (keys: string[]) => {
+      await tick();
+      keys.forEach((key) => objects.delete(key));
+    },
+  };
+}
+
 describe('importLegacyUsers: users whose audio copies share a key', () => {
   it('a refused user never deletes the copy another user of the run imported (Ann B / Ann-B)', async () => {
     const shared = 'voice-submissions/bcs/Ann-B/Ann/v.ogg';
     const copy = `voice-submissions/bcs/partner:${KEY.userNamespace}:Ann-B/Ann/v.ogg`;
     const objects = new Map<string, unknown>([[shared, new Uint8Array([1])]]);
-    const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
-    const bucket = {
-      // Every R2 call yields, so users copied together interleave their head/put.
-      head: async (key: string) => {
-        await tick();
-        return objects.has(key) ? {} : null;
-      },
-      get: async (key: string) => {
-        await tick();
-        return objects.has(key) ? { body: objects.get(key) } : null;
-      },
-      put: async (key: string, body: unknown) => {
-        await tick();
-        objects.set(key, body);
-      },
-      delete: async (keys: string[]) => {
-        await tick();
-        keys.forEach((key) => objects.delete(key));
-      },
-    };
+    const bucket = yieldingBucket(objects);
     const source = {
       ...SOURCE,
       entries: [['history', [{ inbound_voice_audio_key: shared }]]],

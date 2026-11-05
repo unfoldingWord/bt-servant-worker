@@ -31,6 +31,8 @@ const EXPECTED_KEYS: readonly UiStringKey[] = [
   'status_tts_generating',
   'status_tts_still_generating',
   'notice_max_iterations',
+  // #481: appended after an answer cut short by a stalled stream or max_tokens.
+  'notice_answer_truncated',
   'error_processing_failed',
 ];
 

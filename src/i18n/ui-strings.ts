@@ -48,6 +48,18 @@ const en = {
     "If you'd like me to keep going, send me a follow-up telling me what to focus on " +
     '(e.g. "just submit the standard PDF" or "try once more with X"), and I\'ll pick ' +
     'up from here without re-doing the parts that already worked.',
+  /**
+   * Appended after an answer that was cut short (#481): the stream stalled or
+   * ran into the turn ceiling, or the model hit its output-token cap. Streamed
+   * and persisted like `notice_max_iterations`, so TTS reads it too.
+   */
+  notice_answer_truncated:
+    '\n\n⚠️ My answer was cut off before I could finish it. ' +
+    'Send "continue" if you would like the rest.',
+  /**
+   * The only failure text a user ever receives (#481): no internal
+   * `Error.message` is forwarded, on any transport.
+   */
   error_processing_failed: 'Processing failed',
 } as const satisfies Record<string, UiStringValue>;
 
@@ -72,6 +84,9 @@ const pt = {
     'Se quiser que eu continue, envie uma nova mensagem dizendo no que devo ' +
     'focar (por exemplo, "apenas envie o PDF padrão" ou "tente mais uma vez com X"), e ' +
     'eu retomo daqui sem refazer o que já funcionou.',
+  notice_answer_truncated:
+    '\n\n⚠️ Minha resposta foi interrompida antes que eu pudesse terminá-la. ' +
+    'Envie "continue" se quiser o restante.',
   error_processing_failed: 'Falha no processamento',
 } as const satisfies Record<UiStringKey, UiStringValue>;
 
