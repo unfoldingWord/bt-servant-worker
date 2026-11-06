@@ -1,20 +1,23 @@
 name: Deploy Staging
 
+# Staging follows the develop branch only: it deploys after CI succeeds on a
+# push to develop. PR branches never deploy here (a PR branch once advanced
+# staging's Durable Object migration past main and froze every later deploy).
 on:
-  pull_request:
-    branches: [main]
   workflow_run:
     workflows: ['CI']
     types: [completed]
-    branches: [main]
+    branches: [develop]
 
 jobs:
   deploy-staging:
     name: Deploy to Staging
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'pull_request' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
