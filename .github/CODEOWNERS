@@ -1,3 +1,4 @@
-# Every path: a PR into main (a release or a hotfix) needs this review.
+# Every path: a PR into main (a release or a hotfix) needs a review from one of these
+# owners, and the author cannot review their own PR, so every release is seen by two people.
 # develop does not require code-owner review; see CLAUDE.md "Branching model".
-* @IanLindsley
+* @IanLindsley @sethstoll
