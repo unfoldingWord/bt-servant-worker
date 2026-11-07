@@ -40,4 +40,13 @@ describe('workflow triggers follow the develop/main branching model', () => {
     expect(prodYml).toContain('git merge-base --is-ancestor "$GITHUB_SHA" origin/main');
     expect(prodYml).toMatch(/fetch-depth: 0/);
   });
+
+  it('Release Source reads the PR branch from env, not inline in the script', () => {
+    // A PR author picks the branch name; interpolating ${{ github.head_ref }} into
+    // run: would let a crafted name inject shell commands.
+    const job = ciYml.slice(ciYml.indexOf('release-source:'), ciYml.indexOf('security-audit:'));
+    expect(job).toContain('HEAD_REF: ${{ github.head_ref }}');
+    const script = job.slice(job.indexOf('run: |'));
+    expect(script).not.toContain('${{ github.head_ref }}');
+  });
 });

@@ -17,9 +17,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Require develop or hotfix/* as the source of a PR into main
+        # The branch name is chosen by the PR author, so it reaches the script
+        # through env rather than ${{ }} interpolation (no shell injection).
+        env:
+          HEAD_REF: ${{ github.head_ref }}
         run: |
           set -euo pipefail
-          head="${{ github.head_ref }}"
+          head="$HEAD_REF"
           echo "PR into main from '$head'"
           case "$head" in
             develop|hotfix/*) echo "ok" ;;
