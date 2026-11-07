@@ -3,6 +3,9 @@ name: Deploy Staging
 # Staging follows the develop branch only: it deploys after CI succeeds on a
 # push to develop. PR branches never deploy here (a PR branch once advanced
 # staging's Durable Object migration past main and froze every later deploy).
+# The branch filter alone is not enough: a release PR (develop → main) runs CI
+# with head branch develop too, so the job also requires the CI run to have
+# been triggered by a push. Otherwise each merge into develop deploys twice.
 on:
   workflow_run:
     workflows: ['CI']
@@ -13,7 +16,7 @@ jobs:
   deploy-staging:
     name: Deploy to Staging
     runs-on: ubuntu-latest
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' }}
     steps:
       - uses: actions/checkout@v4
         with:
