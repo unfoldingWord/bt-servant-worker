@@ -11,8 +11,10 @@ Two long-lived branches, since 2026-11-05:
 - **Rule: `develop` is always releasable.** Work that is not ready to ship stays on its feature branch, or merges behind a flag that is off in production. Never cherry-pick into `main`; if something on `develop` must not ship, revert it on `develop` or flag it off, then release.
 - **Hotfix:** branch from `main` as `hotfix/<name>`, PR into `main`, then open a PR from `main` into `develop` the same day so `develop` stays ahead of `main`.
 - **Release:** merge the release PR, tag `v<version>` on the resulting `main` commit, dispatch the production deploy on that tag.
+- **Merge methods:** feature PRs into `develop` are **squash**-merged (`develop` requires linear history). Release and hotfix PRs into `main` use a **merge commit**, never squash or rebase; a ruleset on `main` allows only merge commits. A squash would copy `develop`'s work into a new commit that `develop` never contains, so the branches would diverge and every later release PR would re-list already-shipped commits. With merge commits, the next release PR shows only what is new, and `git log --first-parent main` lists one commit per release. Never delete `develop` when merging a release PR.
+- **Up to date before merge:** `develop` requires a PR branch to be current with `develop` before it merges (use "Update branch"), so two PRs that pass alone cannot break together. `main` does not, because `develop` never contains `main`'s release merge commits.
 
-CI's `Release Source` job refuses a PR into `main` from any other branch.
+CI's `Release Source` job refuses a PR into `main` from any other branch. The production deploy (`deploy.yml`) refuses to run on anything but a `v*` tag that is on `main`.
 
 ## CRITICAL: Ask Before Pushing
 
