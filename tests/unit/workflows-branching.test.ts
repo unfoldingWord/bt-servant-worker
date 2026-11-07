@@ -25,6 +25,13 @@ describe('workflow triggers follow the develop/main branching model', () => {
     expect(stagingYml).not.toContain("github.event_name == 'pull_request'");
   });
 
+  it('staging deploys only after CI runs triggered by a push, not by a PR whose head is develop', () => {
+    // A release PR (develop → main) runs CI with head branch develop, which the
+    // workflow_run branch filter also matches; without this, every merge into
+    // develop deployed staging twice while a release PR was open.
+    expect(stagingYml).toContain("github.event.workflow_run.event == 'push'");
+  });
+
   it('production refuses to deploy anything but a v* tag on main, before any deploy step', () => {
     const guardAt = prodYml.indexOf('name: Require a release tag on main');
     expect(guardAt).toBeGreaterThan(-1);
