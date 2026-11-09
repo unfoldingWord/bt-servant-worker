@@ -2,22 +2,36 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## CRITICAL: Ask Before Pushing to Main
+## CRITICAL: Branching Model (develop → main)
+
+Two long-lived branches, since 2026-11-05:
+
+- **`develop`** is the integration branch and the default branch. Every feature branch and every PR targets `develop`. Staging deploys automatically after CI passes on `develop`. Bot review plus CI is enough to merge there.
+- **`main`** is the release branch. It only ever receives `develop` (a release PR, "Release vX.Y.Z: develop → main") or a `hotfix/*` branch. Only the repo owner can merge to `main` (branch protection restricts pushes and requires a code-owner review). Production deploys from `main` by tag.
+- **Rule: `develop` is always releasable.** Work that is not ready to ship stays on its feature branch, or merges behind a flag that is off in production. Never cherry-pick into `main`; if something on `develop` must not ship, revert it on `develop` or flag it off, then release.
+- **Hotfix:** branch from `main` as `hotfix/<name>`, PR into `main`, then open a PR from `main` into `develop` the same day so `develop` stays ahead of `main`.
+- **Release:** merge the release PR, tag `v<version>` on the resulting `main` commit, dispatch the production deploy on that tag.
+- **Merge methods:** feature PRs into `develop` are **squash**-merged (`develop` requires linear history). Release and hotfix PRs into `main` use a **merge commit**, never squash or rebase; a ruleset on `main` allows only merge commits. A squash would copy `develop`'s work into a new commit that `develop` never contains, so the branches would diverge and every later release PR would re-list already-shipped commits. With merge commits, the next release PR shows only what is new, and `git log --first-parent main` lists one commit per release. Never delete `develop` when merging a release PR.
+- **Up to date before merge:** `develop` requires a PR branch to be current with `develop` before it merges (use "Update branch"), so two PRs that pass alone cannot break together. `main` does not, because `develop` never contains `main`'s release merge commits.
+
+CI's `Release Source` job refuses a PR into `main` from any other branch. The production deploy (`deploy.yml`) refuses to run on anything but a `v*` tag that is on `main`.
+
+## CRITICAL: Ask Before Pushing
 
 **ALWAYS ask the user before pushing changes.** This is non-negotiable.
 
 Before committing and pushing, ask:
 
-> "Should I push this directly to main, or create a feature branch and PR?"
+> "Should I create a feature branch and PR against develop?"
 
-**Default to creating a branch and PR** unless the user explicitly says to push to main. PRs enable:
+**Always create a branch and PR against `develop`.** Never push to `develop` or `main` directly. PRs enable:
 
 - Claude PR Review to catch issues
 - Code review before deployment
 - Discussion and iteration on changes
 - Clean git history with context
 
-Pushing directly to main bypasses all review mechanisms and should only be done when the user explicitly requests it.
+Pushing directly to `develop` or `main` bypasses all review mechanisms. `main` is protected so that only the repo owner can merge, and only from `develop` or `hotfix/*`.
 
 ## CRITICAL: Never Deploy Directly
 
@@ -27,10 +41,11 @@ All deployments MUST go through the CI/CD pipeline:
 
 1. Commit changes to git
 2. Push to a branch
-3. Create a PR
+3. Create a PR against `develop`
 4. Wait for CI to pass
 5. Get approval and merge
-6. CI will deploy automatically
+6. CI deploys `develop` to staging automatically
+7. Production: the owner merges a release PR (`develop` → `main`), tags it, and dispatches the production deploy on the tag
 
 Deploying directly bypasses:
 
@@ -273,13 +288,14 @@ The version in `package.json` is the single source of truth. A `version` lifecyc
    - Updates `package.json`
    - Regenerates `src/generated/version.ts` (via the `version` lifecycle hook)
 3. Commit the version bump files (`package.json` and `src/generated/version.ts`) as part of the PR
-4. After the PR is merged to main, tag the release on main:
+4. After the release PR (`develop` → `main`) is merged, tag the release on `main`:
    - `git checkout main && git pull`
    - `git tag v<version>` (e.g., `git tag v2.12.1`)
    - `git push --tags`
+     Feature PRs into `develop` are not tagged; the release tag covers every PR since the previous release.
 5. The new version flows to the health endpoint and `{{version}}` template variables
 
-### Why bump in the branch, not on main?
+### Why bump in the branch, not on develop or main?
 
 - The version change is reviewed alongside the code
 - One merge = one atomic unit of work
@@ -290,7 +306,7 @@ The version in `package.json` is the single source of truth. A `version` lifecyc
 
 - Do NOT manually edit `src/generated/version.ts` — it is auto-generated
 - Use `--no-git-tag-version` on branches to avoid creating tags before merge
-- Tags are created on main after merge to point at the actual merged commit
+- Tags are created on `main` after a release merge, never on `develop`
 
 ## What to Do After a Push
 
