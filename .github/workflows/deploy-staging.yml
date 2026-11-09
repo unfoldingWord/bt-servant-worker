@@ -6,6 +6,12 @@ name: Deploy Staging
 # The branch filter alone is not enough: a release PR (develop → main) runs CI
 # with head branch develop too, so the job also requires the CI run to have
 # been triggered by a push. Otherwise each merge into develop deploys twice.
+#
+# Ordering: two pushes to develop can finish CI in either order, so this job
+# is serialized (one staging deploy at a time, queued, never cancelled) and,
+# once it holds the slot, deploys only if its commit is still the tip of
+# develop. An older CI run that completes after a newer one therefore skips
+# instead of putting staging back on a stale commit.
 on:
   workflow_run:
     workflows: ['CI']
@@ -17,44 +23,75 @@ jobs:
     name: Deploy to Staging
     runs-on: ubuntu-latest
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' }}
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
+          # Full history so the guard below can compare against develop's tip.
+          fetch-depth: 0
+
+      - name: Skip if a newer push to develop exists
+        id: tip
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin develop
+          tip="$(git rev-parse origin/develop)"
+          if [ "$tip" != "$HEAD_SHA" ]; then
+            echo "::notice::Skipping: $HEAD_SHA is no longer the tip of develop ($tip). The newer push deploys instead."
+            echo "superseded=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok: $HEAD_SHA is the tip of develop"
+            echo "superseded=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Install pnpm
+        if: steps.tip.outputs.superseded != 'true'
         uses: pnpm/action-setup@v4
 
       - name: Setup Node.js
+        if: steps.tip.outputs.superseded != 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'pnpm'
 
       - name: Install dependencies
+        if: steps.tip.outputs.superseded != 'true'
         run: pnpm install
 
       - name: Type check
+        if: steps.tip.outputs.superseded != 'true'
         run: pnpm check
 
       - name: Type check (tail worker)
+        if: steps.tip.outputs.superseded != 'true'
         run: pnpm check:tail
 
       - name: Lint
+        if: steps.tip.outputs.superseded != 'true'
         run: pnpm lint
 
       - name: Architecture check
+        if: steps.tip.outputs.superseded != 'true'
         run: pnpm architecture
 
       - name: Test
+        if: steps.tip.outputs.superseded != 'true'
         run: pnpm test
 
       - name: Build
+        if: steps.tip.outputs.superseded != 'true'
         run: pnpm build
 
       # Tail consumer must exist before the producer worker references it
       # via tail_consumers in wrangler.toml — deploy it first.
       - name: Deploy Tail Worker (Staging)
+        if: steps.tip.outputs.superseded != 'true'
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -62,6 +99,7 @@ jobs:
           command: deploy --config tail-worker/wrangler.toml --env staging
 
       - name: Deploy to Staging
+        if: steps.tip.outputs.superseded != 'true'
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}

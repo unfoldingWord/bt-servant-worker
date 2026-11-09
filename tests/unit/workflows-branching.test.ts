@@ -50,3 +50,41 @@ describe('workflow triggers follow the develop/main branching model', () => {
     expect(script).not.toContain('${{ github.head_ref }}');
   });
 });
+
+/**
+ * Staging deploys are serialized and superseded: two pushes to develop can
+ * finish CI in either order, so without this an older run could deploy after a
+ * newer one and leave staging on a stale commit.
+ */
+describe('staging deploys cannot land out of order', () => {
+  const job = stagingYml.slice(stagingYml.indexOf('deploy-staging:'));
+
+  it('serializes staging deploys in one concurrency group without cancelling the running one', () => {
+    expect(job).toMatch(
+      /concurrency:\s*\n\s*group: deploy-staging\s*\n\s*cancel-in-progress: false/
+    );
+  });
+
+  it('skips the deploy when the CI run is no longer the tip of develop', () => {
+    const guardAt = job.indexOf('name: Skip if a newer push to develop exists');
+    expect(guardAt).toBeGreaterThan(-1);
+    expect(guardAt).toBeLessThan(job.indexOf('wrangler-action'));
+    const guard = job.slice(guardAt, job.indexOf('- name:', guardAt + 1));
+    expect(guard).toContain('id: tip');
+    expect(guard).toContain('HEAD_SHA: ${{ github.event.workflow_run.head_sha }}');
+    expect(guard).toContain('git fetch --no-tags origin develop');
+    expect(guard).toContain('git rev-parse origin/develop');
+    expect(guard).toContain('superseded=true');
+    expect(job).toMatch(/fetch-depth: 0/);
+  });
+
+  it('every step after the guard, including both deploys, is conditioned on not being superseded', () => {
+    const guardAt = job.indexOf('name: Skip if a newer push to develop exists');
+    const after = job.slice(job.indexOf('- name:', guardAt + 1));
+    const steps = after.split(/\n\s*- name: /).filter((s) => s.trim() !== '');
+    expect(steps.length).toBeGreaterThanOrEqual(10);
+    for (const step of steps) {
+      expect(step).toContain("if: steps.tip.outputs.superseded != 'true'");
+    }
+  });
+});
