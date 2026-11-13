@@ -68,11 +68,25 @@ export interface PartnerKeyRecord {
   limits?: Record<string, number>;
 }
 
+/**
+ * A record as the admin endpoints see it: the stored record plus, when the key
+ * has authenticated since use tracking shipped, `lastUsedAt`. That time is
+ * NOT part of the stored record or its KV auth projection; the
+ * PartnerKeyStoreDO keeps it in its own row and joins it in on read. It is
+ * coarse: recorded at most once per key per LAST_USED_THROTTLE_MS per worker
+ * isolate (see services/partner-keys/last-used.ts), so it can lag the true
+ * last request by up to that much, never lead it.
+ */
+export type PartnerKeyWithUsage = PartnerKeyRecord & {
+  /** ISO-8601 time the key last authenticated (to within ~10 minutes); absent when never recorded. */
+  lastUsedAt?: string;
+};
+
 /** Lifecycle state of a key at a given instant. */
 export type PartnerKeyStatus = 'active' | 'revoked' | 'expired';
 
 /** What the admin endpoints return for a key: the record plus a derived status. */
-export type PublicPartnerKey = PartnerKeyRecord & { status: PartnerKeyStatus };
+export type PublicPartnerKey = PartnerKeyWithUsage & { status: PartnerKeyStatus };
 
 /**
  * The one definition of whether a key works at `now` (ms). Explicit revocation
@@ -358,7 +372,7 @@ function termsAndLimitFields(record: PartnerKeyRecord): Partial<PartnerKeyRecord
  * response. `status` is derived at `now` (ms; default the current time).
  */
 export function toPublicPartnerKey(
-  record: PartnerKeyRecord,
+  record: PartnerKeyWithUsage,
   now: number = Date.now()
 ): PublicPartnerKey {
   return {
@@ -373,6 +387,7 @@ export function toPublicPartnerKey(
     userNamespace: record.userNamespace,
     ...lifecycleFields(record),
     ...termsAndLimitFields(record),
+    ...(record.lastUsedAt !== undefined ? { lastUsedAt: record.lastUsedAt } : {}),
     status: partnerKeyStatus(record, now),
   };
 }

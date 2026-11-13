@@ -800,3 +800,95 @@ describe('import lease: a holder that keeps renewing is never displaced', () => 
     expect(await leaseOp('acquireImportLease', ns, 'run-b')).toEqual({ acquired: false });
   });
 });
+
+/** One operation through the DO's real fetch handler (the worker's protocol). */
+async function doOp<T>(op: Record<string, unknown>): Promise<T> {
+  const res = await stub().fetch('https://partner-key-store/op', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Request-ID': REQUEST_ID },
+    body: JSON.stringify(op),
+  });
+  expect(res.status).toBe(200);
+  return (await res.json()) as T;
+}
+
+type WithUsage = PartnerKeyRecord & { lastUsedAt?: string };
+
+describe('last used: the ledger keeps a forward-only used:<id> row', () => {
+  it('records a use, ignores an older or equal one, and never touches the record or KV', async () => {
+    const created = await withLedger((l) => l.create(INPUT));
+    const id = created.record.id;
+    const before = await projected(created.plaintext);
+    expect(await withLedger((l) => l.recordUse(id, 2_000))).toEqual({ recorded: true });
+    expect(await withLedger((l) => l.recordUse(id, 1_000))).toEqual({ recorded: false });
+    expect(await withLedger((l) => l.recordUse(id, 2_000))).toEqual({ recorded: false });
+    await withLedger(async (_l, storage) => {
+      expect(await storage.get(`used:${id}`)).toBe(2_000);
+      expect(await storage.get(`proj:${id}`)).toBeUndefined();
+    });
+    expect((await withLedger((l) => l.get(id)))?.record).toEqual(created.record);
+    expect(await projected(created.plaintext)).toEqual(before);
+  });
+
+  it('writes nothing for an unknown or malformed id (no orphan rows)', async () => {
+    expect(await withLedger((l) => l.recordUse('pk_0000000000000000', 1))).toEqual({
+      recorded: false,
+    });
+    expect(await withLedger((l) => l.recordUse('not-a-key', 1))).toEqual({ recorded: false });
+    await withLedger(async (_l, storage) => {
+      expect((await storage.list({ prefix: 'used:' })).size).toBe(0);
+    });
+  });
+
+  it('withLastUsed joins an ISO time only for keys that have one', async () => {
+    const a = await withLedger((l) => l.create(INPUT));
+    const b = await withLedger((l) => l.create(INPUT));
+    const at = Date.parse('2026-11-13T12:00:00.000Z');
+    await withLedger((l) => l.recordUse(a.record.id, at));
+    const joined = await withLedger((l) => l.withLastUsed([a.record, b.record]));
+    expect(joined[0]).toEqual({ ...a.record, lastUsedAt: '2026-11-13T12:00:00.000Z' });
+    expect(joined[1]).toEqual(b.record);
+  });
+});
+
+describe('last used: the DO operations', () => {
+  // These go through the DO's own fetch, so they project to the real API_KEYS.
+  afterEach(async () => {
+    const { keys } = await env.API_KEYS.list();
+    await Promise.all(keys.map((k) => env.API_KEYS.delete(k.name)));
+  });
+
+  it('recordUse stamps the DO clock; list, get, revoke and rotate answer with lastUsedAt', async () => {
+    const { record } = await doOp<{ record: PartnerKeyRecord }>({ op: 'create', input: INPUT });
+    const start = Date.now();
+    expect(await doOp({ op: 'recordUse', id: record.id })).toEqual({ recorded: true });
+
+    const got = (await doOp<{ record: WithUsage }>({ op: 'get', id: record.id })).record;
+    const stamped = Date.parse(got.lastUsedAt ?? '');
+    expect(stamped).toBeGreaterThanOrEqual(start);
+    expect(stamped).toBeLessThanOrEqual(Date.now());
+    const listed = await doOp<{ records: WithUsage[] }>({ op: 'list', org: INPUT.org });
+    expect(listed.records.map((r) => r.lastUsedAt)).toEqual([got.lastUsedAt]);
+
+    // Rotation: the old key keeps its own last use; the new key starts without one.
+    const rotated = await doOp<{ status: string; record: WithUsage; previous: WithUsage }>({
+      op: 'rotate',
+      id: record.id,
+      graceSeconds: 3600,
+    });
+    expect(rotated.status).toBe('ok');
+    expect(rotated.previous.lastUsedAt).toBe(got.lastUsedAt);
+    expect(rotated.record.lastUsedAt).toBeUndefined();
+    const fresh = await doOp<{ record: WithUsage }>({ op: 'get', id: rotated.record.id });
+    expect(fresh.record.lastUsedAt).toBeUndefined();
+
+    const revoked = await doOp<{ record: WithUsage }>({ op: 'revoke', id: record.id });
+    expect(revoked.record.lastUsedAt).toBe(got.lastUsedAt);
+  });
+
+  it('recordUse of an unknown key answers recorded: false', async () => {
+    expect(await doOp({ op: 'recordUse', id: 'pk_0000000000000000' })).toEqual({
+      recorded: false,
+    });
+  });
+});

@@ -17,7 +17,11 @@
  * compares `expiresAt` with the clock on every request.
  */
 
-import type { PartnerKeyCreateInput, PartnerKeyRecord } from '../../types/partner-keys.js';
+import type {
+  PartnerKeyCreateInput,
+  PartnerKeyRecord,
+  PartnerKeyWithUsage,
+} from '../../types/partner-keys.js';
 import type { RevokeOutcome, RotateOutcome } from './ledger.js';
 import { PARTNER_KEY_KV_PREFIX, partnerKeyHash } from './key-material.js';
 
@@ -55,6 +59,7 @@ export type PartnerKeyStoreOp =
   | { op: 'get'; id: string }
   | { op: 'revoke'; id: string; revokedBy?: string }
   | { op: 'rotate'; id: string; createdBy?: string; graceSeconds: number }
+  | { op: 'recordUse'; id: string }
   | { op: 'acquireImportLease'; namespace: string; holder: string }
   | { op: 'renewImportLease'; namespace: string; holder: string }
   | { op: 'releaseImportLease'; namespace: string; holder: string };
@@ -83,17 +88,23 @@ export function partnerKeyStore(ns: DurableObjectNamespace, requestId: string) {
   return {
     create: (input: PartnerKeyCreateInput) => call<CreateOutcome>({ op: 'create', input }),
     list: (org?: string) =>
-      call<{ records: PartnerKeyRecord[] }>(
+      call<{ records: PartnerKeyWithUsage[] }>(
         org === undefined ? { op: 'list' } : { op: 'list', org }
       ),
     get: async (id: string) =>
-      (await call<{ record: PartnerKeyRecord | null }>({ op: 'get', id })).record,
+      (await call<{ record: PartnerKeyWithUsage | null }>({ op: 'get', id })).record,
     revoke: (id: string, revokedBy?: string) =>
       call<RevokeOutcome | null>(
         revokedBy === undefined ? { op: 'revoke', id } : { op: 'revoke', id, revokedBy }
       ),
     rotate: (id: string, opts: { createdBy?: string; graceSeconds: number }) =>
       call<RotateOutcome>({ op: 'rotate', id, ...opts }),
+    /**
+     * Record that key `id` authenticated just now (the DO stamps its own
+     * clock). Callers throttle this; see last-used.ts.
+     */
+    recordUse: async (id: string) =>
+      (await call<{ recorded: boolean }>({ op: 'recordUse', id })).recorded,
     /**
      * Take the legacy-import lease of a user namespace for `holder`; false
      * while another import holds it. Keyed by namespace, not key id: every key
