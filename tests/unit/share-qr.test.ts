@@ -13,6 +13,8 @@ import {
   shareQrFlagKey,
   shareQrImagePath,
   shareQrRequestSkip,
+  shareQrSignature,
+  verifyShareQrSignature,
 } from '../../src/utils/share-qr.js';
 
 const NUMBER = '15558196461';
@@ -137,30 +139,60 @@ describe('dueShareQrCode', () => {
   });
 });
 
+describe('share QR signatures', () => {
+  it('is deterministic per secret and code, and differs across codes and secrets', async () => {
+    const a = await shareQrSignature('k1', 'spoken');
+    expect(a).toMatch(/^[0-9a-f]{32}$/);
+    expect(await shareQrSignature('k1', 'spoken')).toBe(a);
+    expect(await shareQrSignature('k1', 'fia')).not.toBe(a);
+    expect(await shareQrSignature('k2', 'spoken')).not.toBe(a);
+    expect(await shareQrSignature('k1', null)).not.toBe(a);
+  });
+  it('verifies only the matching signature', async () => {
+    const sig = await shareQrSignature('k1', 'spoken');
+    expect(await verifyShareQrSignature('k1', 'spoken', sig)).toBe(true);
+    expect(await verifyShareQrSignature('k1', 'fia', sig)).toBe(false);
+    expect(await verifyShareQrSignature('k1', 'spoken', sig.slice(1))).toBe(false);
+    expect(await verifyShareQrSignature('k1', 'spoken', null)).toBe(false);
+    expect(await verifyShareQrSignature('', 'spoken', sig)).toBe(false);
+  });
+  it('refuses to sign with an empty secret', async () => {
+    await expect(shareQrSignature('', 'spoken')).rejects.toThrow(/empty secret/);
+  });
+});
+
 describe('buildShareQrMedia', () => {
   const origin = 'https://api.btservant.ai';
-  it('builds the image URL and an English caption ending with the link', () => {
-    const qr = buildShareQrMedia({ whatsappNumber: NUMBER, workerOrigin: origin, code: 'spoken', locale: 'en' }); // prettier-ignore
+  const base = { whatsappNumber: NUMBER, signingSecret: 'k1', workerOrigin: origin };
+  it('builds a signed image URL and an English caption ending with the link', async () => {
+    const qr = await buildShareQrMedia({ ...base, code: 'spoken', locale: 'en' });
+    const sig = await shareQrSignature('k1', 'spoken');
     expect(qr).toEqual({
-      url: 'https://api.btservant.ai/public/share-qr/spoken.png',
+      url: `https://api.btservant.ai/public/share-qr/spoken.png?s=${sig}`,
       caption:
         'Share BT Servant with others: scan this code, or forward this image.\n' +
         'https://wa.me/15558196461?text=%23spoken',
       code: 'spoken',
     });
   });
-  it('translates the caption (pt) and falls back to English for other locales', () => {
-    const pt = buildShareQrMedia({ whatsappNumber: NUMBER, workerOrigin: origin, code: null, locale: 'pt-BR' }); // prettier-ignore
+  it('translates the caption (pt) and falls back to English for other locales', async () => {
+    const pt = await buildShareQrMedia({ ...base, code: null, locale: 'pt-BR' });
     expect(pt?.caption.startsWith('Compartilhe o BT Servant')).toBe(true);
-    expect(pt?.url).toBe('https://api.btservant.ai/public/share-qr.png');
-    const sw = buildShareQrMedia({ whatsappNumber: NUMBER, workerOrigin: origin, code: null, locale: 'sw' }); // prettier-ignore
+    expect(pt?.url.startsWith('https://api.btservant.ai/public/share-qr.png?s=')).toBe(true);
+    const sw = await buildShareQrMedia({ ...base, code: null, locale: 'sw' });
     expect(sw?.caption.startsWith('Share BT Servant')).toBe(true);
   });
-  it('returns null without a valid number, for a clear token, or off HTTPS', () => {
-    expect(buildShareQrMedia({ whatsappNumber: undefined, workerOrigin: origin, code: 'a', locale: 'en' })).toBeNull(); // prettier-ignore
-    expect(buildShareQrMedia({ whatsappNumber: NUMBER, workerOrigin: origin, code: 'default', locale: 'en' })).toBeNull(); // prettier-ignore
-    expect(buildShareQrMedia({ whatsappNumber: NUMBER, workerOrigin: 'http://x', code: 'a', locale: 'en' })).toBeNull(); // prettier-ignore
-    expect(buildShareQrMedia({ whatsappNumber: NUMBER, workerOrigin: '', code: 'a', locale: 'en' })).toBeNull(); // prettier-ignore
+  it('returns null without a number or secret, for a clear token, or off HTTPS', async () => {
+    const cases = [
+      { ...base, whatsappNumber: undefined, code: 'a' },
+      { ...base, signingSecret: '', code: 'a' },
+      { ...base, code: 'default' },
+      { ...base, workerOrigin: 'http://x', code: 'a' },
+      { ...base, workerOrigin: '', code: 'a' },
+    ];
+    for (const c of cases) {
+      expect(await buildShareQrMedia({ ...c, locale: 'en' })).toBeNull();
+    }
   });
 });
 

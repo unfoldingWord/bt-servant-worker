@@ -30,6 +30,7 @@ import type { ChatRequest, UserPreferencesInternal } from '../../src/types/engin
 import type { OrgModes, PromptMode } from '../../src/types/prompt-overrides.js';
 import type { InternalQueueEntry } from '../../src/types/queue.js';
 import { createRequestLogger, type RequestLogger } from '../../src/utils/logger.js';
+import { shareQrImagePath, shareQrSignature } from '../../src/utils/share-qr.js';
 
 vi.mock('@anthropic-ai/sdk', () => ({ default: vi.fn() }));
 
@@ -96,9 +97,12 @@ function switchModeCall(mode: string): Response {
 
 /**
  * Mock Anthropic (each call takes the next scripted response, then 'ok') and
- * capture every gateway webhook POST, in arrival order.
+ * capture every gateway webhook POST, in arrival order, answering `hookStatus`.
  */
-function setupMocks(script: Array<() => Response> = []): { hooks: Array<Record<string, unknown>> } {
+function setupMocks(
+  script: Array<() => Response> = [],
+  hookStatus = 200
+): { hooks: Array<Record<string, unknown>> } {
   const hooks: Array<Record<string, unknown>> = [];
   (Anthropic as unknown as ReturnType<typeof vi.fn>).mockImplementation(function MockAnthropic(
     this: object
@@ -112,7 +116,7 @@ function setupMocks(script: Array<() => Response> = []): { hooks: Array<Record<s
     if (url.includes('api.anthropic.com')) return (script.shift() ?? (() => textAnswer('ok')))();
     if (url.startsWith(HOOK_URL)) {
       hooks.push(JSON.parse(await readMockRequestBody(input, init)) as Record<string, unknown>);
-      return new Response('ok', { status: 200 });
+      return new Response('ok', { status: hookStatus });
     }
     return realFetch(input, init);
   });
@@ -196,10 +200,10 @@ describe('share QR — WhatsApp callback path (#474)', () => {
     const completeIdx = hooks.findIndex((h) => h.type === 'complete');
     expect(welcomeIdx).toBeGreaterThanOrEqual(0);
     expect(completeIdx).toBeGreaterThan(welcomeIdx);
-    const complete = hooks[completeIdx];
+    const complete = hooks.at(completeIdx);
     expect(complete?.text).toBe('ok');
     expect(complete?.share_qr).toEqual({
-      url: `${ORIGIN}/public/share-qr/spoken.png`,
+      url: `${ORIGIN}${await signedPath('spoken')}`,
       caption: `Share BT Servant with others: scan this code, or forward this image.\n${LINK}?text=%23spoken`, // prettier-ignore
       code: 'spoken',
     });
@@ -251,7 +255,7 @@ describe('share QR — no-mode users, locale and gating (#474)', () => {
     await runCallbackTurn(stub, waBody('hi'));
     const qr = completeOf(hooks)?.share_qr as { url: string; code: null; caption: string };
     expect(qr.code).toBeNull();
-    expect(qr.url).toBe(`${ORIGIN}/public/share-qr.png`);
+    expect(qr.url).toBe(`${ORIGIN}${await signedPath(null)}`);
     expect(qr.caption.endsWith(`\n${LINK}`)).toBe(true);
     expect(await readFlag(stub, '@bare')).toBe(true);
   });
@@ -291,35 +295,71 @@ describe('share QR — no-mode users, locale and gating (#474)', () => {
   }
 });
 
-/** Collect the parsed `data:` events from an SSE Response body. */
-async function readSSEEvents(response: Response): Promise<Array<Record<string, unknown>>> {
-  const events: Array<Record<string, unknown>> = [];
-  for (const line of (await response.text()).split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith('data:')) continue;
-    const json = trimmed.slice('data:'.length).trim();
-    if (json) events.push(JSON.parse(json) as Record<string, unknown>);
+describe('share QR — failures are non-fatal (#474)', () => {
+  let stub: DurableObjectStub;
+  let hooks: Array<Record<string, unknown>>;
+
+  beforeEach(() => {
+    stub = env.USER_DO.get(env.USER_DO.newUniqueId());
+    hooks = setupMocks().hooks;
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  /** Run one callback turn with the share-QR flag write failing, capturing log lines. */
+  async function runWithFailingFlagWrite(): Promise<string[]> {
+    const logged: string[] = [];
+    const capture = (...args: unknown[]) => {
+      logged.push(args.map(String).join(' '));
+    };
+    vi.spyOn(console, 'warn').mockImplementation(capture);
+    vi.spyOn(console, 'log').mockImplementation(capture);
+    const body = waBody('#spoken hi');
+    const entry: InternalQueueEntry = { message_id: body.message_key as string, body, enqueued_at: Date.now(), retry_count: 0 }; // prettier-ignore
+    await runInDurableObject(stub, async (instance, state) => {
+      const realPut = state.storage.put.bind(state.storage) as (k: string, v: unknown) => Promise<void>; // prettier-ignore
+      vi.spyOn(state.storage, 'put').mockImplementation((async (key: unknown, value: unknown) => {
+        if (typeof key === 'string' && key.startsWith('share_qr_sent:')) {
+          throw new Error('storage down');
+        }
+        return realPut(key as string, value);
+      }) as typeof state.storage.put);
+      await (instance as unknown as QueueInstance).processCallbackEntry(entry, createRequestLogger('t')); // prettier-ignore
+    });
+    return logged;
   }
-  return events;
+
+  it('a failed flag write sends the answer without a QR and logs a warning', async () => {
+    const logged = await runWithFailingFlagWrite();
+    const complete = completeOf(hooks);
+    expect(complete?.text).toBe('ok');
+    expect(complete).not.toHaveProperty('share_qr');
+    expect(hooks.some((h) => h.type === 'error')).toBe(false);
+    expect(logged.some((line) => line.includes('share_qr_attach_failed'))).toBe(true);
+    expect(await listShareFlags(stub)).toEqual([]);
+  });
+
+  it('a failed complete webhook still burns the flag: no re-emit (decided 2026-11-05)', async () => {
+    vi.restoreAllMocks();
+    const failing = setupMocks([], 503);
+    await runCallbackTurn(stub, waBody('#spoken hi'));
+    expect(completeOf(failing.hooks)?.share_qr).toBeDefined();
+    expect(await readFlag(stub, 'spoken')).toBe(true);
+  });
+});
+
+/**
+ * Blank the values of fields that differ run to run (ids, clocks, timings) in
+ * a RAW body, leaving framing, whitespace and key order intact, so the
+ * comparison below is byte-for-byte on everything else.
+ */
+const VOLATILE_RE =
+  /"(timestamp|message_id|request_id|turn_id|duration_ms|processing_ms|first_token_ms|created_at)":("[^"]*"|-?[0-9.]+)/g;
+
+function blankVolatile(raw: string): string {
+  return raw.replace(VOLATILE_RE, '"$1":"<volatile>"');
 }
 
-/** Fields that differ run to run (ids, clocks, timings), blanked before comparing. */
-const VOLATILE = new Set(['timestamp', 'message_id', 'request_id', 'duration_ms', 'processing_ms', 'first_token_ms', 'turn_id']); // prettier-ignore
-
-function normalize(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(normalize);
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>).map(([k, v]) => [
-        k,
-        VOLATILE.has(k) ? '<volatile>' : normalize(v),
-      ])
-    );
-  }
-  return value;
-}
-
-/** A first-contact `#spoken` turn as the web/Fluent clients send it, with or without the opt-in. */
+/** A first-contact `#spoken` turn, with or without the opt-in. */
 function sseBody(optIn: boolean): ChatRequest {
   return buildChatBody({
     message: '#spoken hi',
@@ -334,8 +374,8 @@ describe('share QR — SSE stream is unchanged (ETEN hold, #421)', () => {
   beforeEach(() => setupMocks());
   afterEach(() => vi.restoreAllMocks());
 
-  it('/chat/stream emits the same events with or without accepts_share_qr', async () => {
-    const runs: unknown[] = [];
+  it('/chat/stream sends the same bytes with or without accepts_share_qr', async () => {
+    const runs: string[] = [];
     for (const optIn of [false, true]) {
       const stub = env.USER_DO.get(env.USER_DO.newUniqueId());
       const response = await stub.fetch('http://fake-host/chat/stream', {
@@ -343,12 +383,13 @@ describe('share QR — SSE stream is unchanged (ETEN hold, #421)', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(sseBody(optIn)),
       });
-      const events = await readSSEEvents(response);
-      expect(JSON.stringify(events)).not.toContain('share_qr');
+      const raw = await response.text();
+      expect(raw).toContain('"type":"complete"');
+      expect(raw).not.toContain('share_qr');
       expect(await listShareFlags(stub)).toEqual([]);
-      runs.push(normalize(events));
+      runs.push(blankVolatile(raw));
     }
-    expect(runs[1]).toEqual(runs[0]);
+    expect(runs[1]).toBe(runs[0]);
   });
 });
 
@@ -358,18 +399,18 @@ describe('share QR — /chat/final is unchanged (#474)', () => {
   });
   afterEach(() => vi.restoreAllMocks());
 
-  it('/chat/final returns the same body with or without accepts_share_qr', async () => {
-    const runs: unknown[] = [];
+  it('/chat/final returns the same bytes with or without accepts_share_qr', async () => {
+    const runs: string[] = [];
     for (const optIn of [false, true]) {
       const stub = env.USER_DO.get(env.USER_DO.newUniqueId());
       const response = await postChatFinal(stub, sseBody(optIn));
       expect(response.status).toBe(200);
-      const json = await response.json();
-      expect(JSON.stringify(json)).not.toContain('share_qr');
+      const raw = await response.text();
+      expect(raw).not.toContain('share_qr');
       expect(await listShareFlags(stub)).toEqual([]);
-      runs.push(normalize(json));
+      runs.push(blankVolatile(raw));
     }
-    expect(runs[1]).toEqual(runs[0]);
+    expect(runs[1]).toBe(runs[0]);
   });
 });
 
@@ -383,6 +424,12 @@ async function fetchPublic(path: string, overrides: Partial<Env> = {}): Promise<
   return res;
 }
 
+/** A worker-issued (signed) image path for `code`, as the DO builds it. */
+async function signedPath(code: string | null): Promise<string> {
+  const sig = await shareQrSignature(env.ENGINE_API_KEY, code);
+  return `${shareQrImagePath(code)}?s=${sig}`;
+}
+
 describe('share QR — public PNG route (#474)', () => {
   beforeEach(() => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -391,15 +438,15 @@ describe('share QR — public PNG route (#474)', () => {
   });
   afterEach(() => vi.restoreAllMocks());
 
-  const cases: Array<[string, string]> = [
-    ['/public/share-qr/spoken.png', `${LINK}?text=%23spoken`],
-    ['/public/share-qr/fia-coach.png', `${LINK}?text=%23fia-coach`],
-    ['/public/share-qr/wordcollective/bible-study.png', `${LINK}?text=%23wordcollective%2Fbible-study`], // prettier-ignore
-    ['/public/share-qr.png', LINK],
+  const cases: Array<[string | null, string]> = [
+    ['spoken', `${LINK}?text=%23spoken`],
+    ['fia-coach', `${LINK}?text=%23fia-coach`],
+    ['wordcollective/bible-study', `${LINK}?text=%23wordcollective%2Fbible-study`],
+    [null, LINK],
   ];
-  for (const [path, link] of cases) {
-    it(`serves a PNG for ${path} that scans to ${link}`, async () => {
-      const res = await fetchPublic(path);
+  for (const [code, link] of cases) {
+    it(`serves a signed PNG for ${code ?? '(bare)'} that scans to ${link}`, async () => {
+      const res = await fetchPublic(await signedPath(code));
       expect(res.status).toBe(200);
       expect(res.headers.get('Content-Type')).toBe('image/png');
       expect(res.headers.get('Cache-Control')).toBe('public, max-age=86400');
@@ -409,8 +456,18 @@ describe('share QR — public PNG route (#474)', () => {
     });
   }
 
+  it('404s an unsigned URL, a wrong signature, and a signature for another code', async () => {
+    expect((await fetchPublic('/public/share-qr/spoken.png')).status).toBe(404);
+    expect((await fetchPublic('/public/share-qr/spoken.png?s=00')).status).toBe(404);
+    const other = await shareQrSignature(env.ENGINE_API_KEY, 'fia-coach');
+    expect((await fetchPublic(`/public/share-qr/spoken.png?s=${other}`)).status).toBe(404);
+  });
+
+  it('404s a signed clear token (default)', async () => {
+    expect((await fetchPublic(await signedPath('default'))).status).toBe(404);
+  });
+
   for (const path of [
-    '/public/share-qr/default.png',
     '/public/share-qr/Spoken.png',
     '/public/share-qr/a/b/c.png',
     '/public/share-qr/spoken',
@@ -422,7 +479,7 @@ describe('share QR — public PNG route (#474)', () => {
   }
 
   it('503s when WHATSAPP_NUMBER is not configured', async () => {
-    const res = await fetchPublic('/public/share-qr/spoken.png', { WHATSAPP_NUMBER: undefined });
+    const res = await fetchPublic(await signedPath('spoken'), { WHATSAPP_NUMBER: undefined });
     expect(res.status).toBe(503);
   });
 });

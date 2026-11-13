@@ -2358,8 +2358,9 @@ export class UserDO {
       return null;
     }
     if (await this.state.storage.get<boolean>(shareQrFlagKey(due.code))) return null;
-    const qr = buildShareQrMedia({
+    const qr = await buildShareQrMedia({
       whatsappNumber: this.env.WHATSAPP_NUMBER,
+      signingSecret: this.env.ENGINE_API_KEY,
       workerOrigin,
       code: due.code,
       locale: loaded.locale,

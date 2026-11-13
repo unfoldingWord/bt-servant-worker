@@ -13,16 +13,59 @@
  * deterministic from `WHATSAPP_NUMBER` + code, so nothing is stored.
  *
  * The route is not an open QR generator: it only ever encodes a link to our
- * own WhatsApp number, and the code must have the shape of a mode name
- * (`MODE_NAME_PATTERN`, optionally qualified by one org slug). It does NOT
- * check that the mode exists: that would cost KV reads on every fetch, and a
- * QR for a code that matches nothing only opens BT Servant with that text.
+ * own WhatsApp number, the code must have the shape of a mode name
+ * (`MODE_NAME_PATTERN`, optionally qualified by one org slug), and the URL
+ * must carry the worker's signature over that code (`?s=`, an HMAC keyed by a
+ * worker secret). So only URLs the worker itself issued are rendered, and the
+ * route needs no KV read to check the mode exists.
  */
 
 import { uiString } from '../i18n/ui-strings.js';
 import type { ChatRequest, ShareQrMedia } from '../types/engine.js';
 import { MODE_NAME_PATTERN } from '../types/prompt-overrides.js';
+import { bytesToHex, constantTimeCompare } from './crypto.js';
 import { buildModeShareLink, normalizeWhatsAppNumber, WA_ME_ORIGIN } from './mode-share-link.js';
+
+/** Query parameter carrying the URL signature. */
+export const SHARE_QR_SIGNATURE_PARAM = 's';
+
+/** Domain separation, so this HMAC can never collide with another use of the key. */
+const SIGNATURE_LABEL = 'bt-servant:share-qr:v1:';
+
+/** Hex chars kept from the HMAC-SHA256 (128 bits). */
+const SIGNATURE_HEX_LENGTH = 32;
+
+/**
+ * Signature over `code` (null ⇒ the bare link), keyed by a worker secret.
+ * Throws when `secret` is empty: an unkeyed signature would be forgeable.
+ */
+export async function shareQrSignature(secret: string, code: string | null): Promise<string> {
+  if (!secret) throw new Error('shareQrSignature: empty secret');
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const mac = await crypto.subtle.sign(
+    'HMAC',
+    key,
+    encoder.encode(`${SIGNATURE_LABEL}${code ?? ''}`)
+  );
+  return bytesToHex(new Uint8Array(mac)).slice(0, SIGNATURE_HEX_LENGTH);
+}
+
+/** Constant-time check of a URL signature. False for a missing signature or secret. */
+export async function verifyShareQrSignature(
+  secret: string,
+  code: string | null,
+  signature: string | null | undefined
+): Promise<boolean> {
+  if (!secret || !signature) return false;
+  return constantTimeCompare(await shareQrSignature(secret, code), signature);
+}
 
 /** Public path prefix for share QR images. */
 export const SHARE_QR_PATH_PREFIX = '/public/share-qr';
@@ -139,22 +182,25 @@ export function dueShareQrCode(facts: {
 
 /**
  * Build the QR media for `code`, or null when it cannot be built (no valid
- * WhatsApp number, an invalid or reserved code, or a non-HTTPS origin, since
- * Meta only fetches media over HTTPS). The caption is localized through the
+ * WhatsApp number, an invalid or reserved code, no signing secret, or a
+ * non-HTTPS origin, since Meta only fetches media over HTTPS). The URL carries
+ * the signature the public route checks. The caption is localized through the
  * worker UI string table and ends with the link, so a user who cannot scan
  * their own screen can still tap or forward it.
  */
-export function buildShareQrMedia(input: {
+export async function buildShareQrMedia(input: {
   whatsappNumber: string | null | undefined;
+  signingSecret: string;
   workerOrigin: string;
   code: string | null;
   locale: string | null | undefined;
-}): ShareQrMedia | null {
+}): Promise<ShareQrMedia | null> {
   const link = buildShareQrLink(input.whatsappNumber, input.code);
-  if (!link || !input.workerOrigin.startsWith('https://')) return null;
+  if (!link || !input.signingSecret || !input.workerOrigin.startsWith('https://')) return null;
   const origin = input.workerOrigin.replace(/\/+$/, '');
+  const signature = await shareQrSignature(input.signingSecret, input.code);
   return {
-    url: `${origin}${shareQrImagePath(input.code)}`,
+    url: `${origin}${shareQrImagePath(input.code)}?${SHARE_QR_SIGNATURE_PARAM}=${signature}`,
     caption: `${uiString(input.locale, 'share_qr_caption')}\n${link}`,
     code: input.code,
   };

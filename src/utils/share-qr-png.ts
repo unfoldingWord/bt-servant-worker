@@ -47,7 +47,7 @@ function getCrcTable(): Uint32Array {
   for (let n = 0; n < 256; n++) {
     let c = n;
     for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    table[n] = c >>> 0;
+    table.set([c >>> 0], n);
   }
   crcTable = table;
   return table;
@@ -57,7 +57,7 @@ function getCrcTable(): Uint32Array {
 export function crc32(bytes: Uint8Array): number {
   const table = getCrcTable();
   let c = 0xffffffff;
-  for (const byte of bytes) c = (table[(c ^ byte) & 0xff] as number) ^ (c >>> 8);
+  for (const byte of bytes) c = (table.at((c ^ byte) & 0xff) ?? 0) ^ (c >>> 8);
   return (c ^ 0xffffffff) >>> 0;
 }
 
@@ -103,12 +103,12 @@ function scanlines(matrix: readonly (readonly boolean[])[], scale: number): Uint
   const stride = rowBytes + 1;
   const raw = new Uint8Array(stride * width);
   for (let y = 0; y < width; y++) {
-    const row = matrix[Math.floor(y / scale)] as readonly boolean[];
+    const row = matrix.at(Math.floor(y / scale)) ?? [];
     const base = y * stride; // raw[base] stays 0: filter type None
     for (let x = 0; x < width; x++) {
-      if (row[Math.floor(x / scale)]) continue; // dark module ⇒ 0 bit
+      if (row.at(Math.floor(x / scale))) continue; // dark module ⇒ 0 bit
       const index = base + 1 + (x >> 3);
-      raw[index] = (raw[index] as number) | (0x80 >> (x & 7));
+      raw.set([(raw.at(index) ?? 0) | (0x80 >> (x & 7))], index);
     }
   }
   return raw;

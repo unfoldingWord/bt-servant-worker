@@ -95,6 +95,8 @@ import {
   parseShareQrPath,
   SHARE_QR_BARE_PATH,
   SHARE_QR_PATH_PREFIX,
+  SHARE_QR_SIGNATURE_PARAM,
+  verifyShareQrSignature,
 } from './utils/share-qr.js';
 import { renderQrPngForText } from './utils/share-qr-png.js';
 import {
@@ -218,10 +220,11 @@ app.get('/public/ptxprint/*', async (c) => servePublicPtxprintObject(c.req.path,
 
 // Public share QR images (#474) — no auth required. Meta's media fetcher loads
 // the image by link when the WhatsApp gateway sends it, so it cannot carry our
-// API key. The image only ever encodes a wa.me link to WHATSAPP_NUMBER (see
-// utils/share-qr.ts), so the route is not an open QR generator.
-app.get(SHARE_QR_BARE_PATH, async (c) => serveShareQrPng(c.req.path, c.env));
-app.get(`${SHARE_QR_PATH_PREFIX}/*`, async (c) => serveShareQrPng(c.req.path, c.env));
+// API key. The image only ever encodes a wa.me link to WHATSAPP_NUMBER, and the
+// URL must carry the worker's signature over the code (see utils/share-qr.ts),
+// so only URLs the worker issued are rendered.
+app.get(SHARE_QR_BARE_PATH, async (c) => serveShareQrPng(c.req.url, c.env));
+app.get(`${SHARE_QR_PATH_PREFIX}/*`, async (c) => serveShareQrPng(c.req.url, c.env));
 
 /**
  * Rejections of a VALID partner key that is used outside its scope: the key
@@ -3345,17 +3348,24 @@ async function servePublicPtxprintObject(path: string, env: Env): Promise<Respon
 }
 
 /**
- * Render the share QR PNG for a `/public/share-qr…` path (#474). 404 for a
- * path that is not a valid share code or a reserved clear token; 503 when the
- * worker has no valid WHATSAPP_NUMBER (a config fault, logged as an error).
+ * Render the share QR PNG for a `/public/share-qr…` URL (#474). 404 for a path
+ * that is not a valid share code, a missing or wrong signature, or a reserved
+ * clear token; 503 when the worker has no valid WHATSAPP_NUMBER (a config
+ * fault, logged as an error).
  */
-async function serveShareQrPng(path: string, env: Env): Promise<Response> {
+async function serveShareQrPng(requestUrl: string, env: Env): Promise<Response> {
   const start = Date.now();
   // Public route: no request-scoped logger exists yet (same as ptxprint above).
   const logger = createRequestLogger(crypto.randomUUID());
-  const parsed = parseShareQrPath(path);
+  const url = new URL(requestUrl);
+  const parsed = parseShareQrPath(url.pathname);
   if (!parsed) {
-    logger.warn('share_qr_invalid_path', { path });
+    logger.warn('share_qr_invalid_path', { path: url.pathname });
+    return Response.json({ error: 'Not found' }, { status: 404 });
+  }
+  const signature = url.searchParams.get(SHARE_QR_SIGNATURE_PARAM);
+  if (!(await verifyShareQrSignature(env.ENGINE_API_KEY, parsed.code, signature))) {
+    logger.warn('share_qr_bad_signature', { code: parsed.code, has_signature: !!signature });
     return Response.json({ error: 'Not found' }, { status: 404 });
   }
   if (!normalizeWhatsAppNumber(env.WHATSAPP_NUMBER)) {

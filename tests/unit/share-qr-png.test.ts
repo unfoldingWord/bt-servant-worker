@@ -28,14 +28,14 @@ describe('encodeQrMatrix', () => {
     const size = m.length;
     for (let i = 0; i < size; i++) {
       for (let b = 0; b < SHARE_QR_BORDER; b++) {
-        expect(m[b]?.[i]).toBe(false);
-        expect(m[size - 1 - b]?.[i]).toBe(false);
-        expect(m[i]?.[b]).toBe(false);
-        expect(m[i]?.[size - 1 - b]).toBe(false);
+        expect(m.at(b)?.at(i)).toBe(false);
+        expect(m.at(size - 1 - b)?.at(i)).toBe(false);
+        expect(m.at(i)?.at(b)).toBe(false);
+        expect(m.at(i)?.at(size - 1 - b)).toBe(false);
       }
     }
     // The top-left finder pattern starts right after the border.
-    expect(m[SHARE_QR_BORDER]?.[SHARE_QR_BORDER]).toBe(true);
+    expect(m.at(SHARE_QR_BORDER)?.at(SHARE_QR_BORDER)).toBe(true);
   });
 });
 
@@ -49,8 +49,8 @@ describe('renderQrPng', () => {
     expect(png.height).toBe(matrix.length * 3);
     for (let y = 0; y < png.height; y++) {
       for (let x = 0; x < png.width; x++) {
-        const dark = matrix[Math.floor(y / 3)]?.[Math.floor(x / 3)];
-        expect(png.gray[y * png.width + x]).toBe(dark ? 0 : 255);
+        const dark = matrix.at(Math.floor(y / 3))?.at(Math.floor(x / 3));
+        expect(png.gray.at(y * png.width + x)).toBe(dark ? 0 : 255);
       }
     }
   });
