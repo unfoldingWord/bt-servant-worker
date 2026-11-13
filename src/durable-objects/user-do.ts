@@ -85,6 +85,7 @@ import {
   AppError,
   AudioTranscriptionError,
   RouteChainExhaustedError,
+  UpstreamSpendLimitError,
   ValidationError,
 } from '../utils/errors.js';
 import { createRequestLogger, RequestLogger, withEndpointLogging } from '../utils/logger.js';
@@ -841,11 +842,17 @@ export function resolveStatusLocale(
  * `error_processing_failed` (#481). An internal `Error.message` (for example
  * a stream abort's `upstream-abort` reason, as logged in #481) is never put on
  * the error event or callback, on any transport. The cause is diagnostic and
- * goes to the logs, which every caller writes before sending this. Pure: callers resolve
+ * goes to the logs, which every caller writes before sending this. The one
+ * exception is a spend or billing stop (#468), which gets its own localized
+ * `error_service_unavailable`; still no upstream text. Pure: callers resolve
  * `locale` before their `try`, so no storage read ever happens inside a catch
  * block.
  */
-export function processingFailureDetail(locale: string): string {
+export function processingFailureDetail(locale: string, error?: unknown): string {
+  // #468: a spend or billing stop lasts until a person acts, so "try again"
+  // style text is wrong; say the service is unavailable instead.
+  if (error instanceof UpstreamSpendLimitError)
+    return uiString(locale, 'error_service_unavailable');
   return uiString(locale, 'error_processing_failed');
 }
 
@@ -1305,13 +1312,18 @@ export class UserDO {
           status: error.statusCode,
         });
       }
+      if (error instanceof UpstreamSpendLimitError) {
+        // #468: localized text only; the upstream body is in the logs.
+        const detail = processingFailureDetail(locale, error);
+        return createErrorResponse(detail, error.code, detail, error.statusCode);
+      }
       return createErrorResponse(error.name, error.code, error.message, error.statusCode);
     }
     logger.error('immediate_final_error', error, { message_id: messageId });
     return createErrorResponse(
       uiString(locale, 'error_processing_failed'),
       'INTERNAL_ERROR',
-      processingFailureDetail(locale),
+      processingFailureDetail(locale, error),
       500
     );
   }
@@ -1335,7 +1347,7 @@ export class UserDO {
       } catch (error) {
         this.logFailedChatTurn(body, error, logger);
         logger.error('immediate_callback_error', error, { message_id: messageId });
-        await callbacks?.onError?.(processingFailureDetail(locale));
+        await callbacks?.onError?.(processingFailureDetail(locale, error));
       } finally {
         await this.releaseLock();
         await this.drainQueue(logger);
@@ -1397,7 +1409,7 @@ export class UserDO {
       } catch (error) {
         this.logFailedChatTurn(body, error, logger);
         logger.error('immediate_sse_error', error, { message_id: messageId });
-        await sendEvent({ type: 'error', error: processingFailureDetail(locale) });
+        await sendEvent({ type: 'error', error: processingFailureDetail(locale, error) });
       } finally {
         clearInterval(keepaliveInterval);
         await this.closeSSEWriter(writer, 'processImmediateSSE', messageId, logger);
@@ -1573,7 +1585,7 @@ export class UserDO {
       const response = await this.processChat(body, workerOrigin, logger, timing, callbacks);
       await callbacks?.onComplete?.(response);
     } catch (error) {
-      await callbacks?.onError?.(processingFailureDetail(locale));
+      await callbacks?.onError?.(processingFailureDetail(locale, error));
       throw error;
     }
   }
@@ -1683,7 +1695,7 @@ export class UserDO {
       // Send error to SSE client BEFORE closing the writer — if we let this propagate
       // to processQueueEntry's handleProcessingError, the writer is already closed.
       logger.error('sse_entry_processing_error', error, { message_id: entry.message_id });
-      await sendEvent({ type: 'error', error: processingFailureDetail(locale) });
+      await sendEvent({ type: 'error', error: processingFailureDetail(locale, error) });
       throw error; // Re-throw for retry logic in processQueueEntry
     } finally {
       clearInterval(keepaliveInterval);
@@ -1855,7 +1867,10 @@ export class UserDO {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const maxRetries = this.getMaxRetries();
 
-    if (this.isTransientError(errorMessage) && entry.retry_count < maxRetries) {
+    // #468: a spend or billing stop fails every retry the same way; never re-run it.
+    const retryable =
+      !(error instanceof UpstreamSpendLimitError) && this.isTransientError(errorMessage);
+    if (retryable && entry.retry_count < maxRetries) {
       const reinserted = await this.reEnqueue({ ...entry, retry_count: entry.retry_count + 1 });
       if (reinserted) {
         logger.warn('queue_entry_retry', {
@@ -1885,7 +1900,7 @@ export class UserDO {
       const locale = resolveStatusLocale(entry.body, DEFAULT_PREFERENCES);
       try {
         const encoder = new TextEncoder();
-        const event: SSEEvent = { type: 'error', error: processingFailureDetail(locale) };
+        const event: SSEEvent = { type: 'error', error: processingFailureDetail(locale, error) };
         await writer.write(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
         await writer.close();
       } catch (writeErr) {

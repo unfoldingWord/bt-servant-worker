@@ -42,6 +42,7 @@ import type {
   UserPreferencesInternal,
 } from '../../src/types/engine.js';
 import type { InternalQueueEntry } from '../../src/types/queue.js';
+import { UpstreamSpendLimitError } from '../../src/utils/errors.js';
 import type { RequestLogger } from '../../src/utils/logger.js';
 import { createTimingContext, type TimingContext } from '../../src/utils/timing.js';
 import type { Env } from '../../src/config/types.js';
@@ -683,5 +684,91 @@ describe('SSE status contract (#405)', () => {
     ]);
     for (const s of statuses) expect(STATUS_KEYS).toContain(s.key);
     expect(events.at(-1)?.type).toBe('complete');
+  });
+});
+
+/*
+ * A spend or billing stop (#468): the user gets the localized "service
+ * unavailable" text, never the upstream body, and the queue never re-runs it.
+ */
+
+/** An UpstreamSpendLimitError whose message would otherwise look transient to the queue. */
+function spendStop(): UpstreamSpendLimitError {
+  const error = new UpstreamSpendLimitError('spend_limit', 400, 'primary');
+  // `isTransientError` matches "timeout"; the guard must win over the regex.
+  Object.defineProperty(error, 'message', { value: 'upstream timeout while spend-limited' });
+  return error;
+}
+
+describe('UserDO: spend-limit stop (#468)', () => {
+  it('processingFailureDetail picks error_service_unavailable for a spend stop, in the user language', () => {
+    expect(processingFailureDetail('pt', spendStop())).toBe(
+      UI_STRINGS.pt.error_service_unavailable
+    );
+    expect(processingFailureDetail('en', new Error('boom'))).toBe(
+      UI_STRINGS.en.error_processing_failed
+    );
+  });
+
+  it('immediate SSE: the error frame carries the localized text and nothing from upstream', async () => {
+    const userDo = createDO();
+    const logger = createMockLogger();
+    vi.spyOn(userDo, 'processChat').mockRejectedValue(spendStop());
+
+    const res = await userDo.dispatchUnifiedChat(
+      textBody,
+      new Request('https://do.test/chat'),
+      'sse',
+      logger
+    );
+    const events = await readSSEEvents(res);
+
+    expect(events.at(-1)).toEqual({
+      type: 'error',
+      error: UI_STRINGS.pt.error_service_unavailable,
+    });
+  });
+});
+
+describe('UserDO: spend-limit stop, final and queued transports (#468)', () => {
+  it('final mode: 503 with code UPSTREAM_SPEND_LIMIT and localized text only', async () => {
+    const userDo = createDO();
+    const logger = createMockLogger();
+    vi.spyOn(userDo, 'processChat').mockRejectedValue(spendStop());
+
+    const res = await userDo.dispatchUnifiedChat(
+      textBody,
+      new Request('https://do.test/chat'),
+      'final',
+      logger
+    );
+
+    expect(res.status).toBe(503);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).toEqual({
+      error: UI_STRINGS.pt.error_service_unavailable,
+      code: 'UPSTREAM_SPEND_LIMIT',
+      message: UI_STRINGS.pt.error_service_unavailable,
+    });
+    expect(JSON.stringify(body)).not.toMatch(/timeout|usage limit/i);
+  });
+
+  it('queued SSE: the turn runs once (no retry) and the client gets the localized error', async () => {
+    const userDo = createDO();
+    const logger = createMockLogger();
+    const processChat = vi.spyOn(userDo, 'processChat').mockRejectedValue(spendStop());
+
+    const res = await userDo.enqueueAndReturn(textBody, 'msg-spend', '', 'pt', logger);
+    const eventsPending = readSSEEvents(res);
+    await userDo.drainQueue(logger);
+    const events = await eventsPending;
+
+    expect(processChat).toHaveBeenCalledTimes(1);
+    expect(logger.warn).not.toHaveBeenCalledWith('queue_entry_retry', expect.anything());
+    const errors = events.filter((e) => e.type === 'error');
+    expect(errors.length).toBeGreaterThan(0);
+    for (const e of errors) {
+      expect(e).toEqual({ type: 'error', error: UI_STRINGS.pt.error_service_unavailable });
+    }
   });
 });
