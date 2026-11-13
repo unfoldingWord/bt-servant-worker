@@ -19,10 +19,11 @@
  *   Its message reads "You have reached your API usage limits: ...".
  * - Billing problem (for example a declined card): HTTP 402, `billing_error`.
  *
- * Match rules, in order (first hit wins):
+ * Only HTTP 400, 402 and 429 are inspected (the documented spend and billing
+ * statuses). Match rules, in order (first hit wins):
  * 1. `error.type === "billing_error"` or HTTP 402 → `billing`.
- * 2. `error.details.error_code === "enforced_spend_limit_reached"` on any
- *    status → `spend_cap` for a 429, `spend_limit` otherwise.
+ * 2. `error.details.error_code === "enforced_spend_limit_reached"` →
+ *    `spend_cap` for a 429, `spend_limit` otherwise.
  * 3. HTTP 400 or 429 whose message (the parsed `error.message`, else the raw
  *    body) matches {@link SPEND_MESSAGE_PATTERNS} → `spend_limit` for a 400,
  *    `spend_cap` for a 429. A 429 that carries `retry-after` is excluded: that

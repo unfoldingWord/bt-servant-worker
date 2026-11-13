@@ -585,3 +585,42 @@ describe('route chain — non-spend errors keep their handling (#468)', () => {
     expect(eventsNamed(sink, 'anthropic_spend_limit_reached')).toHaveLength(0);
   });
 });
+
+describe('route chain — unreadable error bodies (#468)', () => {
+  /** A response whose body stream errors on read. */
+  const unreadable = (code: number): Response =>
+    new Response(
+      new ReadableStream({
+        pull(controller) {
+          controller.error(new Error('socket reset'));
+        },
+      }),
+      { status: code }
+    );
+
+  it('an unreadable 402 is still a billing stop (status alone), logged, with no retry', async () => {
+    const sink: LoggedEvent[] = [];
+    const calls = scriptFetch(() => unreadable(402));
+
+    const caught = await run(fullEnv(), sink).catch((error: unknown) => error);
+
+    expect(caught).toMatchObject({ kind: 'billing', code: 'UPSTREAM_BILLING' });
+    expect(calls).toHaveLength(1);
+    expect(eventsNamed(sink, 'claude_error_body_unreadable')[0]!.data).toMatchObject({
+      status: 402,
+      error: 'socket reset',
+    });
+  });
+
+  it('an unreadable ordinary 429 is logged and keeps its retry policy', async () => {
+    const sink: LoggedEvent[] = [];
+    const calls = scriptFetch((c, i) => (i === 0 ? unreadable(429) : json(message('ok', c.model))));
+
+    const result = await run(fullEnv(), sink);
+
+    expect(result.responses).toEqual(['ok']);
+    expect(calls).toHaveLength(2);
+    expect(eventsNamed(sink, 'claude_error_body_unreadable')).toHaveLength(1);
+    expect(eventsNamed(sink, 'anthropic_spend_limit_reached')).toHaveLength(0);
+  });
+});
