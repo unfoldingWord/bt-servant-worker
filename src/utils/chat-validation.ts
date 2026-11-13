@@ -282,6 +282,8 @@ function validateClientOwnedFields(body: ChatRequest, isGroup: boolean): string 
   if (welcomeError) return welcomeError;
   const memoryError = validateOptionalBoolean(body.suppress_memory, 'suppress_memory');
   if (memoryError) return memoryError;
+  const shareQrError = validateOptionalBoolean(body.accepts_share_qr, 'accepts_share_qr');
+  if (shareQrError) return shareQrError;
   const historyError = validateClientHistory(body.history);
   if (historyError) return historyError;
   if (isGroup && hasClientHistory(body)) {

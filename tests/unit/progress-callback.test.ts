@@ -261,6 +261,60 @@ describe('createWebhookCallbacks onComplete forwards attachments', () => {
   });
 });
 
+describe('createWebhookCallbacks share_qr (#474)', () => {
+  beforeEach(setupMocks);
+
+  const QR = {
+    url: 'https://api.example.test/public/share-qr/spoken.png',
+    caption:
+      'Share BT Servant with others: scan this code, or forward this image.\nhttps://wa.me/1',
+    code: 'spoken',
+  };
+  const RESPONSE = { responses: ['ok'], response_language: 'en', voice_audio_base64: null };
+
+  function completeBodies(): Array<Record<string, unknown>> {
+    return (fetch as ReturnType<typeof vi.fn>).mock.calls
+      .map((call: unknown[]) => JSON.parse((call as [string, { body: string }])[1].body))
+      .filter((body: Record<string, unknown>) => body.type === 'complete');
+  }
+
+  it('carries the handed-over QR on the complete callback, after the answer text', async () => {
+    const sender = new ProgressCallbackSender(mockConfig);
+    const callbacks = createWebhookCallbacks(sender, testLogger);
+    expect(callbacks.onShareQr).toBeTypeOf('function');
+    callbacks.onShareQr?.(QR);
+    callbacks.onComplete(RESPONSE);
+    await vi.runAllTimersAsync();
+    const [complete] = completeBodies();
+    expect(complete?.text).toBe('ok');
+    expect(complete?.share_qr).toEqual(QR);
+  });
+
+  it('sends a complete for the QR alone when the answer already streamed', async () => {
+    const sender = new ProgressCallbackSender(mockConfig);
+    const callbacks = createWebhookCallbacks(sender, testLogger);
+    callbacks.onIterationComplete?.('ok');
+    callbacks.onShareQr?.(QR);
+    callbacks.onComplete(RESPONSE);
+    await vi.runAllTimersAsync();
+    const completes = completeBodies();
+    expect(completes).toHaveLength(1);
+    expect(completes[0]).not.toHaveProperty('text');
+    expect(completes[0]?.share_qr).toEqual(QR);
+  });
+
+  it('adds no share_qr key when none was handed over (payload unchanged)', async () => {
+    const sender = new ProgressCallbackSender(mockConfig);
+    const callbacks = createWebhookCallbacks(sender, testLogger);
+    callbacks.onComplete(RESPONSE);
+    await vi.runAllTimersAsync();
+    const [complete] = completeBodies();
+    expect(Object.keys(complete ?? {}).sort()).toEqual(
+      ['message_key', 'text', 'timestamp', 'type', 'user_id'].sort()
+    );
+  });
+});
+
 describe('createWebhookCallbacks onComplete forwards audio', () => {
   beforeEach(setupMocks);
 

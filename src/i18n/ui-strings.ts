@@ -61,6 +61,11 @@ const en = {
    * `Error.message` is forwarded, on any transport.
    */
   error_processing_failed: 'Processing failed',
+  /**
+   * Caption on the one-time share QR image (#474), sent on WhatsApp after the
+   * answer. The wa.me link follows it on its own line.
+   */
+  share_qr_caption: 'Share BT Servant with others: scan this code, or forward this image.',
 } as const satisfies Record<string, UiStringValue>;
 
 /** Every worker-emitted UI string key. */
@@ -88,6 +93,8 @@ const pt = {
     '\n\n⚠️ Minha resposta foi interrompida antes que eu pudesse terminá-la. ' +
     'Envie "continue" se quiser o restante.',
   error_processing_failed: 'Falha no processamento',
+  share_qr_caption:
+    'Compartilhe o BT Servant com outras pessoas: escaneie este código ou encaminhe esta imagem.',
 } as const satisfies Record<UiStringKey, UiStringValue>;
 
 /** Locale → table. Keys are ISO 639-1 primary subtags, lower-case. */
