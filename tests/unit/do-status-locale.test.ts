@@ -772,3 +772,66 @@ describe('UserDO: spend-limit stop, final and queued transports (#468)', () => {
     }
   });
 });
+
+const spendCallbackBody: ChatRequest = {
+  ...textBody,
+  progress_callback_url: 'https://example.test/cb',
+  message_key: 'k',
+};
+
+describe('UserDO: spend-limit stop, queued callback (#468)', () => {
+  it('queued callback: onError gets the localized text and the spend stop (not a notify failure) is rethrown', async () => {
+    const userDo = createDO();
+    const logger = createMockLogger();
+    const stop = spendStop();
+    const onError = vi.fn(async () => {
+      throw new Error('webhook timeout');
+    });
+    vi.spyOn(userDo, 'buildWebhookCallbacks').mockReturnValue({
+      onStatus: vi.fn(),
+      onProgress: vi.fn(),
+      onComplete: vi.fn(),
+      onError,
+    });
+    vi.spyOn(userDo, 'processChat').mockRejectedValue(stop);
+    const entry: InternalQueueEntry = {
+      message_id: 'msg-cb-spend',
+      body: spendCallbackBody,
+      enqueued_at: Date.now(),
+      retry_count: 0,
+    };
+
+    await expect(userDo.processCallbackEntry(entry, logger)).rejects.toBe(stop);
+    expect(onError).toHaveBeenCalledWith(UI_STRINGS.pt.error_service_unavailable);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'callback_error_notify_failed',
+      expect.objectContaining({ message_id: 'msg-cb-spend', error: 'webhook timeout' })
+    );
+  });
+});
+
+describe('UserDO: spend-limit stop, immediate callback (#468)', () => {
+  it('immediate callback: onError gets the localized service-unavailable text', async () => {
+    const userDo = createDO();
+    const logger = createMockLogger();
+    const onError = vi.fn();
+    vi.spyOn(userDo, 'buildWebhookCallbacks').mockReturnValue({
+      onStatus: vi.fn(),
+      onProgress: vi.fn(),
+      onComplete: vi.fn(),
+      onError,
+    });
+    vi.spyOn(userDo, 'processChat').mockRejectedValue(spendStop());
+
+    const res = await userDo.dispatchUnifiedChat(
+      spendCallbackBody,
+      new Request('https://do.test/chat'),
+      'callback',
+      logger
+    );
+    expect(res.status).toBe(202);
+    await vi.waitFor(() =>
+      expect(onError).toHaveBeenCalledWith(UI_STRINGS.pt.error_service_unavailable)
+    );
+  });
+});

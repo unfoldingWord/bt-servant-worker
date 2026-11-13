@@ -1585,7 +1585,16 @@ export class UserDO {
       const response = await this.processChat(body, workerOrigin, logger, timing, callbacks);
       await callbacks?.onComplete?.(response);
     } catch (error) {
-      await callbacks?.onError?.(processingFailureDetail(locale, error));
+      // Rethrow the PROCESSING error, never a notification failure: the queue's
+      // retry decision must see the real cause (a #468 spend stop is never re-run).
+      try {
+        await callbacks?.onError?.(processingFailureDetail(locale, error));
+      } catch (notifyError) {
+        logger.warn('callback_error_notify_failed', {
+          message_id: entry.message_id,
+          error: notifyError instanceof Error ? notifyError.message : String(notifyError),
+        });
+      }
       throw error;
     }
   }
