@@ -442,6 +442,13 @@ async function fetchPublic(path: string, overrides: Partial<Env> = {}): Promise<
   return res;
 }
 
+/** Silence the route's structured logs (tests that read them re-spy). */
+function quietConsole(): void {
+  vi.spyOn(console, 'log').mockImplementation(() => {});
+  vi.spyOn(console, 'warn').mockImplementation(() => {});
+  vi.spyOn(console, 'error').mockImplementation(() => {});
+}
+
 /** A worker-issued (signed) image path for `code`, as the DO builds it. */
 async function signedPath(code: string | null): Promise<string> {
   const sig = await shareQrSignature(env.ENGINE_API_KEY, code);
@@ -449,11 +456,7 @@ async function signedPath(code: string | null): Promise<string> {
 }
 
 describe('share QR — public PNG route (#474)', () => {
-  beforeEach(() => {
-    vi.spyOn(console, 'log').mockImplementation(() => {});
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
-    vi.spyOn(console, 'error').mockImplementation(() => {});
-  });
+  beforeEach(quietConsole);
   afterEach(() => vi.restoreAllMocks());
 
   const cases: Array<[string | null, string]> = [
@@ -475,17 +478,15 @@ describe('share QR — public PNG route (#474)', () => {
   }
 });
 
-describe('share QR — public PNG route refusals and caching (#474)', () => {
-  beforeEach(() => {
-    vi.spyOn(console, 'log').mockImplementation(() => {});
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
-    vi.spyOn(console, 'error').mockImplementation(() => {});
-  });
+describe('share QR — public PNG route refusals (#474)', () => {
+  beforeEach(quietConsole);
   afterEach(() => vi.restoreAllMocks());
 
   it('404s an unsigned URL, a wrong signature, and a signature for another code', async () => {
     expect((await fetchPublic('/public/share-qr/spoken.png')).status).toBe(404);
     expect((await fetchPublic('/public/share-qr/spoken.png?s=00')).status).toBe(404);
+    const upper = (await shareQrSignature(env.ENGINE_API_KEY, 'spoken')).toUpperCase();
+    expect((await fetchPublic(`/public/share-qr/spoken.png?s=${upper}`)).status).toBe(404);
     const other = await shareQrSignature(env.ENGINE_API_KEY, 'fia-coach');
     expect((await fetchPublic(`/public/share-qr/spoken.png?s=${other}`)).status).toBe(404);
   });
@@ -504,6 +505,11 @@ describe('share QR — public PNG route refusals and caching (#474)', () => {
       expect((await fetchPublic(path)).status).toBe(404);
     });
   }
+});
+
+describe('share QR — public PNG route caching and config (#474)', () => {
+  beforeEach(quietConsole);
+  afterEach(() => vi.restoreAllMocks());
 
   it('renders once per link: a replay or an extra query parameter is a cache hit', async () => {
     const lines: string[] = [];
@@ -522,6 +528,30 @@ describe('share QR — public PNG route refusals and caching (#474)', () => {
     expect(served).toHaveLength(3);
     expect(served.filter((l) => l.includes('"cache":"miss"'))).toHaveLength(1);
     expect(served.filter((l) => l.includes('"cache":"hit"'))).toHaveLength(2);
+  });
+
+  it('a different WHATSAPP_NUMBER renders (and caches) a different image', async () => {
+    const path = await signedPath('spoken');
+    const res = await fetchPublic(path, { WHATSAPP_NUMBER: '+44 20 7946 0000' });
+    expect(res.status).toBe(200);
+    const png = await decodeGrayPng(new Uint8Array(await res.arrayBuffer()));
+    expect(scanQr(png)).toBe('https://wa.me/442079460000?text=%23spoken');
+  });
+
+  it('serves the PNG when the cache throws, and logs both failures', async () => {
+    const lines: string[] = [];
+    vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+      lines.push(args.map(String).join(' '));
+    });
+    vi.spyOn(caches.default, 'match').mockRejectedValue(new Error('cache down'));
+    vi.spyOn(caches.default, 'put').mockRejectedValue(new Error('cache down'));
+    const res = await fetchPublic(await signedPath('fia-coach'));
+    expect(res.status).toBe(200);
+    expect(scanQr(await decodeGrayPng(new Uint8Array(await res.arrayBuffer())))).toBe(
+      `${LINK}?text=%23fia-coach`
+    );
+    expect(lines.some((l) => l.includes('share_qr_cache_match_failed'))).toBe(true);
+    expect(lines.some((l) => l.includes('share_qr_cache_put_failed'))).toBe(true);
   });
 
   it('503s when WHATSAPP_NUMBER is not configured', async () => {

@@ -34,6 +34,7 @@ const SIGNATURE_LABEL = 'bt-servant:share-qr:v1:';
 
 /** Hex chars kept from the HMAC-SHA256 (128 bits). */
 const SIGNATURE_HEX_LENGTH = 32;
+const SIGNATURE_SHAPE = /^[0-9a-f]{32}$/;
 
 /**
  * Signature over `code` (null ⇒ the bare link), keyed by a worker secret.
@@ -63,7 +64,8 @@ export async function verifyShareQrSignature(
   code: string | null,
   signature: string | null | undefined
 ): Promise<boolean> {
-  if (!secret || !signature) return false;
+  // Reject a malformed signature before spending an HMAC on it.
+  if (!secret || !signature || !SIGNATURE_SHAPE.test(signature)) return false;
   return constantTimeCompare(await shareQrSignature(secret, code), signature);
 }
 
