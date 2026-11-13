@@ -402,7 +402,7 @@ export interface UpdatePreferencesRequest {
  * SSE event types for streaming endpoint
  */
 export type SSEEventType =
-  'status' | 'progress' | 'complete' | 'error' | 'tool_use' | 'tool_result';
+  'status' | 'progress' | 'complete' | 'error' | 'tool_use' | 'tool_result' | 'retract';
 
 /**
  * Worker-emitted status line. `key` is the stable identifier clients should
@@ -417,6 +417,30 @@ export interface SSEStatusEvent extends StatusUpdate {
 export interface SSEProgressEvent {
   type: 'progress';
   text: string;
+}
+
+/**
+ * What a `retract` frame carries (#421). Spec: README "SSE Event Types".
+ *
+ * Meaning: discard ALL `progress` text received since the turn started or
+ * since the previous `retract`, whichever is later. Sent when a model round
+ * that streamed text turns out to end in tool calls, so that text was
+ * narration ("Let me look that up…"), not the answer.
+ */
+export interface RetractNotice {
+  /** 0-based orchestration round whose text is being retracted. */
+  iteration: number;
+  /**
+   * Length (JavaScript string length, i.e. UTF-16 code units) of the
+   * `progress` text being discarded. For checking and telemetry only; a client
+   * discards everything since the last retract regardless of this number.
+   */
+  chars: number;
+}
+
+/** SSE transport ONLY. Never sent to a callback webhook (gateways 400 on it). */
+export interface SSERetractEvent extends RetractNotice {
+  type: 'retract';
 }
 
 export interface SSECompleteEvent {
@@ -447,7 +471,8 @@ export type SSEEvent =
   | SSECompleteEvent
   | SSEErrorEvent
   | SSEToolUseEvent
-  | SSEToolResultEvent;
+  | SSEToolResultEvent
+  | SSERetractEvent;
 
 /**
  * Stream callbacks interface for orchestrator
@@ -461,6 +486,16 @@ export interface StreamCallbacks {
   onToolUse?: (toolName: string, input: unknown) => void;
   onToolResult?: (toolName: string, result: unknown) => void;
   onIterationComplete?: (text: string) => void;
+  /**
+   * SSE transport ONLY (#421). Present means "this transport can take back
+   * streamed text": the orchestrator then sends a `retract` after any round
+   * whose streamed text turned out to precede tool calls, and the turn's
+   * `responses` (the `complete` payload and saved history) carry only the text
+   * streamed after the last retract. MUST stay absent on the callback/webhook
+   * transport: the gateways return 400 on an unknown event type, and their
+   * narration is deliberately unchanged (Ian, #421, 2026-11-11).
+   */
+  onRetract?: (retract: RetractNotice) => void;
   /**
    * Deliver a one-time mode first-contact welcome (#311) as its OWN message
    * ahead of the model's answer. Present only on transports that render each

@@ -22,7 +22,18 @@ export interface ProgressCallbackConfig {
   thread_id?: string;
 }
 
-type CallbackPayloadType = 'status' | 'progress' | 'complete' | 'error';
+/**
+ * The event types a callback webhook accepts. The gateways (WhatsApp,
+ * Telegram, Signal) return 400 on anything else, so `post` refuses any other
+ * type at runtime too (#421: an SSE-only `retract` must never reach them).
+ */
+const CALLBACK_PAYLOAD_TYPES = ['status', 'progress', 'complete', 'error'] as const;
+
+type CallbackPayloadType = (typeof CALLBACK_PAYLOAD_TYPES)[number];
+
+function isCallbackPayloadType(type: unknown): type is CallbackPayloadType {
+  return (CALLBACK_PAYLOAD_TYPES as readonly unknown[]).includes(type);
+}
 
 /**
  * Internal payload shape sent over the wire. Must stay in sync with the
@@ -204,8 +215,9 @@ export class ProgressCallbackSender {
   private async post(
     payload: Omit<CallbackPayload, 'user_id' | 'message_key' | 'timestamp'>
   ): Promise<void> {
-    const fullPayload = this.buildPayload(payload);
     const ctx = { type: payload.type, user_id: this.config.user_id };
+    if (this.refuseUnsupportedType(payload.type, ctx)) return;
+    const fullPayload = this.buildPayload(payload);
     this.logOutgoing(payload, ctx);
 
     try {
@@ -237,6 +249,18 @@ export class ProgressCallbackSender {
         ...ctx,
       });
     }
+  }
+
+  /**
+   * Defense in depth (#421): the type system already rules out a non-webhook
+   * event type, but a cast or a future callback wiring must never turn into a
+   * gateway 400. A refused send is logged at error level and metered.
+   */
+  private refuseUnsupportedType(type: unknown, ctx: { type: string; user_id: string }): boolean {
+    if (isCallbackPayloadType(type)) return false;
+    this.logger?.error('webhook_payload_type_refused', new Error('unsupported callback type'), ctx);
+    countMetric('progress_webhook_total', { type: String(type), status: 'refused' });
+    return true;
   }
 
   private buildPayload(
@@ -304,6 +328,30 @@ export class ProgressCallbackSender {
 
 /** Default progress mode */
 export const DEFAULT_PROGRESS_MODE: ProgressMode = 'iteration';
+
+/**
+ * The progress mode a callback turn actually runs in.
+ *
+ * #421 Q3 (Ian, 2026-11-11): `periodic` and `sentence` no longer send
+ * incremental text. No known sender uses them (every gateway sends
+ * `iteration`), but logs do not record progress_mode, so for one release they
+ * are coerced to `iteration` with a warning, so a hidden sender shows up in
+ * the logs instead of going quiet.
+ *
+ * TODO(#421): remove this coercion, and the periodic/sentence code paths it
+ * makes unreachable (`IncrementalProgressSender`), in the release after the
+ * one that ships it.
+ */
+export function resolveProgressMode(
+  requested: ProgressMode | undefined,
+  logger: RequestLogger
+): ProgressMode {
+  const mode = requested ?? DEFAULT_PROGRESS_MODE;
+  if (mode !== 'periodic' && mode !== 'sentence') return mode;
+  logger.warn('progress_mode_coerced', { requested: mode, applied: 'iteration', issue: 421 });
+  countMetric('progress_mode_coerced_total', { reason: mode });
+  return 'iteration';
+}
 
 /** Default throttle for periodic mode */
 export const DEFAULT_THROTTLE_SECONDS = 5;
