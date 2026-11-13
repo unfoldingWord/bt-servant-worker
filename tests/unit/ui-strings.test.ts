@@ -34,6 +34,8 @@ const EXPECTED_KEYS: readonly UiStringKey[] = [
   // #481: appended after an answer cut short by a stalled stream or max_tokens.
   'notice_answer_truncated',
   'error_processing_failed',
+  // #474: caption on the one-time WhatsApp share QR image.
+  'share_qr_caption',
 ];
 
 /** Every textual form a table value can take (plain string, or plural pair). */

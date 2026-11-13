@@ -42,6 +42,7 @@ import {
   ChatResponse,
   ChatTransport,
   SSEEvent,
+  ShareQrMedia,
   StoredIdentity,
   StreamCallbacks,
   UpdatePreferencesRequest,
@@ -65,6 +66,14 @@ import {
 } from '../types/prompt-overrides.js';
 import { resolveEffectiveMode } from '../types/mode-markdown.js';
 import { buildModeWelcomeText } from '../utils/mode-welcome.js';
+import { shareCodeOpensMode } from '../utils/mode-share-code.js';
+import { resolveOrgFromBody } from '../utils/org.js';
+import {
+  buildShareQrMedia,
+  dueShareQrCode,
+  shareQrFlagKey,
+  shareQrRequestSkip,
+} from '../utils/share-qr.js';
 import { WA_ME_ORIGIN } from '../utils/mode-share-link.js';
 import {
   transcribeAudio,
@@ -2269,17 +2278,97 @@ export class UserDO {
     // `complete` write, gated on the client still being connected) via
     // `deferInBandWelcomeRecord`; `/chat/final` (no such hook) records inline.
     // FIX 2: an emitted admin preview also persists `first_interaction:false`.
-    await this.finalizeEmittedWelcome(welcome, welcomeDelivery.handledOutOfBand, callbacks, logger);
-    // #311 FIX B: in-band recording ran (or was deferred to the SSE caller) — the
-    // wrapper's finally guard must NOT also arm pending. Set only after a clean
+    // #311 FIX B: `finalizeAndMarkWelcome` then marks the tracker finalized, so the
+    // wrapper's finally guard does NOT also arm pending. Set only after a clean
     // finalize.
-    welcomeTracker.finalized = true;
+    await this.finalizeAndMarkWelcome(welcome, welcomeDelivery.handledOutOfBand, welcomeTracker, callbacks, logger); // prettier-ignore
+    // #474: hand the one-time share QR to the webhook transport (no-op elsewhere).
+    await this.maybeAttachShareQr(body, loaded, workerOrigin, callbacks, logger);
 
     // prettier-ignore
     this.logChatTurn(body, effectivePreferences.response_language, logger, { turnId, activeModeName: triggerCtx.activeModeName, activeLanguageName: triggerCtx.activeLanguageName, languageSource: triggerCtx.languageSource, orchestration: orchResult.telemetry, durationMs: Date.now() - ctx.startTime, hadInboundVoice: !!loaded.inboundVoiceKey, hadOutboundVoice: audioKey !== null, inputLanguage, text: chatTurnText(triggerCtx.messageText, responses), ...clientOwnedTurnFacts(body) });
 
     // prettier-ignore
     return this.assembleChatResponse({ responses, audioKey, workerOrigin, attachmentsContext, effectivePreferences, inputLanguage, logger, startTime: ctx.startTime, historyReceipt: clientHistoryReceipt(body, saved) });
+  }
+
+  /**
+   * #474: attach the one-time share QR for this turn to the `complete` callback.
+   *
+   * Webhook transport only: `onShareQr` exists only on the callbacks built by
+   * `createWebhookCallbacks`, so SSE and `/chat/final` return before anything
+   * is read or written and their output is unchanged. The request must also
+   * opt in (`accepts_share_qr`, sent by the WhatsApp gateway) and be an
+   * unfoldingWord WhatsApp private chat (`shareQrRequestSkip`).
+   *
+   * Once per mode: the `share_qr_sent:<code>` flag is written BEFORE the QR is
+   * handed over, so a failed flag write sends nothing rather than risking a
+   * repeat. Delivery is the gateway's job: it retries a failed image send once,
+   * then skips and logs it; the worker never re-emits (decided 2026-11-05).
+   *
+   * Non-fatal: any failure here is logged and the turn's answer still goes out.
+   */
+  private async maybeAttachShareQr(
+    body: ChatRequest,
+    loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
+    workerOrigin: string,
+    callbacks: StreamCallbacks | undefined,
+    logger: RequestLogger
+  ): Promise<void> {
+    if (!callbacks?.onShareQr) return;
+    const org = resolveOrgFromBody(body, this.env.DEFAULT_ORG);
+    const skip = shareQrRequestSkip(body, org);
+    if (skip) {
+      if (skip !== 'not_opted_in') logger.log('share_qr_skipped', { reason: skip });
+      return;
+    }
+    try {
+      const qr = await this.resolveDueShareQr(loaded, workerOrigin, org, logger);
+      if (!qr) return;
+      await this.state.storage.put(shareQrFlagKey(qr.code), true);
+      callbacks.onShareQr(qr);
+      logger.log('share_qr_attached', { code: qr.code, locale: loaded.locale });
+    } catch (error) {
+      logger.warn('share_qr_attach_failed', {
+        error: error instanceof Error ? error.message : String(error),
+        user_id: body.user_id,
+      });
+    }
+  }
+
+  /**
+   * #474: the share QR due this turn, or null. Reads the end-of-turn mode
+   * (so a `switch_mode` this turn counts as entering it) and the flag.
+   */
+  private async resolveDueShareQr(
+    loaded: Awaited<ReturnType<UserDO['loadChatContext']>>,
+    workerOrigin: string,
+    org: string,
+    logger: RequestLogger
+  ): Promise<ShareQrMedia | null> {
+    const endMode = await this.getSelectedMode();
+    const due = dueShareQrCode({
+      startMode: loaded.activeModeName,
+      endMode,
+      firstInteraction: loaded.preferences.first_interaction === true,
+    });
+    if (!due) return null;
+    if (due.code !== null && !shareCodeOpensMode(due.code, loaded.orgModes.modes, org)) {
+      logger.log('share_qr_skipped', { reason: 'code_does_not_open_mode', code: due.code });
+      return null;
+    }
+    if (await this.state.storage.get<boolean>(shareQrFlagKey(due.code))) return null;
+    const qr = buildShareQrMedia({
+      whatsappNumber: this.env.WHATSAPP_NUMBER,
+      workerOrigin,
+      code: due.code,
+      locale: loaded.locale,
+    });
+    if (!qr) {
+      // prettier-ignore
+      logger.warn('share_qr_unbuildable', { code: due.code, whatsapp_number_configured: !!this.env.WHATSAPP_NUMBER, https_origin: workerOrigin.startsWith('https://') });
+    }
+    return qr;
   }
 
   /**
@@ -2626,6 +2715,22 @@ export class UserDO {
    * !clientDisconnected`. On `/chat/final` there is no stream to drop, so record
    * inline right here (as before). A throw before this point re-emits on retry.
    */
+  /**
+   * #311 FIX B: `finalizeEmittedWelcome`, then mark the in-band tracker
+   * finalized (only reached when finalize did not throw), so the wrapper's
+   * finally guard does not also arm a pending re-emit.
+   */
+  private async finalizeAndMarkWelcome(
+    welcome: ModeWelcome | undefined,
+    sentOutOfBand: boolean,
+    tracker: InBandWelcomeTracker,
+    callbacks: StreamCallbacks | undefined,
+    logger: RequestLogger
+  ): Promise<void> {
+    await this.finalizeEmittedWelcome(welcome, sentOutOfBand, callbacks, logger);
+    tracker.finalized = true;
+  }
+
   private async finalizeEmittedWelcome(
     welcome: ModeWelcome | undefined,
     sentOutOfBand: boolean,
