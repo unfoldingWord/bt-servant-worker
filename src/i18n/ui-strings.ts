@@ -57,6 +57,15 @@ const en = {
     '\n\n⚠️ My answer was cut off before I could finish it. ' +
     'Send "continue" if you would like the rest.',
   /**
+   * SSE turns only (#421, #158): every round of the turn ended in tool calls
+   * or empty, its narration was retracted, and the one tools-off recovery call
+   * produced no text either (or could not run). Streamed and persisted, so the
+   * turn never ends on a blank screen.
+   */
+  notice_empty_answer:
+    "I wasn't able to put an answer together this time. " +
+    'Please ask again, perhaps with a little more detail.',
+  /**
    * The only failure text a user ever receives (#481): no internal
    * `Error.message` is forwarded, on any transport.
    */
@@ -87,6 +96,9 @@ const pt = {
   notice_answer_truncated:
     '\n\n⚠️ Minha resposta foi interrompida antes que eu pudesse terminá-la. ' +
     'Envie "continue" se quiser o restante.',
+  notice_empty_answer:
+    'Não consegui montar uma resposta desta vez. ' +
+    'Pergunte de novo, talvez com um pouco mais de detalhe.',
   error_processing_failed: 'Falha no processamento',
 } as const satisfies Record<UiStringKey, UiStringValue>;
 

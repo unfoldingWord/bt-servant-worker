@@ -33,6 +33,8 @@ const EXPECTED_KEYS: readonly UiStringKey[] = [
   'notice_max_iterations',
   // #481: appended after an answer cut short by a stalled stream or max_tokens.
   'notice_answer_truncated',
+  // #421/#158: SSE turn whose narration was retracted and whose recovery was empty.
+  'notice_empty_answer',
   'error_processing_failed',
 ];
 

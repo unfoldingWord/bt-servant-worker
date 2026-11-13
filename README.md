@@ -457,14 +457,48 @@ Threads longer than the org's `max_history_storage` are trimmed from the oldest 
 
 For `POST /api/v1/chat/stream`:
 
-| Event         | Payload                                                  | Description               |
-| ------------- | -------------------------------------------------------- | ------------------------- |
-| `status`      | `{ type: 'status', key: StatusKey, message: string }`    | Processing status updates |
-| `progress`    | `{ type: 'progress', text: string }`                     | Streaming text chunks     |
-| `complete`    | `{ type: 'complete', response: ChatResponse }`           | Final response            |
-| `error`       | `{ type: 'error', error: string }`                       | Error message             |
-| `tool_use`    | `{ type: 'tool_use', tool: string, input: unknown }`     | Tool invocation (debug)   |
-| `tool_result` | `{ type: 'tool_result', tool: string, result: unknown }` | Tool result (debug)       |
+| Event         | Payload                                                  | Description                       |
+| ------------- | -------------------------------------------------------- | --------------------------------- |
+| `status`      | `{ type: 'status', key: StatusKey, message: string }`    | Processing status updates         |
+| `progress`    | `{ type: 'progress', text: string }`                     | Streaming text chunks             |
+| `complete`    | `{ type: 'complete', response: ChatResponse }`           | Final response                    |
+| `error`       | `{ type: 'error', error: string }`                       | Error message                     |
+| `tool_use`    | `{ type: 'tool_use', tool: string, input: unknown }`     | Tool invocation (debug)           |
+| `tool_result` | `{ type: 'tool_result', tool: string, result: unknown }` | Tool result (debug)               |
+| `retract`     | `{ type: 'retract', iteration: number, chars: number }`  | Discard streamed text (see below) |
+
+Clients must ignore any event type they do not recognize. The stream also carries `{ type: 'keepalive' }` frames while a turn runs.
+
+#### `retract` (#421)
+
+The model often writes a line before it calls a tool ("Let me look that up…"). That text streams as `progress` before the worker knows a tool call follows. When a round that streamed text ends in tool calls, the worker sends `retract`, so a client can take the narration back off the screen.
+
+Wire format, one frame, exactly:
+
+```
+data: {"type":"retract","iteration":0,"chars":20}
+
+```
+
+| Field       | Type   | Meaning                                                                                                                          |
+| ----------- | ------ | -------------------------------------------------------------------------------------------------------------------------------- |
+| `type`      | string | Always `"retract"`.                                                                                                              |
+| `iteration` | number | 0-based model round whose text is being retracted. Informational.                                                                |
+| `chars`     | number | Length of the `progress` text being discarded, as a JavaScript string length (UTF-16 code units). For checks and telemetry only. |
+
+**Semantics.** On `retract`, discard **all** `progress` text received since the turn started or since the previous `retract`, whichever is later. Do not trim by `chars`: discard everything in that span, even if your count differs. Then keep appending `progress` text as usual.
+
+**Guarantees.**
+
+- `retract` is sent only when there is text to discard. A round that calls tools without writing text sends none.
+- It arrives before the tools run, ahead of the `status_executing_tools` status.
+- No `progress` separator (`"\n"`) follows a `retract`, so the next text starts clean.
+- `complete.response.responses` carries only the text streamed after the last `retract`, and that is what history stores. A client that replaces its streamed text with `complete.responses` (as the web client and portal do) ends in the same place.
+- If every round was retracted and the model ends without text, the worker makes one more model call with tools disabled to write the answer (#158). If that is empty too, or the turn is too late to afford it, the user gets a localized apology (`notice_empty_answer`) instead of a blank reply.
+
+**Transports.** Only `/api/v1/chat/stream` sends `retract`. It is never sent to a callback webhook (`/chat/callback`): gateways keep receiving the narration as `progress` messages exactly as before. `/api/v1/chat` (final JSON) is unchanged and returns every round's text.
+
+**Older clients.** A client that ignores `retract` shows the narration until `complete` arrives, which is the behaviour before this event existed.
 
 ### Webhook Progress Callbacks
 
@@ -505,8 +539,10 @@ The `progress_mode` field on the request body controls which events the worker s
 | ----------- | --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
 | `complete`  | **Only** the final `complete` event                                   | Clean "one request, one delivery" — anywhere intermediate updates would be noise in a user-facing chat.        |
 | `iteration` | `status` + per-orchestration-iteration `progress` deltas + `complete` | Default. Used by the Telegram and WhatsApp gateways — good for surfacing "typing" indicators and partial text. |
-| `periodic`  | `status` + accumulated `progress` every N seconds + `complete`        | Rate-limited intermediate updates on a fixed cadence. `progress_throttle_seconds` controls N.                  |
-| `sentence`  | `status` + `progress` per complete sentence + `complete`              | Natural streaming where partial text only surfaces at sentence boundaries.                                     |
+| `periodic`  | Runs as `iteration` (see below)                                       | Deprecated (#421).                                                                                             |
+| `sentence`  | Runs as `iteration` (see below)                                       | Deprecated (#421).                                                                                             |
+
+`periodic` and `sentence` no longer send incremental text. For one release they are still accepted, run as `iteration`, and log a `progress_mode_coerced` warning. The release after that removes them.
 
 ### Error Codes
 

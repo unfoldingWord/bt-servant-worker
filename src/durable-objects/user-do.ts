@@ -29,9 +29,9 @@ import { buildToolCatalog, discoverAllTools } from '../services/mcp/index.js';
 import { MCPServerConfig } from '../services/mcp/types.js';
 import {
   createWebhookCallbacks,
-  DEFAULT_PROGRESS_MODE,
   DEFAULT_THROTTLE_SECONDS,
   ProgressCallbackSender,
+  resolveProgressMode,
 } from '../services/progress/index.js';
 import {
   Attachment,
@@ -1379,6 +1379,8 @@ export class UserDO {
       onError: async (error) => sendEvent({ type: 'error', error }),
       onToolUse: async (tool, input) => sendEvent({ type: 'tool_use', tool, input }),
       onToolResult: async (tool, result) => sendEvent({ type: 'tool_result', tool, result }),
+      // #421: SSE can take back narration once a round turns to tool calls.
+      onRetract: async (retract) => sendEvent({ type: 'retract', ...retract }),
       deferInBandWelcomeRecord: (record) => {
         recordWelcome = record;
       },
@@ -1662,6 +1664,8 @@ export class UserDO {
         onError: async (error) => sendEvent({ type: 'error', error }),
         onToolUse: async (tool, input) => sendEvent({ type: 'tool_use', tool, input }),
         onToolResult: async (tool, result) => sendEvent({ type: 'tool_result', tool, result }),
+        // #421: SSE can take back narration once a round turns to tool calls.
+        onRetract: async (retract) => sendEvent({ type: 'retract', ...retract }),
         deferInBandWelcomeRecord: (record) => {
           recordWelcome = record;
         },
@@ -2025,8 +2029,10 @@ export class UserDO {
       typeof body.progress_throttle_seconds === 'number' && body.progress_throttle_seconds > 0
         ? body.progress_throttle_seconds
         : DEFAULT_THROTTLE_SECONDS;
+    // Deliberately no `onRetract` here (#421): gateways 400 on unknown event
+    // types, and their narration stays as it is (Ian, 2026-11-11).
     return createWebhookCallbacks(sender, logger, {
-      mode: body.progress_mode ?? DEFAULT_PROGRESS_MODE,
+      mode: resolveProgressMode(body.progress_mode, logger),
       throttleSeconds,
       // #428: voice turns get a voice reply whose TTS already strips
       // intermediate narration (extractTtsResponses); suppress the text
