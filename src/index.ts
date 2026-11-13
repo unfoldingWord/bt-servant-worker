@@ -89,16 +89,8 @@ import {
   upsertServer,
 } from './utils/mcp-servers.js';
 import { orgDoNameError, resolveOrgFromBody } from './utils/org.js';
-import { normalizeWhatsAppNumber } from './utils/mode-share-link.js';
-import {
-  buildShareQrLink,
-  parseShareQrPath,
-  SHARE_QR_BARE_PATH,
-  SHARE_QR_PATH_PREFIX,
-  SHARE_QR_SIGNATURE_PARAM,
-  verifyShareQrSignature,
-} from './utils/share-qr.js';
-import { renderQrPngForText } from './utils/share-qr-png.js';
+import { SHARE_QR_BARE_PATH, SHARE_QR_PATH_PREFIX } from './utils/share-qr.js';
+import { serveShareQrPng } from './services/share-qr/serve.js';
 import {
   chatIdProblem,
   conversationAddressError,
@@ -218,11 +210,8 @@ app.get('/health', (c) => c.json({ status: 'healthy', version: APP_VERSION }));
 // Bucket: PTXPRINT_BUCKET (defined in wrangler.toml).
 app.get('/public/ptxprint/*', async (c) => servePublicPtxprintObject(c.req.path, c.env));
 
-// Public share QR images (#474) — no auth required. Meta's media fetcher loads
-// the image by link when the WhatsApp gateway sends it, so it cannot carry our
-// API key. The image only ever encodes a wa.me link to WHATSAPP_NUMBER, and the
-// URL must carry the worker's signature over the code (see utils/share-qr.ts),
-// so only URLs the worker issued are rendered.
+// Public share QR images (#474) — no auth required: Meta's media fetcher loads
+// them by link. Signed, cached and closed; see services/share-qr/serve.ts.
 app.get(SHARE_QR_BARE_PATH, async (c) => serveShareQrPng(c.req.url, c.env));
 app.get(`${SHARE_QR_PATH_PREFIX}/*`, async (c) => serveShareQrPng(c.req.url, c.env));
 
@@ -3345,62 +3334,6 @@ async function servePublicPtxprintObject(path: string, env: Env): Promise<Respon
   headers.set('Content-Length', String(object.size));
   headers.set('Cache-Control', 'public, max-age=31536000, immutable');
   return new Response(object.body, { headers });
-}
-
-/**
- * Render the share QR PNG for a `/public/share-qr…` URL (#474). 404 for a path
- * that is not a valid share code, a missing or wrong signature, or a reserved
- * clear token; 503 when the worker has no valid WHATSAPP_NUMBER (a config
- * fault, logged as an error).
- */
-async function serveShareQrPng(requestUrl: string, env: Env): Promise<Response> {
-  const start = Date.now();
-  // Public route: no request-scoped logger exists yet (same as ptxprint above).
-  const logger = createRequestLogger(crypto.randomUUID());
-  const url = new URL(requestUrl);
-  const parsed = parseShareQrPath(url.pathname);
-  if (!parsed) {
-    logger.warn('share_qr_invalid_path', { path: url.pathname });
-    return Response.json({ error: 'Not found' }, { status: 404 });
-  }
-  const signature = url.searchParams.get(SHARE_QR_SIGNATURE_PARAM);
-  if (!(await verifyShareQrSignature(env.ENGINE_API_KEY, parsed.code, signature))) {
-    logger.warn('share_qr_bad_signature', { code: parsed.code, has_signature: !!signature });
-    return Response.json({ error: 'Not found' }, { status: 404 });
-  }
-  if (!normalizeWhatsAppNumber(env.WHATSAPP_NUMBER)) {
-    logger.error('share_qr_number_missing', new Error('WHATSAPP_NUMBER is unset or invalid'), {
-      code: parsed.code,
-    });
-    return Response.json({ error: 'Share QR unavailable' }, { status: 503 });
-  }
-  const link = buildShareQrLink(env.WHATSAPP_NUMBER, parsed.code);
-  if (!link) {
-    // A valid-shaped code the share link refuses: a reserved clear token.
-    logger.warn('share_qr_reserved_code', { code: parsed.code });
-    return Response.json({ error: 'Not found' }, { status: 404 });
-  }
-  let png: Uint8Array;
-  try {
-    png = await renderQrPngForText(link);
-  } catch (error) {
-    logger.error('share_qr_render_failed', error, { code: parsed.code });
-    return Response.json({ error: 'Failed to render QR code' }, { status: 500 });
-  }
-  logger.log('share_qr_served', {
-    code: parsed.code,
-    size_bytes: png.length,
-    total_ms: Date.now() - start,
-  });
-  return new Response(png, {
-    headers: {
-      'Content-Type': 'image/png',
-      'Content-Length': String(png.length),
-      // Deterministic from WHATSAPP_NUMBER + code. A day, not immutable, so a
-      // number change reaches cached copies.
-      'Cache-Control': 'public, max-age=86400',
-    },
-  });
 }
 
 /** Convenience wrapper for user-scoped DO requests. */

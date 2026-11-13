@@ -101,7 +101,7 @@ function switchModeCall(mode: string): Response {
  */
 function setupMocks(
   script: Array<() => Response> = [],
-  hookStatus = 200
+  hookStatus: (type: unknown) => number = () => 200
 ): { hooks: Array<Record<string, unknown>> } {
   const hooks: Array<Record<string, unknown>> = [];
   (Anthropic as unknown as ReturnType<typeof vi.fn>).mockImplementation(function MockAnthropic(
@@ -115,8 +115,9 @@ function setupMocks(
       typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
     if (url.includes('api.anthropic.com')) return (script.shift() ?? (() => textAnswer('ok')))();
     if (url.startsWith(HOOK_URL)) {
-      hooks.push(JSON.parse(await readMockRequestBody(input, init)) as Record<string, unknown>);
-      return new Response('ok', { status: hookStatus });
+      const hook = JSON.parse(await readMockRequestBody(input, init)) as Record<string, unknown>;
+      hooks.push(hook);
+      return new Response('ok', { status: hookStatus(hook.type) });
     }
     return realFetch(input, init);
   });
@@ -337,13 +338,30 @@ describe('share QR — failures are non-fatal (#474)', () => {
     expect(logged.some((line) => line.includes('share_qr_attach_failed'))).toBe(true);
     expect(await listShareFlags(stub)).toEqual([]);
   });
+});
 
-  it('a failed complete webhook still burns the flag: no re-emit (decided 2026-11-05)', async () => {
-    vi.restoreAllMocks();
-    const failing = setupMocks([], 503);
+describe('share QR — a failed complete webhook is not re-emitted (#474)', () => {
+  let stub: DurableObjectStub;
+
+  beforeEach(() => {
+    stub = env.USER_DO.get(env.USER_DO.newUniqueId());
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('a failed complete webhook still burns the flag: no re-emit on re-entry (decided 2026-11-05)', async () => {
+    let failComplete = true;
+    const run = setupMocks([], (type) => (type === 'complete' && failComplete ? 503 : 200));
     await runCallbackTurn(stub, waBody('#spoken hi'));
-    expect(completeOf(failing.hooks)?.share_qr).toBeDefined();
+    expect(completeOf(run.hooks)?.share_qr).toBeDefined();
     expect(await readFlag(stub, 'spoken')).toBe(true);
+
+    // Leave and re-enter the mode with the gateway healthy again.
+    failComplete = false;
+    await runCallbackTurn(stub, waBody('#fia-coach hello'));
+    expect((completeOf(run.hooks)?.share_qr as { code: string }).code).toBe('fia-coach');
+    await runCallbackTurn(stub, waBody('#spoken again'));
+    expect(completeOf(run.hooks)?.text).toBe('ok');
+    expect(completeOf(run.hooks)).not.toHaveProperty('share_qr');
   });
 });
 
@@ -455,6 +473,15 @@ describe('share QR — public PNG route (#474)', () => {
       expect(scanQr(await decodeGrayPng(bytes))).toBe(link);
     });
   }
+});
+
+describe('share QR — public PNG route refusals and caching (#474)', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => vi.restoreAllMocks());
 
   it('404s an unsigned URL, a wrong signature, and a signature for another code', async () => {
     expect((await fetchPublic('/public/share-qr/spoken.png')).status).toBe(404);
@@ -477,6 +504,25 @@ describe('share QR — public PNG route (#474)', () => {
       expect((await fetchPublic(path)).status).toBe(404);
     });
   }
+
+  it('renders once per link: a replay or an extra query parameter is a cache hit', async () => {
+    const lines: string[] = [];
+    vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+      lines.push(args.map(String).join(' '));
+    });
+    const code = `cache-probe-${Date.now()}`;
+    const path = await signedPath(code);
+    const first = await fetchPublic(path);
+    const replay = await fetchPublic(path);
+    const busted = await fetchPublic(`${path}&x=1`);
+    const bodies = await Promise.all([first, replay, busted].map((r) => r.arrayBuffer()));
+    expect([first.status, replay.status, busted.status]).toEqual([200, 200, 200]);
+    expect(new Uint8Array(bodies[1] as ArrayBuffer)).toEqual(new Uint8Array(bodies[0] as ArrayBuffer)); // prettier-ignore
+    const served = lines.filter((l) => l.includes('share_qr_served'));
+    expect(served).toHaveLength(3);
+    expect(served.filter((l) => l.includes('"cache":"miss"'))).toHaveLength(1);
+    expect(served.filter((l) => l.includes('"cache":"hit"'))).toHaveLength(2);
+  });
 
   it('503s when WHATSAPP_NUMBER is not configured', async () => {
     const res = await fetchPublic(await signedPath('spoken'), { WHATSAPP_NUMBER: undefined });
