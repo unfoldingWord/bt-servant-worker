@@ -105,6 +105,7 @@ import {
 } from './services/partner-keys/policy.js';
 import { isReservedPartnerId } from './types/partner-namespace.js';
 import { lookupPartnerKeyByToken, partnerKeyStore } from './services/partner-keys/store.js';
+import { recordPartnerKeyUse } from './services/partner-keys/last-used.js';
 import {
   hasValidPartnerKeyTag,
   looksLikePartnerKey,
@@ -374,7 +375,36 @@ async function authenticatePartnerRequest(
   c.set('principal', { kind: 'partner', key: auth.key });
   c.set('keyClass', null);
   c.set('superAdmin', false);
+  recordUseInBackground(c, auth.key.id);
   return null;
+}
+
+/**
+ * "Last used" for an authenticated, allowed partner request: throttled and in
+ * the background (see last-used.ts), so it never delays or fails the request.
+ */
+function recordUseInBackground(c: Context<AppEnv>, keyId: string): void {
+  const logger = c.get('logger');
+  let waitUntil: (work: Promise<unknown>) => void;
+  try {
+    const ctx = c.executionCtx;
+    waitUntil = (work) => ctx.waitUntil(work);
+  } catch (error) {
+    // Hono throws when the runtime gave no ExecutionContext (some test
+    // harnesses); without waitUntil the write could be cut off, so skip it.
+    logger.warn('partner_key_last_used_skipped', {
+      key_id: keyId,
+      reason: 'no_execution_context',
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return;
+  }
+  recordPartnerKeyUse({
+    keyId,
+    recordUse: (id) => keyStore(c).recordUse(id),
+    waitUntil,
+    logger,
+  });
 }
 
 // Chat endpoints — explicit transport per route.

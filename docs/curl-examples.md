@@ -569,6 +569,16 @@ curl "http://localhost:$PORT/api/v1/admin/api-keys?org=bcs" -H "Authorization: B
 
 **Response (200):** `{"org": "bcs" | null, "keys": [...records]}`
 
+**Last used.** Each key in list and get (and the old key in a revoke or
+rotate response) may carry `lastUsedAt`, an ISO-8601 time the key last
+authenticated on an allowed route. It is absent until the key's first
+recorded use. It is coarse: each worker instance records a key at most once
+every 10 minutes, in the background, so `lastUsedAt` can be up to ~10 minutes
+earlier than the key's true last request, never later. Refused requests
+(revoked, expired, unknown, or a route outside the allowlist) are not
+recorded. A rotated key's replacement starts with no `lastUsedAt`; the old
+key keeps its own.
+
 ### Get One Key
 
 ```bash
