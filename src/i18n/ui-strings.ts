@@ -3,7 +3,8 @@
  *
  * These are the few non-LLM strings the worker writes straight into the chat:
  * SSE status lines, the queue notice, voice pipeline status, the
- * max-iterations notice, and the generic "processing failed" fallback. They
+ * max-iterations notice, the generic "processing failed" fallback and the
+ * "service unavailable" text for a spend stop (#468). They
  * are keyed off the user's `response_language` (ISO 639-1, e.g. `en`, `pt`).
  *
  * Adding a language is one table entry set: add `xx` to `UI_STRINGS` with
@@ -61,6 +62,12 @@ const en = {
    * `Error.message` is forwarded, on any transport.
    */
   error_processing_failed: 'Processing failed',
+  /**
+   * Shown instead of `error_processing_failed` when the model provider has
+   * stopped serving for spend or billing reasons (#468). That lasts until a
+   * person raises the limit, so the text does not promise a quick fix.
+   */
+  error_service_unavailable: 'This service is temporarily unavailable. Please try again later.',
 } as const satisfies Record<string, UiStringValue>;
 
 /** Every worker-emitted UI string key. */
@@ -88,6 +95,8 @@ const pt = {
     '\n\n⚠️ Minha resposta foi interrompida antes que eu pudesse terminá-la. ' +
     'Envie "continue" se quiser o restante.',
   error_processing_failed: 'Falha no processamento',
+  error_service_unavailable:
+    'Este serviço está temporariamente indisponível. Tente novamente mais tarde.',
 } as const satisfies Record<UiStringKey, UiStringValue>;
 
 /** Locale → table. Keys are ISO 639-1 primary subtags, lower-case. */

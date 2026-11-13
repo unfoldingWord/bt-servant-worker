@@ -34,6 +34,8 @@ const EXPECTED_KEYS: readonly UiStringKey[] = [
   // #481: appended after an answer cut short by a stalled stream or max_tokens.
   'notice_answer_truncated',
   'error_processing_failed',
+  // #468: shown instead of error_processing_failed for a spend or billing stop.
+  'error_service_unavailable',
 ];
 
 /** Every textual form a table value can take (plain string, or plural pair). */
