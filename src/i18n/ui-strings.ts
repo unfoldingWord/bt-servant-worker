@@ -65,9 +65,11 @@ const en = {
   /**
    * Shown instead of `error_processing_failed` when the model provider has
    * stopped serving for spend or billing reasons (#468). That lasts until a
-   * person raises the limit, so the text does not promise a quick fix.
+   * person raises the limit, so the text does not promise a quick fix or
+   * ask the user to retry.
    */
-  error_service_unavailable: 'This service is temporarily unavailable. Please try again later.',
+  error_service_unavailable:
+    'This service is unavailable right now. It may take some time to come back.',
 } as const satisfies Record<string, UiStringValue>;
 
 /** Every worker-emitted UI string key. */
@@ -96,7 +98,7 @@ const pt = {
     'Envie "continue" se quiser o restante.',
   error_processing_failed: 'Falha no processamento',
   error_service_unavailable:
-    'Este serviço está temporariamente indisponível. Tente novamente mais tarde.',
+    'Este serviço está indisponível no momento. Pode levar algum tempo para voltar.',
 } as const satisfies Record<UiStringKey, UiStringValue>;
 
 /** Locale → table. Keys are ISO 639-1 primary subtags, lower-case. */

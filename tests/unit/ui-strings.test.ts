@@ -116,6 +116,22 @@ describe('ui-strings literals', () => {
     );
   });
 
+  it('spend-stop text does not ask for a retry or promise a quick fix (#468)', () => {
+    // A spend or billing stop lasts until a person raises the limit, so the
+    // text must not send users into a retry loop against a stopped provider.
+    expect(UI_STRINGS.en.error_service_unavailable).toBe(
+      'This service is unavailable right now. It may take some time to come back.'
+    );
+    expect(UI_STRINGS.pt.error_service_unavailable).toBe(
+      'Este serviço está indisponível no momento. Pode levar algum tempo para voltar.'
+    );
+    for (const [locale, table] of Object.entries(UI_STRINGS)) {
+      expect(table.error_service_unavailable, locale).not.toMatch(
+        /temporar|try again|novamente|tente/i
+      );
+    }
+  });
+
   it('every {{placeholder}} in en also appears in every pt form', () => {
     const pt = new Map(Object.entries(UI_STRINGS.pt));
     for (const [key, enValue] of Object.entries(UI_STRINGS.en)) {
