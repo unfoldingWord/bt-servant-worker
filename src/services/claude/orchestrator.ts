@@ -41,6 +41,7 @@ import {
 import { redactToolInputForError, RequestLogger, summarizeToolInput } from '../../utils/logger.js';
 import { stripUlyssesComments } from '../../utils/ulysses-comments.js';
 import { buildRouteChain, ModelRoute, RouteId } from './routes.js';
+import { RetractState, visibleStartOf, withRetractTracking } from './stream-retract.js';
 import {
   createKvRouteHealthStore,
   createMemoryRouteHealthStore,
@@ -349,6 +350,17 @@ interface OrchestrationContext {
   responses: string[];
   /** Index into responses[] where the most recent iteration's text begins. */
   lastIterationStartIndex: number;
+  /**
+   * #421: stream-and-retract bookkeeping, present only when the transport
+   * wires `onRetract` (SSE). Null on the callback and final-JSON transports,
+   * whose output this feature must not change.
+   */
+  retract: RetractState | null;
+  /**
+   * #158: the one tools-off recovery call is running. The request carries
+   * `tool_choice: none` and the round ends the turn whatever it returns.
+   */
+  forceFinalAnswer: boolean;
   codeExecTimeout: number;
   maxMcpCalls: number;
   maxMcpResponseSize: number;
@@ -599,6 +611,9 @@ export function buildMessageBody(
     system: buildSystemBlocks(ctx),
     messages: ctx.messages,
     ...(ctx.tools.length > 0 ? { tools: ctx.tools } : {}),
+    // #158 recovery call: keep the tool definitions (the history holds
+    // tool_use blocks) but forbid another call.
+    ...(ctx.forceFinalAnswer && ctx.tools.length > 0 ? { tool_choice: { type: 'none' } } : {}),
     // The rolling breakpoint is only honoured by Anthropic-direct endpoints (#403).
     ...(route.topLevelCacheControl ? { cache_control: { type: 'ephemeral' } } : {}),
     stream,
@@ -2252,6 +2267,35 @@ function endFinalRound(
   });
 }
 
+/** Whether this round is the turn's last. The #158 recovery call always is. */
+function roundEndsTurn(
+  ctx: OrchestrationContext,
+  response: Anthropic.Message,
+  toolCalls: ToolUseBlock[]
+): boolean {
+  return ctx.forceFinalAnswer || response.stop_reason === 'end_turn' || toolCalls.length === 0;
+}
+
+/**
+ * Take back the text a round streamed before its tool calls (#421, SSE only).
+ * The client discards every `progress` character since the turn started or
+ * the last retract, and that text drops out of the turn's `responses`, so
+ * `complete` and history match what the client is left showing. A round that
+ * streamed nothing sends no frame.
+ */
+function retractNarration(ctx: OrchestrationContext, iteration: number): void {
+  const retract = ctx.retract;
+  if (!retract) return;
+  const droppedResponses = ctx.responses.length - retract.visibleStart;
+  retract.visibleStart = ctx.responses.length;
+  if (retract.pendingChars === 0) return;
+  const notice = { iteration, chars: retract.pendingChars };
+  retract.pendingChars = 0;
+  ctx.logger.log('progress_retracted', { ...notice, responses_dropped: droppedResponses });
+  countMetric('progress_retract_total', {});
+  notifyCallback(ctx.logger, () => retract.send(notice));
+}
+
 function processIteration(ctx: OrchestrationContext, iteration: number): Promise<boolean> {
   return withSpan('iteration', { iteration }, async () => {
     const iterStart = Date.now();
@@ -2273,8 +2317,10 @@ function processIteration(ctx: OrchestrationContext, iteration: number): Promise
       // as "the answer has started" blank out for the whole tool phase, and the
       // streamed text diverges from the final joined `responses` (#410).
       // `ctx.responses` only ever holds non-whitespace blocks (extractTextResponses),
-      // so a non-empty array means real prose has already gone out.
-      if (ctx.callbacks && ctx.responses.length > 0) {
+      // so entries past the visible start mean real prose is still on the
+      // client's screen. On SSE a retract (#421) clears the screen, so text
+      // retracted there needs no separator after it.
+      if (ctx.callbacks && ctx.responses.length > visibleStartOf(ctx.retract)) {
         notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress('\n'));
       }
       // Status stays unconditional — the tool phase should still narrate itself.
@@ -2290,11 +2336,14 @@ function processIteration(ctx: OrchestrationContext, iteration: number): Promise
     ctx.responses.push(...extractTextResponses(response.content));
 
     // A delivered partial never has a tool call, so it always ends the turn here.
-    if (response.stop_reason === 'end_turn' || toolCalls.length === 0) {
+    if (roundEndsTurn(ctx, response, toolCalls)) {
       endFinalRound(ctx, { iteration, iterStart, stopReason: response.stop_reason, streamAbort });
       return true;
     }
 
+    // The round's text preceded tool calls: it was narration. Take it back on
+    // SSE before the tools run (#421); a no-op on every other transport.
+    retractNarration(ctx, iteration);
     ctx.emitStatus?.('status_executing_tools', { n: toolCalls.length });
     const toolResults = await executeIterationTools(toolCalls, ctx, iteration, iterStart);
     ctx.messages.push({ role: 'assistant', content: response.content as Anthropic.ContentBlock[] });
@@ -2573,12 +2622,33 @@ function defaultRouteHealthStore(env: Env, logger: RequestLogger): RouteHealthSt
   return createMemoryRouteHealthStore();
 }
 
+/**
+ * The turn's outbound callbacks. On SSE (#421) every progress character is
+ * counted so a retract can say how much it takes back; other transports get
+ * their callbacks untouched and no retract state.
+ */
+function streamingState(
+  options: OrchestratorOptions
+): Pick<OrchestrationContext, 'callbacks' | 'emitStatus' | 'retract' | 'forceFinalAnswer'> {
+  const { callbacks, retract } = withRetractTracking(options.callbacks);
+  return {
+    callbacks,
+    emitStatus: createStatusEmitter(
+      callbacks,
+      options.preferences.response_language,
+      options.logger
+    ),
+    retract,
+    forceFinalAnswer: false,
+  };
+}
+
 function createOrchestrationContext(
   userMessage: string,
   options: OrchestratorOptions,
   config: ReturnType<typeof parseEnvConfig>
 ): OrchestrationContext {
-  const { env, catalog, history, preferences, orgConfig, logger, callbacks } = options;
+  const { env, catalog, history, preferences, orgConfig, logger } = options;
   const locale = preferences.response_language;
   const rawPromptValues = options.resolvedPromptValues ?? DEFAULT_PROMPT_VALUES;
   const { values: strippedValues, languageDocument } = stripPromptComments(
@@ -2604,6 +2674,7 @@ function createOrchestrationContext(
     messages: buildSeedMessages(userMessage, options, llmMax),
     responses: [],
     lastIterationStartIndex: 0,
+    ...streamingState(options),
     ...executionLimits(config),
     mcpCallsMade: { count: 0 },
     turnId: options.turnId,
@@ -2612,9 +2683,7 @@ function createOrchestrationContext(
     telemetry: createTelemetryAccumulator(),
     catalog,
     logger,
-    callbacks,
     locale,
-    emitStatus: createStatusEmitter(callbacks, locale, logger),
     healthTracker: createHealthTracker(),
     memoryStore: options.memoryStore,
     modeContext: options.modeContext,
@@ -2646,6 +2715,9 @@ async function runOrchestrationLoop(
       }
     }
   });
+  // #158/#421: on SSE, every round so far may have been retracted. Make sure
+  // the client is left with an answer before any notice is appended.
+  await ensureVisibleAnswer(ctx, lastIteration + 1);
   if (exitReason === 'max_iterations') {
     ctx.logger.warn('orchestration_max_iterations_reached', {
       max_iterations: maxIterations,
@@ -2770,10 +2842,102 @@ export async function orchestrate(
   }
 
   return {
-    responses: ctx.responses,
-    finalIterationStartIndex: ctx.lastIterationStartIndex,
+    ...publishedResponses(ctx),
     telemetry: buildOrchestrationTelemetry(ctx),
   };
+}
+
+/**
+ * What `complete` sends and history stores. On SSE (#421) that is the text
+ * after the last retract, which is exactly what the client is left showing;
+ * on every other transport it is every round, as before.
+ */
+function publishedResponses(
+  ctx: OrchestrationContext
+): Pick<OrchestrationResult, 'responses' | 'finalIterationStartIndex'> {
+  const start = visibleStartOf(ctx.retract);
+  if (start > 0) {
+    // Lengths only: the retracted text itself stays out of the logs.
+    ctx.logger.log('intermediate_responses_dropped', {
+      count: start,
+      lengths: ctx.responses.slice(0, start).map((text) => text.length),
+    });
+  }
+  return {
+    responses: ctx.responses.slice(start),
+    finalIterationStartIndex: Math.max(0, ctx.lastIterationStartIndex - start),
+  };
+}
+
+/**
+ * Recovery instruction for a turn left with no answer text (#158). Appended
+ * to the last user turn (normally the tool results) so roles still alternate.
+ * The language is the turn's `response_language`.
+ */
+function recoveryInstruction(locale: string): string {
+  return (
+    'Answer the user now from what you already gathered in this turn. ' +
+    'Do not call any tools. Do not describe your process. Write the answer itself. ' +
+    `Respond in the language with code "${locale}".`
+  );
+}
+
+function appendRecoveryInstruction(messages: Anthropic.MessageParam[], locale: string): void {
+  const text = recoveryInstruction(locale);
+  const last = messages.at(-1);
+  if (!last || last.role !== 'user') {
+    messages.push({ role: 'user', content: text });
+  } else if (typeof last.content === 'string') {
+    last.content = `${last.content}\n\n${text}`;
+  } else {
+    last.content = [...last.content, { type: 'text', text }];
+  }
+}
+
+/** One tools-off model call that must answer from what the turn gathered (#158). */
+async function runRecoveryCall(ctx: OrchestrationContext, iteration: number): Promise<void> {
+  ctx.logger.warn('empty_final_answer', { recovery: 'forced_reply', iteration });
+  countMetric('empty_final_answer_total', { reason: 'forced_reply' });
+  appendRecoveryInstruction(ctx.messages, ctx.locale);
+  ctx.forceFinalAnswer = true;
+  try {
+    await processIteration(ctx, iteration);
+  } catch (error) {
+    // Degrade to the apology below rather than fail a turn whose earlier
+    // rounds succeeded: the retracted narration cannot be shown again.
+    ctx.logger.error('recovery_call_failed', error, { iteration });
+  } finally {
+    ctx.forceFinalAnswer = false;
+  }
+}
+
+/** The localized apology for a turn that still has no answer text (#158). */
+function appendEmptyAnswerNotice(ctx: OrchestrationContext, iteration: number): void {
+  const notice = uiString(ctx.locale, 'notice_empty_answer');
+  ctx.logger.warn('empty_final_answer', { recovery: 'apology', iteration });
+  countMetric('empty_final_answer_total', { reason: 'apology' });
+  notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress(notice));
+  ctx.lastIterationStartIndex = ctx.responses.length;
+  ctx.responses.push(notice);
+}
+
+/**
+ * SSE turns must not end on a blank screen (#158, #421).
+ *
+ * After the loop, if everything streamed was retracted (every round ended in
+ * tool calls, or the final round had no text), run ONE extra model call with
+ * `tool_choice: none` and an instruction to answer now. It does not count
+ * against MAX_ORCHESTRATION_ITERATIONS, and it is skipped past the recovery
+ * gate (`canAffordRecoveryCall`, #481). If there is still no text, the
+ * localized `notice_empty_answer` is sent. Other transports are untouched:
+ * nothing was retracted there, so the turn ends as it always has.
+ */
+async function ensureVisibleAnswer(ctx: OrchestrationContext, iteration: number): Promise<void> {
+  if (!ctx.retract) return;
+  const hasAnswer = () => ctx.responses.length > visibleStartOf(ctx.retract);
+  if (hasAnswer()) return;
+  if (canAffordRecoveryCall(ctx)) await runRecoveryCall(ctx, iteration);
+  if (!hasAnswer()) appendEmptyAnswerNotice(ctx, iteration);
 }
 
 /** Collapse the mutable accumulator plus static context into the exported shape. */

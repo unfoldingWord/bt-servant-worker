@@ -5,5 +5,6 @@ export {
   IncrementalProgressSender,
   MIN_THROTTLE_SECONDS,
   ProgressCallbackSender,
+  resolveProgressMode,
 } from './callback.js';
 export type { IncrementalProgressConfig, ProgressCallbackConfig } from './callback.js';
