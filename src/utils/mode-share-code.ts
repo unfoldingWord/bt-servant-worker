@@ -194,6 +194,18 @@ function matchCode(code: string, pool: ChatMode[], homeOrg: string): ActualMatch
   return shadowedName === undefined ? base : { ...base, shadowedName };
 }
 
+/**
+ * Pool-level check, no KV reads (#474): does a WhatsApp private chat (non-admin)
+ * that sends `#<code>` open exactly the mode named `code` in `pool`? `pool` is
+ * the merged chat pool the DO already holds (home modes bare, other orgs'
+ * published modes qualified), so this rules out drafts, group-only modes,
+ * reserved tokens and shadowed or prefix/fuzzy matches.
+ */
+export function shareCodeOpensMode(code: string, pool: ChatMode[], homeOrg: string): boolean {
+  const match = matchCode(code, pool, homeOrg);
+  return match.kind === 'mode' && match.whole && match.tier === 'exact' && match.name === code;
+}
+
 /** The message opened this org's own mode, by its canonical name, on the exact tier, consuming it all. */
 function isOwnExactMatch(match: ActualMatch, expected: { name: string; org: string }): boolean {
   return (

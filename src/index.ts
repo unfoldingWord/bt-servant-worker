@@ -89,6 +89,8 @@ import {
   upsertServer,
 } from './utils/mcp-servers.js';
 import { orgDoNameError, resolveOrgFromBody } from './utils/org.js';
+import { SHARE_QR_BARE_PATH, SHARE_QR_PATH_PREFIX } from './utils/share-qr.js';
+import { serveShareQrPng } from './services/share-qr/serve.js';
 import {
   chatIdProblem,
   conversationAddressError,
@@ -207,6 +209,11 @@ app.get('/health', (c) => c.json({ status: 'healthy', version: APP_VERSION }));
 //
 // Bucket: PTXPRINT_BUCKET (defined in wrangler.toml).
 app.get('/public/ptxprint/*', async (c) => servePublicPtxprintObject(c.req.path, c.env));
+
+// Public share QR images (#474) — no auth required: Meta's media fetcher loads
+// them by link. Signed, cached and closed; see services/share-qr/serve.ts.
+app.get(SHARE_QR_BARE_PATH, async (c) => serveShareQrPng(c.req.url, c.env));
+app.get(`${SHARE_QR_PATH_PREFIX}/*`, async (c) => serveShareQrPng(c.req.url, c.env));
 
 /**
  * Rejections of a VALID partner key that is used outside its scope: the key
