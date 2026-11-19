@@ -299,6 +299,12 @@ describe('validateChatBody — client-owned conversation fields, rejections (#39
     expect(validateChatBody(body, 'final')).toBe('suppress_memory must be a boolean');
   });
 
+  it('rejects a non-boolean accepts_share_qr (#474) and accepts a boolean', () => {
+    const bad = { ...baseBody, accepts_share_qr: 'true' } as unknown as ChatRequest;
+    expect(validateChatBody(bad, 'final')).toBe('accepts_share_qr must be a boolean');
+    expect(validateChatBody({ ...baseBody, accepts_share_qr: true }, 'final')).toBeNull();
+  });
+
   it('surfaces the history validator message verbatim', () => {
     const body = {
       ...baseBody,

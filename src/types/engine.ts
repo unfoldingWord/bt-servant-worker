@@ -118,6 +118,16 @@ export interface ChatRequest {
    */
   suppress_memory?: boolean;
 
+  /**
+   * The caller can deliver a share QR image (#474) carried as `share_qr` on
+   * the `complete` callback. Sent by the WhatsApp gateway once it renders that
+   * field; the worker attaches a QR only when this is `true` AND the request
+   * is a callback-transport WhatsApp private chat in the unfoldingWord org.
+   * Absent or false ⇒ no QR, and every response stays byte-identical. Default
+   * false.
+   */
+  accepts_share_qr?: boolean;
+
   /** Internal: MCP servers injected by worker (not from client) */
   _mcp_servers?: MCPServerConfig[];
 
@@ -485,6 +495,27 @@ export interface StreamCallbacks {
    * drop — recorded inline as the turn is saved).
    */
   deferInBandWelcomeRecord?: (record: (delivered: boolean) => Promise<void>) => void;
+  /**
+   * Webhook transport ONLY (#474). Hands the turn's one-time share QR to the
+   * transport, which carries it as `share_qr` on the `complete` callback so the
+   * gateway sends it as its own image after the answer. Must be called before
+   * `onComplete`. Absent on SSE and `/chat/final`, so their output never
+   * changes.
+   */
+  onShareQr?: (qr: ShareQrMedia) => void;
+}
+
+/**
+ * A share QR image for the gateway to send as its own message (#474): the
+ * `complete` callback's `share_qr` field.
+ */
+export interface ShareQrMedia {
+  /** Public HTTPS URL of the PNG (`/public/share-qr/<code>.png`). */
+  url: string;
+  /** Caption in the user's language, ending with the wa.me link itself. */
+  caption: string;
+  /** The mode's chat code the QR opens; null for the bare BT Servant link. */
+  code: string | null;
 }
 
 /**
@@ -524,6 +555,12 @@ export interface ProgressCallback {
   history_entry?: ChatResponse['history_entry'];
   /** Stored thread length after the append (#392) — present on `complete` ONLY when the request supplied `history`. */
   history_length?: number;
+  /**
+   * One-time share QR (#474) — present on `complete` ONLY when the request set
+   * `accepts_share_qr` and a QR was due this turn. The gateway sends it as its
+   * own image message after the answer.
+   */
+  share_qr?: ShareQrMedia;
   /** Group/supergroup chat ID (present only for group chats). */
   chat_id?: string;
   /** Thread ID within a supergroup (present only for threaded chats). */

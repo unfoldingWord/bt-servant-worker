@@ -5,7 +5,13 @@
  * Accumulates text chunks and sends them on complete, with immediate status updates.
  */
 
-import { Attachment, ChatResponse, ProgressMode, StreamCallbacks } from '../../types/engine.js';
+import {
+  Attachment,
+  ChatResponse,
+  ProgressMode,
+  ShareQrMedia,
+  StreamCallbacks,
+} from '../../types/engine.js';
 import type { StatusKey, StatusUpdate } from '../../i18n/ui-strings.js';
 import { releaseBody } from '../../utils/http.js';
 import { RequestLogger, safeAsync } from '../../utils/logger.js';
@@ -56,6 +62,11 @@ interface CallbackPayload {
    */
   history_entry?: ChatResponse['history_entry'];
   history_length?: number;
+  /**
+   * #474: the one-time share QR — `type: 'complete'` only, and ONLY when the
+   * DO handed one over via `onShareQr` (webhook transport, opted-in caller).
+   */
+  share_qr?: ShareQrMedia;
   /** Group/supergroup chat ID (present only for group chats). */
   chat_id?: string;
   /** Thread ID within a supergroup (present only for threaded chats). */
@@ -81,6 +92,8 @@ export class ProgressCallbackSender {
   // await these so a slow progress/status POST can never reach the gateway
   // after the final message — gateways deliver callbacks in arrival order.
   private pending = new Set<Promise<void>>();
+  // #474: the turn's one-time share QR, sent on the complete callback.
+  private shareQr: ShareQrMedia | null = null;
 
   constructor(
     private config: ProgressCallbackConfig,
@@ -147,6 +160,8 @@ export class ProgressCallbackSender {
       ...(attachments && attachments.length > 0 ? { attachments } : {}),
       // #392: present only when the request supplied `history`.
       ...(historyReceipt ?? {}),
+      // #474: present only when a share QR was due this turn.
+      ...(this.shareQr ? { share_qr: this.shareQr } : {}),
     });
   }
 
@@ -195,6 +210,18 @@ export class ProgressCallbackSender {
       });
       throw new Error(`welcome webhook returned HTTP ${response.status}`);
     }
+  }
+
+  /**
+   * #474: carry `qr` as `share_qr` on the `complete` callback. The DO sets it
+   * (via `onShareQr`) before `onComplete` runs.
+   */
+  setShareQr(qr: ShareQrMedia): void {
+    this.shareQr = qr;
+  }
+
+  hasShareQr(): boolean {
+    return this.shareQr !== null;
   }
 
   getAccumulatedText(): string {
@@ -456,12 +483,16 @@ function buildOnComplete(
     // #392: a client that supplied `history` needs the receipt even when the
     // text already streamed as progress and the complete carries no delta.
     const receipt = historyReceiptOf(response);
+    // #474: a due share QR alone is enough to send the complete (the answer
+    // may already have streamed as progress).
+    const hasShareQr = sender.hasShareQr();
     if (
       !delta &&
       !response.voice_audio_url &&
       !response.voice_audio_base64 &&
       !hasAttachments &&
-      !receipt
+      !receipt &&
+      !hasShareQr
     ) {
       return;
     }
@@ -517,6 +548,9 @@ export function createWebhookCallbacks(
     // rejects on failure (unlike the other callbacks, which log-and-continue)
     // so the DO withholds the mode_welcomed flag and re-emits on retry.
     onWelcome: (text) => sender.sendWelcome(text),
+    // #474: webhook-only. The QR rides on the complete callback, after the
+    // answer, so the gateway sends it as its own image in that order.
+    onShareQr: (qr) => sender.setShareQr(qr),
   };
 
   if (mode === 'iteration' && !suppressProgressText) {
