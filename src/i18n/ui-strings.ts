@@ -70,6 +70,11 @@ const en = {
    */
   error_service_unavailable:
     'This service is unavailable right now. It may take some time to come back.',
+  /**
+   * Caption on the one-time share QR image (#474), sent on WhatsApp after the
+   * answer. The wa.me link follows it on its own line.
+   */
+  share_qr_caption: 'Share BT Servant with others: scan this code, or forward this image.',
 } as const satisfies Record<string, UiStringValue>;
 
 /** Every worker-emitted UI string key. */
@@ -99,6 +104,8 @@ const pt = {
   error_processing_failed: 'Falha no processamento',
   error_service_unavailable:
     'Este serviço está indisponível no momento. Pode levar algum tempo para voltar.',
+  share_qr_caption:
+    'Compartilhe o BT Servant com outras pessoas: escaneie este código ou encaminhe esta imagem.',
 } as const satisfies Record<UiStringKey, UiStringValue>;
 
 /** Locale → table. Keys are ISO 639-1 primary subtags, lower-case. */

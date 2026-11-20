@@ -27,6 +27,7 @@ import type { PublicPartnerKey } from '../../src/types/partner-keys';
 import { sha256Hex } from '../../src/utils/crypto';
 import { generatePartnerKeyMaterial } from '../../src/services/partner-keys/key-material';
 import { PARTNER_KEY_STORE_NAME } from '../../src/services/partner-keys/store';
+import { resetLastUsedThrottle } from '../../src/services/partner-keys/last-used';
 import {
   setupAnthropicFetchCapture,
   type AnthropicCapture,
@@ -386,6 +387,72 @@ describe('admin CRUD: rotate with grace', () => {
     expect((await postChat(rotated.apiKey, chatBody())).status).toBe(200);
     expect((await rotateKey(key.id)).status).toBe(409);
     expect((await rotateKey(rotated.key.id, { graceSeconds: 31 * 24 * 3600 })).status).toBe(400);
+  });
+});
+
+type KeyBody = { key: PublicPartnerKey };
+
+/** GET one key through the admin route. */
+async function getKey(keyId: string): Promise<PublicPartnerKey> {
+  const res = await apiFetch(`${KEYS}/${keyId}`, { headers: ADMIN });
+  expect(res.status).toBe(200);
+  return ((await res.json()) as KeyBody).key;
+}
+
+describe('last used (recorded in the background after an authenticated partner request)', () => {
+  beforeEach(() => resetLastUsedThrottle());
+
+  it('a new key has no lastUsedAt; after a chat, get and list carry it', async () => {
+    const { key, apiKey } = await createKey('org-354-last-used');
+    expect('lastUsedAt' in key).toBe(false);
+    expect('lastUsedAt' in (await getKey(key.id))).toBe(false);
+
+    const before = Date.now();
+    expect((await postChat(apiKey, chatBody())).status).toBe(200);
+    const used = await vi.waitFor(async () => {
+      const got = await getKey(key.id);
+      if (got.lastUsedAt === undefined) throw new Error('not recorded yet');
+      return got;
+    });
+    expect(Date.parse(used.lastUsedAt ?? '')).toBeGreaterThanOrEqual(before);
+
+    const list = (await (
+      await apiFetch(`${KEYS}?org=org-354-last-used`, { headers: ADMIN })
+    ).json()) as { keys: PublicPartnerKey[] };
+    expect(list.keys.map((k) => k.lastUsedAt)).toEqual([used.lastUsedAt]);
+  });
+
+  it('a refused request (revoked key, or a route outside the allowlist) records nothing', async () => {
+    const forbidden = await createKey('org-354-last-used-forbidden');
+    const res = await apiFetch(KEYS, { headers: partnerHeaders(forbidden.apiKey) });
+    expect(res.status).toBe(403);
+
+    const revoked = await createKey('org-354-last-used-revoked');
+    await apiFetch(`${KEYS}/${revoked.key.id}/_revoke`, { method: 'POST', headers: ADMIN });
+    expect((await postChat(revoked.apiKey, chatBody())).status).toBe(403);
+
+    // A later allowed request from another key is recorded, so the background
+    // work has had its chance to run for the refused ones too.
+    const control = await createKey('org-354-last-used-control');
+    expect((await postChat(control.apiKey, chatBody())).status).toBe(200);
+    await vi.waitFor(async () => {
+      if ((await getKey(control.key.id)).lastUsedAt === undefined) throw new Error('not yet');
+    });
+    expect('lastUsedAt' in (await getKey(forbidden.key.id))).toBe(false);
+    expect('lastUsedAt' in (await getKey(revoked.key.id))).toBe(false);
+  });
+
+  it('a second request inside the throttle window sends no second write', async () => {
+    const { key, apiKey } = await createKey('org-354-last-used-throttle');
+    expect((await postChat(apiKey, chatBody())).status).toBe(200);
+    await vi.waitFor(async () => {
+      if ((await getKey(key.id)).lastUsedAt === undefined) throw new Error('not yet');
+    });
+    expect((await postChat(apiKey, chatBody())).status).toBe(200);
+    const recorded = capture.logs.filter(
+      (l) => l.event === 'partner_key_last_used_recorded' && l.payload?.key_id === key.id
+    );
+    expect(recorded).toHaveLength(1);
   });
 });
 

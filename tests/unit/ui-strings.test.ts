@@ -36,6 +36,8 @@ const EXPECTED_KEYS: readonly UiStringKey[] = [
   'error_processing_failed',
   // #468: shown instead of error_processing_failed for a spend or billing stop.
   'error_service_unavailable',
+  // #474: caption on the one-time WhatsApp share QR image.
+  'share_qr_caption',
 ];
 
 /** Every textual form a table value can take (plain string, or plural pair). */

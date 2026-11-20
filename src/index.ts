@@ -89,6 +89,8 @@ import {
   upsertServer,
 } from './utils/mcp-servers.js';
 import { orgDoNameError, resolveOrgFromBody } from './utils/org.js';
+import { SHARE_QR_BARE_PATH, SHARE_QR_PATH_PREFIX } from './utils/share-qr.js';
+import { serveShareQrPng } from './services/share-qr/serve.js';
 import {
   chatIdProblem,
   conversationAddressError,
@@ -105,6 +107,7 @@ import {
 } from './services/partner-keys/policy.js';
 import { isReservedPartnerId } from './types/partner-namespace.js';
 import { lookupPartnerKeyByToken, partnerKeyStore } from './services/partner-keys/store.js';
+import { recordPartnerKeyUse } from './services/partner-keys/last-used.js';
 import {
   hasValidPartnerKeyTag,
   looksLikePartnerKey,
@@ -207,6 +210,11 @@ app.get('/health', (c) => c.json({ status: 'healthy', version: APP_VERSION }));
 //
 // Bucket: PTXPRINT_BUCKET (defined in wrangler.toml).
 app.get('/public/ptxprint/*', async (c) => servePublicPtxprintObject(c.req.path, c.env));
+
+// Public share QR images (#474) — no auth required: Meta's media fetcher loads
+// them by link. Signed, cached and closed; see services/share-qr/serve.ts.
+app.get(SHARE_QR_BARE_PATH, async (c) => serveShareQrPng(c.req.url, c.env));
+app.get(`${SHARE_QR_PATH_PREFIX}/*`, async (c) => serveShareQrPng(c.req.url, c.env));
 
 /**
  * Rejections of a VALID partner key that is used outside its scope: the key
@@ -374,7 +382,36 @@ async function authenticatePartnerRequest(
   c.set('principal', { kind: 'partner', key: auth.key });
   c.set('keyClass', null);
   c.set('superAdmin', false);
+  recordUseInBackground(c, auth.key.id);
   return null;
+}
+
+/**
+ * "Last used" for an authenticated, allowed partner request: throttled and in
+ * the background (see last-used.ts), so it never delays or fails the request.
+ */
+function recordUseInBackground(c: Context<AppEnv>, keyId: string): void {
+  const logger = c.get('logger');
+  let waitUntil: (work: Promise<unknown>) => void;
+  try {
+    const ctx = c.executionCtx;
+    waitUntil = (work) => ctx.waitUntil(work);
+  } catch (error) {
+    // Hono throws when the runtime gave no ExecutionContext (some test
+    // harnesses); without waitUntil the write could be cut off, so skip it.
+    logger.warn('partner_key_last_used_skipped', {
+      key_id: keyId,
+      reason: 'no_execution_context',
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return;
+  }
+  recordPartnerKeyUse({
+    keyId,
+    recordUse: (id) => keyStore(c).recordUse(id),
+    waitUntil,
+    logger,
+  });
 }
 
 // Chat endpoints — explicit transport per route.

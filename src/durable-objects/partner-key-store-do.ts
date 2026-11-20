@@ -248,15 +248,48 @@ export class PartnerKeyStoreDO {
       case 'create':
         return ledger.create(op.input);
       case 'list':
-        return { records: await ledger.list(op.org) };
+        return { records: await ledger.withLastUsed(await ledger.list(op.org)) };
       case 'get':
-        return { record: (await ledger.get(op.id))?.record ?? null };
+        return { record: await this.getWithLastUsed(ledger, op.id) };
       case 'revoke':
-        return ledger.revoke(op.id, op.revokedBy);
+        return this.revokeWithLastUsed(ledger, op.id, op.revokedBy);
       case 'rotate':
-        return ledger.rotate(op.id, { createdBy: op.createdBy, graceSeconds: op.graceSeconds });
+        return this.rotateWithLastUsed(ledger, op);
+      case 'recordUse':
+        return ledger.recordUse(op.id, Date.now());
       default:
         return undefined;
     }
+  }
+
+  /*
+   * Reads that answer an admin endpoint join in `lastUsedAt` (ledger
+   * withLastUsed). A rotation's NEW key never has one: it is a different
+   * credential, and inheriting the old key's use would suggest it is live.
+   */
+
+  private async getWithLastUsed(ledger: PartnerKeyLedger, id: string) {
+    const entry = await ledger.get(id);
+    return entry ? ((await ledger.withLastUsed([entry.record]))[0] ?? null) : null;
+  }
+
+  private async revokeWithLastUsed(ledger: PartnerKeyLedger, id: string, revokedBy?: string) {
+    const outcome = await ledger.revoke(id, revokedBy);
+    if (!outcome) return null;
+    const [record = outcome.record] = await ledger.withLastUsed([outcome.record]);
+    return { ...outcome, record };
+  }
+
+  private async rotateWithLastUsed(
+    ledger: PartnerKeyLedger,
+    op: Extract<PartnerKeyStoreOp, { op: 'rotate' }>
+  ) {
+    const outcome = await ledger.rotate(op.id, {
+      createdBy: op.createdBy,
+      graceSeconds: op.graceSeconds,
+    });
+    if (outcome.status !== 'ok') return outcome;
+    const [previous = outcome.previous] = await ledger.withLastUsed([outcome.previous]);
+    return { ...outcome, previous };
   }
 }
