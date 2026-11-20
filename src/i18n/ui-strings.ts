@@ -3,7 +3,8 @@
  *
  * These are the few non-LLM strings the worker writes straight into the chat:
  * SSE status lines, the queue notice, voice pipeline status, the
- * max-iterations notice, and the generic "processing failed" fallback. They
+ * max-iterations notice, the generic "processing failed" fallback and the
+ * "service unavailable" text for a spend stop (#468). They
  * are keyed off the user's `response_language` (ISO 639-1, e.g. `en`, `pt`).
  *
  * Adding a language is one table entry set: add `xx` to `UI_STRINGS` with
@@ -62,6 +63,14 @@ const en = {
    */
   error_processing_failed: 'Processing failed',
   /**
+   * Shown instead of `error_processing_failed` when the model provider has
+   * stopped serving for spend or billing reasons (#468). That lasts until a
+   * person raises the limit, so the text does not promise a quick fix or
+   * ask the user to retry.
+   */
+  error_service_unavailable:
+    'This service is unavailable right now. It may take some time to come back.',
+  /**
    * Caption on the one-time share QR image (#474), sent on WhatsApp after the
    * answer. The wa.me link follows it on its own line.
    */
@@ -93,6 +102,8 @@ const pt = {
     '\n\n⚠️ Minha resposta foi interrompida antes que eu pudesse terminá-la. ' +
     'Envie "continue" se quiser o restante.',
   error_processing_failed: 'Falha no processamento',
+  error_service_unavailable:
+    'Este serviço está indisponível no momento. Pode levar algum tempo para voltar.',
   share_qr_caption:
     'Compartilhe o BT Servant com outras pessoas: escaneie este código ou encaminhe esta imagem.',
 } as const satisfies Record<UiStringKey, UiStringValue>;

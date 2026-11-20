@@ -392,6 +392,7 @@ const BOUNDED_LABEL_VALUES: Record<string, ReadonlySet<string>> = {
     'AudioTranscriptionError',
     'AudioSynthesisError',
     'MCPResponseTooLargeError',
+    'UpstreamSpendLimitError',
     // JS built-ins
     'Error',
     'TypeError',

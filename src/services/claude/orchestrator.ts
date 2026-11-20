@@ -36,11 +36,13 @@ import {
   MCPError,
   MCPRequestCallLimitError,
   RouteChainExhaustedError,
+  UpstreamSpendLimitError,
   ValidationError,
 } from '../../utils/errors.js';
 import { redactToolInputForError, RequestLogger, summarizeToolInput } from '../../utils/logger.js';
 import { stripUlyssesComments } from '../../utils/ulysses-comments.js';
 import { buildRouteChain, ModelRoute, RouteId } from './routes.js';
+import { classifyUpstreamSpend, isSpendCandidateStatus } from './spend-limit.js';
 import {
   createKvRouteHealthStore,
   createMemoryRouteHealthStore,
@@ -1330,6 +1332,71 @@ function decideAfterFailure(
   return { action: 'retry', delayMs, retryAfterMs };
 }
 
+/**
+ * Stop the turn when Anthropic refuses for spend or billing reasons (#468).
+ *
+ * Runs before the retry/outage decision, so a match is never retried, never
+ * opens the breaker and never moves to another route: `anthropic-alt` bills to
+ * the same org and fails the same way, and OpenRouter would only move the bill
+ * (Ian, 2026-11-04). Anthropic routes only; an OpenRouter credit error is a
+ * different account and keeps its existing handling.
+ *
+ * To classify, the error body has to be read. When it does not match, the
+ * attempt's response is replaced with an unread copy of the same body, so the
+ * retry drain and `throwAnthropicHttpError` behave exactly as before.
+ */
+async function stopOnUpstreamSpend(
+  ctx: OrchestrationContext,
+  route: ModelRoute,
+  streaming: boolean,
+  failure: AnthropicAttemptFailure,
+  attempt: number
+): Promise<void> {
+  const response = failure.response;
+  if (route.provider !== 'anthropic' || !response || !isSpendCandidateStatus(response.status)) {
+    return;
+  }
+  let text: string;
+  try {
+    text = await response.text();
+  } catch (error) {
+    ctx.logger.warn('claude_error_body_unreadable', {
+      route: route.id,
+      status: response.status,
+      streaming,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    text = '(unreadable)';
+  }
+  const verdict = classifyUpstreamSpend(response.status, text, response.headers.has('retry-after'));
+  if (!verdict) {
+    failure.response = new Response(text, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+    return;
+  }
+  failure.cleanup();
+  // The one alertable signal for #466: stable event name, one per failed call.
+  ctx.logger.error('anthropic_spend_limit_reached', null, {
+    ...(ctx.turnId ? { turn_id: ctx.turnId } : {}),
+    kind: verdict.kind,
+    route: route.id,
+    model: route.model,
+    status: response.status,
+    error_type: verdict.errorType,
+    error_code: verdict.errorCode,
+    upstream_message: verdict.message,
+    body_json: verdict.bodyJson,
+    streaming,
+    attempt,
+    duration_ms: Date.now() - failure.fetchStart,
+  });
+  countMetric('upstream_quota_total', { reason: verdict.kind, route: route.id });
+  throw new UpstreamSpendLimitError(verdict.kind, response.status, route.id);
+}
+
 export interface RouteRetryOptions {
   streaming: boolean;
   /** Start of the whole chain's wall-clock window, so the window spans routes. */
@@ -1442,6 +1509,7 @@ export async function fetchRouteWithRetry(
   for (let attempt = 1; attempt <= CLAUDE_MAX_ATTEMPTS; attempt++) {
     const outcome = await attemptRouteFetch(ctx, route, body, streaming, attempt);
     if (outcome.ok) return outcome;
+    await stopOnUpstreamSpend(ctx, route, streaming, outcome, attempt);
 
     const decision = decideAfterFailure(route, outcome, attempt, overallStart, clock);
     if (decision.action === 'outage') {

@@ -9,7 +9,7 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import Anthropic from '@anthropic-ai/sdk';
 import { orchestrate, type RetryClock } from '../../src/services/claude/orchestrator.js';
-import { ClaudeAPIError } from '../../src/utils/errors.js';
+import { ClaudeAPIError, UpstreamSpendLimitError } from '../../src/utils/errors.js';
 import {
   createMemoryRouteHealthStore,
   type RouteHealthStore,
@@ -438,5 +438,189 @@ describe('route chain — served model telemetry', () => {
     expect(result.telemetry.servedModel).toBe('claude-sonnet-4-6');
     expect(result.telemetry.route).toBe('primary');
     expect(Object.keys(result.telemetry.usageByModel)).toEqual(['claude-sonnet-4-6']);
+  });
+});
+
+// #468 fixtures: the documented spend-stop bodies.
+const SPEND_400 = JSON.stringify({
+  type: 'error',
+  error: {
+    type: 'invalid_request_error',
+    message:
+      'You have reached your specified API usage limits. You will regain access on 2026-11-01 at 00:00 UTC.',
+  },
+});
+const SPEND_CAP_429 = JSON.stringify({
+  type: 'error',
+  error: {
+    type: 'rate_limit_error',
+    message: 'You have reached your API usage limits.',
+    details: { error_code: 'enforced_spend_limit_reached' },
+  },
+});
+const raw = (code: number, text: string): Response => new Response(text, { status: code });
+
+async function runCaught(env: Env, sink: LoggedEvent[]): Promise<unknown> {
+  try {
+    await run(env, sink);
+  } catch (error) {
+    return error;
+  }
+  throw new Error('expected the turn to fail');
+}
+
+describe('route chain — spend and billing stops never fall over (#468)', () => {
+  it('a self-set spend-limit 400 on the primary stops at once: one call, no hop, typed error, alert event', async () => {
+    const sink: LoggedEvent[] = [];
+    const calls = scriptFetch(() => raw(400, SPEND_400));
+
+    const caught = await runCaught(fullEnv(), sink);
+
+    expect(caught).toBeInstanceOf(UpstreamSpendLimitError);
+    expect(caught).toMatchObject({ code: 'UPSTREAM_SPEND_LIMIT', statusCode: 503 });
+    expect((caught as Error).message).not.toMatch(/usage limits|regain/i);
+    expect(calls).toHaveLength(1);
+    expect(eventsNamed(sink, 'model_route_fallback')).toHaveLength(0);
+    const alert = eventsNamed(sink, 'anthropic_spend_limit_reached');
+    expect(alert).toHaveLength(1);
+    expect(alert[0]!.level).toBe('error');
+    expect(alert[0]!.data).toMatchObject({
+      kind: 'spend_limit',
+      route: 'primary',
+      status: 400,
+      error_type: 'invalid_request_error',
+    });
+    expect(alert[0]!.data.upstream_message).toMatch(/regain access on 2026-11-01/);
+    expect(countMetricSpy).toHaveBeenCalledWith('upstream_quota_total', {
+      reason: 'spend_limit',
+      route: 'primary',
+    });
+  });
+
+  it('the tier spend-cap 429 is not retried and does not hop', async () => {
+    const sink: LoggedEvent[] = [];
+    const calls = scriptFetch(() => raw(429, SPEND_CAP_429));
+
+    const caught = await runCaught(fullEnv(), sink);
+
+    expect(caught).toMatchObject({ kind: 'spend_cap', code: 'UPSTREAM_SPEND_LIMIT' });
+    expect(calls).toHaveLength(1);
+    expect(eventsNamed(sink, 'claude_api_retry')).toHaveLength(0);
+  });
+
+  it('a 402 is a billing stop with its own code', async () => {
+    const sink: LoggedEvent[] = [];
+    const calls = scriptFetch(() =>
+      raw(402, '{"type":"error","error":{"type":"billing_error","message":"declined"}}')
+    );
+
+    const caught = await runCaught(fullEnv(), sink);
+
+    expect(caught).toMatchObject({ kind: 'billing', code: 'UPSTREAM_BILLING', statusCode: 503 });
+    expect(calls).toHaveLength(1);
+  });
+});
+
+describe('route chain — spend stops stop the chain (#468)', () => {
+  it('primary down, then a spend stop on anthropic-alt: the chain stops there and never reaches OpenRouter', async () => {
+    const sink: LoggedEvent[] = [];
+    const calls = scriptFetch((c) =>
+      c.model === 'claude-sonnet-4-6' ? status(529) : raw(400, SPEND_400)
+    );
+
+    const caught = await runCaught(fullEnv(), sink);
+
+    expect(caught).toBeInstanceOf(UpstreamSpendLimitError);
+    expect(calls.some((c) => c.url === OPENROUTER)).toBe(false);
+    expect(eventsNamed(sink, 'anthropic_spend_limit_reached')[0]!.data).toMatchObject({
+      route: 'anthropic-alt',
+    });
+  });
+});
+
+describe('route chain — non-spend errors keep their handling (#468)', () => {
+  it('an ordinary validation 400 keeps its old handling (HTTP error path, no alert)', async () => {
+    const sink: LoggedEvent[] = [];
+    scriptFetch(() =>
+      raw(
+        400,
+        '{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long"}}'
+      )
+    );
+
+    const caught = await runCaught(fullEnv(), sink);
+
+    // The SDK is mocked in this file, so the APIError wrapping is not asserted
+    // here; the terminal HTTP error log proves the old path ran.
+    expect(caught).not.toBeInstanceOf(UpstreamSpendLimitError);
+    expect(eventsNamed(sink, 'anthropic_spend_limit_reached')).toHaveLength(0);
+    // The body was read for classification, then handed on intact.
+    expect(eventsNamed(sink, 'claude_fetch_http_error')[0]!.data.body_preview).toMatch(
+      /prompt is too long/
+    );
+  });
+
+  it('an ordinary 429 is still retried in place, its body intact for the retry drain', async () => {
+    const sink: LoggedEvent[] = [];
+    const calls = scriptFetch((c, i) =>
+      i === 0
+        ? raw(429, '{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}')
+        : json(message('ok', c.model))
+    );
+
+    const result = await run(fullEnv(), sink);
+
+    expect(result.responses).toEqual(['ok']);
+    expect(calls).toHaveLength(2);
+    expect(eventsNamed(sink, 'anthropic_spend_limit_reached')).toHaveLength(0);
+  });
+
+  it('an OpenRouter 402 is not classified as an Anthropic spend stop', async () => {
+    const sink: LoggedEvent[] = [];
+    scriptFetch((c) => (c.url === ANTHROPIC ? status(503) : raw(402, '{"error":"no credits"}')));
+
+    const caught = await runCaught(fullEnv(), sink);
+
+    expect(caught).not.toBeInstanceOf(UpstreamSpendLimitError);
+    expect(eventsNamed(sink, 'anthropic_spend_limit_reached')).toHaveLength(0);
+  });
+});
+
+describe('route chain — unreadable error bodies (#468)', () => {
+  /** A response whose body stream errors on read. */
+  const unreadable = (code: number): Response =>
+    new Response(
+      new ReadableStream({
+        pull(controller) {
+          controller.error(new Error('socket reset'));
+        },
+      }),
+      { status: code }
+    );
+
+  it('an unreadable 402 is still a billing stop (status alone), logged, with no retry', async () => {
+    const sink: LoggedEvent[] = [];
+    const calls = scriptFetch(() => unreadable(402));
+
+    const caught = await run(fullEnv(), sink).catch((error: unknown) => error);
+
+    expect(caught).toMatchObject({ kind: 'billing', code: 'UPSTREAM_BILLING' });
+    expect(calls).toHaveLength(1);
+    expect(eventsNamed(sink, 'claude_error_body_unreadable')[0]!.data).toMatchObject({
+      status: 402,
+      error: 'socket reset',
+    });
+  });
+
+  it('an unreadable ordinary 429 is logged and keeps its retry policy', async () => {
+    const sink: LoggedEvent[] = [];
+    const calls = scriptFetch((c, i) => (i === 0 ? unreadable(429) : json(message('ok', c.model))));
+
+    const result = await run(fullEnv(), sink);
+
+    expect(result.responses).toEqual(['ok']);
+    expect(calls).toHaveLength(2);
+    expect(eventsNamed(sink, 'claude_error_body_unreadable')).toHaveLength(1);
+    expect(eventsNamed(sink, 'anthropic_spend_limit_reached')).toHaveLength(0);
   });
 });
