@@ -15,6 +15,11 @@
  *   settle:<key id>       → { at, step, requestId } (a KV put for the key timed
  *                                                out at `at` and may still land
  *                                                late; see "Settling" below)
+ *   used:<key id>         → <ms since epoch>     (when the key last authenticated,
+ *                                                recorded throttled; see
+ *                                                last-used.ts. Kept out of the
+ *                                                record so recording use never
+ *                                                commits, projects or touches auth)
  *
  * Auth projection: chat-time auth must stay one fast KV read, so after each
  * committed change the ledger writes the record to API_KEYS `key:<sha256>` —
@@ -46,6 +51,7 @@ import { DO_STORAGE_MAX_KEYS_PER_CALL } from '../../types/do-storage.js';
 import {
   type PartnerKeyCreateInput,
   type PartnerKeyRecord,
+  type PartnerKeyWithUsage,
   PARTNER_KEY_ID_PATTERN,
   partnerKeyStatus,
 } from '../../types/partner-keys.js';
@@ -67,6 +73,7 @@ export const KV_OP_TIMEOUT_MS = 10_000;
 /** When the alarm re-puts a key after its last KV timeout (see "Settling"). */
 export const SETTLE_DELAYS_MS: readonly number[] = [60_000, 300_000];
 const SETTLE_PREFIX = 'settle:';
+const USED_PREFIX = 'used:';
 /** How many settle re-puts the alarm runs at once. */
 const SETTLE_CONCURRENCY = 10;
 /** Warning returned when a change is committed but auth (KV) does not have it yet. */
@@ -111,7 +118,8 @@ export type LedgerContext = {
 type RevocationStamp = { revokedAt: string; revokedBy?: string | undefined };
 
 export type RevokeOutcome = {
-  record: PartnerKeyRecord;
+  /** The DO joins in `lastUsedAt` before answering (see PartnerKeyStoreDO). */
+  record: PartnerKeyWithUsage;
   alreadyRevoked: boolean;
   /** Every key this call revoked: this key first, then in-grace predecessors. */
   revokedIds: string[];
@@ -124,7 +132,8 @@ export type RotateOutcome =
   | { status: 'already_rotated'; rotatedTo: string }
   | {
       status: 'ok';
-      previous: PartnerKeyRecord;
+      /** The DO joins in the old key's `lastUsedAt`; `record` (the new key) has none. */
+      previous: PartnerKeyWithUsage;
       record: PartnerKeyRecord;
       plaintext: string;
       /** With grace 0: the rotated key and its in-grace predecessors. Otherwise []. */
@@ -136,6 +145,7 @@ const recKey = (id: string) => `${REC_PREFIX}${id}`;
 const orgKey = (record: PartnerKeyRecord) => `${ORG_PREFIX}${record.org}:${record.id}`;
 const pendingKey = (id: string) => `${PENDING_PREFIX}${id}`;
 const settleKey = (id: string) => `${SETTLE_PREFIX}${id}`;
+const usedKey = (id: string) => `${USED_PREFIX}${id}`;
 
 /** When a settle marker's next re-put is due. */
 const settleDueAt = (marker: SettleMarker) => marker.at + (SETTLE_DELAYS_MS.at(marker.step) ?? 0);
@@ -229,6 +239,39 @@ export class PartnerKeyLedger {
             ...(await this.storage.list<string>({ prefix: `${ORG_PREFIX}${org}:` })).values(),
           ]);
     return entries.map((e) => e.record).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  /**
+   * Record that key `id` authenticated at `at` (ms). Only ever moves the time
+   * forward (a late or out-of-order report is ignored), and an unknown id
+   * writes nothing, so no orphan `used:` row can appear. Returns whether a
+   * time was stored. Touches no record, no projection and no alarm.
+   */
+  async recordUse(id: string, at: number): Promise<{ recorded: boolean }> {
+    if (!PARTNER_KEY_ID_PATTERN.test(id) || !Number.isFinite(at)) return { recorded: false };
+    const [entry, previous] = await Promise.all([
+      this.storage.get<LedgerEntry>(recKey(id)),
+      this.storage.get<number>(usedKey(id)),
+    ]);
+    if (!entry || (previous !== undefined && previous >= at)) return { recorded: false };
+    await this.storage.put(usedKey(id), at);
+    return { recorded: true };
+  }
+
+  /**
+   * `records` with `lastUsedAt` (ISO-8601) joined in from their `used:` rows;
+   * a key with no recorded use gets no field. Batched reads.
+   */
+  async withLastUsed(records: PartnerKeyRecord[]): Promise<PartnerKeyWithUsage[]> {
+    const used = new Map<string, number>();
+    for (let i = 0; i < records.length; i += DO_STORAGE_MAX_KEYS_PER_CALL) {
+      const keys = records.slice(i, i + DO_STORAGE_MAX_KEYS_PER_CALL).map((r) => usedKey(r.id));
+      for (const [key, at] of await this.storage.get<number>(keys)) used.set(key, at);
+    }
+    return records.map((record) => {
+      const at = used.get(usedKey(record.id));
+      return at === undefined ? record : { ...record, lastUsedAt: new Date(at).toISOString() };
+    });
   }
 
   async create(
