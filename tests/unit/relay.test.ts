@@ -10,152 +10,111 @@ import {
   RelayCollector,
   RelayRegistry,
   RelayStreamFilter,
-  expandRelayText,
+  expandRelayBlock,
   formatRelayNote,
+  type FilterOutput,
+  type RelayBlock,
 } from '../../src/services/claude/relay.js';
 import type { ToolCatalog } from '../../src/services/mcp/types.js';
 import { mockRelayLogger, registryWith } from './relay-test-helpers.js';
 
-function feed(filter: RelayStreamFilter, chunks: string[]): string {
-  let out = '';
-  for (const c of chunks) out += filter.push(c).text;
-  out += filter.flush().text;
+const X = [{ id: 'x', text: 'T' }];
+const expand = (s: string, blocks: RelayBlock[] = X): string =>
+  expandRelayBlock(s, registryWith(blocks)).text;
+
+function feed(chunks: string[], blocks: RelayBlock[] = X): FilterOutput {
+  const filter = new RelayStreamFilter(registryWith(blocks));
+  const out: FilterOutput = { text: '', events: [] };
+  for (const o of [...chunks.map((c) => filter.push(c)), filter.flush()]) {
+    out.text += o.text;
+    out.events.push(...o.events);
+  }
   return out;
 }
 
-describe('parseRelayServerIds', () => {
-  it('returns empty for unset, empty, or whitespace-only', () => {
-    expect(parseRelayServerIds(undefined)).toEqual([]);
-    expect(parseRelayServerIds('')).toEqual([]);
-    expect(parseRelayServerIds('  ,  , ')).toEqual([]);
-  });
+function collector(...blocks: RelayBlock[]): RelayCollector {
+  const c = new RelayCollector();
+  for (const b of blocks) c.add(b);
+  c.close();
+  return c;
+}
 
-  it('trims and splits comma-separated ids', () => {
+describe('switch', () => {
+  it('parses RELAY_SERVER_IDS', () => {
+    expect(parseRelayServerIds(undefined)).toEqual([]);
+    expect(parseRelayServerIds('  ,  , ')).toEqual([]);
     expect(parseRelayServerIds(' a ,b,  c ')).toEqual(['a', 'b', 'c']);
   });
-});
 
-describe('isRelayActive', () => {
-  const tool = (serverId: string): ToolCatalog =>
-    ({
-      tools: [{ name: 't', description: '', inputSchema: {}, serverId, serverName: 'n' }],
+  it('is active only when the catalog has a tool from a listed server', () => {
+    const catalog = {
+      tools: [{ name: 't', description: '', inputSchema: {}, serverId: 'obs' }],
       serverMap: new Map(),
-    }) as ToolCatalog;
-
-  it('is false when server id list is empty', () => {
-    expect(isRelayActive([], tool('obs'))).toBe(false);
-  });
-
-  it('is false when catalog has no tool from listed servers', () => {
-    expect(isRelayActive(['obs'], tool('other'))).toBe(false);
-  });
-
-  it('is true when catalog has a tool from a listed server', () => {
-    expect(isRelayActive(['obs'], tool('obs'))).toBe(true);
+    } as unknown as ToolCatalog;
+    expect(isRelayActive([], catalog)).toBe(false);
+    expect(isRelayActive(['other'], catalog)).toBe(false);
+    expect(isRelayActive(['obs'], catalog)).toBe(true);
   });
 });
 
 describe('parseRelayBlocks', () => {
-  it('accepts well-formed blocks', () => {
-    const logger = mockRelayLogger();
-    expect(
-      parseRelayBlocks([{ id: 'obs-en-01-05-observation', text: '- Q1\n- Q2' }], logger)
-    ).toEqual([{ id: 'obs-en-01-05-observation', text: '- Q1\n- Q2' }]);
-    expect(logger.warns).toEqual([]);
-  });
-
-  it('ignores invalid blocks and logs relay_invalid_block', () => {
+  it('keeps well-formed blocks and drops the rest with one warning', () => {
     const logger = mockRelayLogger();
     const blocks = parseRelayBlocks(
       [
-        { id: 'good', text: 'ok' },
+        { id: 'good', text: 'ok', extra: 1 },
         { id: 'bad id', text: 'x' },
-        { id: 'a$b', text: 'x' },
-        { id: '', text: 'x' },
         { id: 'x', text: 1 },
         null,
-        'nope',
       ],
       logger
     );
     expect(blocks).toEqual([{ id: 'good', text: 'ok' }]);
-    expect(logger.warns.every((w) => w.event === 'relay_invalid_block')).toBe(true);
-  });
-
-  it('ignores non-array meta', () => {
-    const logger = mockRelayLogger();
+    expect(logger.warns).toEqual([{ event: 'relay_invalid_block', data: { dropped: 3 } }]);
     expect(parseRelayBlocks(undefined, logger)).toEqual([]);
     expect(parseRelayBlocks({ id: 'x', text: 'y' }, logger)).toEqual([]);
   });
 });
 
 describe('RelayCollector', () => {
-  it('discards late blocks after close', () => {
+  it('discards blocks added after close', () => {
     const logger = mockRelayLogger();
-    const c = new RelayCollector();
-    c.add({ id: 'a', text: '1' });
-    c.close();
+    const c = collector({ id: 'a', text: '1' });
     c.add({ id: 'b', text: '2' }, logger);
     expect(c.blocks).toEqual([{ id: 'a', text: '1' }]);
     expect(logger.warns[0]?.event).toBe('relay_late_block');
   });
 });
 
-describe('RelayRegistry conflict', () => {
-  it('keeps first text on id conflict', () => {
-    const logger = mockRelayLogger();
-    const a = new RelayCollector();
-    a.add({ id: 'same', text: 'first' });
-    a.add({ id: 'same', text: 'second' });
-    a.close();
+describe('RelayRegistry', () => {
+  it('keeps the first text for an id and announces an id only where its text matches', () => {
     const reg = new RelayRegistry();
-    expect(reg.ingestCollectors([a], logger)).toEqual([['same']]);
-    expect(reg.get('same')).toBe('first');
-    expect(logger.warns.some((w) => w.event === 'relay_id_conflict')).toBe(true);
-  });
-
-  it('accepts matching duplicate across collectors', () => {
     const logger = mockRelayLogger();
-    const a = new RelayCollector();
-    a.add({ id: 'x', text: 'same' });
-    a.close();
-    const b = new RelayCollector();
-    b.add({ id: 'x', text: 'same' });
-    b.close();
-    expect(new RelayRegistry().ingestCollectors([a, b], logger)).toEqual([['x'], ['x']]);
-  });
-
-  it('omits conflicting later id from that collector note', () => {
-    const logger = mockRelayLogger();
-    const a = new RelayCollector();
-    a.add({ id: 'x', text: 'one' });
-    a.close();
-    const b = new RelayCollector();
-    b.add({ id: 'x', text: 'two' });
-    b.close();
-    const reg = new RelayRegistry();
-    expect(reg.ingestCollectors([a, b], logger)).toEqual([['x'], []]);
+    const accepted = reg.ingestCollectors(
+      [
+        collector({ id: 'x', text: 'one' }, { id: 'x', text: 'two' }),
+        collector({ id: 'x', text: 'one' }),
+        collector({ id: 'x', text: 'two' }),
+      ],
+      logger
+    );
+    expect(logger.warns.filter((w) => w.event === 'relay_id_conflict')).toHaveLength(2);
+    expect(accepted).toEqual([['x'], ['x'], []]);
     expect(reg.get('x')).toBe('one');
   });
-});
 
-describe('RelayRegistry limits', () => {
-  it('enforces the 200-block cap', () => {
+  it('caps a turn at 200 blocks and 64 KiB', () => {
     const logger = mockRelayLogger();
-    const c = new RelayCollector();
-    for (let i = 0; i < 201; i++) c.add({ id: `id-${i}`, text: 'x' });
-    c.close();
-    expect(new RelayRegistry().ingestCollectors([c], logger)[0]!.length).toBe(200);
-    expect(logger.warns.some((w) => w.event === 'relay_limit_exceeded')).toBe(true);
-  });
-
-  it('enforces the 64KB cap', () => {
-    const logger = mockRelayLogger();
-    const big = new RelayCollector();
-    big.add({ id: 'big', text: 'y'.repeat(64 * 1024 + 1) });
-    big.close();
-    expect(new RelayRegistry().ingestCollectors([big], logger)[0]).toEqual([]);
-    expect(logger.warns.some((w) => w.event === 'relay_limit_exceeded')).toBe(true);
+    const many = collector(
+      ...Array.from({ length: 201 }, (_, i) => ({ id: `id-${i}`, text: 'x' }))
+    );
+    expect(new RelayRegistry().ingestCollectors([many], logger)[0]).toHaveLength(200);
+    const kib = (n: number) => 'y'.repeat(n * 1024);
+    const reg = new RelayRegistry();
+    const sized = [collector({ id: 'a', text: kib(40) }), collector({ id: 'b', text: kib(24) })];
+    expect(reg.ingestCollectors(sized, logger)).toEqual([['a'], ['b']]);
+    expect(reg.ingestCollectors([collector({ id: 'c', text: 'z' })], logger)).toEqual([[]]);
+    expect(logger.warns.filter((w) => w.event === 'relay_limit_exceeded')).toHaveLength(2);
   });
 });
 
@@ -167,184 +126,59 @@ describe('formatRelayNote', () => {
   });
 });
 
-describe('RelayStreamFilter expansion', () => {
-  const text = 'HELLO $& WORLD';
-  const reg = () => registryWith([{ id: 'x', text }]);
-
-  it('expands a whole token', () => {
-    expect(expandRelayText('before {{relay:x}} after', reg(), mockRelayLogger())).toBe(
-      `before ${text} after`
-    );
+describe('RelayStreamFilter', () => {
+  it('replaces tokens with the exact text, never rescanned or treated as a pattern', () => {
+    expect(expand('before {{relay:x}} after')).toBe('before T after');
+    expect(expand('「{{relay:x}}」')).toBe('「T」');
+    expect(expand('{{{relay:x}}')).toBe('{T');
+    expect(expand('{{relay:x}}', [{ id: 'x', text: '$& {{relay:x}}' }])).toBe('$& {{relay:x}}');
+    expect(
+      expand('{{relay:a}}-{{relay:b}}', [
+        { id: 'a', text: 'A' },
+        { id: 'b', text: 'B' },
+      ])
+    ).toBe('A-B');
   });
 
-  it('expands a token split at every cut position', () => {
-    const token = '{{relay:x}}';
-    for (let i = 1; i < token.length; i++) {
-      expect(feed(new RelayStreamFilter(reg()), [token.slice(0, i), token.slice(i)])).toBe(text);
+  it('leaves text that is not an exact token alone', () => {
+    for (const s of [
+      '{{version}}',
+      '{',
+      'keep{{',
+      '{{ relay:x }}',
+      '{{Relay:x}}',
+      '{{relay:a b}}',
+    ]) {
+      expect(expand(s)).toBe(s);
     }
+    const long = `{{relay:${'a'.repeat(129)}}}`;
+    expect(expand(long)).toBe(long);
   });
 
-  it('expands one character per chunk', () => {
-    expect(feed(new RelayStreamFilter(reg()), '{{relay:x}}'.split(''))).toBe(text);
+  it('removes unknown, repeated and cut tokens, and reports them', () => {
+    expect(feed(['a{{relay:missing}}b'])).toEqual({
+      text: 'ab',
+      events: [{ type: 'unknown_id', id: 'missing' }],
+    });
+    expect(feed(['{{relay:x}}{{relay:x}}'])).toEqual({
+      text: 'T',
+      events: [{ type: 'repeated_id', id: 'x' }],
+    });
+    expect(feed(['Hi {{relay:x}'])).toEqual({ text: 'Hi ', events: [{ type: 'truncated_token' }] });
+    expect(feed(['Hi {{relay:'])).toEqual({ text: 'Hi ', events: [{ type: 'truncated_token' }] });
+    expect(feed(['Hi {{rel'])).toEqual({ text: 'Hi {{rel', events: [] });
   });
 
-  it('expands several tokens', () => {
-    const r = registryWith([
-      { id: 'a', text: 'A' },
-      { id: 'b', text: 'B' },
-    ]);
-    expect(expandRelayText('{{relay:a}}-{{relay:b}}', r, mockRelayLogger())).toBe('A-B');
-  });
-
-  it('emits leading brace then expands {{{relay:abc}}', () => {
-    const r = registryWith([{ id: 'abc', text: 'Z' }]);
-    expect(expandRelayText('{{{relay:abc}}', r, mockRelayLogger())).toBe('{Z');
-  });
-
-  it('handles { {{relay:x}}', () => {
-    expect(expandRelayText('{ {{relay:x}}', reg(), mockRelayLogger())).toBe(`{ ${text}`);
-  });
-
-  it('accepts spaced case-insensitive opening', () => {
-    expect(expandRelayText('{{ Relay : x }}', reg(), mockRelayLogger())).toBe(text);
-  });
-
-  it('inserts $& literally without replace semantics', () => {
-    expect(expandRelayText('{{relay:x}}', reg(), mockRelayLogger())).toBe('HELLO $& WORLD');
-  });
-
-  it('does not rescan inserted text that contains a token', () => {
-    const r = registryWith([{ id: 'outer', text: 'see {{relay:inner}}' }]);
-    expect(expandRelayText('{{relay:outer}}', r, mockRelayLogger())).toBe('see {{relay:inner}}');
+  it('passes text without a brace through at once and holds only a possible token', () => {
+    const filter = new RelayStreamFilter(registryWith(X));
+    expect(filter.push('plain text ').text).toBe('plain text ');
+    expect(filter.push('then {{rel').text).toBe('then ');
+    expect(filter.push('ay:x').text).toBe('');
+    expect(filter.push('}} done').text).toBe('T done');
   });
 });
 
-describe('RelayStreamFilter error paths', () => {
-  const reg = () => registryWith([{ id: 'x', text: 'T' }]);
-
-  it('removes a repeated id and logs once', () => {
-    const logger = mockRelayLogger();
-    expect(expandRelayText('{{relay:x}}{{relay:x}}', reg(), logger)).toBe('T');
-    expect(logger.warns.filter((w) => w.event === 'relay_repeated_id')).toHaveLength(1);
-  });
-
-  it('removes unknown id and logs once', () => {
-    const logger = mockRelayLogger();
-    expect(expandRelayText('a{{relay:missing}}b', reg(), logger)).toBe('ab');
-    expect(logger.warns.filter((w) => w.event === 'relay_unknown_id')).toHaveLength(1);
-  });
-
-  it('removes a truncated valid token on flush', () => {
-    const logger = mockRelayLogger();
-    expect(expandRelayText('{{relay:x', reg(), logger)).toBe('');
-    expect(logger.warns.some((w) => w.event === 'relay_truncated_token')).toBe(true);
-  });
-
-  it('removes malformed tokens through }}', () => {
-    const logger = mockRelayLogger();
-    expect(expandRelayText('a{{relay:ab c}}b', reg(), logger)).toBe('ab');
-    expect(logger.warns.some((w) => w.event === 'relay_malformed_token')).toBe(true);
-    const logger2 = mockRelayLogger();
-    expect(expandRelayText('a{{relay:a$b}}b', reg(), logger2)).toBe('ab');
-    expect(logger2.warns.some((w) => w.event === 'relay_malformed_token')).toBe(true);
-  });
-
-  it('leaves {{version}}, lone {, and trailing {{ alone', () => {
-    expect(expandRelayText('{{version}}', reg(), mockRelayLogger())).toBe('{{version}}');
-    expect(expandRelayText('{', reg(), mockRelayLogger())).toBe('{');
-    expect(expandRelayText('keep{{', reg(), mockRelayLogger())).toBe('keep{{');
-  });
-
-  it('handles unicode around a token', () => {
-    expect(expandRelayText('「{{relay:x}}」', reg(), mockRelayLogger())).toBe('「T」');
-  });
-});
-
-describe('RelayStreamFilter 200-char window (Corrección 1)', () => {
-  it('does not treat }} beyond 200 chars from opening as malformed close', () => {
-    const s = `{{relay:${'a'.repeat(250)}}}`;
-    const whole = expandRelayText(s, registryWith([{ id: 'x', text: 'T' }]), mockRelayLogger());
-    const cutAt200 = feed(new RelayStreamFilter(registryWith([{ id: 'x', text: 'T' }])), [
-      s.slice(0, 200),
-      s.slice(200),
-    ]);
-    expect(whole).toBe(s);
-    expect(cutAt200).toBe(whole);
-  });
-
-  it('rescans so a later valid token still expands when a long malformed prefix has no }} in 200', () => {
-    const s = `{{relay: ${'q'.repeat(300)} {{relay:x}}`;
-    const whole = expandRelayText(s, registryWith([{ id: 'x', text: 'T' }]), mockRelayLogger());
-    const cutAt200 = feed(new RelayStreamFilter(registryWith([{ id: 'x', text: 'T' }])), [
-      s.slice(0, 200),
-      s.slice(200),
-    ]);
-    expect(whole).toContain('T');
-    expect(whole).toBe(cutAt200);
-  });
-
-  it('boundaries 199/200/201 with and without }} match across a cut', () => {
-    const reg = () => registryWith([{ id: 'x', text: 'T' }]);
-    for (const n of [199, 200, 201]) {
-      for (const close of [true, false]) {
-        const body = 'a'.repeat(Math.max(0, n - '{{relay:'.length - (close ? 2 : 0)));
-        const s = `{{relay:${body}${close ? '}}' : ''}`;
-        const whole = expandRelayText(s, reg(), mockRelayLogger());
-        for (const cut of [0, 1, Math.min(200, s.length), s.length]) {
-          expect(feed(new RelayStreamFilter(reg()), [s.slice(0, cut), s.slice(cut)])).toBe(whole);
-        }
-      }
-    }
-  });
-
-  it('removes empty-id cut token {{relay: on flush', () => {
-    const logger = mockRelayLogger();
-    expect(expandRelayText('Hi {{relay:', registryWith([]), logger)).toBe('Hi ');
-    expect(logger.warns.some((w) => w.event === 'relay_truncated_token')).toBe(true);
-  });
-});
-
-describe('RelayRegistry exact limits (Corrección 1)', () => {
-  it('accepts a block of exactly 64 KiB', () => {
-    const logger = mockRelayLogger();
-    const c = new RelayCollector();
-    c.add({ id: 'exact', text: 'y'.repeat(64 * 1024) });
-    c.close();
-    expect(new RelayRegistry().ingestCollectors([c], logger)[0]).toEqual(['exact']);
-  });
-
-  it('enforces the 64 KiB cap across two collectors', () => {
-    const logger = mockRelayLogger();
-    const a = new RelayCollector();
-    a.add({ id: 'a', text: 'y'.repeat(40 * 1024) });
-    a.close();
-    const b = new RelayCollector();
-    b.add({ id: 'b', text: 'y'.repeat(40 * 1024) });
-    b.close();
-    const reg = new RelayRegistry();
-    expect(reg.ingestCollectors([a, b], logger)).toEqual([['a'], []]);
-    expect(logger.warns.some((w) => w.event === 'relay_limit_exceeded')).toBe(true);
-  });
-
-  it('accepts only the text that matches the registry for a conflicting second block', () => {
-    const logger = mockRelayLogger();
-    const prior = new RelayCollector();
-    prior.add({ id: 'x', text: 'B' });
-    prior.close();
-    const reg = new RelayRegistry();
-    reg.ingestCollectors([prior], mockRelayLogger());
-    const c = new RelayCollector();
-    c.add({ id: 'x', text: 'A' });
-    c.add({ id: 'x', text: 'B' });
-    c.close();
-    // First in-collector wins for A; registry already has B → conflict on A, skip; B matches.
-    // Within collector, first id wins (A), second (B) is skipped as duplicate id in collector.
-    expect(reg.ingestCollectors([c], logger)).toEqual([[]]);
-    expect(reg.get('x')).toBe('B');
-  });
-});
-
-/** Seeded PRNG so property tests are reproducible. */
+/** Seeded PRNG so the property test is reproducible. */
 function mulberry32(seed: number): () => number {
   return () => {
     let t = (seed += 0x6d2b79f5);
@@ -354,98 +188,35 @@ function mulberry32(seed: number): () => number {
   };
 }
 
-function feedWithEvents(
-  filter: RelayStreamFilter,
-  chunks: string[]
-): { text: string; events: ReturnType<RelayStreamFilter['push']>['events'] } {
-  let text = '';
-  const events: ReturnType<RelayStreamFilter['push']>['events'] = [];
-  for (const c of chunks) {
-    const o = filter.push(c);
-    text += o.text;
-    events.push(...o.events);
-  }
-  const o = filter.flush();
-  text += o.text;
-  events.push(...o.events);
-  return { text, events };
-}
+describe('RelayStreamFilter: split input equals whole input', () => {
+  const blocks = [...X, { id: 'a'.repeat(128), text: 'L' }];
+  const samples = [
+    'plain',
+    'a{{relay:x}}b{{relay:x}}c',
+    '{{{{relay:x}}',
+    '{ {{relay:x}} {{version}}',
+    '{{relay:missing}} 中{{relay:x}}文',
+    `{{relay:${'a'.repeat(128)}}}`,
+    `{{relay:${'a'.repeat(129)}}}`,
+    'end {{relay:x',
+  ];
 
-const CHUNK_SAMPLES = [
-  'plain',
-  '{{relay:x}}',
-  'a{{relay:x}}b{{relay:x}}c',
-  '{{{relay:x}}',
-  '{ {{relay:x}}',
-  '{{version}} and {{relay:x}}',
-  '{{relay:missing}}',
-  '中{{relay:x}}文',
-  '{{ Relay : x }}',
-  '{{{{relay:x}}',
-  `{{relay:${'a'.repeat(128)}}}`,
-  `{{relay:${'a'.repeat(129)}}}`,
-  `{{relay:${'a'.repeat(250)}}}`,
-  `{{relay: ${'q'.repeat(300)} {{relay:x}}`,
-];
-
-const CHUNK_BLOCKS = [
-  { id: 'x', text: 'T' },
-  { id: 'a'.repeat(128), text: 'L' },
-];
-
-describe('RelayStreamFilter single-cut property', () => {
-  it('equals whole input for text and events', () => {
-    for (const s of CHUNK_SAMPLES) {
-      for (let cut = 0; cut <= s.length; cut++) {
-        const whole = feedWithEvents(new RelayStreamFilter(registryWith(CHUNK_BLOCKS)), [s]);
-        const chunked = feedWithEvents(new RelayStreamFilter(registryWith(CHUNK_BLOCKS)), [
-          s.slice(0, cut),
-          s.slice(cut),
-        ]);
-        expect(chunked.text).toBe(whole.text);
-        expect(chunked.events).toEqual(whole.events);
-      }
-    }
-  });
-});
-
-describe('RelayStreamFilter seeded multi-cut property', () => {
-  it('equals whole input for text and events', () => {
+  it('for every single cut and for random multi-cuts, text and events match', () => {
     const rand = mulberry32(462_001);
-    for (const s of CHUNK_SAMPLES) {
-      for (let n = 0; n < 20; n++) {
-        const cuts: number[] = [0];
-        let p = 0;
-        while (p < s.length) {
-          p += 1 + Math.floor(rand() * 5);
-          if (p < s.length) cuts.push(p);
-        }
-        cuts.push(s.length);
-        const chunks: string[] = [];
-        for (let i = 0; i < cuts.length - 1; i++) {
-          chunks.push(s.slice(cuts[i]!, cuts[i + 1]));
-        }
-        const whole = feedWithEvents(new RelayStreamFilter(registryWith(CHUNK_BLOCKS)), [s]);
-        const chunked = feedWithEvents(new RelayStreamFilter(registryWith(CHUNK_BLOCKS)), chunks);
-        expect(chunked.text).toBe(whole.text);
-        expect(chunked.events).toEqual(whole.events);
+    for (const s of samples) {
+      const whole = feed([s], blocks);
+      for (let cut = 0; cut <= s.length; cut++) {
+        expect(feed([s.slice(0, cut), s.slice(cut)], blocks)).toEqual(whole);
       }
-    }
-  });
-});
-
-describe('RelayStreamFilter flush-from-state property', () => {
-  it('matches expand of that prefix', () => {
-    const s = 'pre {{relay:x}} mid {{relay:missing}} end';
-    const blocks = [{ id: 'x', text: 'T' }];
-    for (let i = 0; i <= s.length; i++) {
-      const prefix = s.slice(0, i);
-      const whole = feedWithEvents(new RelayStreamFilter(registryWith(blocks)), [prefix]);
-      const filter = new RelayStreamFilter(registryWith(blocks));
-      const a = filter.push(prefix);
-      const b = filter.flush();
-      expect(a.text + b.text).toBe(whole.text);
-      expect([...a.events, ...b.events]).toEqual(whole.events);
+      for (let n = 0; n < 20; n++) {
+        const chunks: string[] = [];
+        for (let p = 0; p < s.length;) {
+          const next = p + 1 + Math.floor(rand() * 5);
+          chunks.push(s.slice(p, next));
+          p = next;
+        }
+        expect(feed(chunks, blocks)).toEqual(whole);
+      }
     }
   });
 });

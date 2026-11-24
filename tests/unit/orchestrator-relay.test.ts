@@ -448,65 +448,15 @@ describe('webhook iteration deltas', () => {
   });
 });
 
-describe('active: empty-answer recovery (Corrección 1)', () => {
-  it('runs one recovery round then delivers expanded text', async () => {
-    const logs: LoggedEvent[] = [];
-    callMCPToolMock
-      .mockResolvedValueOnce(mcpRelayResult('later', 'RECOVERED'))
-      .mockResolvedValue(mcpRelayResult('later', 'RECOVERED'));
-    mockAnthropicSSE([
-      createMockMessage('m1', 'end_turn', [{ type: 'text', text: '{{relay:missing}}' }]),
-      createMockMessage('m2', 'tool_use', [
-        {
-          type: 'tool_use',
-          id: 't1',
-          name: 'fetch_obs_study_manual',
-          input: {},
-        } as Anthropic.ContentBlock,
-      ]),
-      createMockMessage('m3', 'end_turn', [{ type: 'text', text: '{{relay:later}}' }]),
-    ]);
-    const result = await orchestrate(
-      'hi',
-      baseOpts(createMockLogger(logs), {
-        env: { RELAY_SERVER_IDS: 'obs-5m-mcp' },
-        callbacks: progressCallbacks([]),
-      })
-    );
-    expect(result.responses).toEqual(['RECOVERED']);
-    expect(logs.some((l) => l.event === 'relay_empty_answer_recovery')).toBe(true);
-    expect(logs.some((l) => l.event === 'relay_empty_answer')).toBe(false);
-  });
-
-  it('delivers localized notice when recovery still yields a blank answer', async () => {
+describe('active: empty-answer notice', () => {
+  it('ends with the localized notice when the answer was only unusable tokens', async () => {
     const logs: LoggedEvent[] = [];
     const progress: string[] = [];
-    mockAnthropicSSE([
-      createMockMessage('m1', 'end_turn', [{ type: 'text', text: '{{relay:gone}}' }]),
-      createMockMessage('m2', 'end_turn', [{ type: 'text', text: '{{relay:still-gone}}' }]),
-    ]);
-    const result = await orchestrate(
-      'hi',
-      baseOpts(createMockLogger(logs), {
-        env: { RELAY_SERVER_IDS: 'obs-5m-mcp' },
-        callbacks: progressCallbacks(progress),
-      })
+    const outbound: Array<Array<{ role: string; content: unknown }>> = [];
+    captureOutboundSSE(
+      [createMockMessage('m1', 'end_turn', [{ type: 'text', text: '{{relay:gone}}' }])],
+      outbound
     );
-    expect(result.responses).toEqual([UI_STRINGS.en.notice_relay_empty]);
-    expect(progress.at(-1)).toBe(UI_STRINGS.en.notice_relay_empty);
-    expect(logs.some((l) => l.event === 'relay_empty_answer_recovery')).toBe(true);
-    expect(logs.some((l) => l.event === 'relay_empty_answer')).toBe(true);
-  });
-});
-
-describe('active: blank recovery notice (C2)', () => {
-  it('delivers the notice when recovery returns empty content blocks', async () => {
-    const logs: LoggedEvent[] = [];
-    const progress: string[] = [];
-    mockAnthropicSSE([
-      createMockMessage('m1', 'end_turn', [{ type: 'text', text: '{{relay:gone}}' }]),
-      createMockMessage('m2', 'end_turn', []),
-    ]);
     const result = await orchestrate(
       'hi',
       baseOpts(createMockLogger(logs), {
@@ -517,117 +467,9 @@ describe('active: blank recovery notice (C2)', () => {
     expect(result.responses).toEqual([UI_STRINGS.en.notice_relay_empty]);
     expect(progress.join('')).toBe(UI_STRINGS.en.notice_relay_empty);
     expect(logs.some((l) => l.event === 'relay_empty_answer')).toBe(true);
-  });
-
-  it('delivers the notice when recovery returns whitespace-only text', async () => {
-    const logs: LoggedEvent[] = [];
-    mockAnthropicSSE([
-      createMockMessage('m1', 'end_turn', [{ type: 'text', text: '{{relay:gone}}' }]),
-      createMockMessage('m2', 'end_turn', [{ type: 'text', text: '  \n' }]),
-    ]);
-    const result = await orchestrate('hi', relayOnOpts(createMockLogger(logs)));
-    expect(result.responses).toEqual([UI_STRINGS.en.notice_relay_empty]);
-    expect(logs.some((l) => l.event === 'relay_empty_answer')).toBe(true);
-  });
-});
-
-describe('active: no false notice after successful recovery (C3)', () => {
-  it('skips the notice when a later round already delivered expanded text', async () => {
-    const logs: LoggedEvent[] = [];
-    callMCPToolMock.mockResolvedValue(mcpRelayResult('panel', 'PANEL'));
-    mockAnthropicSSE([
-      createMockMessage('m1', 'end_turn', [{ type: 'text', text: '{{relay:gone}}' }]),
-      createMockMessage('m2', 'tool_use', [
-        { type: 'text', text: 'Here is the answer.' } as Anthropic.ContentBlock,
-        {
-          type: 'tool_use',
-          id: 't1',
-          name: 'fetch_obs_study_manual',
-          input: {},
-        } as Anthropic.ContentBlock,
-      ]),
-      createMockMessage('m3', 'end_turn', []),
-    ]);
-    const result = await orchestrate(
-      'hi',
-      baseOpts(createMockLogger(logs), {
-        env: { RELAY_SERVER_IDS: 'obs-5m-mcp' },
-        callbacks: progressCallbacks([]),
-      })
-    );
-    expect(result.responses).toEqual(['Here is the answer.']);
-    expect(result.responses).not.toContain(UI_STRINGS.en.notice_relay_empty);
-    expect(logs.some((l) => l.event === 'relay_empty_answer_recovery')).toBe(true);
-    expect(logs.some((l) => l.event === 'relay_empty_answer')).toBe(false);
-  });
-});
-
-describe('active: recovery skips tool_use (C2)', () => {
-  it('does not run recovery when end_turn still has a tool_use block', async () => {
-    const logs: LoggedEvent[] = [];
-    const outbound: Array<Array<{ role: string; content: unknown }>> = [];
-    captureOutboundSSE(
-      [
-        createMockMessage('m1', 'end_turn', [
-          { type: 'text', text: 'Hi {{relay:gone}}' } as Anthropic.ContentBlock,
-          {
-            type: 'tool_use',
-            id: 't1',
-            name: 'fetch_obs_study_manual',
-            input: {},
-          } as Anthropic.ContentBlock,
-        ]),
-      ],
-      outbound
-    );
-    const result = await orchestrate('hi', relayOnOpts(createMockLogger(logs)));
-    expect(logs.some((l) => l.event === 'relay_empty_answer_recovery')).toBe(false);
-    expect(logs.some((l) => l.event === 'relay_empty_answer')).toBe(false);
-    expect(result.responses).toEqual(['Hi ']);
     expect(outbound).toHaveLength(1);
   });
-});
 
-describe('active: recovery message wording (C2)', () => {
-  it('lists each unknown id once in the recovery message', async () => {
-    const outbound: Array<Array<{ role: string; content: unknown }>> = [];
-    captureOutboundSSE(
-      [
-        createMockMessage('m1', 'end_turn', [
-          { type: 'text', text: '{{relay:gone}}{{relay:gone}}{{relay:x' } as Anthropic.ContentBlock,
-        ]),
-        createMockMessage('m2', 'end_turn', [{ type: 'text', text: 'ok' }]),
-      ],
-      outbound
-    );
-    await orchestrate('hi', relayOnOpts());
-    const recoveryUser = (outbound[1] ?? []).filter((m) => m.role === 'user').at(-1);
-    expect(String(recoveryUser?.content)).toContain(
-      'only relay tokens that are not available in this turn: gone.'
-    );
-    expect(String(recoveryUser?.content)).not.toContain('gone, gone');
-  });
-
-  it('uses unread wording when there are no unknown ids', async () => {
-    const outbound: Array<Array<{ role: string; content: unknown }>> = [];
-    captureOutboundSSE(
-      [
-        createMockMessage('m1', 'end_turn', [
-          { type: 'text', text: '{{relay:bad id}}' } as Anthropic.ContentBlock,
-        ]),
-        createMockMessage('m2', 'end_turn', [{ type: 'text', text: 'ok' }]),
-      ],
-      outbound
-    );
-    await orchestrate('hi', relayOnOpts());
-    const recoveryUser = (outbound[1] ?? []).filter((m) => m.role === 'user').at(-1);
-    expect(String(recoveryUser?.content)).toContain(
-      'only relay tokens that could not be read. Fetch the content again with the tool and use the listed ids, or answer in words.'
-    );
-  });
-});
-
-describe('active: empty-answer notice separator (C2)', () => {
   it('emits the notice through the pending separator gate', async () => {
     const progress: string[] = [];
     callMCPToolMock.mockResolvedValue(mcpRelayResult('known', 'KNOWN'));
@@ -642,7 +484,6 @@ describe('active: empty-answer notice separator (C2)', () => {
         { type: 'text', text: 'Intro' } as Anthropic.ContentBlock,
       ]),
       createMockMessage('m2', 'end_turn', [{ type: 'text', text: '{{relay:gone}}' }]),
-      createMockMessage('m3', 'end_turn', [{ type: 'text', text: '{{relay:still}}' }]),
     ]);
     const result = await orchestrate(
       'hi',
@@ -653,6 +494,44 @@ describe('active: empty-answer notice separator (C2)', () => {
     );
     expect(result.responses).toEqual(['Intro', UI_STRINGS.en.notice_relay_empty]);
     expect(progress.join('')).toBe(result.responses.join('\n'));
+  });
+});
+
+describe('active: truncation notice after a held separator', () => {
+  it('releases the separator so progress matches responses', async () => {
+    const progress: string[] = [];
+    callMCPToolMock.mockResolvedValue(mcpRelayResult('known', 'KNOWN'));
+    mockAnthropicSSE([
+      createMockMessage('m1', 'tool_use', [
+        { type: 'text', text: 'Intro' } as Anthropic.ContentBlock,
+        {
+          type: 'tool_use',
+          id: 't1',
+          name: 'fetch_obs_study_manual',
+          input: {},
+        } as Anthropic.ContentBlock,
+      ]),
+      createMockMessage('m2', 'max_tokens', [{ type: 'text', text: '{{relay:gone}}' }]),
+    ]);
+    const result = await orchestrate(
+      'hi',
+      baseOpts(createMockLogger(), {
+        env: { RELAY_SERVER_IDS: 'obs-5m-mcp' },
+        callbacks: progressCallbacks(progress),
+      })
+    );
+    expect(result.responses).toEqual(['Intro', UI_STRINGS.en.notice_answer_truncated]);
+    expect(progress.join('')).toBe(result.responses.join('\n'));
+  });
+});
+
+describe('active: no notice for a blank answer', () => {
+  it('adds no notice when the model wrote no text at all', async () => {
+    const logs: LoggedEvent[] = [];
+    mockAnthropicSSE([createMockMessage('m1', 'end_turn', [{ type: 'text', text: '  \n' }])]);
+    const result = await orchestrate('hi', relayOnOpts(createMockLogger(logs)));
+    expect(result.responses).toEqual([]);
+    expect(logs.some((l) => l.event === 'relay_empty_answer')).toBe(false);
   });
 });
 

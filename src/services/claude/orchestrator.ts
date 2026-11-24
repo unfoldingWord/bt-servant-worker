@@ -84,7 +84,6 @@ import {
   RelayCollector,
   RelayRegistry,
   RelayStreamFilter,
-  type RelayEvent,
 } from './relay.js';
 import {
   buildAllTools,
@@ -375,8 +374,6 @@ interface OrchestrationContext {
    * before anything stops it.
    */
   maxMcpCallsPerRequest: number;
-  /** Cap on orchestration rounds for this turn (from env). */
-  maxIterations: number;
   /** Mutable counter — increments inside handleMCPToolCall before each call. */
   mcpCallsMade: { count: number };
   /**
@@ -419,29 +416,18 @@ interface OrchestrationContext {
   org: string;
   env: Env;
   /**
-   * Verbatim relay (#462). Fixed for the turn: env list non-empty AND catalog
-   * has a tool from a listed server. When false, no filters/notes are created
-   * and streaming is byte-identical to pre-relay behavior.
+   * Verbatim relay (#462): the turn's id → text map. Set only when relay is
+   * active for the turn (env list non-empty AND the catalog has a tool from a
+   * listed server). Undefined ⇒ no filters or notes; streaming is unchanged.
    */
-  relayActive: boolean;
-  /** Parsed `RELAY_SERVER_IDS` for this turn. */
-  relayServerIds: readonly string[];
-  /** Turn-scoped id → text map; only allocated when `relayActive`. */
   relay: RelayRegistry | undefined;
+  /** Parsed `RELAY_SERVER_IDS`: the servers whose blocks are accepted. */
+  relayServerIds: readonly string[];
   /**
    * When relay is active, the inter-round `\n` is held until the first
    * non-empty filtered progress of that round (boolean, not a counter).
    */
   pendingRelaySeparator: boolean;
-  /**
-   * At most one empty-answer recovery round per turn (#462 Corrección 1).
-   */
-  relayEmptyRecoveryUsed: boolean;
-  /**
-   * True once any non-blank expanded text reached `responses` after recovery
-   * started. The empty-answer notice only fires when this stays false (#462 C3).
-   */
-  relayExpandedAfterRecovery: boolean;
 }
 
 /**
@@ -584,59 +570,22 @@ function extractTextResponses(content: Anthropic.ContentBlock[]): string[] {
   return texts;
 }
 
-interface TurnTextExpansion {
-  /** Expanded non-whitespace blocks (untrimmed), for `ctx.responses`. */
-  responses: string[];
-  /** True when any raw text block has non-whitespace content. */
-  rawNonBlank: boolean;
-  /** Unknown relay ids seen while expanding (for empty-answer recovery). */
-  unavailableIds: string[];
-}
-
 /**
  * When relay is active: expand each text block, drop blocks whose expanded
- * form is only whitespace, keep expanded text untrimmed (#410 / #462).
+ * form is only whitespace, keep expanded text untrimmed (#410 / #462). The
+ * `relay_*` events are logged here only (streaming does not log them).
  * When inactive: identical to {@link extractTextResponses}.
- *
- * #410 equality (concatenated progress === responses.join('\\n')) holds for
- * one text block per round. Two text blocks in one message, and the truncation
- * notice, already differ by `\\n` on develop — that is unchanged.
  */
-function expandTurnText(
-  content: Anthropic.ContentBlock[],
-  ctx: OrchestrationContext
-): TurnTextExpansion {
-  if (!ctx.relayActive || !ctx.relay) {
-    const responses = extractTextResponses(content);
-    return {
-      responses,
-      rawNonBlank: responses.some((t) => t.trim() !== ''),
-      unavailableIds: [],
-    };
-  }
+function expandTurnText(content: Anthropic.ContentBlock[], ctx: OrchestrationContext): string[] {
+  if (!ctx.relay) return extractTextResponses(content);
   const responses: string[] = [];
-  const unavailableIds: string[] = [];
-  let rawNonBlank = false;
   for (const block of content) {
     if (block.type !== 'text') continue;
-    if (block.text.trim() !== '') rawNonBlank = true;
-    const { text: expanded, events } = expandRelayBlock(block.text, ctx.relay);
-    logRelayExpansionEvents(ctx, events);
-    for (const e of events) {
-      if (e.type === 'unknown_id') unavailableIds.push(e.id);
-    }
-    if (expanded.trim()) responses.push(expanded);
+    const { text, events } = expandRelayBlock(block.text, ctx.relay);
+    for (const e of events) ctx.logger.warn(`relay_${e.type}`, 'id' in e ? { id: e.id } : {});
+    if (text.trim()) responses.push(text);
   }
-  return { responses, rawNonBlank, unavailableIds };
-}
-
-function logRelayExpansionEvents(ctx: OrchestrationContext, events: readonly RelayEvent[]): void {
-  for (const e of events) {
-    if (e.type === 'unknown_id') ctx.logger.warn('relay_unknown_id', { id: e.id });
-    else if (e.type === 'repeated_id') ctx.logger.warn('relay_repeated_id', { id: e.id });
-    else if (e.type === 'malformed_token') ctx.logger.warn('relay_malformed_token', {});
-    else if (e.type === 'truncated_token') ctx.logger.warn('relay_truncated_token', {});
-  }
+  return responses;
 }
 
 /**
@@ -1734,10 +1683,13 @@ async function streamClaudeResponse(ctx: OrchestrationContext): Promise<Anthropi
       touch,
       abortKind,
       onChunk: () => ctx.lockRefresher.maybe('stream_chunk'),
-      ...(ctx.relayActive && ctx.relay
+      ...(ctx.relay
         ? {
-            relay: ctx.relay,
-            emitProgress: (text: string) => emitRelayProgress(ctx, text),
+            relay: {
+              registry: ctx.relay,
+              emit: (text: string) => emitRelayProgress(ctx, text),
+              blocks: new Map(),
+            },
           }
         : {}),
     });
@@ -1762,21 +1714,25 @@ async function streamClaudeResponse(ctx: OrchestrationContext): Promise<Anthropi
 interface SSEParseState {
   message: Anthropic.Message | undefined;
   eventCounts: Record<string, number>;
-  /** Per text-block-index filter; only when relay is active for the turn. */
-  relayFilters?: Map<number, RelayStreamFilter>;
-  relay?: RelayRegistry;
-  /** Emit progress through the relay separator gate when present. */
-  emitProgress?: (text: string) => void;
-  /**
-   * Per text-block leading whitespace held until the first non-whitespace
-   * filtered output. Discarded if the block ends whitespace-only (#462).
-   */
-  heldRelayWhitespace?: Map<number, string>;
-  /**
-   * Text-block indexes that have already released non-whitespace progress.
-   * After this, whitespace streams normally (trailing `\n\n` must not vanish).
-   */
-  relayBlockReleasedNonWs?: Set<number>;
+  /** Only when relay is active for the turn (#462). */
+  relay?: RelaySSEState;
+}
+
+/** Streaming relay state for one model call (#462). */
+interface RelaySSEState {
+  registry: RelayRegistry;
+  /** Progress through the relay separator gate. */
+  emit: (text: string) => void;
+  /** Open text blocks by content index. */
+  blocks: Map<number, RelayBlockStream>;
+}
+
+interface RelayBlockStream {
+  filter: RelayStreamFilter;
+  /** Leading whitespace held until the block's first real text. */
+  held: string;
+  /** True once real text went out; after that whitespace streams normally. */
+  released: boolean;
 }
 
 function applySSELines(
@@ -1895,7 +1851,7 @@ function abortSSEStream(
 ): never {
   // Flush open relay filters before the throw so truncated-token cleanup and
   // any retained prefix reach onProgress ahead of finishTruncatedAnswer (#462).
-  flushRelayFilters(state, logger);
+  endAllRelayBlocks(state.relay);
   // Only the attempt guard aborts this signal, so a kind is always recorded;
   // `deadline` is the defensive fallback.
   const kind = detail.watch.abortKind() ?? 'deadline';
@@ -1928,62 +1884,44 @@ function emitRelayProgress(ctx: OrchestrationContext, text: string): void {
   notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress(text));
 }
 
+/** Filter one text delta of block `index`. */
+function relayDelta(relay: RelaySSEState, index: number, text: string): void {
+  let block = relay.blocks.get(index);
+  if (!block) {
+    block = { filter: new RelayStreamFilter(relay.registry), held: '', released: false };
+    relay.blocks.set(index, block);
+  }
+  releaseRelayText(relay, block, block.filter.push(text).text);
+}
+
 /**
- * Hold leading whitespace per text block until the first non-whitespace chunk.
- * After that point, whitespace streams normally. Whitespace-only blocks emit
- * nothing (so they cannot desync length-based webhooks from `responses`).
+ * Hold a block's leading whitespace until its first real text, so a block that
+ * expands to nothing emits nothing and length-based webhooks stay aligned with
+ * `responses`. After that, whitespace streams normally.
  */
-function releaseRelayBlockProgress(
-  state: SSEParseState,
-  index: number,
-  chunk: string,
-  logger: RequestLogger
-): void {
-  if (!state.heldRelayWhitespace) state.heldRelayWhitespace = new Map();
-  if (!state.relayBlockReleasedNonWs) state.relayBlockReleasedNonWs = new Set();
-
-  const emit = (text: string): void => {
-    if (!text || !state.emitProgress) return;
-    try {
-      state.emitProgress(text);
-    } catch (error) {
-      logger.warn('relay_flush_progress_failed', {
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  };
-
-  // After the first non-whitespace release, do not gate — trailing ws must pass.
-  if (state.relayBlockReleasedNonWs.has(index)) {
-    emit(chunk);
+function releaseRelayText(relay: RelaySSEState, block: RelayBlockStream, text: string): void {
+  if (block.released) {
+    relay.emit(text);
     return;
   }
-
-  const held = state.heldRelayWhitespace.get(index) ?? '';
-  const combined = held + chunk;
-  if (!combined) return;
-  if (combined.trim() === '') {
-    state.heldRelayWhitespace.set(index, combined);
-    return;
-  }
-  state.heldRelayWhitespace.delete(index);
-  state.relayBlockReleasedNonWs.add(index);
-  emit(combined);
+  block.held += text;
+  if (block.held.trim() === '') return;
+  block.released = true;
+  relay.emit(block.held);
+  block.held = '';
 }
 
-function discardHeldRelayWhitespace(state: SSEParseState, index: number): void {
-  state.heldRelayWhitespace?.delete(index);
-  state.relayBlockReleasedNonWs?.delete(index);
+/** End of a text block: flush its filter; whitespace still held is dropped. */
+function endRelayBlock(relay: RelaySSEState | undefined, index: number): void {
+  const block = relay?.blocks.get(index);
+  if (!relay || !block) return;
+  relay.blocks.delete(index);
+  releaseRelayText(relay, block, block.filter.flush().text);
 }
 
-function flushRelayFilters(state: SSEParseState, logger: RequestLogger): void {
-  if (!state.relayFilters) return;
-  for (const [index, filter] of state.relayFilters.entries()) {
-    const { text } = filter.flush();
-    releaseRelayBlockProgress(state, index, text, logger);
-    discardHeldRelayWhitespace(state, index);
-  }
-  state.relayFilters.clear();
+/** End of the stream (clean or aborted): close every open block. */
+function endAllRelayBlocks(relay: RelaySSEState | undefined): void {
+  for (const index of [...(relay?.blocks.keys() ?? [])]) endRelayBlock(relay, index);
 }
 
 /** A chunk arrived: re-arm the stall timer and run the per-chunk hook (#481). */
@@ -2030,20 +1968,14 @@ async function parseSSEStream(
   body: ReadableStream<Uint8Array>,
   logger: RequestLogger,
   callbacks?: StreamCallbacks,
-  watch?: StreamWatch & { relay?: RelayRegistry; emitProgress?: (text: string) => void }
+  watch?: StreamWatch & { relay?: RelaySSEState }
 ): Promise<Anthropic.Message> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   const state: SSEParseState = {
     message: undefined,
     eventCounts: {},
-    ...(watch?.relay
-      ? {
-          relay: watch.relay,
-          relayFilters: new Map(),
-          emitProgress: watch.emitProgress,
-        }
-      : {}),
+    ...(watch?.relay ? { relay: watch.relay } : {}),
   };
   const stats: SSEReadStats = { chunks: 0, bytes: 0, start: Date.now() };
   const aborted = watch ? abortedSignal(watch.signal) : undefined;
@@ -2070,9 +2002,8 @@ async function parseSSEStream(
   if (watch?.signal.aborted) {
     return abortSSEStream(reader, state, stats, logger, { watch, readError: undefined });
   }
-  // Clean EOF: flush any open filters so retained prefixes / truncated tokens
-  // reach progress before responses are finalized (#462 Corrección 1).
-  flushRelayFilters(state, logger);
+  // Clean EOF: flush open filters so held text reaches progress (#462).
+  endAllRelayBlocks(state.relay);
   return finalizeSSEStream(state, stats, logger);
 }
 
@@ -2085,38 +2016,15 @@ function applyContentDelta(
 ): void {
   const block = message.content[event.index];
   if (event.delta.type === 'text_delta' && block?.type === 'text') {
-    block.text += event.delta.text;
-    emitTextDeltaProgress(event.index, event.delta.text, logger, callbacks, state);
+    const text = event.delta.text;
+    block.text += text;
+    if (state.relay) relayDelta(state.relay, event.index, text);
+    else notifyCallback(logger, () => callbacks?.onProgress(text));
   }
   if (event.delta.type === 'input_json_delta' && block?.type === 'tool_use') {
     const prev = typeof block.input === 'string' ? block.input : '';
     (block as { input: string }).input = prev + event.delta.partial_json;
   }
-}
-
-function emitTextDeltaProgress(
-  index: number,
-  text: string,
-  logger: RequestLogger,
-  callbacks: StreamCallbacks | undefined,
-  state: SSEParseState
-): void {
-  if (!state.relay || !state.relayFilters) {
-    notifyCallback(logger, () => callbacks?.onProgress(text));
-    return;
-  }
-  let filter = state.relayFilters.get(index);
-  if (!filter) {
-    filter = new RelayStreamFilter(state.relay);
-    state.relayFilters.set(index, filter);
-  }
-  const { text: emitted } = filter.push(text);
-  if (state.emitProgress) {
-    releaseRelayBlockProgress(state, index, emitted, logger);
-    return;
-  }
-  if (!emitted) return;
-  notifyCallback(logger, () => callbacks?.onProgress(emitted));
 }
 
 function finalizeToolInput(message: Anthropic.Message, index: number, logger: RequestLogger): void {
@@ -2163,23 +2071,10 @@ function applySSEEvent(
     applyContentDelta(message, event, logger, callbacks, state);
   } else if (event.type === 'content_block_stop') {
     finalizeToolInput(message, event.index, logger);
-    flushRelayFilterAt(state, event.index, logger);
+    endRelayBlock(state.relay, event.index);
   }
 
   return message;
-}
-
-function flushRelayFilterAt(state: SSEParseState, index: number, logger: RequestLogger): void {
-  const filter = state.relayFilters?.get(index);
-  if (!filter) {
-    discardHeldRelayWhitespace(state, index);
-    return;
-  }
-  const { text } = filter.flush();
-  state.relayFilters?.delete(index);
-  releaseRelayBlockProgress(state, index, text, logger);
-  // End of block: drop any remaining held whitespace (whitespace-only block).
-  discardHeldRelayWhitespace(state, index);
 }
 
 /** Invoke a callback safely — catches both sync throws and async rejections. */
@@ -2222,7 +2117,7 @@ function deliverablePartial(error: unknown, ctx: OrchestrationContext): Anthropi
   if (!content.every((block) => PARTIAL_DELIVERABLE_BLOCKS.has(block.type))) return null;
   const hasText = content.some((block) => {
     if (block.type !== 'text') return false;
-    if (!ctx.relayActive || !ctx.relay) return block.text.trim() !== '';
+    if (!ctx.relay) return block.text.trim() !== '';
     // Do not log here — expandTurnText logs once.
     return expandRelayBlock(block.text, ctx.relay).text.trim() !== '';
   });
@@ -2464,7 +2359,9 @@ function finishTruncatedAnswer(ctx: OrchestrationContext, cause: TruncationCause
   // tells a cut-off stream apart from a clean stop.
   if (cause !== 'max_tokens') ctx.telemetry.finalStopReason = 'stream_aborted';
   const notice = uiString(ctx.locale, 'notice_answer_truncated');
-  notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress(notice));
+  // Through the relay separator gate (a no-op gate when relay is off), so a
+  // held separator goes out first and progress matches `responses` (#410, #462).
+  emitRelayProgress(ctx, notice);
   ctx.responses.push(notice);
 }
 
@@ -2480,97 +2377,79 @@ function finalRoundReason(
 /** The round that ends the turn: add the truncation notice when the answer was cut short. */
 function endFinalRound(
   ctx: OrchestrationContext,
+  response: Anthropic.Message,
   round: {
     iteration: number;
     iterStart: number;
-    stopReason: Anthropic.Message['stop_reason'];
     streamAbort: StreamAbortKind | null;
+    /** How many responses this round added (#462 empty-answer notice). */
+    added: number;
   }
 ): void {
   const cause: TruncationCause | null =
-    round.streamAbort ?? (round.stopReason === 'max_tokens' ? 'max_tokens' : null);
+    round.streamAbort ?? (response.stop_reason === 'max_tokens' ? 'max_tokens' : null);
   if (cause) finishTruncatedAnswer(ctx, cause);
+  else if (round.added === 0) addRelayEmptyNotice(ctx, response.content);
   ctx.logger.log('iteration_end', {
     iteration: round.iteration,
-    reason: finalRoundReason(round.stopReason, round.streamAbort),
+    reason: finalRoundReason(response.stop_reason, round.streamAbort),
     total_duration_ms: Date.now() - round.iterStart,
   });
 }
 
-function recordTurnResponses(
-  ctx: OrchestrationContext,
-  content: Anthropic.ContentBlock[]
-): TurnTextExpansion {
-  const expansion = expandTurnText(content, ctx);
-  ctx.responses.push(...expansion.responses);
+function recordTurnResponses(ctx: OrchestrationContext, content: Anthropic.ContentBlock[]): number {
+  const expanded = expandTurnText(content, ctx);
+  ctx.responses.push(...expanded);
   // Only drop a held separator when this round contributed expanded text.
-  if (ctx.relayActive && expansion.responses.length > 0) {
-    ctx.pendingRelaySeparator = false;
-  }
-  if (ctx.relayEmptyRecoveryUsed && expansion.responses.length > 0) {
-    ctx.relayExpandedAfterRecovery = true;
-  }
-  return expansion;
+  if (expanded.length > 0) ctx.pendingRelaySeparator = false;
+  return expanded.length;
 }
 
 /**
- * Whether this final round is an empty expanded answer that should recover or
- * get the localized notice (#462). Recovery / notice only when there are no
- * tool calls — otherwise a tool_use without tool_result hits the API (#462 C2).
- * After recovery, notice only if no expanded text reached responses since (#462 C3).
+ * Relay active and the final round's text was only tokens that expanded to
+ * nothing (unknown or repeated ids): end with a notice instead of a blank
+ * answer (#462). A cut-off answer already gets the truncation notice.
  */
-function isRelayEmptyAnswerEligible(
-  ctx: OrchestrationContext,
-  expansion: TurnTextExpansion,
-  toolCallCount: number,
-  streamAbort: StreamAbortKind | null,
-  stopReason: Anthropic.Message['stop_reason']
-): boolean {
-  if (!ctx.relayActive || expansion.responses.length > 0 || toolCallCount > 0) return false;
-  if (streamAbort || stopReason === 'max_tokens') return false;
-  if (!ctx.relayEmptyRecoveryUsed) return expansion.rawNonBlank;
-  return !ctx.relayExpandedAfterRecovery;
-}
-
-/**
- * Final round (no more tools): optional empty-answer recovery, else end turn.
- * @returns true when the turn is done; false when recovery continues the loop.
- */
-function finishOrRecoverEmptyRound(
-  ctx: OrchestrationContext,
-  round: {
-    response: Anthropic.Message;
-    expansion: TurnTextExpansion;
-    iteration: number;
-    iterStart: number;
-    streamAbort: StreamAbortKind | null;
-    toolCallCount: number;
-  }
-): boolean {
-  const { response, expansion, iteration, iterStart, streamAbort, toolCallCount } = round;
-  const eligibleEmpty = isRelayEmptyAnswerEligible(
-    ctx,
-    expansion,
-    toolCallCount,
-    streamAbort,
-    response.stop_reason
-  );
-  if (
-    eligibleEmpty &&
-    tryRelayEmptyAnswerRecovery(ctx, response, expansion, iteration, iterStart)
-  ) {
-    return false;
-  }
-  if (eligibleEmpty) finishRelayEmptyAnswer(ctx);
-  endFinalRound(ctx, { iteration, iterStart, stopReason: response.stop_reason, streamAbort });
-  return true;
+function addRelayEmptyNotice(ctx: OrchestrationContext, content: Anthropic.ContentBlock[]): void {
+  if (!ctx.relay) return;
+  if (!content.some((block) => block.type === 'text' && block.text.trim() !== '')) return;
+  ctx.logger.warn('relay_empty_answer', ctx.turnId ? { turn_id: ctx.turnId } : {});
+  const notice = uiString(ctx.locale, 'notice_relay_empty');
+  // Through the separator gate so progress stays aligned with responses.
+  emitRelayProgress(ctx, notice);
+  ctx.responses.push(notice);
 }
 
 function processIteration(ctx: OrchestrationContext, iteration: number): Promise<boolean> {
   return withSpan('iteration', { iteration }, async () => {
     const iterStart = Date.now();
-    logIterationStart(ctx, iteration);
-    maybeEmitRoundSeparator(ctx, iteration);
+    ctx.logger.log('iteration_start', { iteration, message_count: ctx.messages.length });
+    ctx.lockRefresher.now('round_start');
+    ctx.logger.log('claude_request', {
+      ...(ctx.turnId ? { turn_id: ctx.turnId } : {}),
+      iteration,
+      message_count: ctx.messages.length,
+      system_stable_hash: ctx.systemStableHash,
+      system_stable_chars: ctx.systemStable.length,
+    });
+
+    if (iteration > 0) {
+      // The separator divides prose from prose. On a tools-first turn (iteration 0
+      // returns tool_use with no text block — the normal shape for a fresh account's
+      // first question) nothing has been streamed yet, so emitting it would put
+      // whitespace ahead of the first word: stream consumers that treat `progress`
+      // as "the answer has started" blank out for the whole tool phase, and the
+      // streamed text diverges from the final joined `responses` (#410).
+      // `ctx.responses` only ever holds non-whitespace blocks (extractTextResponses),
+      // so a non-empty array means real prose has already gone out.
+      // With relay active it is held until the round's first filtered text (#462).
+      if (ctx.callbacks && ctx.responses.length > 0) {
+        if (ctx.relay) ctx.pendingRelaySeparator = true;
+        else notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress('\n'));
+      }
+      // Status stays unconditional — the tool phase should still narrate itself.
+      ctx.emitStatus?.('status_preparing');
+    }
 
     const { response, streamAbort } = await callClaudeForIteration(ctx, iteration, iterStart);
     response.content = sanitizeAssistantContent(response.content, ctx.logger);
@@ -2578,18 +2457,12 @@ function processIteration(ctx: OrchestrationContext, iteration: number): Promise
     reportClaudeResponse(ctx, { iteration, response, toolCalls, iterStart });
 
     ctx.lastIterationStartIndex = ctx.responses.length;
-    const expansion = recordTurnResponses(ctx, response.content);
+    const added = recordTurnResponses(ctx, response.content);
 
     // A delivered partial never has a tool call, so it always ends the turn here.
     if (response.stop_reason === 'end_turn' || toolCalls.length === 0) {
-      return finishOrRecoverEmptyRound(ctx, {
-        response,
-        expansion,
-        iteration,
-        iterStart,
-        streamAbort,
-        toolCallCount: toolCalls.length,
-      });
+      endFinalRound(ctx, response, { iteration, iterStart, streamAbort, added });
+      return true;
     }
 
     ctx.emitStatus?.('status_executing_tools', { n: toolCalls.length });
@@ -2607,86 +2480,6 @@ function processIteration(ctx: OrchestrationContext, iteration: number): Promise
     });
     return false;
   });
-}
-
-/**
- * When a normal final round's raw text is non-blank but expansion is blank,
- * run one recovery round (within the iteration limit) asking the model to
- * fetch again or answer in words (#462 Corrección 1).
- *
- * @returns true when recovery was started (caller should continue the loop).
- */
-function tryRelayEmptyAnswerRecovery(
-  ctx: OrchestrationContext,
-  response: Anthropic.Message,
-  expansion: TurnTextExpansion,
-  iteration: number,
-  iterStart: number
-): boolean {
-  if (ctx.relayEmptyRecoveryUsed) return false;
-  // Need another iteration slot after this one.
-  if (iteration + 1 >= ctx.maxIterations) return false;
-
-  ctx.relayEmptyRecoveryUsed = true;
-  const uniqueIds = [...new Set(expansion.unavailableIds)];
-  ctx.logger.warn('relay_empty_answer_recovery', {
-    ...(ctx.turnId ? { turn_id: ctx.turnId } : {}),
-    iteration,
-    unavailable_ids: uniqueIds,
-  });
-  const recoveryContent =
-    uniqueIds.length > 0
-      ? 'Your reply contained only relay tokens that are not available in this turn: ' +
-        `${uniqueIds.join(', ')}. Fetch the content again with the tool and use the new ids, or answer in words.`
-      : 'Your reply contained only relay tokens that could not be read. Fetch the content again with the tool and use the listed ids, or answer in words.';
-  ctx.messages.push({ role: 'assistant', content: response.content as Anthropic.ContentBlock[] });
-  ctx.messages.push({
-    role: 'user',
-    content: recoveryContent,
-  });
-  ctx.logger.log('iteration_end', {
-    iteration,
-    reason: 'relay_empty_answer_recovery',
-    total_duration_ms: Date.now() - iterStart,
-  });
-  return true;
-}
-
-/** Localized notice when expanded answer is still blank after recovery (or none left). */
-function finishRelayEmptyAnswer(ctx: OrchestrationContext): void {
-  ctx.logger.warn('relay_empty_answer', {
-    ...(ctx.turnId ? { turn_id: ctx.turnId } : {}),
-    recovery_used: ctx.relayEmptyRecoveryUsed,
-  });
-  const notice = uiString(ctx.locale, 'notice_relay_empty');
-  // Go through the separator gate so progress length stays aligned with responses.
-  emitRelayProgress(ctx, notice);
-  ctx.responses.push(notice);
-}
-
-function logIterationStart(ctx: OrchestrationContext, iteration: number): void {
-  ctx.logger.log('iteration_start', { iteration, message_count: ctx.messages.length });
-  ctx.lockRefresher.now('round_start');
-  ctx.logger.log('claude_request', {
-    ...(ctx.turnId ? { turn_id: ctx.turnId } : {}),
-    iteration,
-    message_count: ctx.messages.length,
-    system_stable_hash: ctx.systemStableHash,
-    system_stable_chars: ctx.systemStable.length,
-  });
-}
-
-/**
- * The separator divides prose from prose (#410). With relay active it is held
- * until the first non-empty filtered progress of the round (#462).
- */
-function maybeEmitRoundSeparator(ctx: OrchestrationContext, iteration: number): void {
-  if (iteration <= 0) return;
-  if (ctx.callbacks && ctx.responses.length > 0) {
-    if (ctx.relayActive) ctx.pendingRelaySeparator = true;
-    else notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress('\n'));
-  }
-  ctx.emitStatus?.('status_preparing');
 }
 
 /** Default code execution timeout in milliseconds (30 seconds) */
@@ -2891,18 +2684,13 @@ function executionLimits(
   config: ReturnType<typeof parseEnvConfig>
 ): Pick<
   OrchestrationContext,
-  | 'codeExecTimeout'
-  | 'maxMcpCalls'
-  | 'maxMcpResponseSize'
-  | 'maxMcpCallsPerRequest'
-  | 'maxIterations'
+  'codeExecTimeout' | 'maxMcpCalls' | 'maxMcpResponseSize' | 'maxMcpCallsPerRequest'
 > {
   return {
     codeExecTimeout: config.codeExecTimeout,
     maxMcpCalls: config.maxMcpCalls,
     maxMcpResponseSize: config.maxMcpResponseSize,
     maxMcpCallsPerRequest: config.maxMcpCallsPerRequest,
-    maxIterations: config.maxIterations,
   };
 }
 
@@ -2958,41 +2746,13 @@ function defaultRouteHealthStore(env: Env, logger: RequestLogger): RouteHealthSt
 function relayContextFields(
   env: Env,
   catalog: ToolCatalog
-): Pick<
-  OrchestrationContext,
-  | 'relayActive'
-  | 'relayServerIds'
-  | 'relay'
-  | 'pendingRelaySeparator'
-  | 'relayEmptyRecoveryUsed'
-  | 'relayExpandedAfterRecovery'
-> {
+): Pick<OrchestrationContext, 'relay' | 'relayServerIds' | 'pendingRelaySeparator'> {
   const relayServerIds = parseRelayServerIds(env.RELAY_SERVER_IDS);
-  const relayActive = isRelayActive(relayServerIds, catalog);
   return {
-    relayActive,
+    relay: isRelayActive(relayServerIds, catalog) ? new RelayRegistry() : undefined,
     relayServerIds,
-    relay: relayActive ? new RelayRegistry() : undefined,
     pendingRelaySeparator: false,
-    relayEmptyRecoveryUsed: false,
-    relayExpandedAfterRecovery: false,
   };
-}
-
-function buildPromptForContext(options: OrchestratorOptions) {
-  const rawPromptValues = options.resolvedPromptValues ?? DEFAULT_PROMPT_VALUES;
-  const { values: strippedValues, languageDocument } = stripPromptComments(
-    rawPromptValues,
-    options.languageDocument,
-    options.logger
-  );
-  const promptValues = applyResourcePriorityToPrompt(
-    strippedValues,
-    options.catalog,
-    options.logger
-  );
-  // prettier-ignore
-  return buildSystemPromptBlocks(options.catalog, options.preferences, options.history, promptValues, { memoryTOC: options.memoryTOC, memoryEnabled: hasMemoryForTurn(options), caller: options.caller, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument, triggerOnly: options.triggerOnly, unmatchedTriggers: options.unmatchedTriggers, addressedToBot: options.addressedToBot, inboundVoiceKey: options.inboundVoiceKey });
 }
 
 function createOrchestrationContext(
@@ -3000,18 +2760,43 @@ function createOrchestrationContext(
   options: OrchestratorOptions,
   config: ReturnType<typeof parseEnvConfig>
 ): OrchestrationContext {
-  const { env, catalog, preferences, orgConfig, logger, callbacks } = options;
-  const locale = preferences.response_language;
+  const { env, catalog, history, preferences, orgConfig, logger, callbacks } = options;
+  const rawPromptValues = options.resolvedPromptValues ?? DEFAULT_PROMPT_VALUES;
+  const { values: strippedValues, languageDocument } = stripPromptComments(
+    rawPromptValues,
+    options.languageDocument,
+    logger
+  );
+  const promptValues = applyResourcePriorityToPrompt(strippedValues, catalog, logger);
   const llmMax = orgConfig?.max_history_llm ?? DEFAULT_ORG_CONFIG.max_history_llm;
-  const systemBlocks = buildPromptForContext(options);
+
+  // prettier-ignore
+  const systemBlocks = buildSystemPromptBlocks(catalog, preferences, history, promptValues, { memoryTOC: options.memoryTOC, memoryEnabled: hasMemoryForTurn(options), caller: options.caller, clientId: options.clientId, groupContext: options.groupContext, isVoiceMessage: options.isVoiceMessage, languageDocument, triggerOnly: options.triggerOnly, unmatchedTriggers: options.unmatchedTriggers, addressedToBot: options.addressedToBot, inboundVoiceKey: options.inboundVoiceKey });
+
   return {
-    ...coreOrchestrationFields(userMessage, options, config, systemBlocks, llmMax),
+    client: new Anthropic({ apiKey: env.ANTHROPIC_API_KEY }),
+    ...routingState(config, options),
+    maxTokens: config.maxTokens,
+    systemStable: systemBlocks.stable,
+    systemVolatile: systemBlocks.volatile,
+    systemStableHash: fingerprint(systemBlocks.stable),
+    activeMode: options.modeContext?.activeModeName,
+    tools: turnTools(catalog, options),
+    messages: buildSeedMessages(userMessage, options, llmMax),
+    responses: [],
+    lastIterationStartIndex: 0,
+    ...executionLimits(config),
+    mcpCallsMade: { count: 0 },
+    turnId: options.turnId,
+    turnStartedAt: options.turnStartedAt ?? Date.now(),
+    lockRefresher: createLockRefresher(options.refreshLock, logger),
+    telemetry: createTelemetryAccumulator(),
     ...relayContextFields(env, catalog),
     catalog,
     logger,
     callbacks,
-    locale,
-    emitStatus: createStatusEmitter(callbacks, locale, logger),
+    locale: preferences.response_language,
+    emitStatus: createStatusEmitter(callbacks, preferences.response_language, logger),
     healthTracker: createHealthTracker(),
     memoryStore: options.memoryStore,
     modeContext: options.modeContext,
@@ -3021,34 +2806,6 @@ function createOrchestrationContext(
     workerOrigin: options.workerOrigin ?? '',
     org: options.org ?? options.env.DEFAULT_ORG,
     env: options.env,
-  };
-}
-
-function coreOrchestrationFields(
-  userMessage: string,
-  options: OrchestratorOptions,
-  config: ReturnType<typeof parseEnvConfig>,
-  systemBlocks: ReturnType<typeof buildPromptForContext>,
-  llmMax: number
-) {
-  return {
-    client: new Anthropic({ apiKey: options.env.ANTHROPIC_API_KEY }),
-    ...routingState(config, options),
-    maxTokens: config.maxTokens,
-    systemStable: systemBlocks.stable,
-    systemVolatile: systemBlocks.volatile,
-    systemStableHash: fingerprint(systemBlocks.stable),
-    activeMode: options.modeContext?.activeModeName,
-    tools: turnTools(options.catalog, options),
-    messages: buildSeedMessages(userMessage, options, llmMax),
-    responses: [] as string[],
-    lastIterationStartIndex: 0,
-    ...executionLimits(config),
-    mcpCallsMade: { count: 0 },
-    turnId: options.turnId,
-    turnStartedAt: options.turnStartedAt ?? Date.now(),
-    lockRefresher: createLockRefresher(options.refreshLock, options.logger),
-    telemetry: createTelemetryAccumulator(),
   };
 }
 
@@ -3085,7 +2842,7 @@ async function runOrchestrationLoop(
     // next turn does not see the partial mid-thought as the previous reply.
     // Text: `notice_max_iterations` in `src/i18n/ui-strings.ts`, localized (#405).
     const notice = uiString(ctx.locale, 'notice_max_iterations');
-    notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress(notice));
+    emitRelayProgress(ctx, notice);
     ctx.responses.push(notice);
   }
   ctx.logger.log('orchestration_loop_end', {
@@ -3223,27 +2980,18 @@ async function executeToolCalls(
   toolCalls: ToolUseBlock[],
   ctx: OrchestrationContext
 ): Promise<Anthropic.ToolResultBlockParam[]> {
-  const collectors = toolCalls.map(() => (ctx.relayActive ? new RelayCollector() : undefined));
+  const collectors = toolCalls.map(() => new RelayCollector());
   const results = await Promise.all(
     toolCalls.map((tc, i) => executeSingleTool(tc, ctx, collectors[i]))
   );
-  for (const c of collectors) c?.close();
-
-  if (ctx.relayActive && ctx.relay) {
-    const closed = collectors.map((c) => {
-      if (!c) throw new Error('relay collector missing while relayActive');
-      return c;
-    });
-    const accepted = ctx.relay.ingestCollectors(closed, ctx.logger);
-    for (let i = 0; i < results.length; i++) {
-      const ids = accepted[i] ?? [];
-      if (ids.length === 0) continue;
-      const result = results[i]!;
-      const content = typeof result.content === 'string' ? result.content : '';
-      results[i] = { ...result, content: content + formatRelayNote(ids) };
-    }
-  }
-  return results;
+  if (!ctx.relay) return results;
+  // After every call of the round has finished (and closed its collector).
+  const accepted = ctx.relay.ingestCollectors(collectors, ctx.logger);
+  return results.map((result, i) => {
+    const ids = accepted[i] ?? [];
+    if (ids.length === 0 || typeof result.content !== 'string') return result;
+    return { ...result, content: result.content + formatRelayNote(ids) };
+  });
 }
 
 /** Emit the tool-dispatch counter + duration histogram with bounded labels. */
@@ -3994,14 +3742,10 @@ async function handleMCPToolCall(
     maxResponseSizeBytes: ctx.maxMcpResponseSize,
   });
 
-  if (
-    collector &&
-    ctx.relayActive &&
-    ctx.relayServerIds.includes(server.id) &&
-    callResult.metadata?.['bt/relay'] !== undefined
-  ) {
-    const blocks = parseRelayBlocks(callResult.metadata['bt/relay'], ctx.logger);
-    for (const block of blocks) collector.add(block, ctx.logger);
+  if (collector && ctx.relay && ctx.relayServerIds.includes(server.id)) {
+    for (const block of parseRelayBlocks(callResult.metadata?.['bt/relay'], ctx.logger)) {
+      collector.add(block, ctx.logger);
+    }
   }
 
   return callResult.result;
