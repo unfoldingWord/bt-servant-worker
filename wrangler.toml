@@ -53,6 +53,10 @@ WHATSAPP_NUMBER = "15558196461"
 # closed) means only the ADMIN_API_KEY secret may use them. No effect while
 # ADMIN_API_KEY is unset. See README "Authentication".
 ADMIN_KEY_REQUIRED = "true"
+# Verbatim relay (#462): comma-separated MCP server ids allowed to publish
+# `_meta["bt/relay"]` blocks. Empty = off (default). Do not enable in
+# production until staging has been validated with a concrete server id.
+RELAY_SERVER_IDS = ""
 
 # KV Namespaces
 [[kv_namespaces]]
@@ -146,6 +150,8 @@ DEFAULT_ORG = "unfoldingWord"
 WHATSAPP_NUMBER = "15558196461"
 # See top-level [vars] note on admin key enforcement.
 ADMIN_KEY_REQUIRED = "true"
+# Verbatim relay (#462): empty until Claude confirms the staging server id.
+RELAY_SERVER_IDS = ""
 # Model fallback chain (#403), last tier: a non-Claude model via OpenRouter. Set
 # on staging first so its answers can be checked (quality, theology) with the
 # FALLBACK_FORCE_ROUTE drill before production gets a value. Needs the

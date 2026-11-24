@@ -51,6 +51,13 @@ export interface Env {
   // MCP resilience configuration (optional - has defaults)
   MAX_MCP_RESPONSE_SIZE_BYTES?: string;
 
+  /**
+   * Comma-separated MCP server ids whose `_meta["bt/relay"]` blocks are
+   * accepted for verbatim relay (#462). Empty/unset ⇒ relay inactive for the
+   * turn (no filters, no notes, streaming unchanged).
+   */
+  RELAY_SERVER_IDS?: string;
+
   // Queue configuration (optional - has defaults)
   MAX_QUEUE_DEPTH?: string;
   QUEUE_MAX_RETRIES?: string;
