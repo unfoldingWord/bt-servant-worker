@@ -150,7 +150,7 @@ DEFAULT_ORG = "unfoldingWord"
 WHATSAPP_NUMBER = "15558196461"
 # See top-level [vars] note on admin key enforcement.
 ADMIN_KEY_REQUIRED = "true"
-# Verbatim relay (#462): empty until Claude confirms the staging server id.
+# Verbatim relay (#462): empty until the staging server id of obs-5m-mcp is confirmed.
 RELAY_SERVER_IDS = ""
 # Model fallback chain (#403), last tier: a non-Claude model via OpenRouter. Set
 # on staging first so its answers can be checked (quality, theology) with the
