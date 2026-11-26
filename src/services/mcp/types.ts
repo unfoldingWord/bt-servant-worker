@@ -81,6 +81,11 @@ export interface MCPResponseMetadata {
   cache_status?: 'hit' | 'miss' | 'partial';
   /** Size of the response payload in bytes */
   response_size_bytes?: number;
+  /**
+   * Verbatim relay blocks (#462). Shape-validated by `parseRelayBlocks`;
+   * typed `unknown` so a misbehaving server cannot break the call path.
+   */
+  'bt/relay'?: unknown;
 }
 
 /**

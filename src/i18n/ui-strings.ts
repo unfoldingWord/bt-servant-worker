@@ -57,6 +57,13 @@ const en = {
     '\n\n⚠️ My answer was cut off before I could finish it. ' +
     'Send "continue" if you would like the rest.',
   /**
+   * When a relay-active turn ends with only unavailable tokens (#462): streamed
+   * and persisted like `notice_answer_truncated`, so TTS reads it too.
+   */
+  notice_relay_empty:
+    '\n\n⚠️ I could not load the content for this reply. ' +
+    'Please ask me to fetch it again, or tell me what you need in your own words.',
+  /**
    * The only failure text a user ever receives (#481): no internal
    * `Error.message` is forwarded, on any transport.
    */
@@ -92,6 +99,9 @@ const pt = {
   notice_answer_truncated:
     '\n\n⚠️ Minha resposta foi interrompida antes que eu pudesse terminá-la. ' +
     'Envie "continue" se quiser o restante.',
+  notice_relay_empty:
+    '\n\n⚠️ Não consegui carregar o conteúdo desta resposta. ' +
+    'Peça que eu busque de novo, ou diga com suas palavras o que precisa.',
   error_processing_failed: 'Falha no processamento',
   share_qr_caption:
     'Compartilhe o BT Servant com outras pessoas: escaneie este código ou encaminhe esta imagem.',

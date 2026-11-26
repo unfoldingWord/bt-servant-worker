@@ -52,6 +52,8 @@ MCP servers can optionally return metadata in their response to enable accurate 
 
 When servers don't return `_meta`, the worker falls back to the configured default estimate.
 
+Servers may also publish verbatim relay blocks under `_meta["bt/relay"]`; see [relay.md](./relay.md).
+
 #### Metadata Fields
 
 | Field                  | Type                               | Description                                |

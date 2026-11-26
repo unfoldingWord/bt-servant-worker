@@ -76,6 +76,16 @@ import {
 } from './system-prompt.js';
 import { applyResourcePriority } from './resource-priority.js';
 import {
+  expandRelayBlock,
+  formatRelayNote,
+  isRelayActive,
+  parseRelayBlocks,
+  parseRelayServerIds,
+  RelayCollector,
+  RelayRegistry,
+  RelayStreamFilter,
+} from './relay.js';
+import {
   buildAllTools,
   getToolDefinitions,
   isR2KeyInput,
@@ -405,6 +415,19 @@ interface OrchestrationContext {
    *  enforce that requested R2 keys belong to this org. */
   org: string;
   env: Env;
+  /**
+   * Verbatim relay (#462): the turn's id → text map. Set only when relay is
+   * active for the turn (env list non-empty AND the catalog has a tool from a
+   * listed server). Undefined ⇒ no filters or notes; streaming is unchanged.
+   */
+  relay: RelayRegistry | undefined;
+  /** Parsed `RELAY_SERVER_IDS`: the servers whose blocks are accepted. */
+  relayServerIds: readonly string[];
+  /**
+   * When relay is active, the inter-round `\n` is held until the first
+   * non-empty filtered progress of that round (boolean, not a counter).
+   */
+  pendingRelaySeparator: boolean;
 }
 
 /**
@@ -545,6 +568,24 @@ function extractTextResponses(content: Anthropic.ContentBlock[]): string[] {
     }
   }
   return texts;
+}
+
+/**
+ * When relay is active: expand each text block, drop blocks whose expanded
+ * form is only whitespace, keep expanded text untrimmed (#410 / #462). The
+ * `relay_*` events are logged here only (streaming does not log them).
+ * When inactive: identical to {@link extractTextResponses}.
+ */
+function expandTurnText(content: Anthropic.ContentBlock[], ctx: OrchestrationContext): string[] {
+  if (!ctx.relay) return extractTextResponses(content);
+  const responses: string[] = [];
+  for (const block of content) {
+    if (block.type !== 'text') continue;
+    const { text, events } = expandRelayBlock(block.text, ctx.relay);
+    for (const e of events) ctx.logger.warn(`relay_${e.type}`, 'id' in e ? { id: e.id } : {});
+    if (text.trim()) responses.push(text);
+  }
+  return responses;
 }
 
 /**
@@ -1642,6 +1683,15 @@ async function streamClaudeResponse(ctx: OrchestrationContext): Promise<Anthropi
       touch,
       abortKind,
       onChunk: () => ctx.lockRefresher.maybe('stream_chunk'),
+      ...(ctx.relay
+        ? {
+            relay: {
+              registry: ctx.relay,
+              emit: (text: string) => emitRelayProgress(ctx, text),
+              blocks: new Map(),
+            },
+          }
+        : {}),
     });
     recordServedModel(ctx, route, parsed);
     ctx.logger.log('claude_fetch_complete', {
@@ -1664,6 +1714,25 @@ async function streamClaudeResponse(ctx: OrchestrationContext): Promise<Anthropi
 interface SSEParseState {
   message: Anthropic.Message | undefined;
   eventCounts: Record<string, number>;
+  /** Only when relay is active for the turn (#462). */
+  relay?: RelaySSEState;
+}
+
+/** Streaming relay state for one model call (#462). */
+interface RelaySSEState {
+  registry: RelayRegistry;
+  /** Progress through the relay separator gate. */
+  emit: (text: string) => void;
+  /** Open text blocks by content index. */
+  blocks: Map<number, RelayBlockStream>;
+}
+
+interface RelayBlockStream {
+  filter: RelayStreamFilter;
+  /** Leading whitespace held until the block's first real text. */
+  held: string;
+  /** True once real text went out; after that whitespace streams normally. */
+  released: boolean;
 }
 
 function applySSELines(
@@ -1686,7 +1755,7 @@ function applySSELines(
     const t = (event as { type?: string }).type ?? 'unknown';
     state.eventCounts[t] = (state.eventCounts[t] ?? 0) + 1;
     if (t === 'ping') continue;
-    state.message = applySSEEvent(state.message, event, logger, callbacks);
+    state.message = applySSEEvent(state, state.message, event, logger, callbacks);
   }
 }
 
@@ -1780,6 +1849,9 @@ function abortSSEStream(
   logger: RequestLogger,
   detail: { watch: StreamWatch; readError: string | undefined }
 ): never {
+  // Flush open relay filters before the throw so truncated-token cleanup and
+  // any retained prefix reach onProgress ahead of finishTruncatedAnswer (#462).
+  endAllRelayBlocks(state.relay);
   // Only the attempt guard aborts this signal, so a kind is always recorded;
   // `deadline` is the defensive fallback.
   const kind = detail.watch.abortKind() ?? 'deadline';
@@ -1800,6 +1872,56 @@ function abortSSEStream(
     });
   });
   throw new ClaudeStreamAbortedError(kind, state.message, stats.bytes);
+}
+
+/** Emit filtered progress, releasing a pending inter-round separator first. */
+function emitRelayProgress(ctx: OrchestrationContext, text: string): void {
+  if (!text) return;
+  if (ctx.pendingRelaySeparator) {
+    ctx.pendingRelaySeparator = false;
+    notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress('\n'));
+  }
+  notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress(text));
+}
+
+/** Filter one text delta of block `index`. */
+function relayDelta(relay: RelaySSEState, index: number, text: string): void {
+  let block = relay.blocks.get(index);
+  if (!block) {
+    block = { filter: new RelayStreamFilter(relay.registry), held: '', released: false };
+    relay.blocks.set(index, block);
+  }
+  releaseRelayText(relay, block, block.filter.push(text).text);
+}
+
+/**
+ * Hold a block's leading whitespace until its first real text, so a block that
+ * expands to nothing emits nothing and length-based webhooks stay aligned with
+ * `responses`. After that, whitespace streams normally.
+ */
+function releaseRelayText(relay: RelaySSEState, block: RelayBlockStream, text: string): void {
+  if (block.released) {
+    relay.emit(text);
+    return;
+  }
+  block.held += text;
+  if (block.held.trim() === '') return;
+  block.released = true;
+  relay.emit(block.held);
+  block.held = '';
+}
+
+/** End of a text block: flush its filter; whitespace still held is dropped. */
+function endRelayBlock(relay: RelaySSEState | undefined, index: number): void {
+  const block = relay?.blocks.get(index);
+  if (!relay || !block) return;
+  relay.blocks.delete(index);
+  releaseRelayText(relay, block, block.filter.flush().text);
+}
+
+/** End of the stream (clean or aborted): close every open block. */
+function endAllRelayBlocks(relay: RelaySSEState | undefined): void {
+  for (const index of [...(relay?.blocks.keys() ?? [])]) endRelayBlock(relay, index);
 }
 
 /** A chunk arrived: re-arm the stall timer and run the per-chunk hook (#481). */
@@ -1846,11 +1968,15 @@ async function parseSSEStream(
   body: ReadableStream<Uint8Array>,
   logger: RequestLogger,
   callbacks?: StreamCallbacks,
-  watch?: StreamWatch
+  watch?: StreamWatch & { relay?: RelaySSEState }
 ): Promise<Anthropic.Message> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
-  const state: SSEParseState = { message: undefined, eventCounts: {} };
+  const state: SSEParseState = {
+    message: undefined,
+    eventCounts: {},
+    ...(watch?.relay ? { relay: watch.relay } : {}),
+  };
   const stats: SSEReadStats = { chunks: 0, bytes: 0, start: Date.now() };
   const aborted = watch ? abortedSignal(watch.signal) : undefined;
   let buffer = '';
@@ -1876,6 +2002,8 @@ async function parseSSEStream(
   if (watch?.signal.aborted) {
     return abortSSEStream(reader, state, stats, logger, { watch, readError: undefined });
   }
+  // Clean EOF: flush open filters so held text reaches progress (#462).
+  endAllRelayBlocks(state.relay);
   return finalizeSSEStream(state, stats, logger);
 }
 
@@ -1883,13 +2011,15 @@ function applyContentDelta(
   message: Anthropic.Message,
   event: Anthropic.RawContentBlockDeltaEvent,
   logger: RequestLogger,
-  callbacks?: StreamCallbacks
+  callbacks: StreamCallbacks | undefined,
+  state: SSEParseState
 ): void {
   const block = message.content[event.index];
   if (event.delta.type === 'text_delta' && block?.type === 'text') {
     const text = event.delta.text;
     block.text += text;
-    notifyCallback(logger, () => callbacks?.onProgress(text));
+    if (state.relay) relayDelta(state.relay, event.index, text);
+    else notifyCallback(logger, () => callbacks?.onProgress(text));
   }
   if (event.delta.type === 'input_json_delta' && block?.type === 'tool_use') {
     const prev = typeof block.input === 'string' ? block.input : '';
@@ -1917,6 +2047,7 @@ function finalizeToolInput(message: Anthropic.Message, index: number, logger: Re
 
 /** Apply a single SSE event to build up the final Message. */
 function applySSEEvent(
+  state: SSEParseState,
   message: Anthropic.Message | undefined,
   event: Anthropic.RawMessageStreamEvent,
   logger: RequestLogger,
@@ -1937,9 +2068,10 @@ function applySSEEvent(
     if (block.type === 'tool_use') (block as { input: unknown }).input = '';
     message.content.push(block as Anthropic.ContentBlock);
   } else if (event.type === 'content_block_delta') {
-    applyContentDelta(message, event, logger, callbacks);
+    applyContentDelta(message, event, logger, callbacks, state);
   } else if (event.type === 'content_block_stop') {
     finalizeToolInput(message, event.index, logger);
+    endRelayBlock(state.relay, event.index);
   }
 
   return message;
@@ -1975,12 +2107,20 @@ const PARTIAL_DELIVERABLE_BLOCKS = new Set(['text', 'thinking', 'redacted_thinki
  * (#481): `message_start` arrived, the round has non-whitespace text, and it
  * has no tool call. A round with a tool call is narration whose call never
  * finished, so its text is not an answer and the turn still fails.
+ *
+ * When relay is active, "has text" is judged on the **expanded** form so a
+ * cut token like `{{relay:panel` does not count as a delivered answer (#462).
  */
-function deliverablePartial(error: unknown): Anthropic.Message | null {
+function deliverablePartial(error: unknown, ctx: OrchestrationContext): Anthropic.Message | null {
   if (!(error instanceof ClaudeStreamAbortedError) || !error.partial) return null;
   const { content } = error.partial;
   if (!content.every((block) => PARTIAL_DELIVERABLE_BLOCKS.has(block.type))) return null;
-  const hasText = content.some((block) => block.type === 'text' && block.text.trim() !== '');
+  const hasText = content.some((block) => {
+    if (block.type !== 'text') return false;
+    if (!ctx.relay) return block.text.trim() !== '';
+    // Do not log here — expandTurnText logs once.
+    return expandRelayBlock(block.text, ctx.relay).text.trim() !== '';
+  });
   return hasText ? error.partial : null;
 }
 
@@ -2035,7 +2175,7 @@ async function callClaudeForIteration(
     countMetric('claude_fetch_total', { status: 'success', route });
     return { response, streamAbort: null };
   } catch (error) {
-    const partial = deliverablePartial(error);
+    const partial = deliverablePartial(error, ctx);
     if (partial) {
       const aborted = error as ClaudeStreamAbortedError;
       return acceptPartialResponse(ctx, aborted, partial, { iteration, callStart });
@@ -2219,7 +2359,9 @@ function finishTruncatedAnswer(ctx: OrchestrationContext, cause: TruncationCause
   // tells a cut-off stream apart from a clean stop.
   if (cause !== 'max_tokens') ctx.telemetry.finalStopReason = 'stream_aborted';
   const notice = uiString(ctx.locale, 'notice_answer_truncated');
-  notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress(notice));
+  // Through the relay separator gate (a no-op gate when relay is off), so a
+  // held separator goes out first and progress matches `responses` (#410, #462).
+  emitRelayProgress(ctx, notice);
   ctx.responses.push(notice);
 }
 
@@ -2235,21 +2377,47 @@ function finalRoundReason(
 /** The round that ends the turn: add the truncation notice when the answer was cut short. */
 function endFinalRound(
   ctx: OrchestrationContext,
+  response: Anthropic.Message,
   round: {
     iteration: number;
     iterStart: number;
-    stopReason: Anthropic.Message['stop_reason'];
     streamAbort: StreamAbortKind | null;
+    /** How many responses this round added (#462 empty-answer notice). */
+    added: number;
   }
 ): void {
   const cause: TruncationCause | null =
-    round.streamAbort ?? (round.stopReason === 'max_tokens' ? 'max_tokens' : null);
+    round.streamAbort ?? (response.stop_reason === 'max_tokens' ? 'max_tokens' : null);
   if (cause) finishTruncatedAnswer(ctx, cause);
+  else if (round.added === 0) addRelayEmptyNotice(ctx, response.content);
   ctx.logger.log('iteration_end', {
     iteration: round.iteration,
-    reason: finalRoundReason(round.stopReason, round.streamAbort),
+    reason: finalRoundReason(response.stop_reason, round.streamAbort),
     total_duration_ms: Date.now() - round.iterStart,
   });
+}
+
+function recordTurnResponses(ctx: OrchestrationContext, content: Anthropic.ContentBlock[]): number {
+  const expanded = expandTurnText(content, ctx);
+  ctx.responses.push(...expanded);
+  // Only drop a held separator when this round contributed expanded text.
+  if (expanded.length > 0) ctx.pendingRelaySeparator = false;
+  return expanded.length;
+}
+
+/**
+ * Relay active and the final round's text was only tokens that expanded to
+ * nothing (unknown or repeated ids): end with a notice instead of a blank
+ * answer (#462). A cut-off answer already gets the truncation notice.
+ */
+function addRelayEmptyNotice(ctx: OrchestrationContext, content: Anthropic.ContentBlock[]): void {
+  if (!ctx.relay) return;
+  if (!content.some((block) => block.type === 'text' && block.text.trim() !== '')) return;
+  ctx.logger.warn('relay_empty_answer', ctx.turnId ? { turn_id: ctx.turnId } : {});
+  const notice = uiString(ctx.locale, 'notice_relay_empty');
+  // Through the separator gate so progress stays aligned with responses.
+  emitRelayProgress(ctx, notice);
+  ctx.responses.push(notice);
 }
 
 function processIteration(ctx: OrchestrationContext, iteration: number): Promise<boolean> {
@@ -2274,8 +2442,10 @@ function processIteration(ctx: OrchestrationContext, iteration: number): Promise
       // streamed text diverges from the final joined `responses` (#410).
       // `ctx.responses` only ever holds non-whitespace blocks (extractTextResponses),
       // so a non-empty array means real prose has already gone out.
+      // With relay active it is held until the round's first filtered text (#462).
       if (ctx.callbacks && ctx.responses.length > 0) {
-        notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress('\n'));
+        if (ctx.relay) ctx.pendingRelaySeparator = true;
+        else notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress('\n'));
       }
       // Status stays unconditional — the tool phase should still narrate itself.
       ctx.emitStatus?.('status_preparing');
@@ -2287,11 +2457,11 @@ function processIteration(ctx: OrchestrationContext, iteration: number): Promise
     reportClaudeResponse(ctx, { iteration, response, toolCalls, iterStart });
 
     ctx.lastIterationStartIndex = ctx.responses.length;
-    ctx.responses.push(...extractTextResponses(response.content));
+    const added = recordTurnResponses(ctx, response.content);
 
     // A delivered partial never has a tool call, so it always ends the turn here.
     if (response.stop_reason === 'end_turn' || toolCalls.length === 0) {
-      endFinalRound(ctx, { iteration, iterStart, stopReason: response.stop_reason, streamAbort });
+      endFinalRound(ctx, response, { iteration, iterStart, streamAbort, added });
       return true;
     }
 
@@ -2573,13 +2743,24 @@ function defaultRouteHealthStore(env: Env, logger: RequestLogger): RouteHealthSt
   return createMemoryRouteHealthStore();
 }
 
+function relayContextFields(
+  env: Env,
+  catalog: ToolCatalog
+): Pick<OrchestrationContext, 'relay' | 'relayServerIds' | 'pendingRelaySeparator'> {
+  const relayServerIds = parseRelayServerIds(env.RELAY_SERVER_IDS);
+  return {
+    relay: isRelayActive(relayServerIds, catalog) ? new RelayRegistry() : undefined,
+    relayServerIds,
+    pendingRelaySeparator: false,
+  };
+}
+
 function createOrchestrationContext(
   userMessage: string,
   options: OrchestratorOptions,
   config: ReturnType<typeof parseEnvConfig>
 ): OrchestrationContext {
   const { env, catalog, history, preferences, orgConfig, logger, callbacks } = options;
-  const locale = preferences.response_language;
   const rawPromptValues = options.resolvedPromptValues ?? DEFAULT_PROMPT_VALUES;
   const { values: strippedValues, languageDocument } = stripPromptComments(
     rawPromptValues,
@@ -2610,11 +2791,12 @@ function createOrchestrationContext(
     turnStartedAt: options.turnStartedAt ?? Date.now(),
     lockRefresher: createLockRefresher(options.refreshLock, logger),
     telemetry: createTelemetryAccumulator(),
+    ...relayContextFields(env, catalog),
     catalog,
     logger,
     callbacks,
-    locale,
-    emitStatus: createStatusEmitter(callbacks, locale, logger),
+    locale: preferences.response_language,
+    emitStatus: createStatusEmitter(callbacks, preferences.response_language, logger),
     healthTracker: createHealthTracker(),
     memoryStore: options.memoryStore,
     modeContext: options.modeContext,
@@ -2660,7 +2842,7 @@ async function runOrchestrationLoop(
     // next turn does not see the partial mid-thought as the previous reply.
     // Text: `notice_max_iterations` in `src/i18n/ui-strings.ts`, localized (#405).
     const notice = uiString(ctx.locale, 'notice_max_iterations');
-    notifyCallback(ctx.logger, () => ctx.callbacks?.onProgress(notice));
+    emitRelayProgress(ctx, notice);
     ctx.responses.push(notice);
   }
   ctx.logger.log('orchestration_loop_end', {
@@ -2798,7 +2980,18 @@ async function executeToolCalls(
   toolCalls: ToolUseBlock[],
   ctx: OrchestrationContext
 ): Promise<Anthropic.ToolResultBlockParam[]> {
-  return Promise.all(toolCalls.map((tc) => executeSingleTool(tc, ctx)));
+  const collectors = toolCalls.map(() => new RelayCollector());
+  const results = await Promise.all(
+    toolCalls.map((tc, i) => executeSingleTool(tc, ctx, collectors[i]))
+  );
+  if (!ctx.relay) return results;
+  // After every call of the round has finished (and closed its collector).
+  const accepted = ctx.relay.ingestCollectors(collectors, ctx.logger);
+  return results.map((result, i) => {
+    const ids = accepted[i] ?? [];
+    if (ids.length === 0 || typeof result.content !== 'string') return result;
+    return { ...result, content: result.content + formatRelayNote(ids) };
+  });
 }
 
 /** Emit the tool-dispatch counter + duration histogram with bounded labels. */
@@ -2818,7 +3011,8 @@ function recordToolCallMetrics(
 
 function executeSingleTool(
   toolCall: ToolUseBlock,
-  ctx: OrchestrationContext
+  ctx: OrchestrationContext,
+  collector?: RelayCollector
 ): Promise<Anthropic.ToolResultBlockParam> {
   // `tool_name`/`tool_id` are allow-listed bounded ids; the tool INPUT is not attached
   // to the span (it can carry user content) — the existing summarized log keeps it.
@@ -2843,7 +3037,7 @@ function executeSingleTool(
       const startTime = Date.now();
 
       try {
-        const result = await dispatchToolCall(toolCall, ctx);
+        const result = await dispatchToolCall(toolCall, ctx, collector);
         recordToolCallMetrics(metricToolName, 'success', Date.now() - startTime);
         logToolSuccess(ctx, toolCall, startTime);
         ctx.callbacks?.onToolResult?.(toolCall.name, result);
@@ -2868,6 +3062,8 @@ function executeSingleTool(
           error instanceof Error ? error.name : 'Error'
         );
         return handleToolError(ctx, toolCall, error, startTime);
+      } finally {
+        collector?.close();
       }
     }
   );
@@ -2899,7 +3095,8 @@ function dispatchSimpleInternalTool(
 
 async function dispatchToolCall(
   toolCall: ToolUseBlock,
-  ctx: OrchestrationContext
+  ctx: OrchestrationContext,
+  collector?: RelayCollector
 ): Promise<unknown> {
   if (toolCall.name === 'execute_code') {
     if (!isExecuteCodeInput(toolCall.input)) {
@@ -2907,7 +3104,7 @@ async function dispatchToolCall(
         `Invalid input for execute_code: expected { code: string }, got ${truncateInput(toolCall.input)}`
       );
     }
-    return handleExecuteCode(toolCall.input, ctx);
+    return handleExecuteCode(toolCall.input, ctx, collector);
   }
   if (toolCall.name === 'get_tool_definitions') {
     if (!isGetToolDefinitionsInput(toolCall.input)) {
@@ -2921,7 +3118,7 @@ async function dispatchToolCall(
   if (simpleResult !== null) return simpleResult;
   const ptxprintResult = dispatchPtxprintTool(toolCall, ctx);
   if (ptxprintResult) return ptxprintResult;
-  return handleMCPToolCall(toolCall.name, toolCall.input, ctx);
+  return handleMCPToolCall(toolCall.name, toolCall.input, ctx, collector);
 }
 
 function buildPtxprintCtx(ctx: OrchestrationContext) {
@@ -3424,14 +3621,15 @@ async function dispatchSandboxInternalTool(
  * re-thrown: the sandbox still sees the failure.
  */
 function createSandboxToolCaller(
-  ctx: OrchestrationContext
+  ctx: OrchestrationContext,
+  collector?: RelayCollector
 ): (name: string, args: unknown) => Promise<unknown> {
   return async (name: string, args: unknown): Promise<unknown> => {
     const startTime = Date.now();
     try {
       const result = isSandboxInternalTool(name)
         ? await dispatchSandboxInternalTool(name, args, ctx)
-        : await handleMCPToolCall(name, args, ctx);
+        : await handleMCPToolCall(name, args, ctx, collector);
       recordToolCall(ctx, name, startTime, true, 'execute_code');
       return result;
     } catch (error) {
@@ -3443,11 +3641,12 @@ function createSandboxToolCaller(
 
 async function handleExecuteCode(
   input: { code: string },
-  ctx: OrchestrationContext
+  ctx: OrchestrationContext,
+  collector?: RelayCollector
 ): Promise<unknown> {
   const mcpToolNames = getToolNames(ctx.catalog);
   const toolNames = [...mcpToolNames, ...SANDBOX_INTERNAL_TOOLS];
-  const hostFunctions = createMCPHostFunctions(createSandboxToolCaller(ctx), toolNames);
+  const hostFunctions = createMCPHostFunctions(createSandboxToolCaller(ctx, collector), toolNames);
 
   const result = await executeCode(
     input.code,
@@ -3531,7 +3730,8 @@ function checkAndCountRequestMCPCall(toolName: string, ctx: OrchestrationContext
 async function handleMCPToolCall(
   toolName: string,
   input: unknown,
-  ctx: OrchestrationContext
+  ctx: OrchestrationContext,
+  collector?: RelayCollector
 ): Promise<unknown> {
   const { server } = validateMCPToolCall(toolName, ctx);
   checkServerHealth(toolName, server.id, ctx);
@@ -3541,6 +3741,12 @@ async function handleMCPToolCall(
     healthTracker: ctx.healthTracker,
     maxResponseSizeBytes: ctx.maxMcpResponseSize,
   });
+
+  if (collector && ctx.relay && ctx.relayServerIds.includes(server.id)) {
+    for (const block of parseRelayBlocks(callResult.metadata?.['bt/relay'], ctx.logger)) {
+      collector.add(block, ctx.logger);
+    }
+  }
 
   return callResult.result;
 }

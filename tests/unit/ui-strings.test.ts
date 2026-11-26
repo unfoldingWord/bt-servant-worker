@@ -33,6 +33,8 @@ const EXPECTED_KEYS: readonly UiStringKey[] = [
   'notice_max_iterations',
   // #481: appended after an answer cut short by a stalled stream or max_tokens.
   'notice_answer_truncated',
+  // #462: relay-active turn whose expanded answer is blank.
+  'notice_relay_empty',
   'error_processing_failed',
   // #474: caption on the one-time WhatsApp share QR image.
   'share_qr_caption',
